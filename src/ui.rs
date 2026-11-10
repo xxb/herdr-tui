@@ -10,7 +10,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget},
     Frame,
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Clone, Debug)]
 pub enum HitTarget {
@@ -44,6 +44,7 @@ pub enum Modal {
     Fuzzy {
         query: String,
         selected: usize,
+        selected_tab_id: Option<String>,
     },
 }
 
@@ -63,6 +64,47 @@ pub struct FuzzyItem {
     pub term_addr: String,
     pub state: AgentState,
     pub cwd: String,
+}
+
+pub fn resolve_fuzzy_selection(
+    items: &[FuzzyItem],
+    selected: usize,
+    selected_tab_id: Option<&str>,
+) -> Option<usize> {
+    if items.is_empty() {
+        return None;
+    }
+    if let Some(tid) = selected_tab_id {
+        if let Some(pos) = items.iter().position(|it| it.tab_id == tid) {
+            return Some(pos);
+        }
+    }
+    Some(selected.min(items.len() - 1))
+}
+
+fn truncate_to_width(s: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if s.width() <= max_width {
+        return s.to_string();
+    }
+    if max_width == 1 {
+        return "…".to_string();
+    }
+    let target = max_width - 1;
+    let mut out = String::new();
+    let mut w = 0usize;
+    for ch in s.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if w + cw > target {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    out.push('…');
+    out
 }
 
 pub fn collect_fuzzy_items(world: &World, query: &str) -> Vec<FuzzyItem> {
@@ -210,7 +252,11 @@ pub fn render_ui(
         Modal::Help => render_help_modal(f, area),
         Modal::ConfirmCloseTab { tab_title, .. } => render_confirm_close_modal(f, area, tab_title),
         Modal::Prompt { kind, input } => render_prompt_modal(f, area, kind, input),
-        Modal::Fuzzy { query, selected } => render_fuzzy_modal(f, area, world, query, *selected),
+        Modal::Fuzzy {
+            query,
+            selected,
+            selected_tab_id,
+        } => render_fuzzy_modal(f, area, world, query, *selected, selected_tab_id.as_deref()),
     }
 
     UiGeometry { term_rect, hits }
@@ -259,7 +305,7 @@ fn render_top_bar(
 
     // 2. Active Space badge `[Space]`
     if let Some(space) = world.active_space() {
-        let sname = world.space_display_name(space);
+        let sname = truncate_to_width(&world.space_display_name(space), 14);
         let sstate = world.space_state(space);
         let badge = format!(" [{} {}] ", sstate.symbol(), sname);
         let bw = badge.width() as u16;
@@ -304,7 +350,7 @@ fn render_top_bar(
             .iter()
             .enumerate()
             .map(|(ti, tab)| {
-                let name = world.tab_display_name(space, ti);
+                let name = truncate_to_width(&world.tab_display_name(space, ti), 18);
                 let panes = world.tab_terminals(tab).len();
                 let pane_suffix = if panes > 1 {
                     format!("({panes})")
@@ -332,11 +378,19 @@ fn render_top_bar(
             }
         }
 
-        for &(ti, ref tid, ref lbl, st, is_active) in tab_items.iter().skip(start_idx) {
-            let lw = lbl.width() as u16;
-            if x + lw + plus_w > avail_end {
+        let max_tab_end = avail_end.saturating_sub(plus_w);
+        for (vis_idx, &(ti, ref tid, ref lbl, st, is_active)) in
+            tab_items.iter().skip(start_idx).enumerate()
+        {
+            let remaining = max_tab_end.saturating_sub(x);
+            let rendered_lbl = if (lbl.width() as u16) <= remaining {
+                lbl.clone()
+            } else if vis_idx == 0 && remaining >= 4 {
+                truncate_to_width(lbl, remaining as usize)
+            } else {
                 break;
-            }
+            };
+            let lw = rendered_lbl.width() as u16;
             let tab_bg = if is_active {
                 Color::Rgb(72, 82, 130)
             } else {
@@ -351,12 +405,12 @@ fn render_top_bar(
             if is_active {
                 style = style.add_modifier(Modifier::BOLD);
             }
-            buf.set_string(x, rect.y, lbl, style);
+            buf.set_string(x, rect.y, &rendered_lbl, style);
 
-            // Colorize the status dot inside the tab pill
+            // Colorize the status dot inside the tab pill if it wasn't truncated out
             let num_prefix = format!(" {}:", ti + 1);
             let dot_x = x + (num_prefix.width() as u16);
-            if dot_x < avail_end {
+            if dot_x < x + lw {
                 buf.set_string(
                     dot_x,
                     rect.y,
@@ -749,7 +803,14 @@ fn render_prompt_modal(f: &mut Frame, area: Rect, kind: &PromptKind, input: &str
     f.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
-fn render_fuzzy_modal(f: &mut Frame, area: Rect, world: &World, query: &str, selected: usize) {
+fn render_fuzzy_modal(
+    f: &mut Frame,
+    area: Rect,
+    world: &World,
+    query: &str,
+    selected: usize,
+    selected_tab_id: Option<&str>,
+) {
     let popup = centered_rect(72, 18, area);
     f.render_widget(Clear, popup);
     let block = Block::default()
@@ -770,7 +831,7 @@ fn render_fuzzy_modal(f: &mut Frame, area: Rect, world: &World, query: &str, sel
     f.render_widget(prompt, chunks[0]);
 
     let items = collect_fuzzy_items(world, query);
-    let sel = selected.min(items.len().saturating_sub(1));
+    let sel = resolve_fuzzy_selection(&items, selected, selected_tab_id).unwrap_or(0);
     let list_items: Vec<ListItem> = items
         .iter()
         .enumerate()

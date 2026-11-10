@@ -11,11 +11,13 @@ use crate::keys::{
 };
 use crate::model::World;
 use crate::ui::{
-    collect_fuzzy_items, compute_terminal_rect, render_ui, HitRegion, HitTarget, Modal, PromptKind,
+    collect_fuzzy_items, compute_terminal_rect, render_ui, resolve_fuzzy_selection, HitRegion,
+    HitTarget, Modal, PromptKind,
 };
 use anyhow::Result;
 use clap::Parser;
 use crossterm::{
+    cursor::Show,
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
         Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
@@ -29,6 +31,22 @@ use std::time::{Duration, Instant};
 
 const SCROLLBACK_LINES: usize = 5000;
 const MAX_MSGS_PER_TICK: usize = 64;
+
+struct TerminalCleanupGuard;
+
+impl Drop for TerminalCleanupGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let mut stdout = io::stdout();
+        let _ = execute!(
+            stdout,
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen,
+            Show
+        );
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -85,8 +103,10 @@ fn main() -> Result<()> {
     let mut world = World::default();
     world.load_initial(&core, &snapshot)?;
 
-    // Setup terminal
+    // Setup terminal with an immediate RAII guard so any setup or runtime error
+    // restores raw mode, alternate screen, mouse capture, and cursor visibility.
     enable_raw_mode()?;
+    let _cleanup_guard = TerminalCleanupGuard;
     let mut stdout = io::stdout();
     execute!(
         stdout,
@@ -257,9 +277,12 @@ fn execute_action(
             *sidebar_open = !*sidebar_open;
         }
         Action::FuzzyFinder => {
+            let items = collect_fuzzy_items(world, "");
+            let selected_tab_id = items.first().map(|it| it.tab_id.clone());
             *modal = Modal::Fuzzy {
                 query: String::new(),
                 selected: 0,
+                selected_tab_id,
             };
         }
         Action::JumpAlertAgent => {
@@ -416,6 +439,18 @@ fn run_app(
                 modal = Modal::None;
                 dirty = true;
             }
+        } else if let Modal::Fuzzy {
+            ref mut selected_tab_id,
+            ..
+        } = modal
+        {
+            if selected_tab_id
+                .as_deref()
+                .is_some_and(|tid| !world.has_tab(tid))
+            {
+                *selected_tab_id = None;
+                dirty = true;
+            }
         }
 
         let poll_timeout = if more_messages {
@@ -451,9 +486,16 @@ fn run_app(
                     }
                 } else if let Modal::Prompt { input, .. } = &mut modal {
                     input.push_str(&text);
-                } else if let Modal::Fuzzy { query, selected } = &mut modal {
+                } else if let Modal::Fuzzy {
+                    query,
+                    selected,
+                    selected_tab_id,
+                } = &mut modal
+                {
                     query.push_str(&text);
                     *selected = 0;
+                    let items = collect_fuzzy_items(world, query);
+                    *selected_tab_id = items.first().map(|it| it.tab_id.clone());
                 }
             }
             Event::Mouse(mev) => {
@@ -568,32 +610,49 @@ fn run_app(
                         }
                         continue;
                     }
-                    Modal::Fuzzy { query, selected } => {
+                    Modal::Fuzzy {
+                        query,
+                        selected,
+                        selected_tab_id,
+                    } => {
                         let items = collect_fuzzy_items(world, query);
+                        let cur_sel =
+                            resolve_fuzzy_selection(&items, *selected, selected_tab_id.as_deref())
+                                .unwrap_or(0);
                         match kev.code {
                             KeyCode::Esc => {
                                 modal = Modal::None;
                             }
                             KeyCode::Up => {
-                                *selected = selected.saturating_sub(1);
+                                *selected = cur_sel.saturating_sub(1);
+                                *selected_tab_id = items.get(*selected).map(|it| it.tab_id.clone());
                             }
                             KeyCode::Down => {
                                 if !items.is_empty() {
-                                    *selected = (*selected + 1).min(items.len() - 1);
+                                    *selected = (cur_sel + 1).min(items.len() - 1);
+                                    *selected_tab_id =
+                                        items.get(*selected).map(|it| it.tab_id.clone());
                                 }
                             }
                             KeyCode::Char('p') if kev.modifiers.contains(KeyModifiers::CONTROL) => {
-                                *selected = selected.saturating_sub(1);
+                                *selected = cur_sel.saturating_sub(1);
+                                *selected_tab_id = items.get(*selected).map(|it| it.tab_id.clone());
                             }
                             KeyCode::Char('n') if kev.modifiers.contains(KeyModifiers::CONTROL) => {
                                 if !items.is_empty() {
-                                    *selected = (*selected + 1).min(items.len() - 1);
+                                    *selected = (cur_sel + 1).min(items.len() - 1);
+                                    *selected_tab_id =
+                                        items.get(*selected).map(|it| it.tab_id.clone());
                                 }
                             }
                             KeyCode::Enter => {
-                                if let Some(chosen) = items.get(*selected) {
-                                    if world.select_tab_by_id(&chosen.space_id, &chosen.tab_id) {
-                                        world.mark_active_seen(core);
+                                if let Some(ref tid) = *selected_tab_id {
+                                    if let Some(chosen) = items.iter().find(|it| &it.tab_id == tid)
+                                    {
+                                        if world.select_tab_by_id(&chosen.space_id, &chosen.tab_id)
+                                        {
+                                            world.mark_active_seen(core);
+                                        }
                                     }
                                 }
                                 modal = Modal::None;
@@ -601,10 +660,14 @@ fn run_app(
                             KeyCode::Backspace => {
                                 query.pop();
                                 *selected = 0;
+                                let next_items = collect_fuzzy_items(world, query);
+                                *selected_tab_id = next_items.first().map(|it| it.tab_id.clone());
                             }
                             KeyCode::Char(c) if !kev.modifiers.contains(KeyModifiers::CONTROL) => {
                                 query.push(c);
                                 *selected = 0;
+                                let next_items = collect_fuzzy_items(world, query);
+                                *selected_tab_id = next_items.first().map(|it| it.tab_id.clone());
                             }
                             _ => {}
                         }
