@@ -363,8 +363,9 @@ fn run_app(
                 CoreMessage::TerminalClosed { channel, .. } => {
                     if attached.as_ref().is_some_and(|a| a.channel == channel) {
                         attached = None;
-                        let _ = world.refresh_terminals(core);
-                        let _ = world.reconcile_and_sync(core);
+                        if world.refresh_terminals(core).is_ok() {
+                            let _ = world.reconcile_and_sync(core);
+                        }
                     }
                 }
                 CoreMessage::Event(ev) => {
@@ -375,13 +376,15 @@ fn run_app(
                         .unwrap_or("");
                     match ev_type {
                         "doc" | "missed" => {
-                            let _ = world.refresh_terminals(core);
-                            let _ = world.fetch_doc(core);
-                            let _ = world.reconcile_and_sync(core);
+                            if world.fetch_doc(core).is_ok() && world.refresh_terminals(core).is_ok()
+                            {
+                                let _ = world.reconcile_and_sync(core);
+                            }
                         }
                         "started" | "finished" => {
-                            let _ = world.refresh_terminals(core);
-                            let _ = world.reconcile_and_sync(core);
+                            if world.refresh_terminals(core).is_ok() {
+                                let _ = world.reconcile_and_sync(core);
+                            }
                         }
                         "status" | "turn" | "title" | "labels" => {
                             let _ = world.refresh_terminals(core);

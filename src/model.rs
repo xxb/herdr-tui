@@ -355,6 +355,19 @@ impl World {
         Ok(())
     }
 
+    pub fn doc_has_unseen_terminals(&self) -> bool {
+        for space in &self.doc.spaces {
+            for tab in &space.tabs {
+                let mut terms = Vec::new();
+                extract_terminals(&tab.root, &mut terms);
+                if terms.iter().any(|t| !self.terminals.contains_key(t)) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn fetch_doc(&mut self, core: &CoreClient) -> Result<()> {
         let res = core.call("doc.get", json!({ "name": "herdr-app" }))?;
         self.doc_version = res.get("version").and_then(Value::as_u64).unwrap_or(0);
@@ -366,6 +379,13 @@ impl World {
             } else {
                 self.doc = AppDocument::default();
             }
+        }
+        // If the fetched document references any terminal address absent from our
+        // local snapshot (e.g. created by another client after our last `terminal.list`),
+        // refresh `self.terminals` before reconciling so we never mistake a newly
+        // created remote terminal for a dead one.
+        if self.doc_has_unseen_terminals() {
+            self.refresh_terminals(core)?;
         }
         self.clamp_selection();
         Ok(())
@@ -515,6 +535,9 @@ impl World {
 
     /// Reconcile `doc("herdr-app")` with live terminals in `herdr-core` and persist with CAS rebase.
     pub fn reconcile_and_sync(&mut self, core: &CoreClient) -> Result<bool> {
+        if self.doc_has_unseen_terminals() {
+            self.refresh_terminals(core)?;
+        }
         let mut any_changed = self.reconcile_doc_in_place();
 
         // Ensure at least one live terminal exists if all spaces/tabs are empty
