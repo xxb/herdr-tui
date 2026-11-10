@@ -99,7 +99,7 @@ impl CoreClient {
             Arc::new(Mutex::new(HashMap::new()));
         let events_channel: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
 
-        let (msg_tx, msg_rx) = mpsc::sync_channel(512);
+        let (msg_tx, msg_rx) = mpsc::channel();
 
         {
             let writer_clone = writer.clone();
@@ -166,24 +166,10 @@ impl CoreClient {
 
                     match kind {
                         wire::DATA => {
-                            let len = payload.len() as u32;
-                            if msg_tx
-                                .send(CoreMessage::TerminalData {
-                                    channel: ch,
-                                    data: payload,
-                                })
-                                .is_ok()
-                                && len > 0
-                            {
-                                // Acknowledge flow-control credit immediately after queuing into
-                                // the bounded channel so `herdr-core` never stalls at 32 KiB
-                                // boundaries waiting for the UI thread's poll timer.
-                                let credit = wire::encode(ch, wire::CREDIT, &len.to_le_bytes());
-                                let mut w =
-                                    writer_clone.lock().unwrap_or_else(|e| e.into_inner());
-                                let _ = w.write_all(&credit);
-                                let _ = w.flush();
-                            }
+                            let _ = msg_tx.send(CoreMessage::TerminalData {
+                                channel: ch,
+                                data: payload,
+                            });
                         }
                         wire::CLOSE => {
                             let reason = serde_json::from_slice(&payload).unwrap_or(Value::Null);
@@ -303,6 +289,13 @@ impl CoreClient {
     pub fn set_focus(&self, channel: u32, focused: bool) {
         let byte = u8::from(focused);
         let _ = self.send_frame(channel, wire::FOCUS, &[byte]);
+    }
+
+    /// Return flow-control credit for a terminal channel after the UI thread drains data.
+    pub fn ack_credit(&self, channel: u32, bytes: u32) {
+        if bytes > 0 {
+            let _ = self.send_frame(channel, wire::CREDIT, &bytes.to_le_bytes());
+        }
     }
 
     /// Send input bytes to an attached terminal channel.

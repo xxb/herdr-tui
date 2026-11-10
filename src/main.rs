@@ -110,12 +110,8 @@ fn sanitize_vt_bytes(payload: &[u8]) -> Cow<'_, [u8]> {
         return Cow::Borrowed(payload);
     }
 
-    let mut out = Vec::with_capacity(payload.len() + if is_home_redraw { 128 } else { 0 });
+    let mut out = Vec::with_capacity(payload.len() + if is_home_redraw { 64 } else { 0 });
     let mut i = 0;
-    if is_home_redraw {
-        out.extend_from_slice(b"\x1b[H\x1b[2J");
-        i = 3;
-    }
     while i < payload.len() {
         if has_9001
             && i + 8 <= payload.len()
@@ -139,7 +135,7 @@ fn sanitize_vt_bytes(payload: &[u8]) -> Cow<'_, [u8]> {
             continue;
         }
         if is_home_redraw && i + 2 <= payload.len() && &payload[i..i + 2] == b"\r\n" {
-            out.extend_from_slice(b"\x1b[0m\x1b[K\r\n");
+            out.extend_from_slice(b"\x1b[K\r\n");
             i += 2;
             continue;
         }
@@ -409,7 +405,6 @@ fn sync_attached_terminals(
             }
             if active_addr.as_ref() != Some(addr) {
                 core.set_focus(cur.channel, true);
-                core.resize_channel(cur.channel, cols, rows);
                 world.mark_active_seen(core);
             }
         } else if let Ok(ch) = core.attach_terminal(addr, cols, rows, ATTACH_HISTORY_LINES) {
@@ -680,6 +675,7 @@ fn run_app(
             drained += 1;
             match msg {
                 CoreMessage::TerminalData { channel, data } => {
+                    core.ack_credit(channel, data.len() as u32);
                     let is_active = active_channel == Some(channel);
                     if is_active {
                         dirty = true;
