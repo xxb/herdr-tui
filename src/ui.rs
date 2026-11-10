@@ -249,35 +249,9 @@ impl TerminalSelection {
         if scr_rows == 0 || scr_cols == 0 {
             return String::new();
         }
-        let mut lines = Vec::new();
-        for r in sr..=er.min(scr_rows.saturating_sub(1)) {
-            let c_start = if r == sr { sc } else { 0 };
-            let c_end = if r == er {
-                ec.min(scr_cols.saturating_sub(1))
-            } else {
-                scr_cols.saturating_sub(1)
-            };
-            if c_start > c_end {
-                lines.push(String::new());
-                continue;
-            }
-            let mut line = String::new();
-            for c in c_start..=c_end {
-                if let Some(cell) = screen.cell(r, c) {
-                    if cell.is_wide_continuation() {
-                        continue;
-                    }
-                    let contents = cell.contents();
-                    if contents.is_empty() {
-                        line.push(' ');
-                    } else {
-                        line.push_str(&contents);
-                    }
-                }
-            }
-            lines.push(line.trim_end().to_string());
-        }
-        lines.join("\n").trim_end_matches('\n').to_string()
+        let end_row = er.min(scr_rows.saturating_sub(1));
+        let end_col_excl = ec.min(scr_cols.saturating_sub(1)).saturating_add(1);
+        screen.contents_between(sr, sc, end_row, end_col_excl)
     }
 }
 
@@ -579,19 +553,16 @@ fn render_bottom_touchbar(
 
     // 2. Left Space Name + Hollow/Solid Tab Circles (`●` = active tab, `○` = inactive tab):
     // When `rect.height >= 2`, row 0 shows the current Space name and row 1 underneath it shows `● ○ ○`.
-    // Reserve budget for the core terminal keys first so a large number of tabs never crowds out `[^B]`/`[Esc]`,
-    // and keep a fixed width on >=76 col terminals so keys never jitter.
+    // Compute `dots_budget` strictly from the state-independent `base_end` so `[^B]` and all key buttons
+    // stay at the exact same column regardless of `copied_flash` or `scrollback_offset`.
     let dots_start_x = x;
+    let base_end = max_x.saturating_sub(help_w.min(rect.width.saturating_sub(4)));
     let min_key_reserve: u16 = 29; // Enough for `[^B]│[Esc]│[Tab]│[^C]`
-    let dots_budget = if rect.width >= 78 {
-        11.min(avail_end.saturating_sub(dots_start_x))
-    } else {
-        avail_end
-            .saturating_sub(dots_start_x)
-            .saturating_sub(min_key_reserve)
-            .min(11)
-    };
-    let dots_limit_x = dots_start_x + dots_budget;
+    let dots_budget = base_end
+        .saturating_sub(dots_start_x)
+        .saturating_sub(min_key_reserve)
+        .min(11);
+    let dots_limit_x = (dots_start_x + dots_budget).min(max_x);
 
     if dots_budget >= 2 {
         if let Some(space) = world.active_space() {
@@ -694,8 +665,8 @@ fn render_bottom_touchbar(
                 x = dots_limit_x;
             } else {
                 // 1-row fallback (`--no-touch`): compact Space prefix + `●`/`○` circles
-                let compact_dots = total_tabs > 3 || (dots_budget as usize) < total_tabs * 2;
-                let dot_step: usize = if compact_dots { 1 } else { 2 };
+                let compact_dots = total_tabs > 3 || (dots_budget as usize) < total_tabs * 3;
+                let dot_step: usize = if compact_dots { 2 } else { 3 };
                 let max_visible_dots = (dots_budget as usize / dot_step).max(1);
                 let start_ti = if total_tabs <= max_visible_dots || active_ti < max_visible_dots {
                     0
@@ -752,7 +723,7 @@ fn render_bottom_touchbar(
             }
         }
     }
-    if rect.width >= 78 && x < dots_limit_x {
+    if dots_budget >= 2 && x < dots_limit_x {
         x = dots_limit_x;
     }
     if x > dots_start_x && x < avail_end {
@@ -2070,13 +2041,26 @@ mod tests {
 
     #[test]
     fn terminal_selection_extracts_single_and_multiline_text() {
-        let mut parser = vt100::Parser::new(10, 40, 100);
-        parser.process(b"hello world\r\nsecond line here");
+        let mut parser = vt100::Parser::new(10, 12, 100);
+        parser.process(b"hello world\r\nsecond line");
         let sel = TerminalSelection {
             anchor: (0, 6),
             head: (1, 5),
             active: false,
         };
         assert_eq!(sel.extract_text(parser.screen()), "world\nsecond");
+
+        // Soft-wrapped lines (no `\r\n`) should be joined without inserting a spurious newline
+        let mut wrap_parser = vt100::Parser::new(10, 10, 100);
+        wrap_parser.process(b"abcdefghijklmno");
+        let wrap_sel = TerminalSelection {
+            anchor: (0, 0),
+            head: (1, 4),
+            active: false,
+        };
+        assert_eq!(
+            wrap_sel.extract_text(wrap_parser.screen()),
+            "abcdefghijklmno"
+        );
     }
 }
