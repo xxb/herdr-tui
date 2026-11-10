@@ -92,11 +92,10 @@ impl TouchSwipeState {
         if col < 2 || col >= screen_width.saturating_sub(2) {
             return None;
         }
-        if col < term_rect.x
-            || col >= term_rect.x.saturating_add(term_rect.width)
-            || row < term_rect.y
-            || row >= term_rect.y.saturating_add(term_rect.height)
-        {
+        // Never intercept drags inside the terminal viewport (`row < term_rect.y + term_rect.height`),
+        // so finger text selection in the terminal body never conflicts with switching tabs.
+        // Only allow horizontal swipe along the bottom touchbar rows.
+        if row < term_rect.y.saturating_add(term_rect.height) {
             return None;
         }
         Some(Self {
@@ -659,6 +658,11 @@ fn run_app(
                                     prefix_active = false;
                                     *sidebar_open = !*sidebar_open;
                                 }
+                                HitTarget::ToggleSpaceCollapse(space_id) => {
+                                    modal = Modal::None;
+                                    prefix_active = false;
+                                    world.toggle_space_collapsed(&space_id);
+                                }
                                 HitTarget::SelectSpace(space_id) => {
                                     modal = Modal::None;
                                     prefix_active = false;
@@ -1042,37 +1046,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn touch_swipe_switches_tab_and_ignores_screen_edges() {
-        let term_rect = Rect::new(0, 1, 100, 23);
+    fn touch_swipe_only_on_bottom_touchbar_never_conflicts_with_terminal_selection() {
+        let term_rect = Rect::new(0, 0, 100, 23);
+
+        // Starting inside the terminal body (`row < 23`) is ignored so finger text selection never switches tabs
+        assert!(TouchSwipeState::try_begin(20, 0, term_rect, 100).is_none());
+        assert!(TouchSwipeState::try_begin(40, 10, term_rect, 100).is_none());
+        assert!(TouchSwipeState::try_begin(40, 22, term_rect, 100).is_none());
 
         // Starting within leftmost or rightmost 2 columns is ignored (avoids iPadOS system back gesture)
-        assert!(TouchSwipeState::try_begin(0, 10, term_rect, 100).is_none());
-        assert!(TouchSwipeState::try_begin(1, 10, term_rect, 100).is_none());
-        assert!(TouchSwipeState::try_begin(98, 10, term_rect, 100).is_none());
-        assert!(TouchSwipeState::try_begin(99, 10, term_rect, 100).is_none());
+        assert!(TouchSwipeState::try_begin(0, 23, term_rect, 100).is_none());
+        assert!(TouchSwipeState::try_begin(1, 23, term_rect, 100).is_none());
+        assert!(TouchSwipeState::try_begin(98, 23, term_rect, 100).is_none());
+        assert!(TouchSwipeState::try_begin(99, 23, term_rect, 100).is_none());
 
-        // Starting on the top bar (outside term_rect) is ignored
-        assert!(TouchSwipeState::try_begin(20, 0, term_rect, 100).is_none());
-
-        // Natural swipe left (dx = -10, dy = 1) inside terminal body -> NextTab once
-        let mut swipe = TouchSwipeState::try_begin(40, 10, term_rect, 100).unwrap();
-        assert_eq!(swipe.update_and_eval(35, 10, 8, true), None);
+        // Natural swipe left (dx = -10, dy = 0) on the bottom touchbar (`row == 23`) -> NextTab once
+        let mut swipe = TouchSwipeState::try_begin(40, 23, term_rect, 100).unwrap();
+        assert_eq!(swipe.update_and_eval(35, 23, 8, true), None);
         assert_eq!(
-            swipe.update_and_eval(30, 11, 8, true),
+            swipe.update_and_eval(30, 23, 8, true),
             Some(Action::NextTab)
         );
         // Subsequent drag events in the same gesture do not fire a second switch
-        assert_eq!(swipe.update_and_eval(20, 11, 8, true), None);
+        assert_eq!(swipe.update_and_eval(20, 23, 8, true), None);
 
-        // Natural swipe right (dx = +10, dy = 0) -> PrevTab
-        let mut swipe_r = TouchSwipeState::try_begin(20, 10, term_rect, 100).unwrap();
+        // Natural swipe right (dx = +10, dy = 0) on bottom touchbar -> PrevTab
+        let mut swipe_r = TouchSwipeState::try_begin(20, 23, term_rect, 100).unwrap();
         assert_eq!(
-            swipe_r.update_and_eval(30, 10, 8, true),
+            swipe_r.update_and_eval(30, 23, 8, true),
             Some(Action::PrevTab)
         );
-
-        // Mostly vertical drag (dx = -10, dy = 8 -> |dx| < 2 * |dy|) does not trigger tab switch
-        let mut diag = TouchSwipeState::try_begin(40, 5, term_rect, 100).unwrap();
-        assert_eq!(diag.update_and_eval(30, 13, 8, true), None);
     }
 }

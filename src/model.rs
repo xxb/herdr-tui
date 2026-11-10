@@ -343,6 +343,8 @@ pub struct World {
     pub active_tab_by_space: BTreeMap<String, String>,
     /// Per-tab selected terminal address (when a tab from desktop app has multiple panes)
     pub active_term_by_tab: BTreeMap<String, String>,
+    /// Spaces whose secondary tab lists are collapsed in the left sidebar
+    pub collapsed_spaces: HashSet<String>,
 }
 
 impl Default for World {
@@ -354,6 +356,7 @@ impl Default for World {
             active_space_idx: 0,
             active_tab_by_space: BTreeMap::new(),
             active_term_by_tab: BTreeMap::new(),
+            collapsed_spaces: HashSet::new(),
         }
     }
 }
@@ -790,9 +793,24 @@ impl World {
         }
     }
 
+    pub fn is_space_collapsed(&self, space_id: &str) -> bool {
+        self.collapsed_spaces.contains(space_id)
+    }
+
+    pub fn toggle_space_collapsed(&mut self, space_id: &str) {
+        if !self.collapsed_spaces.remove(space_id) {
+            self.collapsed_spaces.insert(space_id.to_string());
+        }
+    }
+
     pub fn select_space_by_id(&mut self, space_id: &str) -> bool {
         if let Some(si) = self.doc.spaces.iter().position(|s| s.id == space_id) {
-            self.active_space_idx = si;
+            if self.active_space_idx == si {
+                self.toggle_space_collapsed(space_id);
+            } else {
+                self.active_space_idx = si;
+                self.collapsed_spaces.remove(space_id);
+            }
             return true;
         }
         false
@@ -802,6 +820,7 @@ impl World {
         if let Some(si) = self.doc.spaces.iter().position(|s| s.id == space_id) {
             if self.doc.spaces[si].tabs.iter().any(|t| t.id == tab_id) {
                 self.active_space_idx = si;
+                self.collapsed_spaces.remove(space_id);
                 self.active_tab_by_space
                     .insert(space_id.to_string(), tab_id.to_string());
                 return true;

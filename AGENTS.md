@@ -7,8 +7,8 @@
 ### Architectural Invariants
 1. **No Pane Splitting Complexity**: `hct` intentionally omits pane splitting and complex 2D tiling. Every tab displays a single full-size terminal viewport (with `^b o` available to cycle panes if a tab created by the desktop app contains multiple panes).
 2. **Collapsible 2-Row Left Sidebar + Herdr-Style Bottom Touchbar**:
-   - **Left Sidebar (`^b b`)**: Displays Spaces, Tabs, and live Agent status (`◉` blocked, `●` working, `✓` done, `○` idle) as 2-row touch cards, plus `[+ New Tab]` and `[+ New Space]` buttons. Auto-collapses when terminal width `< 80` cols and can be toggled open at any width.
-   - **Bottom Touchbar (1 row, or 2 rows with `--touch`)**: Displays `[≡]` sidebar toggle + active Space/Tab status, `[^B]` sticky prefix button, terminal keys (`[Esc]`, `[Tab]`, `[^C]`, `[←]`, `[↓]`, `[↑]`, `[→]`), `[▼ SCROLL]` jump-to-bottom badge when scrolled, and `[ ? ]` Quick Actions panel toggle.
+   - **Left Sidebar (`^b b`)**: Displays Spaces, Tabs, and live Agent status (`◉` blocked, `●` working, `✓` done, `○` idle) as 2-row touch cards, collapsible Space child tabs (`▾` / `▸`), and spaced-out `[+ New Tab]` and `[+ New Space]` buttons. Auto-collapses when terminal width `< 80` cols and can be toggled open at any width.
+   - **Bottom Touchbar (1 row, or 2 rows with `--touch`)**: Displays compact `◄≡`/`≡►` sidebar toggle, left-side clickable Tab status dots (`● ○ ✓`), constant-width `[^B]` sticky prefix button and terminal keys (`[Esc]`, `[Tab]`, `[^C]`, `[←]`, `[↓]`, `[↑]`, `[→]`), `[▼ BOT]` jump-to-bottom badge when scrolled, and `[ ? ]` Quick Actions panel toggle.
 3. **Bidirectional `doc("herdr-app")` Sync**:
    - Reads and writes `herdr-core`'s `doc("herdr-app")` layout document with CAS version checks (`doc.get` / `doc.set`).
    - Preserves unknown JSON fields (`#[serde(flatten)]`) so official Herdr Desktop and Android clients never lose metadata when `hct` saves changes.

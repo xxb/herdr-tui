@@ -17,6 +17,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HitTarget {
     ToggleSidebar,
+    ToggleSpaceCollapse(String),
     SelectSpace(String),
     SelectTab { space_id: String, tab_id: String },
     NewTab,
@@ -418,47 +419,26 @@ fn render_bottom_touchbar(
     let max_x = rect.x + rect.width;
     let buf = f.buffer_mut();
 
-    // Reserve right-side space for optional `[ ▼ SCROLL -N ]` and `[ ? ]`
+    // Reserve right-side space for optional `[▼ BOT]` and `[ ? ]`
     let scroll_lbl = if scrollback_offset > 0 {
-        Some(format!(" [ ▼ SCROLL -{scrollback_offset} ] "))
+        Some(" [▼ BOT] ")
     } else {
         None
     };
     let help_lbl = " [ ? ] ";
-    let scroll_w = scroll_lbl.as_ref().map_or(0, |s| s.width() as u16);
+    let scroll_w = scroll_lbl.map_or(0, |s| s.width() as u16);
     let help_w = help_lbl.width() as u16;
     let right_reserved = (scroll_w + help_w).min(rect.width.saturating_sub(4));
     let avail_end = max_x.saturating_sub(right_reserved);
 
-    // 1. Left: `[≡]` Sidebar Toggle + current Space:Tab indicator (falls back to compact icon on narrow screens)
-    let icon = if sidebar_open { "◄≡" } else { "≡►" };
-    let compact_sb = format!(" {icon} ");
-    let (full_sb_label, active_state, dot_offset) = if let Some(space) = world.active_space() {
-        let sname = truncate_to_width(&world.space_display_name(space), 10);
-        let ti = world.active_tab_index();
-        let tname = truncate_to_width(&world.tab_display_name(space, ti), 10);
-        let st = world
-            .active_tab()
-            .map_or_else(|| world.space_state(space), |t| world.tab_state(t));
-        let prefix_part = format!(" {icon} {sname} {}:", ti + 1);
-        let dot_off = prefix_part.width() as u16;
-        let full = format!("{prefix_part}{} {tname} ", st.symbol());
-        (full, Some(st), dot_off)
-    } else {
-        (format!(" {icon} Spaces "), None, 0)
-    };
-
-    // Leave room for terminal keys when possible; on narrow terminals fall back to truncated or icon-only toggle
+    // 1. Far Left: compact 4-column icon-only Sidebar Toggle (` ◄≡ ` or ` ≡► `)
+    let icon_lbl = if sidebar_open { " ◄≡ " } else { " ≡► " };
     let max_sb_budget = avail_end.saturating_sub(x);
-    let (sb_label, show_colored_dot) =
-        if (full_sb_label.width() as u16) <= max_sb_budget && rect.width >= 56 {
-            (full_sb_label, true)
-        } else if (compact_sb.width() as u16) <= max_sb_budget {
-            (compact_sb, false)
-        } else {
-            (truncate_to_width(&compact_sb, max_sb_budget as usize), false)
-        };
-
+    let sb_label = if (icon_lbl.width() as u16) <= max_sb_budget {
+        icon_lbl.to_string()
+    } else {
+        truncate_to_width(icon_lbl, max_sb_budget as usize)
+    };
     let sb_w = sb_label.width() as u16;
     if sb_w > 0 && x + sb_w <= max_x {
         let style = Style::default()
@@ -470,18 +450,6 @@ fn render_bottom_touchbar(
             .fg(Color::White)
             .add_modifier(Modifier::BOLD);
         draw_touchbar_pill(buf, x, rect, &sb_label, style, sidebar_open);
-        if show_colored_dot {
-            if let Some(st) = active_state {
-                if x + dot_offset < x + sb_w {
-                    buf.set_string(
-                        x + dot_offset,
-                        rect.y,
-                        st.symbol(),
-                        style.fg(state_color(st)).add_modifier(Modifier::BOLD),
-                    );
-                }
-            }
-        }
         hits.push(HitRegion {
             rect: Rect {
                 x,
@@ -501,54 +469,101 @@ fn render_bottom_touchbar(
         x += 1;
     }
 
-    // 2. Center: Herdr App-style Touchbar Keys (`^B`, `Esc`, `Tab`, `^C`, `←`, `↓`, `↑`, `→`, `[+]`)
-    let wide = avail_end.saturating_sub(x) >= 68;
-    let key_buttons: [(String, HitTarget, bool); 9] = [
-        (
-            if prefix_active {
-                " [^B*] ".to_string()
+    // 2. Left Tab Status Dots (` ● ○ ✓ `, similar to legacy Herdr):
+    // Fixed minimum zone width on >=76 col terminals so key buttons never jitter when tabs are 1..3.
+    let dots_start_x = x;
+    if let Some(space) = world.active_space() {
+        let active_ti = world.active_tab_index();
+        let space_id = space.id.clone();
+        let compact_dots = space.tabs.len() > 3;
+        for (ti, tab) in space.tabs.iter().enumerate() {
+            let st = world.tab_state(tab);
+            let pill = if compact_dots {
+                format!("{} ", st.symbol())
             } else {
-                " [^B] ".to_string()
-            },
-            HitTarget::TogglePrefix,
-            prefix_active,
-        ),
+                format!(" {} ", st.symbol())
+            };
+            let pw = pill.width() as u16;
+            if x + pw > avail_end {
+                break;
+            }
+            let is_active = ti == active_ti;
+            let pstyle = Style::default()
+                .bg(if is_active {
+                    Color::Rgb(68, 78, 128)
+                } else {
+                    Color::Rgb(20, 22, 34)
+                })
+                .fg(state_color(st))
+                .add_modifier(Modifier::BOLD);
+            draw_touchbar_pill(buf, x, rect, &pill, pstyle, is_active);
+            hits.push(HitRegion {
+                rect: Rect {
+                    x,
+                    y: rect.y,
+                    width: pw,
+                    height: rect.height,
+                },
+                target: HitTarget::SelectTab {
+                    space_id: space_id.clone(),
+                    tab_id: tab.id.clone(),
+                },
+            });
+            x += pw;
+        }
+    }
+    if rect.width >= 76 {
+        let min_dots_end = (dots_start_x + 9).min(avail_end);
+        if x < min_dots_end {
+            x = min_dots_end;
+        }
+    }
+    if x > dots_start_x && x < avail_end {
+        for r in 0..rect.height {
+            buf.set_string(x, rect.y + r, "│", bg_bar.fg(Color::Rgb(55, 60, 82)));
+        }
+        x += 1;
+    }
+
+    // 3. Constant-width Herdr App-style Touchbar Keys (`[^B]`, `[Esc]`, `[Tab]`, `[^C]`, `[←]`, `[↓]`, `[↑]`, `[→]`)
+    // All labels have invariant character widths so toggling `^B` or scrolling never causes horizontal jitter.
+    let key_buttons: [(&str, HitTarget, bool); 8] = [
+        (" [^B] ", HitTarget::TogglePrefix, prefix_active),
         (
-            if wide { " [ Esc ] " } else { " [Esc] " }.to_string(),
+            " [Esc] ",
             HitTarget::SendKey(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             false,
         ),
         (
-            if wide { " [ Tab ] " } else { " [Tab] " }.to_string(),
+            " [Tab] ",
             HitTarget::SendKey(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
             false,
         ),
         (
-            if wide { " [ ^C ] " } else { " [^C] " }.to_string(),
+            " [^C] ",
             HitTarget::SendKey(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             false,
         ),
         (
-            if wide { " [ ← ] " } else { " [←] " }.to_string(),
+            " [←] ",
             HitTarget::SendKey(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
             false,
         ),
         (
-            if wide { " [ ↓ ] " } else { " [↓] " }.to_string(),
+            " [↓] ",
             HitTarget::SendKey(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
             false,
         ),
         (
-            if wide { " [ ↑ ] " } else { " [↑] " }.to_string(),
+            " [↑] ",
             HitTarget::SendKey(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
             false,
         ),
         (
-            if wide { " [ → ] " } else { " [→] " }.to_string(),
+            " [→] ",
             HitTarget::SendKey(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
             false,
         ),
-        (" [+] ".to_string(), HitTarget::NewTab, false),
     ];
 
     for (lbl, target, active_highlight) in key_buttons {
@@ -561,18 +576,13 @@ fn render_bottom_touchbar(
                 .bg(Color::LightYellow)
                 .fg(Color::Black)
                 .add_modifier(Modifier::BOLD)
-        } else if target == HitTarget::NewTab {
-            Style::default()
-                .bg(Color::Rgb(32, 54, 46))
-                .fg(Color::LightGreen)
-                .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
                 .bg(Color::Rgb(34, 38, 58))
                 .fg(Color::Rgb(220, 225, 240))
                 .add_modifier(Modifier::BOLD)
         };
-        draw_touchbar_pill(buf, x, rect, &lbl, kstyle, active_highlight);
+        draw_touchbar_pill(buf, x, rect, lbl, kstyle, active_highlight);
         hits.push(HitRegion {
             rect: Rect {
                 x,
@@ -592,67 +602,9 @@ fn render_bottom_touchbar(
         }
     }
 
-    // When the left sidebar is collapsed and horizontal space remains on the bottom touchbar,
-    // render compact clickable tab status pills (`1:●`, `2:✓`, ...) so live agent statuses
-    // and direct tab selection remain accessible even with the sidebar closed.
-    if !sidebar_open {
-        if let Some(space) = world.active_space() {
-            let active_ti = world.active_tab_index();
-            let space_id = space.id.clone();
-            for (ti, tab) in space.tabs.iter().enumerate() {
-                let st = world.tab_state(tab);
-                let pill = format!(" {}:{} ", ti + 1, st.symbol());
-                let pw = pill.width() as u16;
-                if x + pw > avail_end {
-                    break;
-                }
-                let is_active = ti == active_ti;
-                let pstyle = Style::default()
-                    .bg(if is_active {
-                        Color::Rgb(68, 78, 128)
-                    } else {
-                        Color::Rgb(28, 30, 46)
-                    })
-                    .fg(if is_active {
-                        Color::White
-                    } else {
-                        Color::Rgb(185, 190, 210)
-                    })
-                    .add_modifier(if is_active {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    });
-                draw_touchbar_pill(buf, x, rect, &pill, pstyle, is_active);
-                let prefix_len = format!(" {}:", ti + 1).width() as u16;
-                if x + prefix_len < x + pw {
-                    buf.set_string(
-                        x + prefix_len,
-                        rect.y,
-                        st.symbol(),
-                        pstyle.fg(state_color(st)).add_modifier(Modifier::BOLD),
-                    );
-                }
-                hits.push(HitRegion {
-                    rect: Rect {
-                        x,
-                        y: rect.y,
-                        width: pw,
-                        height: rect.height,
-                    },
-                    target: HitTarget::SelectTab {
-                        space_id: space_id.clone(),
-                        tab_id: tab.id.clone(),
-                    },
-                });
-                x += pw;
-            }
-        }
-    }
-
-    // 3. Right: optional `[ ▼ SCROLL -N ]` and `[ ? ]`
+    // 4. Right: optional `[▼ BOT]` and `[ ? ]`
     let mut rx = avail_end;
-    if let Some(ref slbl) = scroll_lbl {
+    if let Some(slbl) = scroll_lbl {
         if rx + scroll_w <= max_x {
             let sstyle = Style::default()
                 .bg(Color::LightCyan)
@@ -696,6 +648,7 @@ struct SidebarCard {
     dot_col: Option<(u16, AgentState)>,
     is_active: bool,
     is_space: bool,
+    collapse_space_id: Option<String>,
     target: HitTarget,
 }
 
@@ -751,8 +704,11 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
         y += 1;
     }
 
-    // Reserve footer space for 2-row `[+ New Tab]` and `[+ New Space]` buttons
-    let footer_rows = if max_y.saturating_sub(y) >= 8 {
+    // Reserve footer space with vertical separation rows between `[+ New Tab]`, `[+ New Space]`,
+    // and the bottom touchbar's `◄≡` collapse button to prevent accidental mis-taps.
+    let footer_rows = if max_y.saturating_sub(y) >= 10 {
+        7
+    } else if max_y.saturating_sub(y) >= 6 {
         4
     } else if max_y.saturating_sub(y) >= 4 {
         2
@@ -761,21 +717,27 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
     };
     let list_end_y = max_y.saturating_sub(footer_rows);
 
-    // Build 2-row cards for all Spaces and Tabs
+    // Build 2-row cards for all Spaces and (when not collapsed) their child Tabs
     let mut cards: Vec<SidebarCard> = Vec::new();
     let mut active_card_idx: usize = 0;
 
     for (si, space) in world.doc.spaces.iter().enumerate() {
         let is_active_space = si == world.active_space_idx;
+        let is_collapsed = world.is_space_collapsed(&space.id);
         if is_active_space {
             active_card_idx = cards.len();
         }
         let sname = world.space_display_name(space);
         let sstate = world.space_state(space);
-        let arrow = if is_active_space { "▾" } else { "▸" };
+        let arrow = if is_collapsed { "▸" } else { "▾" };
         let prefix = format!(" {arrow} ");
         let dot_x = prefix.width() as u16;
-        let row1 = format!("{prefix}{} {sname}", sstate.symbol());
+        let collapsed_suffix = if is_collapsed {
+            format!(" ({})", space.tabs.len())
+        } else {
+            String::new()
+        };
+        let row1 = format!("{prefix}{} {sname}{collapsed_suffix}", sstate.symbol());
         let folder = shorten_home_path(&space.folder);
         let row2 = format!("     {folder}");
 
@@ -785,8 +747,13 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
             dot_col: Some((dot_x, sstate)),
             is_active: is_active_space,
             is_space: true,
+            collapse_space_id: Some(space.id.clone()),
             target: HitTarget::SelectSpace(space.id.clone()),
         });
+
+        if is_collapsed {
+            continue;
+        }
 
         let active_ti = if is_active_space {
             Some(world.active_tab_index())
@@ -827,6 +794,7 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
                 dot_col: Some((dot_x, st)),
                 is_active: is_active_tab,
                 is_space: false,
+                collapse_space_id: None,
                 target: HitTarget::SelectTab {
                     space_id: space.id.clone(),
                     tab_id: tab.id.clone(),
@@ -909,12 +877,24 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
             },
             target: card.target,
         });
+        if let Some(space_id) = card.collapse_space_id {
+            hits.push(HitRegion {
+                rect: Rect {
+                    x: inner.x,
+                    y,
+                    width: 4.min(inner.width),
+                    height: 2,
+                },
+                target: HitTarget::ToggleSpaceCollapse(space_id),
+            });
+        }
         y += 2;
     }
 
-    // Render 2-row Footer Buttons (`[+ New Tab]` and `[+ New Space]`)
-    if footer_rows == 4 {
-        let tab_y = max_y - 4;
+    // Render Footer Buttons (`[+ New Tab]` and `[+ New Space]`) with empty separator rows
+    // between them and above the bottom touchbar's `◄≡` collapse button.
+    if footer_rows == 7 {
+        let tab_y = max_y - 6;
         let tab_r1 = pad_to_width(" [ + New Tab    (^b c) ]", w);
         let tab_r2 = pad_to_width("   open shell in space", w);
         buf.set_string(
@@ -944,7 +924,7 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
             target: HitTarget::NewTab,
         });
 
-        let sp_y = max_y - 2;
+        let sp_y = max_y - 3;
         let sp_r1 = pad_to_width(" [ + New Space  (^b C) ]", w);
         let sp_r2 = pad_to_width("   create workspace", w);
         buf.set_string(
@@ -970,6 +950,45 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
                 y: sp_y,
                 width: inner.width,
                 height: 2,
+            },
+            target: HitTarget::NewSpacePrompt,
+        });
+    } else if footer_rows == 4 {
+        let tab_y = max_y - 4;
+        buf.set_string(
+            inner.x,
+            tab_y,
+            &pad_to_width(" [ + New Tab (^b c) ]", w),
+            Style::default()
+                .bg(Color::Rgb(32, 54, 46))
+                .fg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD),
+        );
+        hits.push(HitRegion {
+            rect: Rect {
+                x: inner.x,
+                y: tab_y,
+                width: inner.width,
+                height: 1,
+            },
+            target: HitTarget::NewTab,
+        });
+        let sp_y = max_y - 2;
+        buf.set_string(
+            inner.x,
+            sp_y,
+            &pad_to_width(" [ + New Space (^b C) ]", w),
+            Style::default()
+                .bg(Color::Rgb(30, 44, 62))
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        );
+        hits.push(HitRegion {
+            rect: Rect {
+                x: inner.x,
+                y: sp_y,
+                width: inner.width,
+                height: 1,
             },
             target: HitTarget::NewSpacePrompt,
         });
@@ -1145,7 +1164,8 @@ fn render_help_modal(f: &mut Frame, area: Rect, hits: &mut Vec<HitRegion>) {
             "  Keyboard & Touch Gesture Shortcuts:",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )),
-        Line::from("  Swipe Left / Right       In terminal body -> Next / Prev Tab"),
+        Line::from("  Tap ● ○ ✓ on Touchbar    Switch directly to Tab (no body swipe conflict)"),
+        Line::from("  Tap ▾ / ▸ on Space       Collapse / expand Space's child Tabs in sidebar"),
         Line::from("  Prefix Key               Ctrl+b or Tap [^B] on bottom touchbar"),
         Line::from("  Next / Prev Tab          ^b n / ^b p   or  Alt+Right / Alt+Left"),
         Line::from("  Switch Tab 1..9          ^b 1..9       or  Alt+1..9"),
@@ -1153,10 +1173,10 @@ fn render_help_modal(f: &mut Frame, area: Rect, hits: &mut Vec<HitRegion>) {
         Line::from("  Rename / Close Tab       ^b , (rename) /   ^b x (close)"),
         Line::from("  Next / Prev Space        ^b Down / Up  or  Alt+Down / Alt+Up"),
         Line::from("  New / Rename Space       ^b C (new)    /   ^b $ (rename)"),
-        Line::from("  Toggle Left Sidebar      ^b b          or  Tap [≡] on bottom touchbar"),
+        Line::from("  Toggle Left Sidebar      ^b b          or  Tap ◄≡ / ≡► on touchbar"),
         Line::from("  Quick Fuzzy Switcher     ^b w          or  ^b f"),
         Line::from("  Jump Next Alert Agent    ^b a          (◉ blocked / ✓ done)"),
-        Line::from("  Scrollback / History     ^b [          or  Tap [▼ SCROLL] to exit"),
+        Line::from("  Scrollback / History     ^b [          or  Tap [▼ BOT] to exit"),
         Line::from("  Detach (keep running)    ^b q / ^b d   or  Ctrl+\\"),
         Line::from(""),
         Line::from(Span::styled(
@@ -1573,13 +1593,52 @@ mod tests {
             .iter()
             .any(|h| h.target == HitTarget::ToggleHelp && h.rect.height == 2));
 
-        // Sidebar footer has 2-row tall [+ New Tab] and [+ New Space] buttons
-        assert!(hits
+        // Sidebar footer has 2-row tall [+ New Tab] and [+ New Space] buttons with 1-row separator gaps
+        let new_tab_hit = hits
             .iter()
-            .any(|h| h.target == HitTarget::NewTab && h.rect.height == 2));
-        assert!(hits
+            .find(|h| h.target == HitTarget::NewTab && h.rect.height == 2)
+            .expect("expected 2-row NewTab hit in sidebar");
+        let new_space_hit = hits
             .iter()
-            .any(|h| h.target == HitTarget::NewSpacePrompt && h.rect.height == 2));
+            .find(|h| h.target == HitTarget::NewSpacePrompt && h.rect.height == 2)
+            .expect("expected 2-row NewSpacePrompt hit in sidebar");
+        assert!(new_space_hit.rect.y >= new_tab_hit.rect.y + new_tab_hit.rect.height + 1);
+        assert!(22 >= new_space_hit.rect.y + new_space_hit.rect.height + 1);
+    }
+
+    #[test]
+    fn touchbar_keys_do_not_jitter_across_state_toggles() {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let world = World::default();
+
+        let mut prefix_x_1 = 0;
+        let mut prefix_x_2 = 0;
+        terminal
+            .draw(|f| {
+                let geom = render_ui(f, &world, None, true, 24, false, false, 0, &Modal::None);
+                prefix_x_1 = geom
+                    .hits
+                    .iter()
+                    .find(|h| h.target == HitTarget::TogglePrefix)
+                    .unwrap()
+                    .rect
+                    .x;
+            })
+            .unwrap();
+        terminal
+            .draw(|f| {
+                let geom = render_ui(f, &world, None, false, 24, false, true, 15, &Modal::None);
+                prefix_x_2 = geom
+                    .hits
+                    .iter()
+                    .find(|h| h.target == HitTarget::TogglePrefix)
+                    .unwrap()
+                    .rect
+                    .x;
+            })
+            .unwrap();
+        assert_eq!(prefix_x_1, prefix_x_2);
     }
 
     #[test]
