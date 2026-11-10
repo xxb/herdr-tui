@@ -16,8 +16,8 @@ use unicode_width::UnicodeWidthStr;
 pub enum HitTarget {
     ToggleSidebar,
     NextSpace,
-    SelectSpace(usize),
-    SelectTab { space_idx: usize, tab_idx: usize },
+    SelectSpace(String),
+    SelectTab { space_id: String, tab_id: String },
     NewTab,
     NewSpacePrompt,
     ToggleHelp,
@@ -56,8 +56,8 @@ pub enum PromptKind {
 
 #[derive(Clone, Debug)]
 pub struct FuzzyItem {
-    pub space_idx: usize,
-    pub tab_idx: usize,
+    pub space_id: String,
+    pub tab_id: String,
     pub space_name: String,
     pub tab_name: String,
     pub term_addr: String,
@@ -68,7 +68,7 @@ pub struct FuzzyItem {
 pub fn collect_fuzzy_items(world: &World, query: &str) -> Vec<FuzzyItem> {
     let q = query.trim().to_lowercase();
     let mut out = Vec::new();
-    for (si, space) in world.doc.spaces.iter().enumerate() {
+    for space in &world.doc.spaces {
         let sname = world.space_display_name(space);
         for (ti, tab) in space.tabs.iter().enumerate() {
             let tname = world.tab_display_name(space, ti);
@@ -89,8 +89,8 @@ pub fn collect_fuzzy_items(world: &World, query: &str) -> Vec<FuzzyItem> {
             );
             if q.is_empty() || fuzzy_subsequence(&hay, &q) {
                 out.push(FuzzyItem {
-                    space_idx: si,
-                    tab_idx: ti,
+                    space_id: space.id.clone(),
+                    tab_id: tab.id.clone(),
                     space_name: sname.clone(),
                     tab_name: tname,
                     term_addr: addr,
@@ -296,10 +296,10 @@ fn render_top_bar(
     // 3. Tabs strip in active Space (scrolled so active_tab_index is visible)
     if let Some(space) = world.active_space() {
         let active_ti = world.active_tab_index();
-        let space_idx = world.active_space_idx;
+        let space_id = space.id.clone();
 
         // Precompute tab labels
-        let tab_items: Vec<(usize, String, AgentState, bool)> = space
+        let tab_items: Vec<(usize, String, String, AgentState, bool)> = space
             .tabs
             .iter()
             .enumerate()
@@ -313,7 +313,7 @@ fn render_top_bar(
                 };
                 let st = world.tab_state(tab);
                 let label = format!(" {}:{} {}{} ", ti + 1, st.symbol(), name, pane_suffix);
-                (ti, label, st, ti == active_ti)
+                (ti, tab.id.clone(), label, st, ti == active_ti)
             })
             .collect();
 
@@ -323,16 +323,16 @@ fn render_top_bar(
         let mut start_idx = 0;
         if !tab_items.is_empty() {
             let mut sum = 0u16;
-            for &(ti, ref lbl, _, _) in &tab_items[..=active_ti.min(tab_items.len() - 1)] {
+            for &(ti, _, ref lbl, _, _) in &tab_items[..=active_ti.min(tab_items.len() - 1)] {
                 sum += lbl.width() as u16 + 1;
                 while sum > budget && start_idx < ti {
-                    sum = sum.saturating_sub(tab_items[start_idx].1.width() as u16 + 1);
+                    sum = sum.saturating_sub(tab_items[start_idx].2.width() as u16 + 1);
                     start_idx += 1;
                 }
             }
         }
 
-        for &(ti, ref lbl, st, is_active) in tab_items.iter().skip(start_idx) {
+        for &(ti, ref tid, ref lbl, st, is_active) in tab_items.iter().skip(start_idx) {
             let lw = lbl.width() as u16;
             if x + lw + plus_w > avail_end {
                 break;
@@ -373,8 +373,8 @@ fn render_top_bar(
                     height: 1,
                 },
                 target: HitTarget::SelectTab {
-                    space_idx,
-                    tab_idx: ti,
+                    space_id: space_id.clone(),
+                    tab_id: tid.clone(),
                 },
             });
             x += lw;
@@ -503,7 +503,7 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
                 width: inner.width,
                 height: 1,
             },
-            target: HitTarget::SelectSpace(si),
+            target: HitTarget::SelectSpace(space.id.clone()),
         });
         y += 1;
 
@@ -556,8 +556,8 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
                     height: 1,
                 },
                 target: HitTarget::SelectTab {
-                    space_idx: si,
-                    tab_idx: ti,
+                    space_id: space.id.clone(),
+                    tab_id: tab.id.clone(),
                 },
             });
             y += 1;

@@ -790,6 +790,26 @@ impl World {
         }
     }
 
+    pub fn select_space_by_id(&mut self, space_id: &str) -> bool {
+        if let Some(si) = self.doc.spaces.iter().position(|s| s.id == space_id) {
+            self.active_space_idx = si;
+            return true;
+        }
+        false
+    }
+
+    pub fn select_tab_by_id(&mut self, space_id: &str, tab_id: &str) -> bool {
+        if let Some(si) = self.doc.spaces.iter().position(|s| s.id == space_id) {
+            if self.doc.spaces[si].tabs.iter().any(|t| t.id == tab_id) {
+                self.active_space_idx = si;
+                self.active_tab_by_space
+                    .insert(space_id.to_string(), tab_id.to_string());
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn next_tab(&mut self) {
         let Some(space) = self.active_space() else {
             return;
@@ -854,6 +874,7 @@ impl World {
 
     /// Create a new Tab in the active Space, inheriting the current terminal's CWD (or Space folder).
     pub fn create_new_tab(&mut self, core: &CoreClient) -> Result<()> {
+        let _ = self.refresh_terminals(core);
         let cwd = self
             .active_terminal_address()
             .and_then(|addr| self.terminals.get(&addr))
@@ -944,6 +965,7 @@ impl World {
 
     /// Create a new Space with a name and folder, plus its first Tab.
     pub fn create_new_space(&mut self, core: &CoreClient, name: &str) -> Result<()> {
+        let _ = self.refresh_terminals(core);
         let cwd = self
             .active_terminal_address()
             .and_then(|addr| self.terminals.get(&addr))

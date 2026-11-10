@@ -393,7 +393,7 @@ fn run_app(
                                     let _ = world.reconcile_and_sync(core);
                                 }
                             }
-                            "status" | "turn" | "title" | "labels" => {
+                            "status" | "turn" | "title" | "labels" | "foreground" | "renamed" => {
                                 let _ = world.refresh_terminals(core);
                                 world.mark_active_seen(core);
                             }
@@ -476,14 +476,15 @@ fn run_app(
                                     world.next_space();
                                     world.mark_active_seen(core);
                                 }
-                                HitTarget::SelectSpace(si) => {
-                                    world.active_space_idx = si;
-                                    world.mark_active_seen(core);
+                                HitTarget::SelectSpace(space_id) => {
+                                    if world.select_space_by_id(&space_id) {
+                                        world.mark_active_seen(core);
+                                    }
                                 }
-                                HitTarget::SelectTab { space_idx, tab_idx } => {
-                                    world.active_space_idx = space_idx;
-                                    world.select_tab_index(tab_idx);
-                                    world.mark_active_seen(core);
+                                HitTarget::SelectTab { space_id, tab_id } => {
+                                    if world.select_tab_by_id(&space_id, &tab_id) {
+                                        world.mark_active_seen(core);
+                                    }
                                 }
                                 HitTarget::NewTab => {
                                     let _ = world.create_new_tab(core);
@@ -591,9 +592,9 @@ fn run_app(
                             }
                             KeyCode::Enter => {
                                 if let Some(chosen) = items.get(*selected) {
-                                    world.active_space_idx = chosen.space_idx;
-                                    world.select_tab_index(chosen.tab_idx);
-                                    world.mark_active_seen(core);
+                                    if world.select_tab_by_id(&chosen.space_id, &chosen.tab_id) {
+                                        world.mark_active_seen(core);
+                                    }
                                 }
                                 modal = Modal::None;
                             }
