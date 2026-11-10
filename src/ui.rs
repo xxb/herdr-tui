@@ -473,16 +473,28 @@ fn draw_touchbar_pill(
         return;
     }
     let lw = label.width() as u16;
-    buf.set_string(x, rect.y, label, style);
     if rect.height >= 2 && lw > 0 {
-        let bevel_ch = if emphasized { "▂" } else { "▁" };
-        let bevel_fg = if emphasized {
+        // Row 0 (`rect.y`): continuous highlighted MacBook Touch Bar top divider line (`━`),
+        // with brighter accent over each keycap pill (and warm gold when armed/active).
+        let top_fg = if emphasized {
             Color::Rgb(245, 194, 118)
         } else {
-            Color::Rgb(59, 66, 97)
+            Color::Rgb(110, 150, 235)
         };
-        let sub = bevel_ch.repeat(lw as usize);
-        buf.set_string(x, rect.y + 1, &sub, style.fg(bevel_fg));
+        let top_line = "━".repeat(lw as usize);
+        buf.set_string(
+            x,
+            rect.y,
+            &top_line,
+            Style::default()
+                .bg(Color::Rgb(12, 14, 22))
+                .fg(top_fg)
+                .add_modifier(Modifier::BOLD),
+        );
+        // Row 1 (`rect.y + 1`): centered 1-row OLED keycap pill
+        buf.set_string(x, rect.y + 1, label, style);
+    } else {
+        buf.set_string(x, rect.y, label, style);
     }
 }
 
@@ -502,13 +514,27 @@ fn render_bottom_touchbar(
         return;
     }
     let bg_bar = Style::default()
-        .bg(Color::Rgb(16, 18, 27))
+        .bg(Color::Rgb(12, 14, 22))
         .fg(Color::Rgb(169, 177, 214));
     f.render_widget(Block::default().style(bg_bar), rect);
 
     let mut x = rect.x;
     let max_x = rect.x + rect.width;
     let buf = f.buffer_mut();
+
+    // Draw continuous highlighted top divider line across the entire MacBook Touch Bar (`rect.y`)
+    // when in 2-row mode so the bar forms a unified screen strip separated from the terminal above.
+    if rect.height >= 2 {
+        let full_line = "━".repeat(rect.width as usize);
+        buf.set_string(
+            rect.x,
+            rect.y,
+            &full_line,
+            Style::default()
+                .bg(Color::Rgb(12, 14, 22))
+                .fg(Color::Rgb(72, 98, 158)),
+        );
+    }
 
     // Reserve right-side space for optional `✓ Copied`, `▼ BOT`, and `?` keycaps
     let narrow_bar = rect.width < 76;
@@ -1087,10 +1113,10 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
         y += 1;
     }
 
-    // Reserve footer space for 2-row tall `[+ New Tab]` and `[+ New Space]` buttons
-    // with tight margin between them and 1-row safety margin above the touchbar's `◄≡` button.
-    let footer_rows = if max_y.saturating_sub(y) >= 8 {
-        5
+    // Reserve footer space for 2-row visually centered (`▄` + text + `▀`) `[+ New Tab]` and `[+ New Space]`
+    // buttons with tight margin between them and above the bottom touchbar.
+    let footer_rows = if max_y.saturating_sub(y) >= 9 {
+        6
     } else if max_y.saturating_sub(y) >= 4 {
         2
     } else {
@@ -1282,21 +1308,30 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
         y += 2;
     }
 
-    // Render 2-row tall Footer Buttons (`+ New Tab` and `+ New Space`) with internal padding
-    // and a tight margin between them, plus 1-row safety margin above `◄≡`.
+    // Render 2-row tall, vertically centered Footer Buttons (`+ New Tab` and `+ New Space`)
+    // using half-block top (`▄`) and bottom (`▀`) caps so the text row sits dead-center vertically.
     let pad_x: u16 = if inner.width > 6 { 1 } else { 0 };
     let btn_x = inner.x + pad_x;
     let btn_w = inner.width.saturating_sub(pad_x * 2);
     let btn_w_usize = btn_w as usize;
+    let sb_bg = Color::Rgb(18, 20, 30);
 
-    if footer_rows == 5 && btn_w > 0 {
-        let tab_y = max_y - 5;
+    if footer_rows == 6 && btn_w > 0 {
+        let half_top = "▄".repeat(btn_w_usize);
+        let half_bot = "▀".repeat(btn_w_usize);
+
+        let tab_y = max_y - 6;
         let tab_bg = Color::Rgb(28, 48, 42);
         let tab_fg = Color::Rgb(158, 206, 106);
-        let tab_bevel = format!(" ▎{}", "▁".repeat(btn_w_usize.saturating_sub(2)));
         buf.set_string(
             btn_x,
             tab_y,
+            &half_top,
+            Style::default().fg(tab_bg).bg(sb_bg),
+        );
+        buf.set_string(
+            btn_x,
+            tab_y + 1,
             &pad_to_width(" ▎ + New Tab    ^b c ", btn_w_usize),
             Style::default()
                 .bg(tab_bg)
@@ -1305,16 +1340,16 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
         );
         buf.set_string(
             btn_x,
-            tab_y + 1,
-            &pad_to_width(&tab_bevel, btn_w_usize),
-            Style::default().bg(tab_bg).fg(Color::Rgb(52, 88, 76)),
+            tab_y + 2,
+            &half_bot,
+            Style::default().fg(tab_bg).bg(sb_bg),
         );
         hits.push(HitRegion {
             rect: Rect {
                 x: btn_x,
                 y: tab_y,
                 width: btn_w,
-                height: 2,
+                height: 3,
             },
             target: HitTarget::NewTab,
         });
@@ -1322,10 +1357,15 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
         let sp_y = max_y - 3;
         let sp_bg = Color::Rgb(26, 38, 56);
         let sp_fg = Color::Rgb(125, 207, 255);
-        let sp_bevel = format!(" ▎{}", "▁".repeat(btn_w_usize.saturating_sub(2)));
         buf.set_string(
             btn_x,
             sp_y,
+            &half_top,
+            Style::default().fg(sp_bg).bg(sb_bg),
+        );
+        buf.set_string(
+            btn_x,
+            sp_y + 1,
             &pad_to_width(" ▎ + New Space  ^b C ", btn_w_usize),
             Style::default()
                 .bg(sp_bg)
@@ -1334,16 +1374,16 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
         );
         buf.set_string(
             btn_x,
-            sp_y + 1,
-            &pad_to_width(&sp_bevel, btn_w_usize),
-            Style::default().bg(sp_bg).fg(Color::Rgb(48, 72, 106)),
+            sp_y + 2,
+            &half_bot,
+            Style::default().fg(sp_bg).bg(sb_bg),
         );
         hits.push(HitRegion {
             rect: Rect {
                 x: btn_x,
                 y: sp_y,
                 width: btn_w,
-                height: 2,
+                height: 3,
             },
             target: HitTarget::NewSpacePrompt,
         });
@@ -2011,21 +2051,21 @@ mod tests {
             .iter()
             .any(|h| h.target == HitTarget::ToggleHelp && h.rect.height == 2));
 
-        // Sidebar footer has 2-row tall [+ New Tab] and [+ New Space] buttons with tight margin
+        // Sidebar footer has vertically centered [+ New Tab] and [+ New Space] buttons
         let new_tab_hit = hits
             .iter()
-            .find(|h| h.target == HitTarget::NewTab && h.rect.height == 2)
-            .expect("expected 2-row NewTab hit in sidebar");
+            .find(|h| h.target == HitTarget::NewTab && h.rect.height >= 2)
+            .expect("expected multi-row NewTab hit in sidebar");
         let new_space_hit = hits
             .iter()
-            .find(|h| h.target == HitTarget::NewSpacePrompt && h.rect.height == 2)
-            .expect("expected 2-row NewSpacePrompt hit in sidebar");
+            .find(|h| h.target == HitTarget::NewSpacePrompt && h.rect.height >= 2)
+            .expect("expected multi-row NewSpacePrompt hit in sidebar");
         assert!(new_tab_hit.rect.x >= 1);
         assert_eq!(
             new_space_hit.rect.y,
             new_tab_hit.rect.y + new_tab_hit.rect.height
         );
-        assert!(22 >= new_space_hit.rect.y + new_space_hit.rect.height + 1);
+        assert!(22 >= new_space_hit.rect.y + new_space_hit.rect.height);
     }
 
     #[test]
