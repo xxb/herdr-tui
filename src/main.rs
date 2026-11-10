@@ -11,9 +11,8 @@ use crate::keys::{
 };
 use crate::model::World;
 use crate::ui::{
-    collect_fuzzy_items, compute_terminal_rect, find_hit_target, render_ui, resolve_dpad_delta,
-    resolve_dpad_tap, resolve_fuzzy_selection, HitRegion, HitTarget, Modal, PromptKind,
-    TerminalSelection,
+    collect_fuzzy_items, compute_terminal_rect, find_hit_target, render_ui,
+    resolve_fuzzy_selection, HitRegion, HitTarget, Modal, PromptKind, TerminalSelection,
 };
 use anyhow::Result;
 use clap::Parser;
@@ -80,16 +79,6 @@ struct Cli {
     /// Disable 2-row large touch top bar mode
     #[arg(long, conflicts_with = "touch")]
     no_touch: bool,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct DPadGesture {
-    rect: Rect,
-    start_col: u16,
-    start_row: u16,
-    last_col: u16,
-    last_row: u16,
-    swiped: bool,
 }
 
 struct AttachedTerminal {
@@ -702,7 +691,6 @@ fn run_app(
     let mut last_hits: Vec<HitRegion> = Vec::new();
     let mut selection: Option<TerminalSelection> = None;
     let mut selection_screen: Option<vt100::Screen> = None;
-    let mut dpad_gesture: Option<DPadGesture> = None;
     let mut clipboard_buffer = String::new();
     let mut copied_until: Option<Instant> = None;
     let mut dirty = true;
@@ -737,7 +725,6 @@ fn run_app(
         if active_addr != prev_addr {
             selection = None;
             selection_screen = None;
-            dpad_gesture = None;
             dirty = true;
         }
 
@@ -932,7 +919,6 @@ fn run_app(
                     MouseEventKind::Down(MouseButton::Left) => {
                         let mx = mev.column;
                         let my = mev.row;
-                        dpad_gesture = None;
                         if let Some(target) = find_hit_target(&last_hits, mx, my) {
                             selection = None;
                             selection_screen = None;
@@ -1013,16 +999,6 @@ fn run_app(
                                     modal = Modal::None;
                                     prefix_active = false;
                                     alt_active = !alt_active;
-                                }
-                                HitTarget::DPad { rect } => {
-                                    dpad_gesture = Some(DPadGesture {
-                                        rect,
-                                        start_col: mx,
-                                        start_row: my,
-                                        last_col: mx,
-                                        last_row: my,
-                                        swiped: false,
-                                    });
                                 }
                                 HitTarget::PasteClipboard => {
                                     prefix_active = false;
@@ -1144,35 +1120,7 @@ fn run_app(
                         }
                     }
                     MouseEventKind::Drag(MouseButton::Left) => {
-                        if let Some(ref mut g) = dpad_gesture {
-                            let dx = mev.column as i32 - g.last_col as i32;
-                            let dy = mev.row as i32 - g.last_row as i32;
-                            let h_thresh = if g.swiped { 2 } else { 1 };
-                            if dx.abs() >= h_thresh || dy.abs() >= 1 {
-                                if let Some(key) = resolve_dpad_delta(dx, dy) {
-                                    g.last_col = mev.column;
-                                    g.last_row = mev.row;
-                                    g.swiped = true;
-                                    let kev = KeyEvent::new(key, KeyModifiers::NONE);
-                                    if handle_key_event(
-                                        kev,
-                                        core,
-                                        world,
-                                        active_att,
-                                        prefix_spec,
-                                        sidebar_open,
-                                        &mut prefix_active,
-                                        &mut ctrl_active,
-                                        &mut alt_active,
-                                        &mut scrollback_offset,
-                                        &mut modal,
-                                        term_rect,
-                                    )? {
-                                        return Ok(());
-                                    }
-                                }
-                            }
-                        } else if let Some(ref mut sel) = selection {
+                        if let Some(ref mut sel) = selection {
                             if sel.active && term_rect.width > 0 && term_rect.height > 0 {
                                 let rel_col = mev
                                     .column
@@ -1191,32 +1139,7 @@ fn run_app(
                         }
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
-                        if let Some(g) = dpad_gesture.take() {
-                            if !g.swiped {
-                                let dx = mev.column as i32 - g.start_col as i32;
-                                let dy = mev.row as i32 - g.start_row as i32;
-                                let key = resolve_dpad_delta(dx, dy).unwrap_or_else(|| {
-                                    resolve_dpad_tap(g.rect, g.start_col, g.start_row)
-                                });
-                                let kev = KeyEvent::new(key, KeyModifiers::NONE);
-                                if handle_key_event(
-                                    kev,
-                                    core,
-                                    world,
-                                    active_att,
-                                    prefix_spec,
-                                    sidebar_open,
-                                    &mut prefix_active,
-                                    &mut ctrl_active,
-                                    &mut alt_active,
-                                    &mut scrollback_offset,
-                                    &mut modal,
-                                    term_rect,
-                                )? {
-                                    return Ok(());
-                                }
-                            }
-                        } else if let Some(ref mut sel) = selection {
+                        if let Some(ref mut sel) = selection {
                             if sel.active {
                                 if term_rect.width > 0 && term_rect.height > 0 {
                                     let rel_col = mev
@@ -1273,7 +1196,9 @@ fn run_app(
                             .unwrap_or(0);
                             *selected = cur_sel.saturating_sub(1);
                             *selected_tab_id = items.get(*selected).map(|it| it.tab_id.clone());
-                        } else if matches!(modal, Modal::None) {
+                        } else if matches!(modal, Modal::None)
+                            && mev.row < term_rect.y.saturating_add(term_rect.height)
+                        {
                             selection = None;
                             selection_screen = None;
                             scrollback_offset = scrollback_offset.saturating_add(3);
@@ -1298,7 +1223,9 @@ fn run_app(
                                 *selected_tab_id =
                                     items.get(*selected).map(|it| it.tab_id.clone());
                             }
-                        } else if matches!(modal, Modal::None) {
+                        } else if matches!(modal, Modal::None)
+                            && mev.row < term_rect.y.saturating_add(term_rect.height)
+                        {
                             selection = None;
                             selection_screen = None;
                             scrollback_offset = scrollback_offset.saturating_sub(3);
@@ -1310,7 +1237,6 @@ fn run_app(
             Event::Key(kev) if kev.kind == KeyEventKind::Press => {
                 selection = None;
                 selection_screen = None;
-                dpad_gesture = None;
                 if handle_key_event(
                     kev,
                     core,
