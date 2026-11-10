@@ -25,6 +25,7 @@ pub enum HitTarget {
     TogglePrefix,
     ToggleCtrl,
     ToggleAlt,
+    DPad { rect: Rect },
     PasteClipboard,
     ExitScrollback,
     ToggleHelp,
@@ -34,6 +35,61 @@ pub enum HitTarget {
     ModalNoop,
     TriggerAction(Action),
     SendKey(KeyEvent),
+}
+
+/// Resolve a swipe/drag vector `(dx, dy)` originating on the unified D-Pad button into an arrow key.
+/// Because terminal character cells are roughly twice as tall as they are wide, vertical row movement
+/// (`dy`) is weighted 2x relative to horizontal column movement (`dx`).
+pub fn resolve_dpad_delta(dx: i32, dy: i32) -> Option<KeyCode> {
+    if dx == 0 && dy == 0 {
+        return None;
+    }
+    if dx.abs() >= dy.abs() * 2 || dy == 0 {
+        Some(if dx < 0 {
+            KeyCode::Left
+        } else {
+            KeyCode::Right
+        })
+    } else {
+        Some(if dy < 0 { KeyCode::Up } else { KeyCode::Down })
+    }
+}
+
+/// Resolve a stationary tap (without drag) inside the unified D-Pad button into an arrow key:
+/// - Left third -> `Left`
+/// - Right third -> `Right`
+/// - Center third -> `Up` (top row, or upper-right center) / `Down` (bottom row, or lower-left center)
+pub fn resolve_dpad_tap(rect: Rect, col: u16, row: u16) -> KeyCode {
+    let rel_x = col.saturating_sub(rect.x);
+    let rel_y = row.saturating_sub(rect.y);
+    if rect.width >= 3 {
+        let side_w = (rect.width / 3).max(1);
+        if rel_x < side_w {
+            return KeyCode::Left;
+        }
+        if rel_x >= rect.width.saturating_sub(side_w) {
+            return KeyCode::Right;
+        }
+    }
+    if rect.height >= 3 {
+        if rel_y == 0 {
+            return KeyCode::Up;
+        }
+        if rel_y >= 2 {
+            return KeyCode::Down;
+        }
+    } else if rect.height == 2 {
+        return if rel_y == 0 {
+            KeyCode::Up
+        } else {
+            KeyCode::Down
+        };
+    }
+    if rel_x > rect.width / 2 {
+        KeyCode::Up
+    } else {
+        KeyCode::Down
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -548,8 +604,8 @@ fn render_bottom_touchbar(
     }
 
     // Reserve right-side space for optional `✓ Copied`, `▼ BOT`, and `?` keycaps
-    let narrow_bar = rect.width < 76;
-    let compact_badges = rect.width < 110;
+    let narrow_bar = rect.width < 56;
+    let compact_badges = rect.width < 100;
     let copied_lbl = if copied_flash {
         Some(if compact_badges { " ✓ " } else { " ✓ Copied " })
     } else {
@@ -801,9 +857,9 @@ fn render_bottom_touchbar(
         x += 1;
     }
 
-    // 3. Modern Keycap Pills (`^B`, `Esc`, `Ctrl`, `Alt`, `Tab`, `←`, `↓`, `↑`, `→`, `⎘`)
-    // Arrow keys (`"  ←  "`, `"  ↓  "`, `"  ↑  "`, `"  →  "`) are 5 columns wide by 2.0 rows tall
-    // (`▄` + label + `▀`), forming a 1:1 square keycap with dead-center horizontal & vertical alignment.
+    // 3. Modern Keycap Pills (`^B`, `Esc`, `Ctrl`, `Alt`, `Tab`, unified `← ✥ →` D-Pad, `⎘`)
+    // The four directional arrows are combined into a single unified D-Pad / Joystick keycap
+    // (`" ← ✥ → "`) that supports both directional swipe/drag gestures and sub-zone taps.
     let keycap_style = |active_highlight: bool, kind: u8| -> Style {
         if active_highlight {
             Style::default()
@@ -833,67 +889,55 @@ fn render_bottom_touchbar(
     };
 
     if narrow_bar && rect.height >= 2 {
-        let wide_narrow = avail_end.saturating_sub(x) >= 29;
-        let top_keys: [(&str, HitTarget, bool, u8); 5] = [
+        let wide_narrow = avail_end.saturating_sub(x) >= 24;
+        let top_keys: [(&str, Option<HitTarget>, bool, u8); 5] = [
             (
                 if wide_narrow { " ^B " } else { "^B" },
-                HitTarget::TogglePrefix,
+                Some(HitTarget::TogglePrefix),
                 prefix_active,
                 1,
             ),
             (
                 if wide_narrow { " Esc " } else { "Esc" },
-                HitTarget::SendKey(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                Some(HitTarget::SendKey(KeyEvent::new(
+                    KeyCode::Esc,
+                    KeyModifiers::NONE,
+                ))),
                 false,
                 0,
             ),
             (
                 if wide_narrow { " Ctl " } else { "Ctl" },
-                HitTarget::ToggleCtrl,
+                Some(HitTarget::ToggleCtrl),
                 ctrl_active,
                 1,
             ),
             (
                 if wide_narrow { " Alt " } else { "Alt" },
-                HitTarget::ToggleAlt,
+                Some(HitTarget::ToggleAlt),
                 alt_active,
                 1,
             ),
             (
                 if wide_narrow { " Tab " } else { "Tab" },
-                HitTarget::SendKey(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                Some(HitTarget::SendKey(KeyEvent::new(
+                    KeyCode::Tab,
+                    KeyModifiers::NONE,
+                ))),
                 false,
                 0,
             ),
         ];
-        let bot_keys: [(&str, HitTarget, bool, u8); 5] = [
+        let bot_keys: [(&str, Option<HitTarget>, bool, u8); 2] = [
             (
-                if wide_narrow { "  ←  " } else { " ← " },
-                HitTarget::SendKey(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
-                false,
-                2,
-            ),
-            (
-                if wide_narrow { "  ↓  " } else { " ↓ " },
-                HitTarget::SendKey(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-                false,
-                2,
-            ),
-            (
-                if wide_narrow { "  ↑  " } else { " ↑ " },
-                HitTarget::SendKey(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
-                false,
-                2,
-            ),
-            (
-                if wide_narrow { "  →  " } else { " → " },
-                HitTarget::SendKey(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+                if wide_narrow { " ← ✥ → " } else { " ✥ " },
+                None, // DPad target with its computed `Rect`
                 false,
                 2,
             ),
             (
                 if wide_narrow { "  ⎘  " } else { " ⎘ " },
-                HitTarget::PasteClipboard,
+                Some(HitTarget::PasteClipboard),
                 false,
                 3,
             ),
@@ -903,22 +947,29 @@ fn render_bottom_touchbar(
         } else {
             (rect.y, rect.y + 1)
         };
-        for (row_y, row_keys) in [(top_row, top_keys), (bot_row, bot_keys)] {
+        for (row_y, row_keys) in [
+            (top_row, top_keys.as_slice()),
+            (bot_row, bot_keys.as_slice()),
+        ] {
             let mut kx = x;
-            for (lbl, target, active_highlight, kind) in row_keys {
+            for (lbl, target_opt, active_highlight, kind) in row_keys {
                 let kw = lbl.width() as u16;
                 if kx + kw > avail_end {
                     break;
                 }
-                let kstyle = keycap_style(active_highlight, kind);
+                let kstyle = keycap_style(*active_highlight, *kind);
                 buf.set_string(kx, row_y, lbl, kstyle);
+                let hit_rect = Rect {
+                    x: kx,
+                    y: row_y,
+                    width: kw,
+                    height: 1,
+                };
+                let target = target_opt
+                    .clone()
+                    .unwrap_or(HitTarget::DPad { rect: hit_rect });
                 hits.push(HitRegion {
-                    rect: Rect {
-                        x: kx,
-                        y: row_y,
-                        width: kw,
-                        height: 1,
-                    },
+                    rect: hit_rect,
                     target,
                 });
                 kx += kw;
@@ -928,10 +979,9 @@ fn render_bottom_touchbar(
             }
         }
     } else {
-        // 5-column square arrow buttons (`"  ←  "`, `"  ↓  "`, `"  ↑  "`, `"  →  "`) when `rect.width >= 82`
-        let sq_arrows = rect.width >= 82;
-        let wide_mods = rect.width >= 96;
-        let key_buttons: [(&str, HitTarget, bool, u8); 10] = [
+        let wide_dpad = rect.width >= 64;
+        let wide_mods = rect.width >= 80;
+        let key_buttons: [(&str, Option<HitTarget>, bool, u8); 7] = [
             (
                 if narrow_bar {
                     "^B"
@@ -940,97 +990,73 @@ fn render_bottom_touchbar(
                 } else {
                     " ^B "
                 },
-                HitTarget::TogglePrefix,
+                Some(HitTarget::TogglePrefix),
                 prefix_active,
                 1,
             ),
             (
                 if narrow_bar { "Es" } else { " Esc " },
-                HitTarget::SendKey(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                Some(HitTarget::SendKey(KeyEvent::new(
+                    KeyCode::Esc,
+                    KeyModifiers::NONE,
+                ))),
                 false,
                 0,
             ),
             (
-                if narrow_bar { "Ct" } else { " Ctrl " },
-                HitTarget::ToggleCtrl,
+                if narrow_bar {
+                    "Ct"
+                } else if wide_mods {
+                    " Ctrl "
+                } else {
+                    " Ctl "
+                },
+                Some(HitTarget::ToggleCtrl),
                 ctrl_active,
                 1,
             ),
             (
                 if narrow_bar { "Al" } else { " Alt " },
-                HitTarget::ToggleAlt,
+                Some(HitTarget::ToggleAlt),
                 alt_active,
                 1,
             ),
             (
                 if narrow_bar { "Tb" } else { " Tab " },
-                HitTarget::SendKey(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                Some(HitTarget::SendKey(KeyEvent::new(
+                    KeyCode::Tab,
+                    KeyModifiers::NONE,
+                ))),
                 false,
                 0,
             ),
             (
                 if narrow_bar {
-                    "←"
-                } else if sq_arrows {
-                    "  ←  "
+                    "←✥→"
+                } else if wide_dpad {
+                    " ← ✥ → "
                 } else {
-                    " ← "
+                    "  ✥  "
                 },
-                HitTarget::SendKey(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
-                false,
-                2,
-            ),
-            (
-                if narrow_bar {
-                    "↓"
-                } else if sq_arrows {
-                    "  ↓  "
-                } else {
-                    " ↓ "
-                },
-                HitTarget::SendKey(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-                false,
-                2,
-            ),
-            (
-                if narrow_bar {
-                    "↑"
-                } else if sq_arrows {
-                    "  ↑  "
-                } else {
-                    " ↑ "
-                },
-                HitTarget::SendKey(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
-                false,
-                2,
-            ),
-            (
-                if narrow_bar {
-                    "→"
-                } else if sq_arrows {
-                    "  →  "
-                } else {
-                    " → "
-                },
-                HitTarget::SendKey(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+                None, // DPad target with its computed `Rect`
                 false,
                 2,
             ),
             (
                 if narrow_bar {
                     "⎘"
-                } else if sq_arrows {
+                } else if wide_dpad {
                     "  ⎘  "
                 } else {
                     " ⎘ "
                 },
-                HitTarget::PasteClipboard,
+                Some(HitTarget::PasteClipboard),
                 false,
                 3,
             ),
         ];
 
-        for (i, (lbl, target, active_highlight, kind)) in key_buttons.into_iter().enumerate() {
+        for (i, (lbl, target_opt, active_highlight, kind)) in key_buttons.into_iter().enumerate() {
             let kw = lbl.width() as u16;
             if x + kw > avail_end {
                 break;
@@ -1041,13 +1067,15 @@ fn render_bottom_touchbar(
                 keycap_style(active_highlight, kind)
             };
             draw_touchbar_pill(buf, x, rect, lbl, kstyle, active_highlight);
+            let hit_rect = Rect {
+                x,
+                y: rect.y,
+                width: kw,
+                height: rect.height,
+            };
+            let target = target_opt.unwrap_or(HitTarget::DPad { rect: hit_rect });
             hits.push(HitRegion {
-                rect: Rect {
-                    x,
-                    y: rect.y,
-                    width: kw,
-                    height: rect.height,
-                },
+                rect: hit_rect,
                 target,
             });
             x += kw;
@@ -2100,13 +2128,36 @@ mod tests {
         assert!(hits
             .iter()
             .any(|h| h.target == HitTarget::PasteClipboard && h.rect.height == 3));
-        for arrow in [KeyCode::Left, KeyCode::Down, KeyCode::Up, KeyCode::Right] {
-            assert!(hits.iter().any(|h| {
-                h.target == HitTarget::SendKey(KeyEvent::new(arrow, KeyModifiers::NONE))
-                    && h.rect.height == 3
-                    && h.rect.width == 5
-            }));
-        }
+        let dpad_hit = hits
+            .iter()
+            .find(|h| matches!(h.target, HitTarget::DPad { .. }))
+            .expect("expected unified DPad hit in touchbar");
+        assert_eq!(dpad_hit.rect.height, 3);
+        assert_eq!(dpad_hit.rect.width, 7);
+        assert_eq!(
+            resolve_dpad_tap(dpad_hit.rect, dpad_hit.rect.x, dpad_hit.rect.y + 1),
+            KeyCode::Left
+        );
+        assert_eq!(
+            resolve_dpad_tap(
+                dpad_hit.rect,
+                dpad_hit.rect.x + dpad_hit.rect.width - 1,
+                dpad_hit.rect.y + 1
+            ),
+            KeyCode::Right
+        );
+        assert_eq!(
+            resolve_dpad_tap(dpad_hit.rect, dpad_hit.rect.x + 3, dpad_hit.rect.y),
+            KeyCode::Up
+        );
+        assert_eq!(
+            resolve_dpad_tap(dpad_hit.rect, dpad_hit.rect.x + 3, dpad_hit.rect.y + 2),
+            KeyCode::Down
+        );
+        assert_eq!(resolve_dpad_delta(-2, 0), Some(KeyCode::Left));
+        assert_eq!(resolve_dpad_delta(2, 0), Some(KeyCode::Right));
+        assert_eq!(resolve_dpad_delta(0, -1), Some(KeyCode::Up));
+        assert_eq!(resolve_dpad_delta(0, 1), Some(KeyCode::Down));
         assert!(!hits.iter().any(|h| {
             h.target == HitTarget::SendKey(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
         }));
