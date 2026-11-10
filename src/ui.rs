@@ -190,10 +190,70 @@ pub fn state_color(state: AgentState) -> Color {
     }
 }
 
+pub const DPAD_DISC_WIDTH: u16 = 15;
+pub const DPAD_DISC_HEIGHT: u16 = 7;
+
+fn dpad_cross_metrics(r: Rect) -> (u16, u16, u16) {
+    let arm_w = (r.width / 3).max(1);
+    let (arm_h, mid_h) = if r.height >= 7 {
+        (2, 3)
+    } else if r.height >= 5 {
+        (1, 3)
+    } else {
+        (1, 1)
+    };
+    (arm_w, arm_h, mid_h)
+}
+
 #[allow(dead_code)]
 pub struct UiGeometry {
     pub term_rect: Rect,
     pub hits: Vec<HitRegion>,
+    pub dpad_rect: Option<Rect>,
+}
+
+pub fn resolve_dpad_disc_rect(term_rect: Rect, custom_pos: Option<(u16, u16)>) -> Option<Rect> {
+    if term_rect.width < 3 || term_rect.height < 3 {
+        return None;
+    }
+    let pad_w = if term_rect.width >= DPAD_DISC_WIDTH {
+        DPAD_DISC_WIDTH
+    } else if term_rect.width >= 9 {
+        9
+    } else {
+        3
+    };
+    let pad_h = if term_rect.height >= DPAD_DISC_HEIGHT {
+        DPAD_DISC_HEIGHT
+    } else if term_rect.height >= 5 {
+        5
+    } else {
+        3
+    };
+    let max_x = term_rect.x + term_rect.width.saturating_sub(pad_w);
+    let max_y = term_rect.y + term_rect.height.saturating_sub(pad_h);
+    let default_x = max_x.saturating_sub(1).max(term_rect.x);
+    let default_y = max_y.saturating_sub(1).max(term_rect.y);
+    let (px, py) = custom_pos.unwrap_or((default_x, default_y));
+    Some(Rect {
+        x: px.clamp(term_rect.x, max_x),
+        y: py.clamp(term_rect.y, max_y),
+        width: pad_w,
+        height: pad_h,
+    })
+}
+
+pub fn is_on_dpad_disc(disc_rect: Option<Rect>, col: u16, row: u16) -> bool {
+    let Some(r) = disc_rect else {
+        return false;
+    };
+    if col < r.x || col >= r.x + r.width || row < r.y || row >= r.y + r.height {
+        return false;
+    }
+    let dx = col - r.x;
+    let dy = row - r.y;
+    let (arm_w, arm_h, mid_h) = dpad_cross_metrics(r);
+    (arm_w..arm_w * 2).contains(&dx) || (arm_h..arm_h + mid_h).contains(&dy)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -303,6 +363,7 @@ fn pad_to_width(s: &str, width: usize) -> String {
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn render_ui(
     f: &mut Frame,
@@ -318,6 +379,43 @@ pub fn render_ui(
     selection: Option<&TerminalSelection>,
     copied_flash: bool,
     modal: &Modal,
+) -> UiGeometry {
+    render_ui_with_dpad(
+        f,
+        world,
+        screen,
+        sidebar_open,
+        sidebar_width,
+        touch_mode,
+        prefix_active,
+        ctrl_active,
+        alt_active,
+        scrollback_offset,
+        selection,
+        copied_flash,
+        modal,
+        None,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_ui_with_dpad(
+    f: &mut Frame,
+    world: &World,
+    screen: Option<&vt100::Screen>,
+    sidebar_open: bool,
+    sidebar_width: u16,
+    touch_mode: bool,
+    prefix_active: bool,
+    ctrl_active: bool,
+    alt_active: bool,
+    scrollback_offset: usize,
+    selection: Option<&TerminalSelection>,
+    copied_flash: bool,
+    modal: &Modal,
+    dpad_pos: Option<(u16, u16)>,
+    dpad_dragging: bool,
 ) -> UiGeometry {
     let area = f.area();
     let mut hits = Vec::new();
@@ -366,10 +464,13 @@ pub fn render_ui(
         height: bb_h,
     };
 
-    // Render bottom touchbar first when no modal is open, or render modal then bottom touchbar
-    // so bottom touchbar terminal keys (Esc, arrows, etc.) remain usable or visually anchored.
+    let mut dpad_rect = None;
+
+    // Render bottom touchbar and floating semi-transparent 4-way D-Pad disc when no modal is open,
+    // or render bottom touchbar then modal overlay when a modal is active.
     match modal {
         Modal::None => {
+            dpad_rect = render_floating_dpad(f, term_rect, dpad_pos, dpad_dragging, &mut hits);
             render_bottom_touchbar(
                 f,
                 bottom_rect,
@@ -380,6 +481,7 @@ pub fn render_ui(
                 alt_active,
                 scrollback_offset,
                 copied_flash,
+                dpad_rect.is_none(),
                 &mut hits,
             );
         }
@@ -394,6 +496,7 @@ pub fn render_ui(
                 alt_active,
                 scrollback_offset,
                 copied_flash,
+                false,
                 &mut hits,
             );
             render_help_modal(f, area, &mut hits);
@@ -412,6 +515,7 @@ pub fn render_ui(
                 alt_active,
                 scrollback_offset,
                 copied_flash,
+                false,
                 &mut hits,
             );
             render_confirm_close_modal(f, area, tab_id, tab_title, &mut hits);
@@ -427,6 +531,7 @@ pub fn render_ui(
                 alt_active,
                 scrollback_offset,
                 copied_flash,
+                false,
                 &mut hits,
             );
             render_prompt_modal(f, area, kind, input, &mut hits);
@@ -446,6 +551,7 @@ pub fn render_ui(
                 alt_active,
                 scrollback_offset,
                 copied_flash,
+                false,
                 &mut hits,
             );
             render_fuzzy_modal(
@@ -460,7 +566,11 @@ pub fn render_ui(
         }
     }
 
-    UiGeometry { term_rect, hits }
+    UiGeometry {
+        term_rect,
+        hits,
+        dpad_rect,
+    }
 }
 
 fn draw_touchbar_pill(
@@ -509,6 +619,7 @@ fn draw_touchbar_pill(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_bottom_touchbar(
     f: &mut Frame,
     rect: Rect,
@@ -519,6 +630,7 @@ fn render_bottom_touchbar(
     alt_active: bool,
     scrollback_offset: usize,
     copied_flash: bool,
+    include_dpad_fallback: bool,
     hits: &mut Vec<HitRegion>,
 ) {
     if rect.width == 0 || rect.height == 0 {
@@ -547,9 +659,12 @@ fn render_bottom_touchbar(
         );
     }
 
-    // Reserve right-side space for optional `✓ Copied`, `▼ BOT`, and `?` keycaps
-    let narrow_bar = rect.width < 76;
-    let compact_badges = rect.width < 110;
+    // Reserve right-side space for optional `✓ Copied`, `▼ BOT`, and `?` keycaps.
+    // Because the 4 directional arrows (`←`, `↓`, `↑`, `→`) and Paste (`⎘`) are hosted in the
+    // floating semi-transparent 4-way circular disc over the terminal viewport, the bottom Touch Bar
+    // only needs to fit the 5 modifier keycaps (`^B`, `Esc`, `Ctrl`, `Alt`, `Tab`).
+    let narrow_bar = rect.width < 42;
+    let compact_badges = rect.width < 88;
     let copied_lbl = if copied_flash {
         Some(if compact_badges { " ✓ " } else { " ✓ Copied " })
     } else {
@@ -560,14 +675,14 @@ fn render_bottom_touchbar(
     } else {
         None
     };
-    let help_lbl = if narrow_bar { " ? " } else { "  ?  " };
+    let help_lbl = if rect.width < 60 { " ? " } else { "  ?  " };
     let copied_w = copied_lbl.map_or(0, |s| s.width() as u16 + 1);
     let scroll_w = scroll_lbl.map_or(0, |s| s.width() as u16 + 1);
     let help_w = help_lbl.width() as u16;
     let right_reserved = (copied_w + scroll_w + help_w).min(rect.width.saturating_sub(4));
     let avail_end = max_x.saturating_sub(right_reserved);
 
-    // 1. Far Left: compact 4-column icon-only Sidebar Toggle (` ◄≡ ` or ` ≡► `)
+    // 1. Far Left: compact icon-only Sidebar Toggle (` ◄≡ ` / ` ≡► `)
     let icon_lbl = if sidebar_open { " ◄≡ " } else { " ≡► " };
     let max_sb_budget = avail_end.saturating_sub(x);
     let sb_label = if (icon_lbl.width() as u16) <= max_sb_budget {
@@ -603,17 +718,17 @@ fn render_bottom_touchbar(
     }
 
     // 2. Left Space Name + Hollow/Solid Tab Circles (`●` = active tab, `○` = inactive tab):
-    // Compute `dots_budget` strictly from the state-independent `base_end` so `^B` and all key buttons
-    // stay at the exact same column regardless of `copied_flash` or `scrollback_offset`.
     let dots_start_x = x;
     let base_end = max_x.saturating_sub(help_w.min(rect.width.saturating_sub(4)));
     let min_key_reserve: u16 = 29;
-    let max_dots_w: u16 = if rect.width >= 104 {
+    let max_dots_w: u16 = if rect.width >= 90 {
         11
-    } else if rect.width >= 90 {
+    } else if rect.width >= 72 {
         9
-    } else {
+    } else if rect.width >= 56 {
         8
+    } else {
+        0
     };
     let dots_budget = base_end
         .saturating_sub(dots_start_x)
@@ -801,9 +916,9 @@ fn render_bottom_touchbar(
         x += 1;
     }
 
-    // 3. Modern Keycap Pills (`^B`, `Esc`, `Ctrl`, `Alt`, `Tab`, `←`, `↓`, `↑`, `→`, `⎘`)
-    // Arrow keys (`"  ←  "`, `"  ↓  "`, `"  ↑  "`, `"  →  "`) are 5 columns wide by 2.0 rows tall
-    // (`▄` + label + `▀`), forming a 1:1 square keycap with dead-center horizontal & vertical alignment.
+    // 3. Modern Modifier Keycap Pills (`^B`, `Esc`, `Ctrl`, `Alt`, `Tab`)
+    // Directional arrows (`↑`, `↓`, `←`, `→`) and Paste (`⎘`) are rendered in the floating
+    // draggable semi-transparent 4-way circular disc over the terminal viewport.
     let keycap_style = |active_highlight: bool, kind: u8| -> Style {
         if active_highlight {
             Style::default()
@@ -820,10 +935,6 @@ fn render_bottom_touchbar(
                     .bg(Color::Rgb(29, 33, 50))
                     .fg(Color::Rgb(192, 202, 245))
                     .add_modifier(Modifier::BOLD),
-                3 => Style::default()
-                    .bg(Color::Rgb(28, 44, 54))
-                    .fg(Color::Rgb(115, 218, 202))
-                    .add_modifier(Modifier::BOLD),
                 _ => Style::default()
                     .bg(Color::Rgb(34, 38, 57))
                     .fg(Color::Rgb(192, 202, 245))
@@ -832,229 +943,127 @@ fn render_bottom_touchbar(
         }
     };
 
-    if narrow_bar && rect.height >= 2 {
-        let wide_narrow = avail_end.saturating_sub(x) >= 29;
-        let top_keys: [(&str, HitTarget, bool, u8); 5] = [
-            (
-                if wide_narrow { " ^B " } else { "^B" },
-                HitTarget::TogglePrefix,
-                prefix_active,
-                1,
-            ),
-            (
-                if wide_narrow { " Esc " } else { "Esc" },
-                HitTarget::SendKey(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-                false,
-                0,
-            ),
-            (
-                if wide_narrow { " Ctl " } else { "Ctl" },
-                HitTarget::ToggleCtrl,
-                ctrl_active,
-                1,
-            ),
-            (
-                if wide_narrow { " Alt " } else { "Alt" },
-                HitTarget::ToggleAlt,
-                alt_active,
-                1,
-            ),
-            (
-                if wide_narrow { " Tab " } else { "Tab" },
-                HitTarget::SendKey(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
-                false,
-                0,
-            ),
-        ];
-        let bot_keys: [(&str, HitTarget, bool, u8); 5] = [
-            (
-                if wide_narrow { "  ←  " } else { " ← " },
-                HitTarget::SendKey(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
-                false,
-                2,
-            ),
-            (
-                if wide_narrow { "  ↓  " } else { " ↓ " },
-                HitTarget::SendKey(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-                false,
-                2,
-            ),
-            (
-                if wide_narrow { "  ↑  " } else { " ↑ " },
-                HitTarget::SendKey(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
-                false,
-                2,
-            ),
-            (
-                if wide_narrow { "  →  " } else { " → " },
-                HitTarget::SendKey(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
-                false,
-                2,
-            ),
-            (
-                if wide_narrow { "  ⎘  " } else { " ⎘ " },
-                HitTarget::PasteClipboard,
-                false,
-                3,
-            ),
-        ];
-        let (top_row, bot_row) = if rect.height >= 3 {
-            (rect.y + 1, rect.y + 2)
-        } else {
-            (rect.y, rect.y + 1)
-        };
-        for (row_y, row_keys) in [(top_row, top_keys), (bot_row, bot_keys)] {
-            let mut kx = x;
-            for (lbl, target, active_highlight, kind) in row_keys {
-                let kw = lbl.width() as u16;
-                if kx + kw > avail_end {
-                    break;
-                }
-                let kstyle = keycap_style(active_highlight, kind);
-                buf.set_string(kx, row_y, lbl, kstyle);
-                hits.push(HitRegion {
-                    rect: Rect {
-                        x: kx,
-                        y: row_y,
-                        width: kw,
-                        height: 1,
-                    },
-                    target,
-                });
-                kx += kw;
-                if kx < avail_end {
-                    kx += 1;
-                }
-            }
-        }
-    } else {
-        // 5-column square arrow buttons (`"  ←  "`, `"  ↓  "`, `"  ↑  "`, `"  →  "`) when `rect.width >= 82`
-        let sq_arrows = rect.width >= 82;
-        let wide_mods = rect.width >= 96;
-        let key_buttons: [(&str, HitTarget, bool, u8); 10] = [
-            (
-                if narrow_bar {
-                    "^B"
-                } else if wide_mods {
-                    "  ^B  "
-                } else {
-                    " ^B "
-                },
-                HitTarget::TogglePrefix,
-                prefix_active,
-                1,
-            ),
-            (
-                if narrow_bar { "Es" } else { " Esc " },
-                HitTarget::SendKey(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-                false,
-                0,
-            ),
-            (
-                if narrow_bar { "Ct" } else { " Ctrl " },
-                HitTarget::ToggleCtrl,
-                ctrl_active,
-                1,
-            ),
-            (
-                if narrow_bar { "Al" } else { " Alt " },
-                HitTarget::ToggleAlt,
-                alt_active,
-                1,
-            ),
-            (
-                if narrow_bar { "Tb" } else { " Tab " },
-                HitTarget::SendKey(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
-                false,
-                0,
-            ),
-            (
-                if narrow_bar {
-                    "←"
-                } else if sq_arrows {
-                    "  ←  "
-                } else {
-                    " ← "
-                },
-                HitTarget::SendKey(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
-                false,
-                2,
-            ),
-            (
-                if narrow_bar {
-                    "↓"
-                } else if sq_arrows {
-                    "  ↓  "
-                } else {
-                    " ↓ "
-                },
-                HitTarget::SendKey(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-                false,
-                2,
-            ),
-            (
-                if narrow_bar {
-                    "↑"
-                } else if sq_arrows {
-                    "  ↑  "
-                } else {
-                    " ↑ "
-                },
-                HitTarget::SendKey(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
-                false,
-                2,
-            ),
-            (
-                if narrow_bar {
-                    "→"
-                } else if sq_arrows {
-                    "  →  "
-                } else {
-                    " → "
-                },
-                HitTarget::SendKey(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
-                false,
-                2,
-            ),
-            (
-                if narrow_bar {
-                    "⎘"
-                } else if sq_arrows {
-                    "  ⎘  "
-                } else {
-                    " ⎘ "
-                },
-                HitTarget::PasteClipboard,
-                false,
-                3,
-            ),
-        ];
-
-        for (i, (lbl, target, active_highlight, kind)) in key_buttons.into_iter().enumerate() {
-            let kw = lbl.width() as u16;
-            if x + kw > avail_end {
-                break;
-            }
-            let kstyle = if narrow_bar && !active_highlight && i % 2 == 1 {
-                keycap_style(false, 2)
+    let full_mods = rect.width >= 48;
+    let wide_mods = rect.width >= 72;
+    let mut key_buttons: Vec<(&str, HitTarget, bool, u8)> = vec![
+        (
+            if narrow_bar {
+                "^B"
+            } else if wide_mods {
+                "  ^B  "
             } else {
-                keycap_style(active_highlight, kind)
-            };
-            draw_touchbar_pill(buf, x, rect, lbl, kstyle, active_highlight);
-            hits.push(HitRegion {
-                rect: Rect {
-                    x,
-                    y: rect.y,
-                    width: kw,
-                    height: rect.height,
-                },
-                target,
-            });
-            x += kw;
+                " ^B "
+            },
+            HitTarget::TogglePrefix,
+            prefix_active,
+            1,
+        ),
+        (
+            if narrow_bar {
+                "Es"
+            } else if full_mods {
+                " Esc "
+            } else {
+                "Esc"
+            },
+            HitTarget::SendKey(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            false,
+            0,
+        ),
+        (
+            if narrow_bar {
+                "Ct"
+            } else if wide_mods {
+                " Ctrl "
+            } else if full_mods {
+                " Ctl "
+            } else {
+                "Ctl"
+            },
+            HitTarget::ToggleCtrl,
+            ctrl_active,
+            1,
+        ),
+        (
+            if narrow_bar {
+                "Al"
+            } else if full_mods {
+                " Alt "
+            } else {
+                "Alt"
+            },
+            HitTarget::ToggleAlt,
+            alt_active,
+            1,
+        ),
+        (
+            if narrow_bar {
+                "Tb"
+            } else if full_mods {
+                " Tab "
+            } else {
+                "Tab"
+            },
+            HitTarget::SendKey(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            false,
+            0,
+        ),
+    ];
 
-            if !narrow_bar && x < avail_end {
-                x += 1;
-            }
+    if include_dpad_fallback {
+        key_buttons.extend([
+            (
+                "←",
+                HitTarget::SendKey(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+                false,
+                2,
+            ),
+            (
+                "↓",
+                HitTarget::SendKey(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+                false,
+                0,
+            ),
+            (
+                "↑",
+                HitTarget::SendKey(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+                false,
+                2,
+            ),
+            (
+                "→",
+                HitTarget::SendKey(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+                false,
+                0,
+            ),
+            ("⎘", HitTarget::PasteClipboard, false, 3),
+        ]);
+    }
+
+    for (i, (lbl, target, active_highlight, kind)) in key_buttons.into_iter().enumerate() {
+        let kw = lbl.width() as u16;
+        if x + kw > avail_end {
+            break;
+        }
+        let kstyle = if narrow_bar && !active_highlight && i % 2 == 1 {
+            keycap_style(false, 2)
+        } else {
+            keycap_style(active_highlight, kind)
+        };
+        draw_touchbar_pill(buf, x, rect, lbl, kstyle, active_highlight);
+        hits.push(HitRegion {
+            rect: Rect {
+                x,
+                y: rect.y,
+                width: kw,
+                height: rect.height,
+            },
+            target,
+        });
+        x += kw;
+
+        if !narrow_bar && x < avail_end {
+            x += 1;
         }
     }
 
@@ -1108,6 +1117,240 @@ fn render_bottom_touchbar(
             target: HitTarget::ToggleHelp,
         });
     }
+}
+
+fn color_to_rgb(c: Color, default_rgb: (u8, u8, u8)) -> (u8, u8, u8) {
+    match c {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::Black => (20, 22, 32),
+        Color::Red => (247, 118, 142),
+        Color::Green => (158, 206, 106),
+        Color::Yellow => (224, 175, 104),
+        Color::Blue => (122, 162, 247),
+        Color::Magenta => (187, 154, 247),
+        Color::Cyan => (125, 207, 255),
+        Color::Gray => (169, 177, 214),
+        Color::DarkGray => (86, 95, 137),
+        Color::LightRed => (255, 137, 157),
+        Color::LightGreen => (185, 242, 124),
+        Color::LightYellow => (255, 208, 130),
+        Color::LightBlue => (145, 184, 255),
+        Color::LightMagenta => (209, 178, 255),
+        Color::LightCyan => (157, 225, 255),
+        Color::White => (220, 228, 252),
+        _ => default_rgb,
+    }
+}
+
+fn blend_rgb(base: (u8, u8, u8), overlay: (u8, u8, u8), alpha_pct: u16) -> Color {
+    let a = alpha_pct.min(100);
+    let inv = 100 - a;
+    let r = ((base.0 as u16 * inv + overlay.0 as u16 * a) / 100) as u8;
+    let g = ((base.1 as u16 * inv + overlay.1 as u16 * a) / 100) as u8;
+    let b = ((base.2 as u16 * inv + overlay.2 as u16 * a) / 100) as u8;
+    Color::Rgb(r, g, b)
+}
+
+fn render_floating_dpad(
+    f: &mut Frame,
+    term_rect: Rect,
+    dpad_pos: Option<(u16, u16)>,
+    dragging: bool,
+    hits: &mut Vec<HitRegion>,
+) -> Option<Rect> {
+    let disc = resolve_dpad_disc_rect(term_rect, dpad_pos)?;
+    let buf = f.buffer_mut();
+
+    let arrow_tint = if dragging {
+        (58, 76, 124)
+    } else {
+        (42, 56, 94)
+    };
+    let arrow_alpha = if dragging { 82 } else { 72 };
+
+    let center_tint = if dragging {
+        (48, 106, 122)
+    } else {
+        (36, 84, 98)
+    };
+    let center_alpha = if dragging { 86 } else { 78 };
+
+    let border_fg = if dragging {
+        Color::Rgb(125, 207, 255)
+    } else {
+        Color::Rgb(106, 124, 178)
+    };
+    let arrow_fg = Color::Rgb(230, 238, 255);
+    let paste_fg = Color::Rgb(198, 248, 228);
+
+    // 15x7 Compact Cross (+) (or scaled 9/15 x 3/5/7 cross on constrained viewports),
+    // with 4 hollow corners (100% transparent, no wasted space):
+    // col: 012345678901234
+    // r0:       ╭───╮     
+    // r1:       │ ↑ │     
+    // r2:  ╭───╮├───┤╭───╮
+    // r3:  │ ← ││ ⎘ ││ → │
+    // r4:  ╰───╯├───┤╰───╯
+    // r5:       │ ↓ │     
+    // r6:       ╰───╯     
+    let (arm_w, arm_h, mid_h) = dpad_cross_metrics(disc);
+    let mid_col_end = arm_w * 2;
+    let mid_row_end = arm_h + mid_h;
+    let up_label_y = arm_h.saturating_sub(1);
+    let mid_label_y = arm_h + mid_h / 2;
+    let down_label_y = mid_row_end;
+    let left_label_x = arm_w / 2;
+    let center_label_x = arm_w + arm_w / 2;
+    let right_label_x = mid_col_end + arm_w / 2;
+    let full_15x7 = disc.width == DPAD_DISC_WIDTH && disc.height == DPAD_DISC_HEIGHT;
+
+    for dy in 0..disc.height {
+        for dx in 0..disc.width {
+            let in_cross = (arm_w..mid_col_end).contains(&dx) || (arm_h..mid_row_end).contains(&dy);
+            if !in_cross {
+                continue;
+            }
+            let x = disc.x + dx;
+            let y = disc.y + dy;
+            if x >= buf.area.width || y >= buf.area.height {
+                continue;
+            }
+            let is_center =
+                (arm_w..mid_col_end).contains(&dx) && (arm_h..mid_row_end).contains(&dy);
+            let cell = &mut buf[(x, y)];
+            let base_bg = color_to_rgb(cell.bg, (18, 20, 30));
+            let base_fg = color_to_rgb(cell.fg, (169, 177, 214));
+            let (tint, alpha) = if is_center {
+                (center_tint, center_alpha)
+            } else {
+                (arrow_tint, arrow_alpha)
+            };
+            let blended_bg = blend_rgb(base_bg, tint, alpha);
+
+            let glyph: Option<(&str, Color, bool)> = if full_15x7 {
+                match (dy, dx) {
+                    // Row 0: top of Up box
+                    (0, 5) => Some(("╭", border_fg, false)),
+                    (0, 6..=8) => Some(("─", border_fg, false)),
+                    (0, 9) => Some(("╮", border_fg, false)),
+                    // Row 1: Up label
+                    (1, 5) | (1, 9) => Some(("│", border_fg, false)),
+                    (1, 7) => Some(("↑", arrow_fg, true)),
+                    // Row 2: top of Left / Center / Right
+                    (2, 0) | (2, 10) => Some(("╭", border_fg, false)),
+                    (2, 4) | (2, 14) => Some(("╮", border_fg, false)),
+                    (2, 5) => Some(("├", border_fg, false)),
+                    (2, 9) => Some(("┤", border_fg, false)),
+                    (2, 1..=3) | (2, 6..=8) | (2, 11..=13) => Some(("─", border_fg, false)),
+                    // Row 3: Left / Paste / Right labels
+                    (3, 0) | (3, 4) | (3, 5) | (3, 9) | (3, 10) | (3, 14) => {
+                        Some(("│", border_fg, false))
+                    }
+                    (3, 2) => Some(("←", arrow_fg, true)),
+                    (3, 7) => Some(("⎘", paste_fg, true)),
+                    (3, 12) => Some(("→", arrow_fg, true)),
+                    // Row 4: bottom of Left / Center / Right
+                    (4, 0) | (4, 10) => Some(("╰", border_fg, false)),
+                    (4, 4) | (4, 14) => Some(("╯", border_fg, false)),
+                    (4, 5) => Some(("├", border_fg, false)),
+                    (4, 9) => Some(("┤", border_fg, false)),
+                    (4, 1..=3) | (4, 6..=8) | (4, 11..=13) => Some(("─", border_fg, false)),
+                    // Row 5: Down label
+                    (5, 5) | (5, 9) => Some(("│", border_fg, false)),
+                    (5, 7) => Some(("↓", arrow_fg, true)),
+                    // Row 6: bottom of Down box
+                    (6, 5) => Some(("╰", border_fg, false)),
+                    (6, 6..=8) => Some(("─", border_fg, false)),
+                    (6, 9) => Some(("╯", border_fg, false)),
+                    _ => None,
+                }
+            } else if dy == up_label_y && dx == center_label_x {
+                Some(("↑", arrow_fg, true))
+            } else if dy == down_label_y && dx == center_label_x {
+                Some(("↓", arrow_fg, true))
+            } else if dy == mid_label_y && dx == left_label_x {
+                Some(("←", arrow_fg, true))
+            } else if dy == mid_label_y && dx == center_label_x {
+                Some(("⎘", paste_fg, true))
+            } else if dy == mid_label_y && dx == right_label_x {
+                Some(("→", arrow_fg, true))
+            } else {
+                None
+            };
+
+            cell.set_bg(blended_bg);
+            if let Some((sym, fg, bold)) = glyph {
+                cell.set_symbol(sym);
+                cell.set_fg(fg);
+                if bold {
+                    cell.modifier.insert(Modifier::BOLD);
+                } else {
+                    cell.modifier.remove(Modifier::BOLD);
+                }
+            } else {
+                if cell.symbol().width() != 1 {
+                    cell.set_symbol(" ");
+                }
+                let ghost_fg = blend_rgb(base_fg, tint, 55);
+                cell.set_fg(ghost_fg);
+                cell.modifier.remove(Modifier::BOLD);
+            }
+        }
+    }
+
+    // Register 5 hit regions covering 100% of the Compact Cross (+):
+    // Top arm (Up)
+    hits.push(HitRegion {
+        rect: Rect {
+            x: disc.x + arm_w,
+            y: disc.y,
+            width: arm_w,
+            height: arm_h,
+        },
+        target: HitTarget::SendKey(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+    });
+    // Bottom arm (Down)
+    hits.push(HitRegion {
+        rect: Rect {
+            x: disc.x + arm_w,
+            y: disc.y + mid_row_end,
+            width: arm_w,
+            height: arm_h,
+        },
+        target: HitTarget::SendKey(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+    });
+    // Left arm (Left)
+    hits.push(HitRegion {
+        rect: Rect {
+            x: disc.x,
+            y: disc.y + arm_h,
+            width: arm_w,
+            height: mid_h,
+        },
+        target: HitTarget::SendKey(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+    });
+    // Right arm (Right)
+    hits.push(HitRegion {
+        rect: Rect {
+            x: disc.x + mid_col_end,
+            y: disc.y + arm_h,
+            width: arm_w,
+            height: mid_h,
+        },
+        target: HitTarget::SendKey(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+    });
+    // Center square (PasteClipboard)
+    hits.push(HitRegion {
+        rect: Rect {
+            x: disc.x + arm_w,
+            y: disc.y + arm_h,
+            width: arm_w,
+            height: mid_h,
+        },
+        target: HitTarget::PasteClipboard,
+    });
+
+    Some(disc)
 }
 
 struct SidebarCard {
@@ -2084,7 +2327,8 @@ mod tests {
             Some(HitTarget::ToggleSidebar)
         );
 
-        // Scrollback badge, Prefix/Ctrl/Alt buttons, terminal keys (Esc/Tab/Arrows/⎘), and Help button are on the bottom touchbar
+        // Scrollback badge, Prefix/Ctrl/Alt/Esc/Tab buttons, and Help button are on the bottom touchbar;
+        // 4-way arrows + centered Paste (⎘) are on the floating circular disc.
         assert!(hits
             .iter()
             .any(|h| h.target == HitTarget::ExitScrollback && h.rect.height == 3));
@@ -2099,12 +2343,12 @@ mod tests {
             .any(|h| h.target == HitTarget::ToggleAlt && h.rect.height == 3));
         assert!(hits
             .iter()
-            .any(|h| h.target == HitTarget::PasteClipboard && h.rect.height == 3));
+            .any(|h| h.target == HitTarget::PasteClipboard && h.rect.width == 5 && h.rect.height == 3));
         for arrow in [KeyCode::Left, KeyCode::Down, KeyCode::Up, KeyCode::Right] {
             assert!(hits.iter().any(|h| {
                 h.target == HitTarget::SendKey(KeyEvent::new(arrow, KeyModifiers::NONE))
-                    && h.rect.height == 3
                     && h.rect.width == 5
+                    && h.rect.height >= 2
             }));
         }
         assert!(!hits.iter().any(|h| {
@@ -2274,6 +2518,125 @@ mod tests {
         assert!(hits
             .iter()
             .any(|h| h.target == HitTarget::PasteClipboard));
+    }
+
+    #[test]
+    fn floating_square_dpad_exposes_four_directions_and_centered_paste_and_clamps_position() {
+        for width in [64u16, 42u16, 30u16] {
+            let backend = TestBackend::new(width, 20);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let world = World::default();
+            let mut geom_out = None;
+
+            terminal
+                .draw(|f| {
+                    geom_out = Some(render_ui_with_dpad(
+                        f,
+                        &world,
+                        None,
+                        false,
+                        24,
+                        true,
+                        false,
+                        false,
+                        false,
+                        0,
+                        None,
+                        false,
+                        &Modal::None,
+                        Some((999, 999)),
+                        true,
+                    ));
+                })
+                .unwrap();
+
+            let geom = geom_out.unwrap();
+            let disc = geom.dpad_rect.expect("expected floating dpad rect");
+            assert_eq!(disc.width, DPAD_DISC_WIDTH);
+            assert_eq!(disc.height, DPAD_DISC_HEIGHT);
+            assert!(disc.x + disc.width <= geom.term_rect.x + geom.term_rect.width);
+            assert!(disc.y + disc.height <= geom.term_rect.y + geom.term_rect.height);
+
+            // Verify 5 sectors on the 15x7 Compact Cross (+):
+            // Up (top arm), Down (bottom arm), Left (left arm), Right (right arm), Paste (center)
+            assert_eq!(
+                find_hit_target(&geom.hits, disc.x + 7, disc.y + 1),
+                Some(HitTarget::SendKey(KeyEvent::new(
+                    KeyCode::Up,
+                    KeyModifiers::NONE
+                )))
+            );
+            assert_eq!(
+                find_hit_target(&geom.hits, disc.x + 7, disc.y + 5),
+                Some(HitTarget::SendKey(KeyEvent::new(
+                    KeyCode::Down,
+                    KeyModifiers::NONE
+                )))
+            );
+            assert_eq!(
+                find_hit_target(&geom.hits, disc.x + 2, disc.y + 3),
+                Some(HitTarget::SendKey(KeyEvent::new(
+                    KeyCode::Left,
+                    KeyModifiers::NONE
+                )))
+            );
+            assert_eq!(
+                find_hit_target(&geom.hits, disc.x + 12, disc.y + 3),
+                Some(HitTarget::SendKey(KeyEvent::new(
+                    KeyCode::Right,
+                    KeyModifiers::NONE
+                )))
+            );
+            assert_eq!(
+                find_hit_target(&geom.hits, disc.x + 7, disc.y + 3),
+                Some(HitTarget::PasteClipboard)
+            );
+            // Hollow corners (0,0) and (14,6) are outside the cross mask (transparent to terminal)
+            assert!(!is_on_dpad_disc(Some(disc), disc.x, disc.y));
+            assert!(!is_on_dpad_disc(Some(disc), disc.x + 14, disc.y + 6));
+            assert!(is_on_dpad_disc(Some(disc), disc.x + 7, disc.y + 3));
+        }
+
+        // Constrained viewports (e.g. 80x9 with 3-row touchbar -> 6-row viewport, or 30x8 with open sidebar)
+        // scale down the + cross so all 4 directions and centered Paste remain accessible.
+        for (w, h, sidebar_open) in [(80u16, 9u16, false), (30u16, 8u16, true)] {
+            let backend = TestBackend::new(w, h);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let world = World::default();
+            let mut geom_out = None;
+            terminal
+                .draw(|f| {
+                    geom_out = Some(render_ui_with_dpad(
+                        f,
+                        &world,
+                        None,
+                        sidebar_open,
+                        24,
+                        true,
+                        false,
+                        false,
+                        false,
+                        0,
+                        None,
+                        false,
+                        &Modal::None,
+                        None,
+                        false,
+                    ));
+                })
+                .unwrap();
+            let geom = geom_out.unwrap();
+            assert!(geom.dpad_rect.is_some());
+            for arrow in [KeyCode::Up, KeyCode::Down, KeyCode::Left, KeyCode::Right] {
+                assert!(geom.hits.iter().any(|hit| {
+                    hit.target == HitTarget::SendKey(KeyEvent::new(arrow, KeyModifiers::NONE))
+                }));
+            }
+            assert!(geom
+                .hits
+                .iter()
+                .any(|hit| hit.target == HitTarget::PasteClipboard));
+        }
     }
 
     #[test]
