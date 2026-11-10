@@ -40,8 +40,6 @@ pub struct UiFileConfig {
     pub sidebar_start_collapsed: Option<bool>,
     pub mobile_width_threshold: Option<u16>,
     pub touch_mode: Option<bool>,
-    pub swipe_threshold: Option<u16>,
-    pub natural_swipe: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Default)]
