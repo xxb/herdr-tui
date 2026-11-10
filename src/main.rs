@@ -169,6 +169,79 @@ fn copy_to_clipboard(text: &str) {
     });
 }
 
+fn read_clipboard_text(fallback: &str) -> String {
+    if !fallback.is_empty() {
+        return fallback.to_string();
+    }
+    if std::env::var_os("SSH_CONNECTION").is_none() && std::env::var_os("SSH_TTY").is_none() {
+        let local_cmds: &[(&str, &[&str])] = &[
+            ("pbpaste", &[]),
+            ("wl-paste", &["--no-newline"]),
+            ("xclip", &["-selection", "clipboard", "-o"]),
+        ];
+        for (prog, args) in local_cmds {
+            if *prog == "wl-paste" && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+                continue;
+            }
+            if *prog == "xclip" && std::env::var_os("DISPLAY").is_none() {
+                continue;
+            }
+            if let Ok(output) = Command::new(prog)
+                .args(*args)
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+            {
+                if output.status.success() {
+                    let s = String::from_utf8_lossy(&output.stdout).into_owned();
+                    if !s.is_empty() {
+                        return s;
+                    }
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+fn paste_text_into_app(
+    text: &str,
+    core: &CoreClient,
+    world: &World,
+    attached: &Option<AttachedTerminal>,
+    scrollback_offset: &mut usize,
+    modal: &mut Modal,
+) {
+    if text.is_empty() {
+        return;
+    }
+    if matches!(modal, Modal::None) {
+        *scrollback_offset = 0;
+        if let Some(att) = attached {
+            if att.parser.screen().bracketed_paste() {
+                let mut payload = b"\x1b[200~".to_vec();
+                payload.extend_from_slice(text.as_bytes());
+                payload.extend_from_slice(b"\x1b[201~");
+                core.send_input(att.channel, &payload);
+            } else {
+                core.send_input(att.channel, text.as_bytes());
+            }
+        }
+    } else if let Modal::Prompt { input, .. } = modal {
+        input.push_str(text);
+    } else if let Modal::Fuzzy {
+        query,
+        selected,
+        selected_tab_id,
+    } = modal
+    {
+        query.push_str(text);
+        *selected = 0;
+        let items = collect_fuzzy_items(world, query);
+        *selected_tab_id = items.first().map(|it| it.tab_id.clone());
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let file_cfg = FileConfig::load();
@@ -413,10 +486,13 @@ fn run_app(
 ) -> Result<()> {
     let mut attached: Option<AttachedTerminal> = None;
     let mut prefix_active = false;
+    let mut ctrl_active = false;
+    let mut alt_active = false;
     let mut scrollback_offset: usize = 0;
     let mut modal = Modal::None;
     let mut last_hits: Vec<HitRegion> = Vec::new();
     let mut selection: Option<TerminalSelection> = None;
+    let mut clipboard_buffer = String::new();
     let mut copied_until: Option<Instant> = None;
     let mut dirty = true;
     let mut prev_width = terminal.size()?.width;
@@ -462,6 +538,8 @@ fn run_app(
                     sidebar_width,
                     touch_mode,
                     prefix_active,
+                    ctrl_active,
+                    alt_active,
                     scrollback_offset,
                     selection.as_ref(),
                     copied_flash,
@@ -576,30 +654,17 @@ fn run_app(
                 prev_width = w;
             }
             Event::Paste(text) => {
-                if matches!(modal, Modal::None) && scrollback_offset == 0 {
-                    if let Some(att) = &attached {
-                        if att.parser.screen().bracketed_paste() {
-                            let mut payload = b"\x1b[200~".to_vec();
-                            payload.extend_from_slice(text.as_bytes());
-                            payload.extend_from_slice(b"\x1b[201~");
-                            core.send_input(att.channel, &payload);
-                        } else {
-                            core.send_input(att.channel, text.as_bytes());
-                        }
-                    }
-                } else if let Modal::Prompt { input, .. } = &mut modal {
-                    input.push_str(&text);
-                } else if let Modal::Fuzzy {
-                    query,
-                    selected,
-                    selected_tab_id,
-                } = &mut modal
-                {
-                    query.push_str(&text);
-                    *selected = 0;
-                    let items = collect_fuzzy_items(world, query);
-                    *selected_tab_id = items.first().map(|it| it.tab_id.clone());
+                if !text.is_empty() {
+                    clipboard_buffer = text.clone();
                 }
+                paste_text_into_app(
+                    &text,
+                    core,
+                    world,
+                    &attached,
+                    &mut scrollback_offset,
+                    &mut modal,
+                );
             }
             Event::Mouse(mev) => {
                 match mev.kind {
@@ -613,14 +678,20 @@ fn run_app(
                                 HitTarget::CancelModal => {
                                     modal = Modal::None;
                                     prefix_active = false;
+                                    ctrl_active = false;
+                                    alt_active = false;
                                 }
                                 HitTarget::ConfirmCloseYes { tab_id } => {
                                     modal = Modal::None;
                                     prefix_active = false;
+                                    ctrl_active = false;
+                                    alt_active = false;
                                     let _ = world.close_tab_by_id(core, &tab_id);
                                 }
                                 HitTarget::SubmitPrompt => {
                                     prefix_active = false;
+                                    ctrl_active = false;
+                                    alt_active = false;
                                     if let Modal::Prompt { kind, input } =
                                         std::mem::replace(&mut modal, Modal::None)
                                     {
@@ -641,6 +712,8 @@ fn run_app(
                                 HitTarget::TriggerAction(act) => {
                                     modal = Modal::None;
                                     prefix_active = false;
+                                    ctrl_active = false;
+                                    alt_active = false;
                                     if execute_action(
                                         act,
                                         core,
@@ -656,6 +729,8 @@ fn run_app(
                                 }
                                 HitTarget::TogglePrefix => {
                                     modal = Modal::None;
+                                    ctrl_active = false;
+                                    alt_active = false;
                                     if prefix_active {
                                         prefix_active = false;
                                         if let Some(att) = &attached {
@@ -666,24 +741,58 @@ fn run_app(
                                         prefix_active = true;
                                     }
                                 }
+                                HitTarget::ToggleCtrl => {
+                                    modal = Modal::None;
+                                    prefix_active = false;
+                                    ctrl_active = !ctrl_active;
+                                }
+                                HitTarget::ToggleAlt => {
+                                    modal = Modal::None;
+                                    prefix_active = false;
+                                    alt_active = !alt_active;
+                                }
+                                HitTarget::PasteClipboard => {
+                                    prefix_active = false;
+                                    ctrl_active = false;
+                                    alt_active = false;
+                                    let text = read_clipboard_text(&clipboard_buffer);
+                                    if !text.is_empty() {
+                                        paste_text_into_app(
+                                            &text,
+                                            core,
+                                            world,
+                                            &attached,
+                                            &mut scrollback_offset,
+                                            &mut modal,
+                                        );
+                                    }
+                                }
                                 HitTarget::ExitScrollback => {
                                     modal = Modal::None;
                                     prefix_active = false;
+                                    ctrl_active = false;
+                                    alt_active = false;
                                     scrollback_offset = 0;
                                 }
                                 HitTarget::ToggleSidebar => {
                                     modal = Modal::None;
                                     prefix_active = false;
+                                    ctrl_active = false;
+                                    alt_active = false;
                                     *sidebar_open = !*sidebar_open;
                                 }
                                 HitTarget::ToggleSpaceCollapse(space_id) => {
                                     modal = Modal::None;
                                     prefix_active = false;
+                                    ctrl_active = false;
+                                    alt_active = false;
                                     world.toggle_space_collapsed(&space_id);
                                 }
                                 HitTarget::SelectSpace(space_id) => {
                                     modal = Modal::None;
                                     prefix_active = false;
+                                    ctrl_active = false;
+                                    alt_active = false;
                                     if world.select_space_by_id(&space_id) {
                                         world.mark_active_seen(core);
                                     }
@@ -691,6 +800,8 @@ fn run_app(
                                 HitTarget::SelectTab { space_id, tab_id } => {
                                     modal = Modal::None;
                                     prefix_active = false;
+                                    ctrl_active = false;
+                                    alt_active = false;
                                     if world.select_tab_by_id(&space_id, &tab_id) {
                                         world.mark_active_seen(core);
                                     }
@@ -698,10 +809,14 @@ fn run_app(
                                 HitTarget::NewTab => {
                                     modal = Modal::None;
                                     prefix_active = false;
+                                    ctrl_active = false;
+                                    alt_active = false;
                                     let _ = world.create_new_tab(core);
                                 }
                                 HitTarget::NewSpacePrompt => {
                                     prefix_active = false;
+                                    ctrl_active = false;
+                                    alt_active = false;
                                     modal = Modal::Prompt {
                                         kind: PromptKind::NewSpace,
                                         input: String::new(),
@@ -709,6 +824,8 @@ fn run_app(
                                 }
                                 HitTarget::ToggleHelp => {
                                     prefix_active = false;
+                                    ctrl_active = false;
+                                    alt_active = false;
                                     modal = if matches!(modal, Modal::Help) {
                                         Modal::None
                                     } else {
@@ -724,6 +841,8 @@ fn run_app(
                                         prefix_spec,
                                         sidebar_open,
                                         &mut prefix_active,
+                                        &mut ctrl_active,
+                                        &mut alt_active,
                                         &mut scrollback_offset,
                                         &mut modal,
                                         term_rect,
@@ -734,6 +853,9 @@ fn run_app(
                             }
                         } else if !matches!(modal, Modal::None) {
                             modal = Modal::None;
+                            prefix_active = false;
+                            ctrl_active = false;
+                            alt_active = false;
                         } else if mx >= term_rect.x
                             && mx < term_rect.x.saturating_add(term_rect.width)
                             && my >= term_rect.y
@@ -780,6 +902,7 @@ fn run_app(
                                     if let Some(att) = &attached {
                                         let text = sel.extract_text(att.parser.screen());
                                         if !text.is_empty() {
+                                            clipboard_buffer = text.clone();
                                             copy_to_clipboard(&text);
                                             copied_until =
                                                 Some(Instant::now() + Duration::from_secs(2));
@@ -847,6 +970,8 @@ fn run_app(
                     prefix_spec,
                     sidebar_open,
                     &mut prefix_active,
+                    &mut ctrl_active,
+                    &mut alt_active,
                     &mut scrollback_offset,
                     &mut modal,
                     term_rect,
@@ -861,17 +986,27 @@ fn run_app(
 
 #[allow(clippy::too_many_arguments)]
 fn handle_key_event(
-    kev: KeyEvent,
+    mut kev: KeyEvent,
     core: &CoreClient,
     world: &mut World,
     attached: &Option<AttachedTerminal>,
     prefix_spec: &str,
     sidebar_open: &mut bool,
     prefix_active: &mut bool,
+    ctrl_active: &mut bool,
+    alt_active: &mut bool,
     scrollback_offset: &mut usize,
     modal: &mut Modal,
     term_rect: Rect,
 ) -> Result<bool> {
+    if *ctrl_active {
+        kev.modifiers.insert(KeyModifiers::CONTROL);
+        *ctrl_active = false;
+    }
+    if *alt_active {
+        kev.modifiers.insert(KeyModifiers::ALT);
+        *alt_active = false;
+    }
     // 1. Handle active Modal first
     match modal {
         Modal::Help => {
@@ -916,7 +1051,11 @@ fn handle_key_event(
                 KeyCode::Backspace => {
                     input.pop();
                 }
-                KeyCode::Char(c) if !kev.modifiers.contains(KeyModifiers::CONTROL) => {
+                KeyCode::Char(c)
+                    if !kev
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
                     input.push(c);
                 }
                 _ => {}
@@ -971,7 +1110,11 @@ fn handle_key_event(
                     let next_items = collect_fuzzy_items(world, query);
                     *selected_tab_id = next_items.first().map(|it| it.tab_id.clone());
                 }
-                KeyCode::Char(c) if !kev.modifiers.contains(KeyModifiers::CONTROL) => {
+                KeyCode::Char(c)
+                    if !kev
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
                     query.push(c);
                     *selected = 0;
                     let next_items = collect_fuzzy_items(world, query);

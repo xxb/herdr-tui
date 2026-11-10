@@ -23,6 +23,9 @@ pub enum HitTarget {
     NewTab,
     NewSpacePrompt,
     TogglePrefix,
+    ToggleCtrl,
+    ToggleAlt,
+    PasteClipboard,
     ExitScrollback,
     ToggleHelp,
     ConfirmCloseYes { tab_id: String },
@@ -307,6 +310,8 @@ pub fn render_ui(
     sidebar_width: u16,
     touch_mode: bool,
     prefix_active: bool,
+    ctrl_active: bool,
+    alt_active: bool,
     scrollback_offset: usize,
     selection: Option<&TerminalSelection>,
     copied_flash: bool,
@@ -369,6 +374,8 @@ pub fn render_ui(
                 world,
                 sidebar_open,
                 prefix_active,
+                ctrl_active,
+                alt_active,
                 scrollback_offset,
                 copied_flash,
                 &mut hits,
@@ -381,6 +388,8 @@ pub fn render_ui(
                 world,
                 sidebar_open,
                 prefix_active,
+                ctrl_active,
+                alt_active,
                 scrollback_offset,
                 copied_flash,
                 &mut hits,
@@ -397,6 +406,8 @@ pub fn render_ui(
                 world,
                 sidebar_open,
                 prefix_active,
+                ctrl_active,
+                alt_active,
                 scrollback_offset,
                 copied_flash,
                 &mut hits,
@@ -410,6 +421,8 @@ pub fn render_ui(
                 world,
                 sidebar_open,
                 prefix_active,
+                ctrl_active,
+                alt_active,
                 scrollback_offset,
                 copied_flash,
                 &mut hits,
@@ -427,6 +440,8 @@ pub fn render_ui(
                 world,
                 sidebar_open,
                 prefix_active,
+                ctrl_active,
+                alt_active,
                 scrollback_offset,
                 copied_flash,
                 &mut hits,
@@ -481,6 +496,8 @@ fn render_bottom_touchbar(
     world: &World,
     sidebar_open: bool,
     prefix_active: bool,
+    ctrl_active: bool,
+    alt_active: bool,
     scrollback_offset: usize,
     copied_flash: bool,
     hits: &mut Vec<HitRegion>,
@@ -733,43 +750,60 @@ fn render_bottom_touchbar(
         x += 1;
     }
 
-    // 3. Constant-width Herdr App-style Touchbar Keys (`[^B]`, `[Esc]`, `[Tab]`, `[^C]`, `[←]`, `[↓]`, `[↑]`, `[→]`)
-    // All labels have invariant character widths so toggling `^B` or scrolling never causes horizontal jitter.
-    let key_buttons: [(&str, HitTarget, bool); 8] = [
-        (" [^B] ", HitTarget::TogglePrefix, prefix_active),
+    // 3. Constant-width Herdr App-style Touchbar Keys (`[^B]`, `[Esc]`, `[Ctrl]`, `[Alt]`, `[Tab]`, `[←]`, `[↓]`, `[↑]`, `[→]`, `[粘貼]`)
+    // `[^C]` is intentionally omitted to prevent accidental process interruption.
+    // All labels have invariant character widths for a given `rect.width` so toggling `^B`/`Ctrl`/`Alt`
+    // or scrolling never causes horizontal jitter.
+    let wide_keys = rect.width >= 118;
+    let key_buttons: [(&str, HitTarget, bool); 10] = [
         (
-            " [Esc] ",
+            if wide_keys { " [^B] " } else { "[^B]" },
+            HitTarget::TogglePrefix,
+            prefix_active,
+        ),
+        (
+            if wide_keys { " [Esc] " } else { "[Esc]" },
             HitTarget::SendKey(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             false,
         ),
         (
-            " [Tab] ",
+            if wide_keys { " [Ctrl] " } else { "[Ctrl]" },
+            HitTarget::ToggleCtrl,
+            ctrl_active,
+        ),
+        (
+            if wide_keys { " [Alt] " } else { "[Alt]" },
+            HitTarget::ToggleAlt,
+            alt_active,
+        ),
+        (
+            if wide_keys { " [Tab] " } else { "[Tab]" },
             HitTarget::SendKey(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
             false,
         ),
         (
-            " [^C] ",
-            HitTarget::SendKey(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            false,
-        ),
-        (
-            " [←] ",
+            if wide_keys { " [←] " } else { "[←]" },
             HitTarget::SendKey(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
             false,
         ),
         (
-            " [↓] ",
+            if wide_keys { " [↓] " } else { "[↓]" },
             HitTarget::SendKey(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
             false,
         ),
         (
-            " [↑] ",
+            if wide_keys { " [↑] " } else { "[↑]" },
             HitTarget::SendKey(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
             false,
         ),
         (
-            " [→] ",
+            if wide_keys { " [→] " } else { "[→]" },
             HitTarget::SendKey(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            false,
+        ),
+        (
+            if wide_keys { " [粘貼] " } else { "[粘貼]" },
+            HitTarget::PasteClipboard,
             false,
         ),
     ];
@@ -1486,7 +1520,8 @@ fn render_help_modal(f: &mut Frame, area: Rect, hits: &mut Vec<HitRegion>) {
         )),
         Line::from("  Tap ● ○ ✓ on Touchbar    Switch directly to Tab (no body swipe conflict)"),
         Line::from("  Tap ▾ / ▸ on Space       Collapse / expand Space's child Tabs in sidebar"),
-        Line::from("  Prefix Key               Ctrl+b or Tap [^B] on bottom touchbar"),
+        Line::from("  Prefix / Modifiers       Tap [^B], [Ctrl], or [Alt] on bottom touchbar"),
+        Line::from("  Clipboard Copy / Paste   Drag text to copy (OSC 52); Tap [粘貼] to paste"),
         Line::from("  Next / Prev Tab          ^b n / ^b p   or  Alt+Right / Alt+Left"),
         Line::from("  Switch Tab 1..9          ^b 1..9       or  Alt+1..9"),
         Line::from("  New Tab in Space         ^b c          or  Tap [+ New Tab] in sidebar"),
@@ -1820,6 +1855,8 @@ mod tests {
                     24,
                     true, // touch_mode = true (2-row bottom touchbar)
                     false,
+                    false,
+                    false,
                     42, // scrollback_offset > 0
                     None,
                     false,
@@ -1841,13 +1878,25 @@ mod tests {
             Some(HitTarget::ToggleSidebar)
         );
 
-        // Scrollback badge, Prefix button, terminal keys (Esc/Tab/^C/Arrows), and Help button are on the bottom touchbar
+        // Scrollback badge, Prefix/Ctrl/Alt buttons, terminal keys (Esc/Tab/Arrows/粘貼), and Help button are on the bottom touchbar
         assert!(hits
             .iter()
             .any(|h| h.target == HitTarget::ExitScrollback && h.rect.height == 2));
         assert!(hits
             .iter()
             .any(|h| h.target == HitTarget::TogglePrefix && h.rect.height == 2));
+        assert!(hits
+            .iter()
+            .any(|h| h.target == HitTarget::ToggleCtrl && h.rect.height == 2));
+        assert!(hits
+            .iter()
+            .any(|h| h.target == HitTarget::ToggleAlt && h.rect.height == 2));
+        assert!(hits
+            .iter()
+            .any(|h| h.target == HitTarget::PasteClipboard && h.rect.height == 2));
+        assert!(!hits.iter().any(|h| {
+            h.target == HitTarget::SendKey(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        }));
         assert!(hits.iter().any(|h| {
             h.target == HitTarget::SendKey(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
         }));
@@ -1886,6 +1935,8 @@ mod tests {
                     24,
                     true,
                     false,
+                    false,
+                    false,
                     0,
                     None,
                     false,
@@ -1908,6 +1959,8 @@ mod tests {
                     None,
                     false,
                     24,
+                    true,
+                    true,
                     true,
                     true,
                     15,
@@ -1943,6 +1996,8 @@ mod tests {
                     false,
                     24,
                     true,
+                    false,
+                    false,
                     false,
                     0,
                     None,
@@ -1984,6 +2039,8 @@ mod tests {
                     24,
                     false,
                     false,
+                    false,
+                    false,
                     0,
                     None,
                     false,
@@ -2014,6 +2071,8 @@ mod tests {
                     None,
                     false,
                     24,
+                    false,
+                    false,
                     false,
                     false,
                     0,
