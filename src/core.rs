@@ -285,7 +285,13 @@ impl CoreClient {
         let _ = self.send_frame(channel, wire::CLOSE, &[]);
     }
 
-    /// Acknowledge flow-control credit on a stream channel after consuming `bytes` of output.
+    /// Notify `herdr-core` whether this attached terminal channel currently has viewer focus.
+    pub fn set_focus(&self, channel: u32, focused: bool) {
+        let byte = u8::from(focused);
+        let _ = self.send_frame(channel, wire::FOCUS, &[byte]);
+    }
+
+    /// Return flow-control credit for a terminal channel after the UI thread drains data.
     pub fn ack_credit(&self, channel: u32, bytes: u32) {
         if bytes > 0 {
             let _ = self.send_frame(channel, wire::CREDIT, &bytes.to_le_bytes());
