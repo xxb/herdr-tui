@@ -261,6 +261,8 @@ impl TerminalSelection {
 pub fn bottom_bar_height(area: Rect, touch_mode: bool) -> u16 {
     if area.height <= 1 {
         0
+    } else if touch_mode && area.height >= 8 {
+        3
     } else if touch_mode && area.height >= 6 {
         2
     } else {
@@ -469,29 +471,38 @@ fn draw_touchbar_pill(
     style: Style,
     emphasized: bool,
 ) {
-    if rect.height == 0 {
+    if rect.height == 0 || label.is_empty() {
         return;
     }
     let lw = label.width() as u16;
-    if rect.height >= 2 && lw > 0 {
-        // Row 0 (`rect.y`): continuous highlighted MacBook Touch Bar top divider line (`━`),
-        // with brighter accent over each keycap pill (and warm gold when armed/active).
+    if rect.height >= 3 && lw > 0 {
+        // 3-row tall keycap pill (1.5x height):
+        // Row 0 (`rect.y`): top keycap padding + continuous glowing top divider line (`▔`)
+        // Row 1 (`rect.y + 1`): dead-center button label
+        // Row 2 (`rect.y + 2`): bottom keycap padding + subtle bottom bevel (`▁`)
         let top_fg = if emphasized {
             Color::Rgb(245, 194, 118)
         } else {
-            Color::Rgb(110, 150, 235)
+            Color::Rgb(118, 162, 247)
         };
-        let top_line = "━".repeat(lw as usize);
-        buf.set_string(
-            x,
-            rect.y,
-            &top_line,
-            Style::default()
-                .bg(Color::Rgb(12, 14, 22))
-                .fg(top_fg)
-                .add_modifier(Modifier::BOLD),
-        );
-        // Row 1 (`rect.y + 1`): centered 1-row OLED keycap pill
+        let bot_fg = if emphasized {
+            Color::Rgb(210, 155, 80)
+        } else {
+            Color::Rgb(54, 62, 92)
+        };
+        let top_line = "▔".repeat(lw as usize);
+        let bot_line = "▁".repeat(lw as usize);
+        buf.set_string(x, rect.y, &top_line, style.fg(top_fg));
+        buf.set_string(x, rect.y + 1, label, style);
+        buf.set_string(x, rect.y + 2, &bot_line, style.fg(bot_fg));
+    } else if rect.height == 2 && lw > 0 {
+        let top_fg = if emphasized {
+            Color::Rgb(245, 194, 118)
+        } else {
+            Color::Rgb(118, 162, 247)
+        };
+        let top_line = "▔".repeat(lw as usize);
+        buf.set_string(x, rect.y, &top_line, style.fg(top_fg));
         buf.set_string(x, rect.y + 1, label, style);
     } else {
         buf.set_string(x, rect.y, label, style);
@@ -522,17 +533,17 @@ fn render_bottom_touchbar(
     let max_x = rect.x + rect.width;
     let buf = f.buffer_mut();
 
-    // Draw continuous highlighted top divider line across the entire MacBook Touch Bar (`rect.y`)
-    // when in 2-row mode so the bar forms a unified screen strip separated from the terminal above.
+    // Draw continuous highlighted top divider line (`▔`) across the entire MacBook Touch Bar (`rect.y`)
+    // when in multi-row mode so the bar forms a unified screen strip separated from the terminal above.
     if rect.height >= 2 {
-        let full_line = "━".repeat(rect.width as usize);
+        let full_line = "▔".repeat(rect.width as usize);
         buf.set_string(
             rect.x,
             rect.y,
             &full_line,
             Style::default()
                 .bg(Color::Rgb(12, 14, 22))
-                .fg(Color::Rgb(72, 98, 158)),
+                .fg(Color::Rgb(82, 114, 184)),
         );
     }
 
@@ -615,13 +626,33 @@ fn render_bottom_touchbar(
                 .add_modifier(Modifier::BOLD);
 
             if rect.height >= 2 {
-                // Top row: current Space name
+                let name_row = if rect.height >= 3 {
+                    rect.y + 1
+                } else {
+                    rect.y
+                };
+                let dots_row = if rect.height >= 3 {
+                    rect.y + 2
+                } else {
+                    rect.y + 1
+                };
+                if rect.height >= 3 {
+                    buf.set_string(
+                        dots_start_x,
+                        rect.y,
+                        &"▔".repeat(dots_budget as usize),
+                        Style::default()
+                            .bg(Color::Rgb(24, 27, 42))
+                            .fg(Color::Rgb(118, 162, 247)),
+                    );
+                }
+                // Space name row
                 let sname_padded = pad_to_width(&format!(" {sname}"), dots_budget as usize);
-                buf.set_string(dots_start_x, rect.y, &sname_padded, zone_bg);
-                // Bottom row background fill
+                buf.set_string(dots_start_x, name_row, &sname_padded, zone_bg);
+                // Dots row background fill
                 buf.set_string(
                     dots_start_x,
-                    rect.y + 1,
+                    dots_row,
                     &" ".repeat(dots_budget as usize),
                     Style::default().bg(Color::Rgb(24, 27, 42)),
                 );
@@ -636,7 +667,7 @@ fn render_bottom_touchbar(
                     target: HitTarget::TriggerAction(Action::NextTab),
                 });
 
-                // Bottom row: solid `●` for current tab, hollow `○` for other tabs in this Space
+                // Solid `●` for current tab, hollow `○` for other tabs in this Space
                 let compact_dots = total_tabs > 5 || (dots_budget as usize) < total_tabs * 2;
                 let dot_step: usize = if compact_dots { 1 } else { 2 };
                 let max_visible_dots = (dots_budget.saturating_sub(1) as usize / dot_step).max(1);
@@ -682,7 +713,7 @@ fn render_bottom_touchbar(
                         } else {
                             Modifier::empty()
                         });
-                    buf.set_string(dx, rect.y + 1, &pill, dstyle);
+                    buf.set_string(dx, dots_row, &pill, dstyle);
                     hits.push(HitRegion {
                         rect: Rect {
                             x: dx,
@@ -846,7 +877,17 @@ fn render_bottom_touchbar(
             ),
             (" ⎘ ", HitTarget::PasteClipboard, false, 3),
         ];
-        for (row_off, row_keys) in [(0u16, top_keys), (1u16, bot_keys)] {
+        let top_row = if rect.height >= 3 {
+            rect.y + 1
+        } else {
+            rect.y
+        };
+        let bot_row = if rect.height >= 3 {
+            rect.y + 2
+        } else {
+            rect.y + 1
+        };
+        for (row_y, row_keys) in [(top_row, top_keys), (bot_row, bot_keys)] {
             let mut kx = x;
             for (lbl, target, active_highlight, kind) in row_keys {
                 let kw = lbl.width() as u16;
@@ -854,11 +895,11 @@ fn render_bottom_touchbar(
                     break;
                 }
                 let kstyle = keycap_style(active_highlight, kind);
-                buf.set_string(kx, rect.y + row_off, lbl, kstyle);
+                buf.set_string(kx, row_y, lbl, kstyle);
                 hits.push(HitRegion {
                     rect: Rect {
                         x: kx,
-                        y: rect.y + row_off,
+                        y: row_y,
                         width: kw,
                         height: 1,
                     },
@@ -2011,13 +2052,13 @@ mod tests {
                 );
                 hits = geom.hits;
                 assert_eq!(geom.term_rect.y, 0);
-                assert_eq!(geom.term_rect.height, 22);
+                assert_eq!(geom.term_rect.height, 21);
             })
             .unwrap();
 
-        // Sidebar toggle on the bottom touchbar (rows 22 and 23) should hit ToggleSidebar
+        // Sidebar toggle on the 3-row bottom touchbar (rows 21..23) should hit ToggleSidebar
         assert_eq!(
-            find_hit_target(&hits, 1, 22),
+            find_hit_target(&hits, 1, 21),
             Some(HitTarget::ToggleSidebar)
         );
         assert_eq!(
@@ -2025,22 +2066,22 @@ mod tests {
             Some(HitTarget::ToggleSidebar)
         );
 
-        // Scrollback badge, Prefix/Ctrl/Alt buttons, terminal keys (Esc/Tab/Arrows/粘貼), and Help button are on the bottom touchbar
+        // Scrollback badge, Prefix/Ctrl/Alt buttons, terminal keys (Esc/Tab/Arrows/⎘), and Help button are on the 3-row bottom touchbar
         assert!(hits
             .iter()
-            .any(|h| h.target == HitTarget::ExitScrollback && h.rect.height == 2));
+            .any(|h| h.target == HitTarget::ExitScrollback && h.rect.height == 3));
         assert!(hits
             .iter()
-            .any(|h| h.target == HitTarget::TogglePrefix && h.rect.height == 2));
+            .any(|h| h.target == HitTarget::TogglePrefix && h.rect.height == 3));
         assert!(hits
             .iter()
-            .any(|h| h.target == HitTarget::ToggleCtrl && h.rect.height == 2));
+            .any(|h| h.target == HitTarget::ToggleCtrl && h.rect.height == 3));
         assert!(hits
             .iter()
-            .any(|h| h.target == HitTarget::ToggleAlt && h.rect.height == 2));
+            .any(|h| h.target == HitTarget::ToggleAlt && h.rect.height == 3));
         assert!(hits
             .iter()
-            .any(|h| h.target == HitTarget::PasteClipboard && h.rect.height == 2));
+            .any(|h| h.target == HitTarget::PasteClipboard && h.rect.height == 3));
         assert!(!hits.iter().any(|h| {
             h.target == HitTarget::SendKey(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
         }));
@@ -2049,7 +2090,7 @@ mod tests {
         }));
         assert!(hits
             .iter()
-            .any(|h| h.target == HitTarget::ToggleHelp && h.rect.height == 2));
+            .any(|h| h.target == HitTarget::ToggleHelp && h.rect.height == 3));
 
         // Sidebar footer has vertically centered [+ New Tab] and [+ New Space] buttons
         let new_tab_hit = hits
@@ -2065,7 +2106,7 @@ mod tests {
             new_space_hit.rect.y,
             new_tab_hit.rect.y + new_tab_hit.rect.height
         );
-        assert!(22 >= new_space_hit.rect.y + new_space_hit.rect.height);
+        assert!(21 >= new_space_hit.rect.y + new_space_hit.rect.height);
     }
 
     #[test]
