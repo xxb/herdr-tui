@@ -210,8 +210,8 @@ pub fn compute_terminal_rect(
 ) -> Rect {
     let bb_h = bottom_bar_height(area, touch_mode);
     let body_height = area.height.saturating_sub(bb_h).max(1);
-    let sw = if sidebar_open && area.width > sidebar_width + 20 {
-        sidebar_width
+    let sw = if sidebar_open && area.width > 12 {
+        sidebar_width.min(area.width.saturating_sub(12))
     } else {
         0
     };
@@ -418,12 +418,25 @@ fn render_bottom_touchbar(
     let max_x = rect.x + rect.width;
     let buf = f.buffer_mut();
 
-    // 1. Left: `[≡]` Sidebar Toggle + current Space:Tab indicator
+    // Reserve right-side space for optional `[ ▼ SCROLL -N ]` and `[ ? ]`
+    let scroll_lbl = if scrollback_offset > 0 {
+        Some(format!(" [ ▼ SCROLL -{scrollback_offset} ] "))
+    } else {
+        None
+    };
+    let help_lbl = " [ ? ] ";
+    let scroll_w = scroll_lbl.as_ref().map_or(0, |s| s.width() as u16);
+    let help_w = help_lbl.width() as u16;
+    let right_reserved = (scroll_w + help_w).min(rect.width.saturating_sub(4));
+    let avail_end = max_x.saturating_sub(right_reserved);
+
+    // 1. Left: `[≡]` Sidebar Toggle + current Space:Tab indicator (falls back to compact icon on narrow screens)
     let icon = if sidebar_open { "◄≡" } else { "≡►" };
-    let (sb_label, active_state, dot_offset) = if let Some(space) = world.active_space() {
+    let compact_sb = format!(" {icon} ");
+    let (full_sb_label, active_state, dot_offset) = if let Some(space) = world.active_space() {
         let sname = truncate_to_width(&world.space_display_name(space), 10);
         let ti = world.active_tab_index();
-        let tname = truncate_to_width(&world.tab_display_name(space, ti), 12);
+        let tname = truncate_to_width(&world.tab_display_name(space, ti), 10);
         let st = world
             .active_tab()
             .map_or_else(|| world.space_state(space), |t| world.tab_state(t));
@@ -435,8 +448,19 @@ fn render_bottom_touchbar(
         (format!(" {icon} Spaces "), None, 0)
     };
 
+    // Leave room for terminal keys when possible; on narrow terminals fall back to truncated or icon-only toggle
+    let max_sb_budget = avail_end.saturating_sub(x);
+    let (sb_label, show_colored_dot) =
+        if (full_sb_label.width() as u16) <= max_sb_budget && rect.width >= 56 {
+            (full_sb_label, true)
+        } else if (compact_sb.width() as u16) <= max_sb_budget {
+            (compact_sb, false)
+        } else {
+            (truncate_to_width(&compact_sb, max_sb_budget as usize), false)
+        };
+
     let sb_w = sb_label.width() as u16;
-    if x + sb_w <= max_x {
+    if sb_w > 0 && x + sb_w <= max_x {
         let style = Style::default()
             .bg(if sidebar_open {
                 Color::Rgb(52, 58, 92)
@@ -446,14 +470,16 @@ fn render_bottom_touchbar(
             .fg(Color::White)
             .add_modifier(Modifier::BOLD);
         draw_touchbar_pill(buf, x, rect, &sb_label, style, sidebar_open);
-        if let Some(st) = active_state {
-            if x + dot_offset < x + sb_w {
-                buf.set_string(
-                    x + dot_offset,
-                    rect.y,
-                    st.symbol(),
-                    style.fg(state_color(st)).add_modifier(Modifier::BOLD),
-                );
+        if show_colored_dot {
+            if let Some(st) = active_state {
+                if x + dot_offset < x + sb_w {
+                    buf.set_string(
+                        x + dot_offset,
+                        rect.y,
+                        st.symbol(),
+                        style.fg(state_color(st)).add_modifier(Modifier::BOLD),
+                    );
+                }
             }
         }
         hits.push(HitRegion {
@@ -468,27 +494,16 @@ fn render_bottom_touchbar(
         x += sb_w;
     }
 
-    if x < max_x {
+    if x < avail_end {
         for r in 0..rect.height {
             buf.set_string(x, rect.y + r, "│", bg_bar.fg(Color::Rgb(55, 60, 82)));
         }
         x += 1;
     }
 
-    // Reserve right-side space for optional `[ ▼ SCROLL -N ]` and `[ ? ]`
-    let scroll_lbl = if scrollback_offset > 0 {
-        Some(format!(" [ ▼ SCROLL -{scrollback_offset} ] "))
-    } else {
-        None
-    };
-    let help_lbl = " [ ? ] ";
-    let scroll_w = scroll_lbl.as_ref().map_or(0, |s| s.width() as u16);
-    let help_w = help_lbl.width() as u16;
-    let avail_end = max_x.saturating_sub(scroll_w + help_w);
-
-    // 2. Center: Herdr App-style Touchbar Keys (`^B`, `Esc`, `Tab`, `^C`, `←`, `↓`, `↑`, `→`)
-    let wide = avail_end.saturating_sub(x) >= 62;
-    let key_buttons: [(String, HitTarget, bool); 8] = [
+    // 2. Center: Herdr App-style Touchbar Keys (`^B`, `Esc`, `Tab`, `^C`, `←`, `↓`, `↑`, `→`, `[+]`)
+    let wide = avail_end.saturating_sub(x) >= 68;
+    let key_buttons: [(String, HitTarget, bool); 9] = [
         (
             if prefix_active {
                 " [^B*] ".to_string()
@@ -514,25 +529,26 @@ fn render_bottom_touchbar(
             false,
         ),
         (
-            if wide { " [  ←  ] " } else { " [ ← ] " }.to_string(),
+            if wide { " [ ← ] " } else { " [←] " }.to_string(),
             HitTarget::SendKey(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
             false,
         ),
         (
-            if wide { " [  ↓  ] " } else { " [ ↓ ] " }.to_string(),
+            if wide { " [ ↓ ] " } else { " [↓] " }.to_string(),
             HitTarget::SendKey(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
             false,
         ),
         (
-            if wide { " [  ↑  ] " } else { " [ ↑ ] " }.to_string(),
+            if wide { " [ ↑ ] " } else { " [↑] " }.to_string(),
             HitTarget::SendKey(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
             false,
         ),
         (
-            if wide { " [  →  ] " } else { " [ → ] " }.to_string(),
+            if wide { " [ → ] " } else { " [→] " }.to_string(),
             HitTarget::SendKey(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
             false,
         ),
+        (" [+] ".to_string(), HitTarget::NewTab, false),
     ];
 
     for (lbl, target, active_highlight) in key_buttons {
@@ -544,6 +560,11 @@ fn render_bottom_touchbar(
             Style::default()
                 .bg(Color::LightYellow)
                 .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        } else if target == HitTarget::NewTab {
+            Style::default()
+                .bg(Color::Rgb(32, 54, 46))
+                .fg(Color::LightGreen)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
@@ -568,6 +589,64 @@ fn render_bottom_touchbar(
                 buf.set_string(x, rect.y + r, "│", bg_bar.fg(Color::Rgb(50, 54, 74)));
             }
             x += 1;
+        }
+    }
+
+    // When the left sidebar is collapsed and horizontal space remains on the bottom touchbar,
+    // render compact clickable tab status pills (`1:●`, `2:✓`, ...) so live agent statuses
+    // and direct tab selection remain accessible even with the sidebar closed.
+    if !sidebar_open {
+        if let Some(space) = world.active_space() {
+            let active_ti = world.active_tab_index();
+            let space_id = space.id.clone();
+            for (ti, tab) in space.tabs.iter().enumerate() {
+                let st = world.tab_state(tab);
+                let pill = format!(" {}:{} ", ti + 1, st.symbol());
+                let pw = pill.width() as u16;
+                if x + pw > avail_end {
+                    break;
+                }
+                let is_active = ti == active_ti;
+                let pstyle = Style::default()
+                    .bg(if is_active {
+                        Color::Rgb(68, 78, 128)
+                    } else {
+                        Color::Rgb(28, 30, 46)
+                    })
+                    .fg(if is_active {
+                        Color::White
+                    } else {
+                        Color::Rgb(185, 190, 210)
+                    })
+                    .add_modifier(if is_active {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    });
+                draw_touchbar_pill(buf, x, rect, &pill, pstyle, is_active);
+                let prefix_len = format!(" {}:", ti + 1).width() as u16;
+                if x + prefix_len < x + pw {
+                    buf.set_string(
+                        x + prefix_len,
+                        rect.y,
+                        st.symbol(),
+                        pstyle.fg(state_color(st)).add_modifier(Modifier::BOLD),
+                    );
+                }
+                hits.push(HitRegion {
+                    rect: Rect {
+                        x,
+                        y: rect.y,
+                        width: pw,
+                        height: rect.height,
+                    },
+                    target: HitTarget::SelectTab {
+                        space_id: space_id.clone(),
+                        tab_id: tab.id.clone(),
+                    },
+                });
+                x += pw;
+            }
         }
     }
 
@@ -1539,5 +1618,35 @@ mod tests {
                 }
         }));
         assert!(hits.iter().any(|h| h.target == HitTarget::CancelModal));
+    }
+
+    #[test]
+    fn narrow_terminal_retains_compact_sidebar_toggle() {
+        let backend = TestBackend::new(30, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let world = World::default();
+        let mut hits = Vec::new();
+
+        terminal
+            .draw(|f| {
+                let geom = render_ui(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    0,
+                    &Modal::None,
+                );
+                hits = geom.hits;
+            })
+            .unwrap();
+
+        assert_eq!(
+            find_hit_target(&hits, 1, 11),
+            Some(HitTarget::ToggleSidebar)
+        );
     }
 }
