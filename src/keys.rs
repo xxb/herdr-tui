@@ -66,29 +66,43 @@ impl FileConfig {
     }
 }
 
-pub fn is_prefix_key(ev: &KeyEvent, prefix_spec: &str) -> bool {
-    let spec = prefix_spec.trim().to_ascii_lowercase();
-    if let Some(ch_str) = spec.strip_prefix("ctrl+") {
-        if let Some(ch) = ch_str.chars().next() {
-            return ev.modifiers.contains(KeyModifiers::CONTROL)
-                && !ev.modifiers.contains(KeyModifiers::ALT)
-                && matches!(ev.code, KeyCode::Char(c) if c.to_ascii_lowercase() == ch);
-        }
+fn ctrl_char_byte(c: char) -> Option<u8> {
+    match c.to_ascii_lowercase() {
+        lower @ 'a'..='z' => Some((lower as u8) - b'a' + 1),
+        '@' | ' ' => Some(0x00),
+        '[' => Some(0x1b),
+        '\\' => Some(0x1c),
+        ']' => Some(0x1d),
+        '^' => Some(0x1e),
+        '_' | '/' => Some(0x1f),
+        '?' => Some(0x7f),
+        _ => None,
     }
-    // Default Ctrl+b
-    ev.modifiers == KeyModifiers::CONTROL && matches!(ev.code, KeyCode::Char('b' | 'B'))
 }
 
-pub fn prefix_bytes(prefix_spec: &str) -> Vec<u8> {
+fn parse_prefix_ctrl_char(prefix_spec: &str) -> char {
     let spec = prefix_spec.trim().to_ascii_lowercase();
     if let Some(ch_str) = spec.strip_prefix("ctrl+") {
-        if let Some(ch) = ch_str.chars().next() {
-            if ch.is_ascii_alphabetic() {
-                return vec![(ch as u8) - b'a' + 1];
+        let mut chars = ch_str.chars();
+        if let (Some(ch), None) = (chars.next(), chars.next()) {
+            if ctrl_char_byte(ch).is_some() {
+                return ch;
             }
         }
     }
-    vec![0x02] // Ctrl+B
+    'b'
+}
+
+pub fn is_prefix_key(ev: &KeyEvent, prefix_spec: &str) -> bool {
+    let target = parse_prefix_ctrl_char(prefix_spec);
+    ev.modifiers.contains(KeyModifiers::CONTROL)
+        && !ev.modifiers.contains(KeyModifiers::ALT)
+        && matches!(ev.code, KeyCode::Char(c) if c.to_ascii_lowercase() == target)
+}
+
+pub fn prefix_bytes(prefix_spec: &str) -> Vec<u8> {
+    let target = parse_prefix_ctrl_char(prefix_spec);
+    vec![ctrl_char_byte(target).unwrap_or(0x02)]
 }
 
 /// Direct (non-prefix) global shortcuts (compatible with classic `herdr` & `~/.config/herdr/config.toml`).
@@ -155,19 +169,7 @@ pub fn encode_key_event(ev: &KeyEvent, app_cursor: bool) -> Vec<u8> {
     match ev.code {
         KeyCode::Char(c) => {
             if ctrl {
-                let lower = c.to_ascii_lowercase();
-                let code = match lower {
-                    'a'..='z' => Some((lower as u8) - b'a' + 1),
-                    '@' | ' ' => Some(0x00),
-                    '[' => Some(0x1b),
-                    '\\' => Some(0x1c),
-                    ']' => Some(0x1d),
-                    '^' => Some(0x1e),
-                    '_' | '/' => Some(0x1f),
-                    '?' => Some(0x7f),
-                    _ => None,
-                };
-                if let Some(b) = code {
+                if let Some(b) = ctrl_char_byte(c) {
                     out.push(b);
                     return out;
                 }

@@ -291,6 +291,36 @@ pub fn prune_dead_terminals_in_node(node: &mut Value, live: &BTreeMap<String, Te
     }
 }
 
+/// Find and remove an existing `SharedTab` referencing `addr` outside `keep_space_id`
+/// so it can be relocated intact (preserving its `id`, `name`, `root` layout/panes, and `rest` metadata).
+fn take_relocated_tab_for_terminal(
+    spaces: &mut Vec<SharedSpace>,
+    addr: &str,
+    keep_space_id: Option<&str>,
+    fallback_tab: &SharedTab,
+) -> SharedTab {
+    let mut relocated: Option<SharedTab> = None;
+    for s in spaces.iter_mut() {
+        if keep_space_id.is_some_and(|kid| s.id == kid) {
+            continue;
+        }
+        if let Some(pos) = s.tabs.iter().position(|t| {
+            let mut terms = Vec::new();
+            extract_terminals(&t.root, &mut terms);
+            terms.iter().any(|a| a == addr)
+        }) {
+            let removed = s.tabs.remove(pos);
+            if relocated.is_none() {
+                relocated = Some(removed);
+            }
+        }
+    }
+    if spaces.len() > 1 {
+        spaces.retain(|s| !s.tabs.is_empty() || keep_space_id.is_some_and(|kid| s.id == kid));
+    }
+    relocated.unwrap_or_else(|| fallback_tab.clone())
+}
+
 pub fn folder_basename(folder: &str) -> String {
     let trimmed = folder.trim_end_matches('/');
     if trimmed.is_empty() {
@@ -847,37 +877,50 @@ impl World {
         let target_space_id = self.active_space().map(|s| s.id.clone());
 
         self.mutate_doc(core, |world| {
-            // If another client's `"started"` event handler auto-adopted `addr` into a tab
-            // before our `doc.set`, remove that auto-adopted tab so `addr` is not duplicated.
-            for s in &mut world.doc.spaces {
-                s.tabs.retain(|t| {
-                    if t.id == tab_id {
-                        return true;
-                    }
-                    let mut terms = Vec::new();
-                    extract_terminals(&t.root, &mut terms);
-                    !terms.iter().any(|a| a == &addr)
+            let resolved_sid = target_space_id
+                .as_ref()
+                .filter(|sid| world.doc.spaces.iter().any(|s| &s.id == *sid))
+                .cloned()
+                .or_else(|| {
+                    world
+                        .doc
+                        .spaces
+                        .get(world.active_space_idx)
+                        .map(|s| s.id.clone())
                 });
-            }
-            if world.doc.spaces.len() > 1 {
-                let keep_sid = target_space_id.as_deref();
-                world
-                    .doc
-                    .spaces
-                    .retain(|s| !s.tabs.is_empty() || Some(s.id.as_str()) == keep_sid);
-            }
 
-            let idx = target_space_id
+            let candidate_tab = take_relocated_tab_for_terminal(
+                &mut world.doc.spaces,
+                &addr,
+                resolved_sid.as_deref(),
+                &tab,
+            );
+
+            let idx = resolved_sid
                 .as_ref()
                 .and_then(|sid| world.doc.spaces.iter().position(|s| &s.id == sid))
                 .unwrap_or(world.active_space_idx);
             if let Some(space) = world.doc.spaces.get_mut(idx) {
-                if !space.tabs.iter().any(|t| t.id == tab_id) {
+                let existing_id = space
+                    .tabs
+                    .iter()
+                    .find(|t| {
+                        let mut terms = Vec::new();
+                        extract_terminals(&t.root, &mut terms);
+                        terms.iter().any(|a| a == &addr)
+                    })
+                    .map(|t| t.id.clone());
+
+                let chosen_tab_id = if let Some(eid) = existing_id {
+                    eid
+                } else {
+                    let cid = candidate_tab.id.clone();
                     let insert_at = (cur_tab_idx + 1).min(space.tabs.len());
-                    space.tabs.insert(insert_at, tab.clone());
-                }
+                    space.tabs.insert(insert_at, candidate_tab);
+                    cid
+                };
                 let space_id = space.id.clone();
-                world.active_tab_by_space.insert(space_id, tab_id.clone());
+                world.active_tab_by_space.insert(space_id, chosen_tab_id);
             }
         })?;
         Ok(())
@@ -917,38 +960,34 @@ impl World {
         let space_name = name.trim().to_string();
 
         self.mutate_doc(core, |world| {
-            // If another client auto-adopted `addr` before our `doc.set`, remove that
-            // duplicate tab before placing `addr` into the newly created Space.
-            for s in &mut world.doc.spaces {
-                if s.id == space_id {
-                    continue;
-                }
-                s.tabs.retain(|t| {
-                    let mut terms = Vec::new();
-                    extract_terminals(&t.root, &mut terms);
-                    !terms.iter().any(|a| a == &addr)
-                });
-            }
-            world
-                .doc
-                .spaces
-                .retain(|s| !s.tabs.is_empty() || s.id == space_id);
+            let candidate_tab = take_relocated_tab_for_terminal(
+                &mut world.doc.spaces,
+                &addr,
+                Some(&space_id),
+                &tab,
+            );
+            let chosen_tab_id = candidate_tab.id.clone();
 
             if !world.doc.spaces.iter().any(|s| s.id == space_id) {
                 world.doc.spaces.push(SharedSpace {
                     id: space_id.clone(),
                     name: space_name.clone(),
                     folder: cwd.clone(),
-                    tabs: vec![tab.clone()],
+                    tabs: vec![candidate_tab],
                     rest: Map::new(),
                 });
             }
             if let Some(pos) = world.doc.spaces.iter().position(|s| s.id == space_id) {
                 world.active_space_idx = pos;
+                let active_tid = world.doc.spaces[pos]
+                    .tabs
+                    .first()
+                    .map(|t| t.id.clone())
+                    .unwrap_or(chosen_tab_id);
+                world
+                    .active_tab_by_space
+                    .insert(space_id.clone(), active_tid);
             }
-            world
-                .active_tab_by_space
-                .insert(space_id.clone(), tab_id.clone());
         })?;
         Ok(())
     }
