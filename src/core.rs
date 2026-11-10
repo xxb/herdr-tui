@@ -299,6 +299,12 @@ impl CoreClient {
         let _ = self.send_frame(channel, wire::CLOSE, &[]);
     }
 
+    /// Notify `herdr-core` whether this attached terminal channel currently has viewer focus.
+    pub fn set_focus(&self, channel: u32, focused: bool) {
+        let byte = u8::from(focused);
+        let _ = self.send_frame(channel, wire::FOCUS, &[byte]);
+    }
+
     /// Send input bytes to an attached terminal channel.
     pub fn send_input(&self, channel: u32, bytes: &[u8]) {
         let _ = self.send_frame(channel, wire::DATA, bytes);

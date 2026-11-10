@@ -27,12 +27,14 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use unicode_width::UnicodeWidthChar;
 
 const SCROLLBACK_LINES: usize = 2000;
-const ATTACH_HISTORY_LINES: usize = 80;
+const ATTACH_HISTORY_LINES: usize = 0;
 const MAX_MSGS_PER_TICK: usize = 256;
 
 struct TerminalCleanupGuard;
@@ -80,22 +82,69 @@ struct Cli {
 }
 
 struct AttachedTerminal {
-    address: String,
     channel: u32,
     parser: vt100::Parser,
     cols: u16,
     rows: u16,
 }
 
+fn last_utf8_char(buf: &[u8]) -> Option<char> {
+    if buf.is_empty() {
+        return None;
+    }
+    let mut start = buf.len() - 1;
+    while start > 0 && start + 4 > buf.len() && (buf[start] & 0b1100_0000) == 0b1000_0000 {
+        start -= 1;
+    }
+    std::str::from_utf8(&buf[start..]).ok()?.chars().next_back()
+}
+
 fn sanitize_vt_bytes(payload: &[u8]) -> Cow<'_, [u8]> {
-    if !payload.windows(7).any(|w| w == b"\x1b[?9001") {
+    let has_9001 = payload.windows(7).any(|w| w == b"\x1b[?9001");
+    let has_fe0f = payload.windows(3).any(|w| w == b"\xef\xb8\x8f");
+    let is_home_redraw = payload.starts_with(b"\x1b[H")
+        && payload.ends_with(b"\x1b[J")
+        && !payload.windows(4).any(|w| w == b"\x1b[2J");
+
+    if !has_9001 && !has_fe0f && !is_home_redraw {
         return Cow::Borrowed(payload);
     }
-    let mut out = payload.to_vec();
-    for seq in [&b"\x1b[?9001h"[..], b"\x1b[?9001l"] {
-        while let Some(pos) = out.windows(seq.len()).position(|w| w == seq) {
-            out.drain(pos..pos + seq.len());
+
+    let mut out = Vec::with_capacity(payload.len() + if is_home_redraw { 128 } else { 0 });
+    let mut i = 0;
+    if is_home_redraw {
+        out.extend_from_slice(b"\x1b[H\x1b[2J");
+        i = 3;
+    }
+    while i < payload.len() {
+        if has_9001
+            && i + 8 <= payload.len()
+            && (&payload[i..i + 8] == b"\x1b[?9001h" || &payload[i..i + 8] == b"\x1b[?9001l")
+        {
+            i += 8;
+            continue;
         }
+        if has_fe0f && i + 3 <= payload.len() && &payload[i..i + 3] == b"\xef\xb8\x8f" {
+            // U+FE0F (Variation Selector-16) requests 2-column emoji presentation for preceding
+            // 1-column symbols (such as U+2699 '⚙' or U+26A0 '⚠'). Because the `vt100` crate
+            // measures codepoints individually via `unicode-width` (where '⚙' is width 1 and
+            // U+FE0F is width 0), replacing U+FE0F with an ASCII space after a width-1 non-ASCII
+            // symbol keeps column positions aligned with Ghostty, modern terminals, and CLI tools.
+            if last_utf8_char(&out)
+                .is_some_and(|ch| !ch.is_ascii() && UnicodeWidthChar::width(ch) == Some(1))
+            {
+                out.push(b' ');
+            }
+            i += 3;
+            continue;
+        }
+        if is_home_redraw && i + 2 <= payload.len() && &payload[i..i + 2] == b"\r\n" {
+            out.extend_from_slice(b"\x1b[0m\x1b[K\r\n");
+            i += 2;
+            continue;
+        }
+        out.push(payload[i]);
+        i += 1;
     }
     Cow::Owned(out)
 }
@@ -210,7 +259,7 @@ fn paste_text_into_app(
     text: &str,
     core: &CoreClient,
     world: &World,
-    attached: &Option<AttachedTerminal>,
+    attached: Option<&AttachedTerminal>,
     scrollback_offset: &mut usize,
     modal: &mut Modal,
 ) {
@@ -319,59 +368,126 @@ fn main() -> Result<()> {
     res
 }
 
-fn sync_attached_terminal(
+fn sync_attached_terminals(
     core: &CoreClient,
     world: &mut World,
-    attached: &mut Option<AttachedTerminal>,
+    attached_map: &mut BTreeMap<String, AttachedTerminal>,
+    active_addr: &mut Option<String>,
     term_rect: Rect,
     scrollback_offset: &mut usize,
+    preattach_siblings: bool,
 ) -> bool {
     let cols = term_rect.width.max(1);
     let rows = term_rect.height.max(1);
-    let want_addr = world.active_terminal_address();
 
-    let Some(addr) = want_addr else {
-        if let Some(prev) = attached.take() {
-            core.detach_channel(prev.channel);
+    // Prune any terminal channels that have exited or been removed from the world.
+    attached_map.retain(|addr, att| {
+        if world.terminals.contains_key(addr) {
+            true
+        } else {
+            core.detach_channel(att.channel);
+            false
         }
-        return false;
-    };
+    });
 
-    if let Some(cur) = attached.as_mut() {
-        if cur.address == addr {
+    let want_addr = world.active_terminal_address();
+    if want_addr != *active_addr {
+        if let Some(prev) = active_addr.as_ref().and_then(|a| attached_map.get(a)) {
+            core.set_focus(prev.channel, false);
+        }
+        *scrollback_offset = 0;
+    }
+
+    let mut newly_attached_active = false;
+    if let Some(ref addr) = want_addr {
+        if let Some(cur) = attached_map.get_mut(addr) {
             if cur.cols != cols || cur.rows != rows {
                 cur.cols = cols;
                 cur.rows = rows;
                 cur.parser.set_size(rows, cols);
                 core.resize_channel(cur.channel, cols, rows);
             }
-            return false;
+            if active_addr.as_ref() != Some(addr) {
+                core.set_focus(cur.channel, true);
+                core.resize_channel(cur.channel, cols, rows);
+                world.mark_active_seen(core);
+            }
+        } else if let Ok(ch) = core.attach_terminal(addr, cols, rows, ATTACH_HISTORY_LINES) {
+            core.set_focus(ch, true);
+            let parser = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
+            attached_map.insert(
+                addr.clone(),
+                AttachedTerminal {
+                    channel: ch,
+                    parser,
+                    cols,
+                    rows,
+                },
+            );
+            world.mark_active_seen(core);
+            newly_attached_active = true;
         }
-        core.detach_channel(cur.channel);
-        *attached = None;
+    }
+    *active_addr = want_addr;
+
+    // Pre-attach and keep sibling terminals in the active space warm at `(cols, rows)`
+    // so switching tabs is instantaneous (0ms) and background tabs never revert to
+    // 200x120 headless size or trigger slow SIGWINCH reflows on tab switch.
+    if preattach_siblings {
+        let mut sibling_addrs = Vec::new();
+        if let Some(space) = world.active_space() {
+            for tab in &space.tabs {
+                for addr in world.tab_terminals(tab) {
+                    if !sibling_addrs.contains(&addr) {
+                        sibling_addrs.push(addr);
+                    }
+                }
+            }
+        }
+        let mut attached_any_sibling = false;
+        for sib_addr in sibling_addrs {
+            if Some(&sib_addr) == active_addr.as_ref() {
+                continue;
+            }
+            if let Some(sib) = attached_map.get_mut(&sib_addr) {
+                if sib.cols != cols || sib.rows != rows {
+                    sib.cols = cols;
+                    sib.rows = rows;
+                    sib.parser.set_size(rows, cols);
+                    core.resize_channel(sib.channel, cols, rows);
+                }
+            } else if world.terminals.contains_key(&sib_addr) {
+                if let Ok(ch) = core.attach_terminal(&sib_addr, cols, rows, ATTACH_HISTORY_LINES) {
+                    core.set_focus(ch, false);
+                    let parser = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
+                    attached_map.insert(
+                        sib_addr,
+                        AttachedTerminal {
+                            channel: ch,
+                            parser,
+                            cols,
+                            rows,
+                        },
+                    );
+                    attached_any_sibling = true;
+                }
+            }
+        }
+        if attached_any_sibling {
+            if let Some(act) = active_addr.as_ref().and_then(|a| attached_map.get(a)) {
+                core.set_focus(act.channel, true);
+            }
+        }
     }
 
-    *scrollback_offset = 0;
-    if let Ok(ch) = core.attach_terminal(&addr, cols, rows, ATTACH_HISTORY_LINES) {
-        let parser = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
-        *attached = Some(AttachedTerminal {
-            address: addr,
-            channel: ch,
-            parser,
-            cols,
-            rows,
-        });
-        world.mark_active_seen(core);
-        return true;
-    }
-    false
+    newly_attached_active
 }
 
 fn execute_action(
     action: Action,
     core: &CoreClient,
     world: &mut World,
-    attached: &Option<AttachedTerminal>,
+    attached: Option<&AttachedTerminal>,
     prefix_spec: &str,
     sidebar_open: &mut bool,
     scrollback_offset: &mut usize,
@@ -488,7 +604,9 @@ fn run_app(
     mobile_threshold: u16,
     touch_mode: bool,
 ) -> Result<()> {
-    let mut attached: Option<AttachedTerminal> = None;
+    let mut attached_map: BTreeMap<String, AttachedTerminal> = BTreeMap::new();
+    let mut active_addr: Option<String> = None;
+    let mut first_frame_drawn = false;
     let mut prefix_active = false;
     let mut ctrl_active = false;
     let mut alt_active = false;
@@ -518,19 +636,26 @@ fn run_app(
         let area = Rect::new(0, 0, size.width, size.height);
         let term_rect = compute_terminal_rect(area, *sidebar_open, sidebar_width, touch_mode);
 
-        let prev_addr = attached.as_ref().map(|a| a.address.clone());
-        let newly_attached = sync_attached_terminal(
+        let prev_addr = active_addr.clone();
+        let newly_attached = sync_attached_terminals(
             core,
             world,
-            &mut attached,
+            &mut attached_map,
+            &mut active_addr,
             term_rect,
             &mut scrollback_offset,
+            first_frame_drawn,
         );
-        if attached.as_ref().map(|a| &a.address) != prev_addr.as_ref() {
+        if active_addr != prev_addr {
             selection = None;
             selection_screen = None;
             dirty = true;
         }
+
+        let active_channel = active_addr
+            .as_ref()
+            .and_then(|a| attached_map.get(a))
+            .map(|att| att.channel);
 
         // Drain pending messages from `herdr-core` BEFORE rendering so that initial attach
         // history replays and multi-frame output bursts are coalesced into a single screen draw
@@ -552,33 +677,37 @@ fn run_app(
             let Some(msg) = next_msg else {
                 break;
             };
-            dirty = true;
             drained += 1;
             match msg {
                 CoreMessage::TerminalData { channel, data } => {
-                    if data.len() >= 4096 {
-                        coalesce_burst = true;
+                    let is_active = active_channel == Some(channel);
+                    if is_active {
+                        dirty = true;
+                        if data.len() >= 4096 {
+                            coalesce_burst = true;
+                        }
                     }
-                    if let Some(att) = attached.as_mut() {
-                        if att.channel == channel {
-                            let clean = sanitize_vt_bytes(&data);
-                            att.parser.process(&clean);
-                            if selection.as_ref().is_some_and(|s| !s.active) {
-                                selection = None;
-                                selection_screen = None;
-                            }
+                    if let Some(att) = attached_map.values_mut().find(|a| a.channel == channel) {
+                        let clean = sanitize_vt_bytes(&data);
+                        att.parser.process(&clean);
+                        if is_active && selection.as_ref().is_some_and(|s| !s.active) {
+                            selection = None;
+                            selection_screen = None;
                         }
                     }
                 }
                 CoreMessage::TerminalClosed { channel, .. } => {
-                    if attached.as_ref().is_some_and(|a| a.channel == channel) {
-                        attached = None;
-                        if world.refresh_terminals(core).is_ok() {
-                            let _ = world.reconcile_and_sync(core);
-                        }
+                    dirty = true;
+                    attached_map.retain(|_, a| a.channel != channel);
+                    if active_channel == Some(channel) {
+                        active_addr = None;
+                    }
+                    if world.refresh_terminals(core).is_ok() {
+                        let _ = world.reconcile_and_sync(core);
                     }
                 }
                 CoreMessage::Event(ev) => {
+                    dirty = true;
                     let method = ev
                         .get("method")
                         .and_then(serde_json::Value::as_str)
@@ -636,18 +765,19 @@ fn run_app(
             }
         }
 
-        if let Some(att) = attached.as_mut() {
+        if let Some(att) = active_addr.as_ref().and_then(|a| attached_map.get_mut(a)) {
             att.parser.set_scrollback(scrollback_offset);
             scrollback_offset = att.parser.screen().scrollback();
         }
 
         if dirty {
+            let active_att = active_addr.as_ref().and_then(|a| attached_map.get(a));
             let scr_ref = if selection.as_ref().is_some_and(|s| s.active) {
                 selection_screen
                     .as_ref()
-                    .or_else(|| attached.as_ref().map(|a| a.parser.screen()))
+                    .or_else(|| active_att.map(|a| a.parser.screen()))
             } else {
-                attached.as_ref().map(|a| a.parser.screen())
+                active_att.map(|a| a.parser.screen())
             };
             let copied_flash = copied_until.is_some();
             terminal.draw(|f| {
@@ -669,6 +799,10 @@ fn run_app(
                 last_hits = geom.hits;
             })?;
             dirty = false;
+            if !first_frame_drawn {
+                first_frame_drawn = true;
+                continue;
+            }
         }
 
         let poll_timeout = if more_messages {
@@ -682,6 +816,7 @@ fn run_app(
 
         let ev = event::read()?;
         dirty = true;
+        let active_att = active_addr.as_ref().and_then(|a| attached_map.get(a));
 
         match ev {
             Event::Resize(w, _) => {
@@ -698,7 +833,7 @@ fn run_app(
                     &text,
                     core,
                     world,
-                    &attached,
+                    active_att,
                     &mut scrollback_offset,
                     &mut modal,
                 );
@@ -756,7 +891,7 @@ fn run_app(
                                         act,
                                         core,
                                         world,
-                                        &attached,
+                                        active_att,
                                         prefix_spec,
                                         sidebar_open,
                                         &mut scrollback_offset,
@@ -771,7 +906,7 @@ fn run_app(
                                     alt_active = false;
                                     if prefix_active {
                                         prefix_active = false;
-                                        if let Some(att) = &attached {
+                                        if let Some(att) = active_att {
                                             let bytes = prefix_bytes(prefix_spec);
                                             core.send_input(att.channel, &bytes);
                                         }
@@ -799,7 +934,7 @@ fn run_app(
                                             &text,
                                             core,
                                             world,
-                                            &attached,
+                                            active_att,
                                             &mut scrollback_offset,
                                             &mut modal,
                                         );
@@ -875,7 +1010,7 @@ fn run_app(
                                         kev,
                                         core,
                                         world,
-                                        &attached,
+                                        active_att,
                                         prefix_spec,
                                         sidebar_open,
                                         &mut prefix_active,
@@ -922,7 +1057,7 @@ fn run_app(
                                 sel.head = (rel_row, rel_col);
                                 if sel.is_non_empty() && selection_screen.is_none() {
                                     selection_screen =
-                                        attached.as_ref().map(|a| a.parser.screen().clone());
+                                        active_att.map(|a| a.parser.screen().clone());
                                 }
                             }
                         }
@@ -946,7 +1081,7 @@ fn run_app(
                                 if sel.is_non_empty() {
                                     let scr = snap
                                         .as_ref()
-                                        .or_else(|| attached.as_ref().map(|a| a.parser.screen()));
+                                        .or_else(|| active_att.map(|a| a.parser.screen()));
                                     if let Some(screen) = scr {
                                         let text = sel.extract_text(screen);
                                         if !text.is_empty() {
@@ -957,7 +1092,7 @@ fn run_app(
                                         }
                                     }
                                     if snap.as_ref().is_some_and(|s| {
-                                        attached.as_ref().is_some_and(|a| {
+                                        active_att.is_some_and(|a| {
                                             s.contents() != a.parser.screen().contents()
                                         })
                                     }) {
@@ -1026,7 +1161,7 @@ fn run_app(
                     kev,
                     core,
                     world,
-                    &attached,
+                    active_att,
                     prefix_spec,
                     sidebar_open,
                     &mut prefix_active,
@@ -1049,7 +1184,7 @@ fn handle_key_event(
     mut kev: KeyEvent,
     core: &CoreClient,
     world: &mut World,
-    attached: &Option<AttachedTerminal>,
+    attached: Option<&AttachedTerminal>,
     prefix_spec: &str,
     sidebar_open: &mut bool,
     prefix_active: &mut bool,
@@ -1278,5 +1413,24 @@ mod tests {
         assert_eq!(base64_encode(b"fo"), "Zm8=");
         assert_eq!(base64_encode(b"foo"), "Zm9v");
         assert_eq!(base64_encode(b"hello world"), "aGVsbG8gd29ybGQ=");
+    }
+
+    #[test]
+    fn sanitize_vt_bytes_aligns_vs16_emoji_and_clears_home_redraw_remnants() {
+        let mut parser = vt100::Parser::new(4, 20, 0);
+        // Simulate leftover wide line on row 1 before a shorter `\x1b[H ... \x1b[J` redraw
+        parser.process(b"01234567890123456789\r\nLEFT_OVER_TEXT_12345");
+        let frame = "\x1b[H╭──────╮\r\n│ ⚙️ a │\r\n╰──────╯\x1b[J";
+        let sanitized = sanitize_vt_bytes(frame.as_bytes());
+        parser.process(&sanitized);
+        let screen = parser.screen();
+        // Top, middle, and bottom right borders must all land on column 7
+        assert_eq!(screen.cell(0, 7).unwrap().contents(), "╮");
+        assert_eq!(screen.cell(1, 7).unwrap().contents(), "│");
+        assert_eq!(screen.cell(2, 7).unwrap().contents(), "╯");
+        // Characters to the right of the box on row 1 must be cleared
+        for col in 8..20 {
+            assert_eq!(screen.cell(1, col).unwrap().contents(), "");
+        }
     }
 }

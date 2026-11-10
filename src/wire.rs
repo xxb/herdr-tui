@@ -15,7 +15,6 @@ pub const CLOSE: u8 = 2;
 /// u16 LE cols, u16 LE rows: viewer -> core, core -> observer.
 pub const RESIZE: u8 = 3;
 /// Viewer -> core: 1 = gained focus, 0 = lost focus.
-#[allow(dead_code)]
 pub const FOCUS: u8 = 4;
 /// Viewer -> core: JSON display facts.
 #[allow(dead_code)]
