@@ -847,6 +847,26 @@ impl World {
         let target_space_id = self.active_space().map(|s| s.id.clone());
 
         self.mutate_doc(core, |world| {
+            // If another client's `"started"` event handler auto-adopted `addr` into a tab
+            // before our `doc.set`, remove that auto-adopted tab so `addr` is not duplicated.
+            for s in &mut world.doc.spaces {
+                s.tabs.retain(|t| {
+                    if t.id == tab_id {
+                        return true;
+                    }
+                    let mut terms = Vec::new();
+                    extract_terminals(&t.root, &mut terms);
+                    !terms.iter().any(|a| a == &addr)
+                });
+            }
+            if world.doc.spaces.len() > 1 {
+                let keep_sid = target_space_id.as_deref();
+                world
+                    .doc
+                    .spaces
+                    .retain(|s| !s.tabs.is_empty() || Some(s.id.as_str()) == keep_sid);
+            }
+
             let idx = target_space_id
                 .as_ref()
                 .and_then(|sid| world.doc.spaces.iter().position(|s| &s.id == sid))
@@ -897,6 +917,23 @@ impl World {
         let space_name = name.trim().to_string();
 
         self.mutate_doc(core, |world| {
+            // If another client auto-adopted `addr` before our `doc.set`, remove that
+            // duplicate tab before placing `addr` into the newly created Space.
+            for s in &mut world.doc.spaces {
+                if s.id == space_id {
+                    continue;
+                }
+                s.tabs.retain(|t| {
+                    let mut terms = Vec::new();
+                    extract_terminals(&t.root, &mut terms);
+                    !terms.iter().any(|a| a == &addr)
+                });
+            }
+            world
+                .doc
+                .spaces
+                .retain(|s| !s.tabs.is_empty() || s.id == space_id);
+
             if !world.doc.spaces.iter().any(|s| s.id == space_id) {
                 world.doc.spaces.push(SharedSpace {
                     id: space_id.clone(),
