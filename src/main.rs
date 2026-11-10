@@ -11,8 +11,9 @@ use crate::keys::{
 };
 use crate::model::World;
 use crate::ui::{
-    collect_fuzzy_items, compute_terminal_rect, find_hit_target, render_ui,
-    resolve_fuzzy_selection, HitRegion, HitTarget, Modal, PromptKind, TerminalSelection,
+    collect_fuzzy_items, compute_terminal_rect, find_hit_target, is_on_dpad_disc,
+    render_ui_with_dpad, resolve_dpad_disc_rect, resolve_fuzzy_selection, HitRegion, HitTarget,
+    Modal, PromptKind, TerminalSelection,
 };
 use anyhow::Result;
 use clap::Parser;
@@ -668,6 +669,14 @@ fn execute_action(
     Ok(false)
 }
 
+#[derive(Debug, Clone)]
+struct FloatingDPadDrag {
+    start_mouse: (u16, u16),
+    start_pos: (u16, u16),
+    moved: bool,
+    tap_target: Option<HitTarget>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -689,6 +698,9 @@ fn run_app(
     let mut scrollback_offset: usize = 0;
     let mut modal = Modal::None;
     let mut last_hits: Vec<HitRegion> = Vec::new();
+    let mut dpad_pos: Option<(u16, u16)> = None;
+    let mut last_dpad_rect: Option<Rect> = None;
+    let mut dpad_drag: Option<FloatingDPadDrag> = None;
     let mut selection: Option<TerminalSelection> = None;
     let mut selection_screen: Option<vt100::Screen> = None;
     let mut clipboard_buffer = String::new();
@@ -856,8 +868,9 @@ fn run_app(
                 active_att.map(|a| a.parser.screen())
             };
             let copied_flash = copied_until.is_some();
+            let dpad_dragging = dpad_drag.as_ref().is_some_and(|d| d.moved);
             terminal.draw(|f| {
-                let geom = render_ui(
+                let geom = render_ui_with_dpad(
                     f,
                     world,
                     scr_ref,
@@ -871,8 +884,16 @@ fn run_app(
                     selection.as_ref(),
                     copied_flash,
                     &modal,
+                    dpad_pos,
+                    dpad_dragging,
                 );
                 last_hits = geom.hits;
+                last_dpad_rect = geom.dpad_rect;
+                if let Some(r) = geom.dpad_rect {
+                    if dpad_pos.is_some() {
+                        dpad_pos = Some((r.x, r.y));
+                    }
+                }
             })?;
             dirty = false;
             if !first_frame_drawn {
@@ -919,7 +940,19 @@ fn run_app(
                     MouseEventKind::Down(MouseButton::Left) => {
                         let mx = mev.column;
                         let my = mev.row;
-                        if let Some(target) = find_hit_target(&last_hits, mx, my) {
+                        if is_on_dpad_disc(last_dpad_rect, mx, my) {
+                            selection = None;
+                            selection_screen = None;
+                            if let Some(disc) = last_dpad_rect {
+                                dpad_drag = Some(FloatingDPadDrag {
+                                    start_mouse: (mx, my),
+                                    start_pos: (disc.x, disc.y),
+                                    moved: false,
+                                    tap_target: find_hit_target(&last_hits, mx, my),
+                                });
+                            }
+                        } else if let Some(target) = find_hit_target(&last_hits, mx, my) {
+                            dpad_drag = None;
                             selection = None;
                             selection_screen = None;
                             match target {
@@ -1101,6 +1134,7 @@ fn run_app(
                                 }
                             }
                         } else if !matches!(modal, Modal::None) {
+                            dpad_drag = None;
                             modal = Modal::None;
                             prefix_active = false;
                             ctrl_active = false;
@@ -1110,17 +1144,32 @@ fn run_app(
                             && my >= term_rect.y
                             && my < term_rect.y.saturating_add(term_rect.height)
                         {
+                            dpad_drag = None;
                             let rel_col = mx.saturating_sub(term_rect.x);
                             let rel_row = my.saturating_sub(term_rect.y);
                             selection = Some(TerminalSelection::new(rel_row, rel_col));
                             selection_screen = None;
                         } else {
+                            dpad_drag = None;
                             selection = None;
                             selection_screen = None;
                         }
                     }
                     MouseEventKind::Drag(MouseButton::Left) => {
-                        if let Some(ref mut sel) = selection {
+                        if let Some(ref mut drag) = dpad_drag {
+                            let dx = mev.column as i32 - drag.start_mouse.0 as i32;
+                            let dy = mev.row as i32 - drag.start_mouse.1 as i32;
+                            if drag.moved || dx.abs() >= 2 || dy.abs() >= 1 {
+                                drag.moved = true;
+                                let nx = (drag.start_pos.0 as i32 + dx).max(0) as u16;
+                                let ny = (drag.start_pos.1 as i32 + dy).max(0) as u16;
+                                if let Some(clamped) =
+                                    resolve_dpad_disc_rect(term_rect, Some((nx, ny)))
+                                {
+                                    dpad_pos = Some((clamped.x, clamped.y));
+                                }
+                            }
+                        } else if let Some(ref mut sel) = selection {
                             if sel.active && term_rect.width > 0 && term_rect.height > 0 {
                                 let rel_col = mev
                                     .column
@@ -1139,7 +1188,47 @@ fn run_app(
                         }
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
-                        if let Some(ref mut sel) = selection {
+                        if let Some(drag) = dpad_drag.take() {
+                            if !drag.moved {
+                                match drag.tap_target {
+                                    Some(HitTarget::PasteClipboard) => {
+                                        prefix_active = false;
+                                        ctrl_active = false;
+                                        alt_active = false;
+                                        let text = read_clipboard_text(&clipboard_buffer);
+                                        if !text.is_empty() {
+                                            paste_text_into_app(
+                                                &text,
+                                                core,
+                                                world,
+                                                active_att,
+                                                &mut scrollback_offset,
+                                                &mut modal,
+                                            );
+                                        }
+                                    }
+                                    Some(HitTarget::SendKey(kev)) => {
+                                        if handle_key_event(
+                                            kev,
+                                            core,
+                                            world,
+                                            active_att,
+                                            prefix_spec,
+                                            sidebar_open,
+                                            &mut prefix_active,
+                                            &mut ctrl_active,
+                                            &mut alt_active,
+                                            &mut scrollback_offset,
+                                            &mut modal,
+                                            term_rect,
+                                        )? {
+                                            return Ok(());
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        } else if let Some(ref mut sel) = selection {
                             if sel.active {
                                 if term_rect.width > 0 && term_rect.height > 0 {
                                     let rel_col = mev
@@ -1198,6 +1287,7 @@ fn run_app(
                             *selected_tab_id = items.get(*selected).map(|it| it.tab_id.clone());
                         } else if matches!(modal, Modal::None)
                             && mev.row < term_rect.y.saturating_add(term_rect.height)
+                            && !is_on_dpad_disc(last_dpad_rect, mev.column, mev.row)
                         {
                             selection = None;
                             selection_screen = None;
@@ -1225,6 +1315,7 @@ fn run_app(
                             }
                         } else if matches!(modal, Modal::None)
                             && mev.row < term_rect.y.saturating_add(term_rect.height)
+                            && !is_on_dpad_disc(last_dpad_rect, mev.column, mev.row)
                         {
                             selection = None;
                             selection_screen = None;
