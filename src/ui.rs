@@ -193,6 +193,94 @@ pub struct UiGeometry {
     pub hits: Vec<HitRegion>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalSelection {
+    pub anchor: (u16, u16),
+    pub head: (u16, u16),
+    pub active: bool,
+}
+
+impl TerminalSelection {
+    pub fn new(row: u16, col: u16) -> Self {
+        Self {
+            anchor: (row, col),
+            head: (row, col),
+            active: true,
+        }
+    }
+
+    pub fn is_non_empty(&self) -> bool {
+        self.anchor != self.head
+    }
+
+    pub fn normalized(&self) -> ((u16, u16), (u16, u16)) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    pub fn contains(&self, row: u16, col: u16) -> bool {
+        if !self.is_non_empty() {
+            return false;
+        }
+        let ((sr, sc), (er, ec)) = self.normalized();
+        if row < sr || row > er {
+            return false;
+        }
+        if sr == er {
+            col >= sc && col <= ec
+        } else if row == sr {
+            col >= sc
+        } else if row == er {
+            col <= ec
+        } else {
+            true
+        }
+    }
+
+    pub fn extract_text(&self, screen: &vt100::Screen) -> String {
+        if !self.is_non_empty() {
+            return String::new();
+        }
+        let ((sr, sc), (er, ec)) = self.normalized();
+        let (scr_rows, scr_cols) = screen.size();
+        if scr_rows == 0 || scr_cols == 0 {
+            return String::new();
+        }
+        let mut lines = Vec::new();
+        for r in sr..=er.min(scr_rows.saturating_sub(1)) {
+            let c_start = if r == sr { sc } else { 0 };
+            let c_end = if r == er {
+                ec.min(scr_cols.saturating_sub(1))
+            } else {
+                scr_cols.saturating_sub(1)
+            };
+            if c_start > c_end {
+                lines.push(String::new());
+                continue;
+            }
+            let mut line = String::new();
+            for c in c_start..=c_end {
+                if let Some(cell) = screen.cell(r, c) {
+                    if cell.is_wide_continuation() {
+                        continue;
+                    }
+                    let contents = cell.contents();
+                    if contents.is_empty() {
+                        line.push(' ');
+                    } else {
+                        line.push_str(&contents);
+                    }
+                }
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        lines.join("\n").trim_end_matches('\n').to_string()
+    }
+}
+
 pub fn bottom_bar_height(area: Rect, touch_mode: bool) -> u16 {
     if area.height <= 1 {
         0
@@ -246,6 +334,8 @@ pub fn render_ui(
     touch_mode: bool,
     prefix_active: bool,
     scrollback_offset: usize,
+    selection: Option<&TerminalSelection>,
+    copied_flash: bool,
     modal: &Modal,
 ) -> UiGeometry {
     let area = f.area();
@@ -266,7 +356,13 @@ pub fn render_ui(
     }
 
     if let Some(scr) = screen {
-        f.render_widget(VtScreenWidget { screen: scr }, term_rect);
+        f.render_widget(
+            VtScreenWidget {
+                screen: scr,
+                selection,
+            },
+            term_rect,
+        );
         if matches!(modal, Modal::None) && scrollback_offset == 0 && !scr.hide_cursor() {
             let (row, col) = scr.cursor_position();
             let cx = term_rect.x.saturating_add(col);
@@ -300,6 +396,7 @@ pub fn render_ui(
                 sidebar_open,
                 prefix_active,
                 scrollback_offset,
+                copied_flash,
                 &mut hits,
             );
         }
@@ -311,6 +408,7 @@ pub fn render_ui(
                 sidebar_open,
                 prefix_active,
                 scrollback_offset,
+                copied_flash,
                 &mut hits,
             );
             render_help_modal(f, area, &mut hits);
@@ -326,6 +424,7 @@ pub fn render_ui(
                 sidebar_open,
                 prefix_active,
                 scrollback_offset,
+                copied_flash,
                 &mut hits,
             );
             render_confirm_close_modal(f, area, tab_id, tab_title, &mut hits);
@@ -338,6 +437,7 @@ pub fn render_ui(
                 sidebar_open,
                 prefix_active,
                 scrollback_offset,
+                copied_flash,
                 &mut hits,
             );
             render_prompt_modal(f, area, kind, input, &mut hits);
@@ -354,6 +454,7 @@ pub fn render_ui(
                 sidebar_open,
                 prefix_active,
                 scrollback_offset,
+                copied_flash,
                 &mut hits,
             );
             render_fuzzy_modal(
@@ -407,6 +508,7 @@ fn render_bottom_touchbar(
     sidebar_open: bool,
     prefix_active: bool,
     scrollback_offset: usize,
+    copied_flash: bool,
     hits: &mut Vec<HitRegion>,
 ) {
     if rect.width == 0 || rect.height == 0 {
@@ -419,16 +521,22 @@ fn render_bottom_touchbar(
     let max_x = rect.x + rect.width;
     let buf = f.buffer_mut();
 
-    // Reserve right-side space for optional `[▼ BOT]` and `[ ? ]`
+    // Reserve right-side space for optional `[✓ Copied]`, `[▼ BOT]`, and `[ ? ]`
+    let copied_lbl = if copied_flash {
+        Some(" [✓ Copied] ")
+    } else {
+        None
+    };
     let scroll_lbl = if scrollback_offset > 0 {
         Some(" [▼ BOT] ")
     } else {
         None
     };
     let help_lbl = " [ ? ] ";
+    let copied_w = copied_lbl.map_or(0, |s| s.width() as u16);
     let scroll_w = scroll_lbl.map_or(0, |s| s.width() as u16);
     let help_w = help_lbl.width() as u16;
-    let right_reserved = (scroll_w + help_w).min(rect.width.saturating_sub(4));
+    let right_reserved = (copied_w + scroll_w + help_w).min(rect.width.saturating_sub(4));
     let avail_end = max_x.saturating_sub(right_reserved);
 
     // 1. Far Left: compact 4-column icon-only Sidebar Toggle (` ◄≡ ` or ` ≡► `)
@@ -469,79 +577,182 @@ fn render_bottom_touchbar(
         x += 1;
     }
 
-    // 2. Left Tab Status Dots (` ● ○ ✓ `, similar to legacy Herdr):
+    // 2. Left Space Name + Hollow/Solid Tab Circles (`●` = active tab, `○` = inactive tab):
+    // When `rect.height >= 2`, row 0 shows the current Space name and row 1 underneath it shows `● ○ ○`.
     // Reserve budget for the core terminal keys first so a large number of tabs never crowds out `[^B]`/`[Esc]`,
-    // and window the visible dots around `active_ti` within a fixed width on >=76 col terminals so keys never jitter.
+    // and keep a fixed width on >=76 col terminals so keys never jitter.
     let dots_start_x = x;
     let min_key_reserve: u16 = 29; // Enough for `[^B]│[Esc]│[Tab]│[^C]`
-    let dots_budget = if rect.width >= 76 {
-        9.min(avail_end.saturating_sub(dots_start_x))
+    let dots_budget = if rect.width >= 78 {
+        11.min(avail_end.saturating_sub(dots_start_x))
     } else {
         avail_end
             .saturating_sub(dots_start_x)
             .saturating_sub(min_key_reserve)
-            .min(9)
+            .min(11)
     };
     let dots_limit_x = dots_start_x + dots_budget;
 
     if dots_budget >= 2 {
         if let Some(space) = world.active_space() {
+            let sname = world.space_display_name(space);
             let active_ti = world.active_tab_index();
             let space_id = space.id.clone();
             let total_tabs = space.tabs.len();
-            let compact_dots = total_tabs > 3 || (dots_budget as usize) < total_tabs * 3;
-            let dot_step: usize = if compact_dots { 2 } else { 3 };
-            let max_visible_dots = (dots_budget as usize / dot_step).max(1);
-            let start_ti = if total_tabs <= max_visible_dots || active_ti < max_visible_dots {
-                0
-            } else {
-                (active_ti + 1 - max_visible_dots).min(total_tabs.saturating_sub(max_visible_dots))
-            };
+            let zone_bg = Style::default()
+                .bg(Color::Rgb(28, 32, 52))
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD);
 
-            for (ti, tab) in space
-                .tabs
-                .iter()
-                .enumerate()
-                .skip(start_ti)
-                .take(max_visible_dots)
-            {
-                let st = world.tab_state(tab);
-                let pill = if compact_dots {
-                    format!("{} ", st.symbol())
-                } else {
-                    format!(" {} ", st.symbol())
-                };
-                let pw = pill.width() as u16;
-                if x + pw > dots_limit_x {
-                    break;
-                }
-                let is_active = ti == active_ti;
-                let pstyle = Style::default()
-                    .bg(if is_active {
-                        Color::Rgb(68, 78, 128)
-                    } else {
-                        Color::Rgb(20, 22, 34)
-                    })
-                    .fg(state_color(st))
-                    .add_modifier(Modifier::BOLD);
-                draw_touchbar_pill(buf, x, rect, &pill, pstyle, is_active);
+            if rect.height >= 2 {
+                // Top row: current Space name
+                let sname_padded = pad_to_width(&format!(" {sname}"), dots_budget as usize);
+                buf.set_string(dots_start_x, rect.y, &sname_padded, zone_bg);
+                // Bottom row background fill
+                buf.set_string(
+                    dots_start_x,
+                    rect.y + 1,
+                    &" ".repeat(dots_budget as usize),
+                    Style::default().bg(Color::Rgb(28, 32, 52)),
+                );
+                // Default hit target across the Space+Dots widget cycles to the next tab
                 hits.push(HitRegion {
                     rect: Rect {
-                        x,
+                        x: dots_start_x,
                         y: rect.y,
-                        width: pw,
+                        width: dots_budget,
                         height: rect.height,
                     },
-                    target: HitTarget::SelectTab {
-                        space_id: space_id.clone(),
-                        tab_id: tab.id.clone(),
-                    },
+                    target: HitTarget::TriggerAction(Action::NextTab),
                 });
-                x += pw;
+
+                // Bottom row: solid `●` for current tab, hollow `○` for other tabs in this Space
+                let compact_dots = total_tabs > 5 || (dots_budget as usize) < total_tabs * 2;
+                let dot_step: usize = if compact_dots { 1 } else { 2 };
+                let max_visible_dots = (dots_budget.saturating_sub(1) as usize / dot_step).max(1);
+                let start_ti = if total_tabs <= max_visible_dots || active_ti < max_visible_dots {
+                    0
+                } else {
+                    (active_ti + 1 - max_visible_dots)
+                        .min(total_tabs.saturating_sub(max_visible_dots))
+                };
+
+                let mut dx = dots_start_x + 1;
+                for (ti, tab) in space
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .skip(start_ti)
+                    .take(max_visible_dots)
+                {
+                    let is_active = ti == active_ti;
+                    let circle = if is_active { "●" } else { "○" };
+                    let pill = if compact_dots {
+                        circle.to_string()
+                    } else {
+                        format!("{circle} ")
+                    };
+                    let pw = pill.width() as u16;
+                    if dx + pw > dots_limit_x {
+                        break;
+                    }
+                    let st = world.tab_state(tab);
+                    let fg_col = if is_active {
+                        Color::White
+                    } else if matches!(st, AgentState::Blocked | AgentState::Done) {
+                        state_color(st)
+                    } else {
+                        Color::Rgb(150, 160, 195)
+                    };
+                    let dstyle = Style::default()
+                        .bg(Color::Rgb(28, 32, 52))
+                        .fg(fg_col)
+                        .add_modifier(if is_active {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        });
+                    buf.set_string(dx, rect.y + 1, &pill, dstyle);
+                    hits.push(HitRegion {
+                        rect: Rect {
+                            x: dx,
+                            y: rect.y,
+                            width: pw,
+                            height: rect.height,
+                        },
+                        target: if is_active && total_tabs > 1 {
+                            HitTarget::TriggerAction(Action::NextTab)
+                        } else {
+                            HitTarget::SelectTab {
+                                space_id: space_id.clone(),
+                                tab_id: tab.id.clone(),
+                            }
+                        },
+                    });
+                    dx += pw;
+                }
+                x = dots_limit_x;
+            } else {
+                // 1-row fallback (`--no-touch`): compact Space prefix + `●`/`○` circles
+                let compact_dots = total_tabs > 3 || (dots_budget as usize) < total_tabs * 2;
+                let dot_step: usize = if compact_dots { 1 } else { 2 };
+                let max_visible_dots = (dots_budget as usize / dot_step).max(1);
+                let start_ti = if total_tabs <= max_visible_dots || active_ti < max_visible_dots {
+                    0
+                } else {
+                    (active_ti + 1 - max_visible_dots)
+                        .min(total_tabs.saturating_sub(max_visible_dots))
+                };
+
+                for (ti, tab) in space
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .skip(start_ti)
+                    .take(max_visible_dots)
+                {
+                    let is_active = ti == active_ti;
+                    let circle = if is_active { "●" } else { "○" };
+                    let pill = if compact_dots {
+                        format!("{circle} ")
+                    } else {
+                        format!(" {circle} ")
+                    };
+                    let pw = pill.width() as u16;
+                    if x + pw > dots_limit_x {
+                        break;
+                    }
+                    let pstyle = Style::default()
+                        .bg(if is_active {
+                            Color::Rgb(68, 78, 128)
+                        } else {
+                            Color::Rgb(28, 32, 52)
+                        })
+                        .fg(if is_active {
+                            Color::White
+                        } else {
+                            Color::Rgb(150, 160, 195)
+                        })
+                        .add_modifier(Modifier::BOLD);
+                    draw_touchbar_pill(buf, x, rect, &pill, pstyle, is_active);
+                    hits.push(HitRegion {
+                        rect: Rect {
+                            x,
+                            y: rect.y,
+                            width: pw,
+                            height: rect.height,
+                        },
+                        target: HitTarget::SelectTab {
+                            space_id: space_id.clone(),
+                            tab_id: tab.id.clone(),
+                        },
+                    });
+                    x += pw;
+                }
             }
         }
     }
-    if rect.width >= 76 && x < dots_limit_x {
+    if rect.width >= 78 && x < dots_limit_x {
         x = dots_limit_x;
     }
     if x > dots_start_x && x < avail_end {
@@ -628,8 +839,18 @@ fn render_bottom_touchbar(
         }
     }
 
-    // 4. Right: optional `[▼ BOT]` and `[ ? ]`
+    // 4. Right: optional `[✓ Copied]`, `[▼ BOT]`, and `[ ? ]`
     let mut rx = avail_end;
+    if let Some(clbl) = copied_lbl {
+        if rx + copied_w <= max_x {
+            let cstyle = Style::default()
+                .bg(Color::LightGreen)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD);
+            draw_touchbar_pill(buf, rx, rect, clbl, cstyle, true);
+            rx += copied_w;
+        }
+    }
     if let Some(slbl) = scroll_lbl {
         if rx + scroll_w <= max_x {
             let sstyle = Style::default()
@@ -1061,6 +1282,7 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
 
 struct VtScreenWidget<'a> {
     screen: &'a vt100::Screen,
+    selection: Option<&'a TerminalSelection>,
 }
 
 impl Widget for VtScreenWidget<'_> {
@@ -1082,22 +1304,35 @@ impl Widget for VtScreenWidget<'_> {
                 }
                 let x = area.x + c;
                 let y = area.y + r;
-                let mut style = Style::default()
-                    .fg(map_vt_color(cell.fgcolor()))
-                    .bg(map_vt_color(cell.bgcolor()));
+                let selected = self
+                    .selection
+                    .is_some_and(|sel| sel.contains(r, c) || (cell.is_wide() && sel.contains(r, c + 1)));
 
-                if cell.bold() {
-                    style = style.add_modifier(Modifier::BOLD);
-                }
-                if cell.italic() {
-                    style = style.add_modifier(Modifier::ITALIC);
-                }
-                if cell.underline() {
-                    style = style.add_modifier(Modifier::UNDERLINED);
-                }
-                if cell.inverse() {
-                    style = style.add_modifier(Modifier::REVERSED);
-                }
+                let mut style = if selected {
+                    Style::default()
+                        .bg(Color::Rgb(58, 114, 200))
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    let mut st = Style::default()
+                        .fg(map_vt_color(cell.fgcolor()))
+                        .bg(map_vt_color(cell.bgcolor()));
+
+                    if cell.bold() {
+                        st = st.add_modifier(Modifier::BOLD);
+                    }
+                    if cell.italic() {
+                        st = st.add_modifier(Modifier::ITALIC);
+                    }
+                    if cell.underline() {
+                        st = st.add_modifier(Modifier::UNDERLINED);
+                    }
+                    if cell.inverse() {
+                        st = st.add_modifier(Modifier::REVERSED);
+                    }
+                    st
+                };
+                let _ = &mut style;
 
                 let contents = cell.contents();
                 let sym = if contents.is_empty() { " " } else { &contents };
@@ -1615,6 +1850,8 @@ mod tests {
                     true, // touch_mode = true (2-row bottom touchbar)
                     false,
                     42, // scrollback_offset > 0
+                    None,
+                    false,
                     &Modal::None,
                 );
                 hits = geom.hits;
@@ -1670,7 +1907,19 @@ mod tests {
         let mut prefix_x_2 = 0;
         terminal
             .draw(|f| {
-                let geom = render_ui(f, &world, None, true, 24, false, false, 0, &Modal::None);
+                let geom = render_ui(
+                    f,
+                    &world,
+                    None,
+                    true,
+                    24,
+                    true,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::None,
+                );
                 prefix_x_1 = geom
                     .hits
                     .iter()
@@ -1682,7 +1931,19 @@ mod tests {
             .unwrap();
         terminal
             .draw(|f| {
-                let geom = render_ui(f, &world, None, false, 24, false, true, 15, &Modal::None);
+                let geom = render_ui(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    true,
+                    true,
+                    15,
+                    None,
+                    true,
+                    &Modal::None,
+                );
                 prefix_x_2 = geom
                     .hits
                     .iter()
@@ -1710,9 +1971,11 @@ mod tests {
                     None,
                     false,
                     24,
-                    false,
+                    true,
                     false,
                     0,
+                    None,
+                    false,
                     &Modal::ConfirmCloseTab {
                         tab_id: "tab-123".to_string(),
                         tab_title: "zsh".to_string(),
@@ -1751,6 +2014,8 @@ mod tests {
                     false,
                     false,
                     0,
+                    None,
+                    false,
                     &Modal::None,
                 );
                 hits = geom.hits;
@@ -1781,6 +2046,8 @@ mod tests {
                     false,
                     false,
                     0,
+                    None,
+                    false,
                     &Modal::Help,
                 );
                 hits = geom.hits;
@@ -1799,5 +2066,17 @@ mod tests {
         assert!(hits
             .iter()
             .any(|h| h.target == HitTarget::TriggerAction(Action::Detach)));
+    }
+
+    #[test]
+    fn terminal_selection_extracts_single_and_multiline_text() {
+        let mut parser = vt100::Parser::new(10, 40, 100);
+        parser.process(b"hello world\r\nsecond line here");
+        let sel = TerminalSelection {
+            anchor: (0, 6),
+            head: (1, 5),
+            active: false,
+        };
+        assert_eq!(sel.extract_text(parser.screen()), "world\nsecond");
     }
 }

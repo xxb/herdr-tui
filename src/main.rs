@@ -12,7 +12,7 @@ use crate::keys::{
 use crate::model::World;
 use crate::ui::{
     collect_fuzzy_items, compute_terminal_rect, find_hit_target, render_ui,
-    resolve_fuzzy_selection, HitRegion, HitTarget, Modal, PromptKind,
+    resolve_fuzzy_selection, HitRegion, HitTarget, Modal, PromptKind, TerminalSelection,
 };
 use anyhow::Result;
 use clap::Parser;
@@ -26,7 +26,8 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
-use std::io;
+use std::io::{self, Write};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const SCROLLBACK_LINES: usize = 5000;
@@ -94,6 +95,80 @@ fn sanitize_vt_bytes(payload: &[u8]) -> Vec<u8> {
     out
 }
 
+fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(b2 & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+fn copy_to_clipboard(text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    // 1. Emit OSC 52 clipboard escape sequence directly to the outer SSH / terminal stdout
+    // so remote SSH clients (iPad Termius, Blink, ShellFish, WezTerm, Kitty, iTerm2, Ghostty)
+    // automatically update the client device's native clipboard.
+    let b64 = base64_encode(text.as_bytes());
+    let mut stdout = io::stdout();
+    if std::env::var_os("TMUX").is_some() {
+        let _ = write!(
+            stdout,
+            "\x1bPtmux;\x1b\x1b]52;c;{b64}\x07\x1b\\\x1b]52;c;{b64}\x07"
+        );
+    } else {
+        let _ = write!(stdout, "\x1b]52;c;{b64}\x07\x1b]52;;{b64}\x07");
+    }
+    let _ = stdout.flush();
+
+    // 2. Also attempt local clipboard helper in a detached background thread when a local display server is active
+    let owned = text.to_string();
+    std::thread::spawn(move || {
+        let local_cmds: &[(&str, &[&str])] = &[
+            ("pbcopy", &[]),
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+        ];
+        for (prog, args) in local_cmds {
+            if *prog == "wl-copy" && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+                continue;
+            }
+            if *prog == "xclip" && std::env::var_os("DISPLAY").is_none() {
+                continue;
+            }
+            if let Ok(mut child) = Command::new(prog)
+                .args(*args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(owned.as_bytes());
+                }
+                let _ = child.wait();
+                break;
+            }
+        }
+    });
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let file_cfg = FileConfig::load();
@@ -109,7 +184,7 @@ fn main() -> Result<()> {
     } else if cli.no_touch {
         false
     } else {
-        file_cfg.ui.touch_mode.unwrap_or(false)
+        file_cfg.ui.touch_mode.unwrap_or(true)
     };
 
     let (core, core_rx) = CoreClient::connect(cli.session.as_deref())?;
@@ -341,10 +416,16 @@ fn run_app(
     let mut scrollback_offset: usize = 0;
     let mut modal = Modal::None;
     let mut last_hits: Vec<HitRegion> = Vec::new();
+    let mut selection: Option<TerminalSelection> = None;
+    let mut copied_until: Option<Instant> = None;
     let mut dirty = true;
     let mut prev_width = terminal.size()?.width;
 
     loop {
+        if copied_until.is_some_and(|t| Instant::now() >= t) {
+            copied_until = None;
+            dirty = true;
+        }
         let size = terminal.size()?;
         if size.width != prev_width {
             if size.width < mobile_threshold {
@@ -371,6 +452,7 @@ fn run_app(
 
         if dirty {
             let scr_ref = attached.as_ref().map(|a| a.parser.screen());
+            let copied_flash = copied_until.is_some();
             terminal.draw(|f| {
                 let geom = render_ui(
                     f,
@@ -381,6 +463,8 @@ fn run_app(
                     touch_mode,
                     prefix_active,
                     scrollback_offset,
+                    selection.as_ref(),
+                    copied_flash,
                     &modal,
                 );
                 last_hits = geom.hits;
@@ -523,6 +607,7 @@ fn run_app(
                         let mx = mev.column;
                         let my = mev.row;
                         if let Some(target) = find_hit_target(&last_hits, mx, my) {
+                            selection = None;
                             match target {
                                 HitTarget::ModalNoop => {}
                                 HitTarget::CancelModal => {
@@ -649,6 +734,61 @@ fn run_app(
                             }
                         } else if !matches!(modal, Modal::None) {
                             modal = Modal::None;
+                        } else if mx >= term_rect.x
+                            && mx < term_rect.x.saturating_add(term_rect.width)
+                            && my >= term_rect.y
+                            && my < term_rect.y.saturating_add(term_rect.height)
+                        {
+                            let rel_col = mx.saturating_sub(term_rect.x);
+                            let rel_row = my.saturating_sub(term_rect.y);
+                            selection = Some(TerminalSelection::new(rel_row, rel_col));
+                        } else {
+                            selection = None;
+                        }
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        if let Some(ref mut sel) = selection {
+                            if sel.active && term_rect.width > 0 && term_rect.height > 0 {
+                                let rel_col = mev
+                                    .column
+                                    .saturating_sub(term_rect.x)
+                                    .min(term_rect.width.saturating_sub(1));
+                                let rel_row = mev
+                                    .row
+                                    .saturating_sub(term_rect.y)
+                                    .min(term_rect.height.saturating_sub(1));
+                                sel.head = (rel_row, rel_col);
+                            }
+                        }
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        if let Some(ref mut sel) = selection {
+                            if sel.active {
+                                if term_rect.width > 0 && term_rect.height > 0 {
+                                    let rel_col = mev
+                                        .column
+                                        .saturating_sub(term_rect.x)
+                                        .min(term_rect.width.saturating_sub(1));
+                                    let rel_row = mev
+                                        .row
+                                        .saturating_sub(term_rect.y)
+                                        .min(term_rect.height.saturating_sub(1));
+                                    sel.head = (rel_row, rel_col);
+                                }
+                                sel.active = false;
+                                if sel.is_non_empty() {
+                                    if let Some(att) = &attached {
+                                        let text = sel.extract_text(att.parser.screen());
+                                        if !text.is_empty() {
+                                            copy_to_clipboard(&text);
+                                            copied_until =
+                                                Some(Instant::now() + Duration::from_secs(2));
+                                        }
+                                    }
+                                } else {
+                                    selection = None;
+                                }
+                            }
                         }
                     }
                     MouseEventKind::ScrollUp => {
@@ -698,6 +838,7 @@ fn run_app(
                 }
             }
             Event::Key(kev) if kev.kind == KeyEventKind::Press => {
+                selection = None;
                 if handle_key_event(
                     kev,
                     core,
@@ -921,4 +1062,18 @@ fn handle_key_event(
         }
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_encodes_osc52_payloads_accurately() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"hello world"), "aGVsbG8gd29ybGQ=");
+    }
 }
