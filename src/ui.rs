@@ -261,8 +261,6 @@ impl TerminalSelection {
 pub fn bottom_bar_height(area: Rect, touch_mode: bool) -> u16 {
     if area.height <= 1 {
         0
-    } else if touch_mode && area.height >= 8 {
-        3
     } else if touch_mode && area.height >= 6 {
         2
     } else {
@@ -475,27 +473,7 @@ fn draw_touchbar_pill(
         return;
     }
     let lw = label.width() as u16;
-    if rect.height >= 3 && lw > 0 {
-        // 3-row tall keycap pill (1.5x height):
-        // Row 0 (`rect.y`): top keycap padding + continuous glowing top divider line (`▔`)
-        // Row 1 (`rect.y + 1`): dead-center button label
-        // Row 2 (`rect.y + 2`): bottom keycap padding + subtle bottom bevel (`▁`)
-        let top_fg = if emphasized {
-            Color::Rgb(245, 194, 118)
-        } else {
-            Color::Rgb(118, 162, 247)
-        };
-        let bot_fg = if emphasized {
-            Color::Rgb(210, 155, 80)
-        } else {
-            Color::Rgb(54, 62, 92)
-        };
-        let top_line = "▔".repeat(lw as usize);
-        let bot_line = "▁".repeat(lw as usize);
-        buf.set_string(x, rect.y, &top_line, style.fg(top_fg));
-        buf.set_string(x, rect.y + 1, label, style);
-        buf.set_string(x, rect.y + 2, &bot_line, style.fg(bot_fg));
-    } else if rect.height == 2 && lw > 0 {
+    if rect.height >= 2 && lw > 0 {
         let top_fg = if emphasized {
             Color::Rgb(245, 194, 118)
         } else {
@@ -548,14 +526,15 @@ fn render_bottom_touchbar(
     }
 
     // Reserve right-side space for optional `✓ Copied`, `▼ BOT`, and `?` keycaps
-    let narrow_bar = rect.width < 76;
+    let narrow_bar = rect.width < 80;
+    let compact_badges = rect.width < 118;
     let copied_lbl = if copied_flash {
-        Some(if narrow_bar { " ✓ " } else { " ✓ Copied " })
+        Some(if compact_badges { " ✓ " } else { " ✓ Copied " })
     } else {
         None
     };
     let scroll_lbl = if scrollback_offset > 0 {
-        Some(if narrow_bar { " ▼ " } else { " ▼ BOT " })
+        Some(if compact_badges { " ▼ " } else { " ▼ BOT " })
     } else {
         None
     };
@@ -608,10 +587,17 @@ fn render_bottom_touchbar(
     let dots_start_x = x;
     let base_end = max_x.saturating_sub(help_w.min(rect.width.saturating_sub(4)));
     let min_key_reserve: u16 = 29;
+    let max_dots_w: u16 = if rect.width >= 104 {
+        11
+    } else if rect.width >= 90 {
+        9
+    } else {
+        8
+    };
     let dots_budget = base_end
         .saturating_sub(dots_start_x)
         .saturating_sub(min_key_reserve)
-        .min(11);
+        .min(max_dots_w);
     let dots_limit_x = (dots_start_x + dots_budget).min(max_x);
 
     if dots_budget >= 2 {
@@ -626,33 +612,13 @@ fn render_bottom_touchbar(
                 .add_modifier(Modifier::BOLD);
 
             if rect.height >= 2 {
-                let name_row = if rect.height >= 3 {
-                    rect.y + 1
-                } else {
-                    rect.y
-                };
-                let dots_row = if rect.height >= 3 {
-                    rect.y + 2
-                } else {
-                    rect.y + 1
-                };
-                if rect.height >= 3 {
-                    buf.set_string(
-                        dots_start_x,
-                        rect.y,
-                        &"▔".repeat(dots_budget as usize),
-                        Style::default()
-                            .bg(Color::Rgb(24, 27, 42))
-                            .fg(Color::Rgb(118, 162, 247)),
-                    );
-                }
-                // Space name row
+                // Space name on row 0 (`rect.y`)
                 let sname_padded = pad_to_width(&format!(" {sname}"), dots_budget as usize);
-                buf.set_string(dots_start_x, name_row, &sname_padded, zone_bg);
-                // Dots row background fill
+                buf.set_string(dots_start_x, rect.y, &sname_padded, zone_bg);
+                // Dots row background fill on row 1 (`rect.y + 1`)
                 buf.set_string(
                     dots_start_x,
-                    dots_row,
+                    rect.y + 1,
                     &" ".repeat(dots_budget as usize),
                     Style::default().bg(Color::Rgb(24, 27, 42)),
                 );
@@ -713,7 +679,7 @@ fn render_bottom_touchbar(
                         } else {
                             Modifier::empty()
                         });
-                    buf.set_string(dx, dots_row, &pill, dstyle);
+                    buf.set_string(dx, rect.y + 1, &pill, dstyle);
                     hits.push(HitRegion {
                         rect: Rect {
                             x: dx,
@@ -801,9 +767,8 @@ fn render_bottom_touchbar(
     }
 
     // 3. Modern Keycap Pills (`^B`, `Esc`, `Ctrl`, `Alt`, `Tab`, `←`, `↓`, `↑`, `→`, `⎘`)
-    // Clean rounded/beveled keycap look without ASCII `[]` brackets or `│` pipes.
-    // On narrow mobile viewports (`rect.width < 76`), reflow across the 2 touchbar rows (or compact
-    // 1-row pills when `--no-touch`) so all 10 keys remain reachable even on 40-column screens.
+    // Generous horizontal padding on arrow keys (`←`, `↓`, `↑`, `→`) so touch targets are wide
+    // and easy to tap on iPad/mobile screens without fat-fingering.
     let keycap_style = |active_highlight: bool, kind: u8| -> Style {
         if active_highlight {
             Style::default()
@@ -833,18 +798,34 @@ fn render_bottom_touchbar(
     };
 
     if narrow_bar && rect.height >= 2 {
+        let wide_narrow = avail_end.saturating_sub(x) >= 29;
         let top_keys: [(&str, HitTarget, bool, u8); 5] = [
-            ("^B", HitTarget::TogglePrefix, prefix_active, 1),
             (
-                "Esc",
+                if wide_narrow { " ^B " } else { "^B" },
+                HitTarget::TogglePrefix,
+                prefix_active,
+                1,
+            ),
+            (
+                if wide_narrow { " Esc " } else { "Esc" },
                 HitTarget::SendKey(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
                 false,
                 0,
             ),
-            ("Ctl", HitTarget::ToggleCtrl, ctrl_active, 1),
-            ("Alt", HitTarget::ToggleAlt, alt_active, 1),
             (
-                "Tab",
+                if wide_narrow { " Ctl " } else { "Ctl" },
+                HitTarget::ToggleCtrl,
+                ctrl_active,
+                1,
+            ),
+            (
+                if wide_narrow { " Alt " } else { "Alt" },
+                HitTarget::ToggleAlt,
+                alt_active,
+                1,
+            ),
+            (
+                if wide_narrow { " Tab " } else { "Tab" },
                 HitTarget::SendKey(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
                 false,
                 0,
@@ -852,42 +833,37 @@ fn render_bottom_touchbar(
         ];
         let bot_keys: [(&str, HitTarget, bool, u8); 5] = [
             (
-                " ← ",
+                if wide_narrow { "  ←  " } else { " ← " },
                 HitTarget::SendKey(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
                 false,
                 2,
             ),
             (
-                " ↓ ",
+                if wide_narrow { "  ↓  " } else { " ↓ " },
                 HitTarget::SendKey(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
                 false,
                 2,
             ),
             (
-                " ↑ ",
+                if wide_narrow { "  ↑  " } else { " ↑ " },
                 HitTarget::SendKey(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
                 false,
                 2,
             ),
             (
-                " → ",
+                if wide_narrow { "  →  " } else { " → " },
                 HitTarget::SendKey(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
                 false,
                 2,
             ),
-            (" ⎘ ", HitTarget::PasteClipboard, false, 3),
+            (
+                if wide_narrow { "  ⎘  " } else { " ⎘ " },
+                HitTarget::PasteClipboard,
+                false,
+                3,
+            ),
         ];
-        let top_row = if rect.height >= 3 {
-            rect.y + 1
-        } else {
-            rect.y
-        };
-        let bot_row = if rect.height >= 3 {
-            rect.y + 2
-        } else {
-            rect.y + 1
-        };
-        for (row_y, row_keys) in [(top_row, top_keys), (bot_row, bot_keys)] {
+        for (row_y, row_keys) in [(rect.y, top_keys), (rect.y + 1, bot_keys)] {
             let mut kx = x;
             for (lbl, target, active_highlight, kind) in row_keys {
                 let kw = lbl.width() as u16;
@@ -912,12 +888,16 @@ fn render_bottom_touchbar(
             }
         }
     } else {
-        let wide_keys = rect.width >= 108;
+        // Choose arrow & keycap width tier based on viewport width so arrow buttons are wide
+        // touch targets (`7` cols on standard ~96+ col screens, `9` cols on wide >=116 col screens,
+        // `5` cols on 80..95 col screens).
+        let xl_keys = rect.width >= 116;
+        let lg_keys = rect.width >= 96;
         let key_buttons: [(&str, HitTarget, bool, u8); 10] = [
             (
                 if narrow_bar {
                     "^B"
-                } else if wide_keys {
+                } else if lg_keys {
                     "  ^B  "
                 } else {
                     " ^B "
@@ -927,7 +907,13 @@ fn render_bottom_touchbar(
                 1,
             ),
             (
-                if narrow_bar { "Es" } else { " Esc " },
+                if narrow_bar {
+                    "Es"
+                } else if xl_keys {
+                    "  Esc  "
+                } else {
+                    " Esc "
+                },
                 HitTarget::SendKey(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
                 false,
                 0,
@@ -939,13 +925,25 @@ fn render_bottom_touchbar(
                 1,
             ),
             (
-                if narrow_bar { "Al" } else { " Alt " },
+                if narrow_bar {
+                    "Al"
+                } else if xl_keys {
+                    "  Alt  "
+                } else {
+                    " Alt "
+                },
                 HitTarget::ToggleAlt,
                 alt_active,
                 1,
             ),
             (
-                if narrow_bar { "Tb" } else { " Tab " },
+                if narrow_bar {
+                    "Tb"
+                } else if xl_keys {
+                    "  Tab  "
+                } else {
+                    " Tab "
+                },
                 HitTarget::SendKey(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
                 false,
                 0,
@@ -953,10 +951,12 @@ fn render_bottom_touchbar(
             (
                 if narrow_bar {
                     "←"
-                } else if wide_keys {
-                    "  ←  "
+                } else if xl_keys {
+                    "    ←    "
+                } else if lg_keys {
+                    "   ←   "
                 } else {
-                    " ← "
+                    "  ←  "
                 },
                 HitTarget::SendKey(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
                 false,
@@ -965,10 +965,12 @@ fn render_bottom_touchbar(
             (
                 if narrow_bar {
                     "↓"
-                } else if wide_keys {
-                    "  ↓  "
+                } else if xl_keys {
+                    "    ↓    "
+                } else if lg_keys {
+                    "   ↓   "
                 } else {
-                    " ↓ "
+                    "  ↓  "
                 },
                 HitTarget::SendKey(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
                 false,
@@ -977,10 +979,12 @@ fn render_bottom_touchbar(
             (
                 if narrow_bar {
                     "↑"
-                } else if wide_keys {
-                    "  ↑  "
+                } else if xl_keys {
+                    "    ↑    "
+                } else if lg_keys {
+                    "   ↑   "
                 } else {
-                    " ↑ "
+                    "  ↑  "
                 },
                 HitTarget::SendKey(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
                 false,
@@ -989,10 +993,12 @@ fn render_bottom_touchbar(
             (
                 if narrow_bar {
                     "→"
-                } else if wide_keys {
-                    "  →  "
+                } else if xl_keys {
+                    "    →    "
+                } else if lg_keys {
+                    "   →   "
                 } else {
-                    " → "
+                    "  →  "
                 },
                 HitTarget::SendKey(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
                 false,
@@ -1001,10 +1007,10 @@ fn render_bottom_touchbar(
             (
                 if narrow_bar {
                     "⎘"
-                } else if wide_keys {
-                    "  ⎘  "
+                } else if xl_keys {
+                    "   ⎘   "
                 } else {
-                    " ⎘ "
+                    "  ⎘  "
                 },
                 HitTarget::PasteClipboard,
                 false,
@@ -2052,13 +2058,13 @@ mod tests {
                 );
                 hits = geom.hits;
                 assert_eq!(geom.term_rect.y, 0);
-                assert_eq!(geom.term_rect.height, 21);
+                assert_eq!(geom.term_rect.height, 22);
             })
             .unwrap();
 
-        // Sidebar toggle on the 3-row bottom touchbar (rows 21..23) should hit ToggleSidebar
+        // Sidebar toggle on the 2-row bottom touchbar (rows 22..23) should hit ToggleSidebar
         assert_eq!(
-            find_hit_target(&hits, 1, 21),
+            find_hit_target(&hits, 1, 22),
             Some(HitTarget::ToggleSidebar)
         );
         assert_eq!(
@@ -2066,22 +2072,29 @@ mod tests {
             Some(HitTarget::ToggleSidebar)
         );
 
-        // Scrollback badge, Prefix/Ctrl/Alt buttons, terminal keys (Esc/Tab/Arrows/⎘), and Help button are on the 3-row bottom touchbar
+        // Scrollback badge, Prefix/Ctrl/Alt buttons, terminal keys (Esc/Tab/Arrows/⎘), and Help button are on the 2-row bottom touchbar
         assert!(hits
             .iter()
-            .any(|h| h.target == HitTarget::ExitScrollback && h.rect.height == 3));
+            .any(|h| h.target == HitTarget::ExitScrollback && h.rect.height == 2));
         assert!(hits
             .iter()
-            .any(|h| h.target == HitTarget::TogglePrefix && h.rect.height == 3));
+            .any(|h| h.target == HitTarget::TogglePrefix && h.rect.height == 2));
         assert!(hits
             .iter()
-            .any(|h| h.target == HitTarget::ToggleCtrl && h.rect.height == 3));
+            .any(|h| h.target == HitTarget::ToggleCtrl && h.rect.height == 2));
         assert!(hits
             .iter()
-            .any(|h| h.target == HitTarget::ToggleAlt && h.rect.height == 3));
+            .any(|h| h.target == HitTarget::ToggleAlt && h.rect.height == 2));
         assert!(hits
             .iter()
-            .any(|h| h.target == HitTarget::PasteClipboard && h.rect.height == 3));
+            .any(|h| h.target == HitTarget::PasteClipboard && h.rect.height == 2));
+        for arrow in [KeyCode::Left, KeyCode::Down, KeyCode::Up, KeyCode::Right] {
+            assert!(hits.iter().any(|h| {
+                h.target == HitTarget::SendKey(KeyEvent::new(arrow, KeyModifiers::NONE))
+                    && h.rect.height == 2
+                    && h.rect.width >= 7
+            }));
+        }
         assert!(!hits.iter().any(|h| {
             h.target == HitTarget::SendKey(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
         }));
@@ -2090,7 +2103,7 @@ mod tests {
         }));
         assert!(hits
             .iter()
-            .any(|h| h.target == HitTarget::ToggleHelp && h.rect.height == 3));
+            .any(|h| h.target == HitTarget::ToggleHelp && h.rect.height == 2));
 
         // Sidebar footer has vertically centered [+ New Tab] and [+ New Space] buttons
         let new_tab_hit = hits
@@ -2106,7 +2119,7 @@ mod tests {
             new_space_hit.rect.y,
             new_tab_hit.rect.y + new_tab_hit.rect.height
         );
-        assert!(21 >= new_space_hit.rect.y + new_space_hit.rect.height);
+        assert!(22 >= new_space_hit.rect.y + new_space_hit.rect.height);
     }
 
     #[test]
