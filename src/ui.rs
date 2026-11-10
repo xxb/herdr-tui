@@ -969,9 +969,9 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
         y += 1;
     }
 
-    // Reserve footer space with compact padding around `[+ New Tab]` and `[+ New Space]`
-    // and above the bottom touchbar's `◄≡` collapse button to prevent accidental mis-taps.
-    let footer_rows = if max_y.saturating_sub(y) >= 7 {
+    // Reserve footer space for 2-row tall `[+ New Tab]` and `[+ New Space]` buttons
+    // with tight margin between them and 1-row safety margin above the touchbar's `◄≡` button.
+    let footer_rows = if max_y.saturating_sub(y) >= 8 {
         5
     } else if max_y.saturating_sub(y) >= 4 {
         2
@@ -1164,50 +1164,68 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
         y += 2;
     }
 
-    // Render Footer Buttons (`[+ New Tab]` and `[+ New Space]`) with horizontal padding
-    // and a 1-row vertical gap between them and above the bottom touchbar's `◄≡` button.
+    // Render 2-row tall Footer Buttons (`+ New Tab` and `+ New Space`) with internal padding
+    // and a tight margin between them, plus 1-row safety margin above `◄≡`.
     let pad_x: u16 = if inner.width > 6 { 1 } else { 0 };
     let btn_x = inner.x + pad_x;
     let btn_w = inner.width.saturating_sub(pad_x * 2);
     let btn_w_usize = btn_w as usize;
 
     if footer_rows == 5 && btn_w > 0 {
-        let tab_y = max_y - 4;
+        let tab_y = max_y - 5;
+        let tab_bg = Color::Rgb(28, 48, 42);
+        let tab_fg = Color::Rgb(158, 206, 106);
+        let tab_bevel = format!(" ▎{}", "▁".repeat(btn_w_usize.saturating_sub(2)));
         buf.set_string(
             btn_x,
             tab_y,
             &pad_to_width(" ▎ + New Tab    ^b c ", btn_w_usize),
             Style::default()
-                .bg(Color::Rgb(26, 42, 38))
-                .fg(Color::Rgb(158, 206, 106))
+                .bg(tab_bg)
+                .fg(tab_fg)
                 .add_modifier(Modifier::BOLD),
+        );
+        buf.set_string(
+            btn_x,
+            tab_y + 1,
+            &pad_to_width(&tab_bevel, btn_w_usize),
+            Style::default().bg(tab_bg).fg(Color::Rgb(52, 88, 76)),
         );
         hits.push(HitRegion {
             rect: Rect {
                 x: btn_x,
                 y: tab_y,
                 width: btn_w,
-                height: 1,
+                height: 2,
             },
             target: HitTarget::NewTab,
         });
 
-        let sp_y = max_y - 2;
+        let sp_y = max_y - 3;
+        let sp_bg = Color::Rgb(26, 38, 56);
+        let sp_fg = Color::Rgb(125, 207, 255);
+        let sp_bevel = format!(" ▎{}", "▁".repeat(btn_w_usize.saturating_sub(2)));
         buf.set_string(
             btn_x,
             sp_y,
             &pad_to_width(" ▎ + New Space  ^b C ", btn_w_usize),
             Style::default()
-                .bg(Color::Rgb(26, 36, 52))
-                .fg(Color::Rgb(125, 207, 255))
+                .bg(sp_bg)
+                .fg(sp_fg)
                 .add_modifier(Modifier::BOLD),
+        );
+        buf.set_string(
+            btn_x,
+            sp_y + 1,
+            &pad_to_width(&sp_bevel, btn_w_usize),
+            Style::default().bg(sp_bg).fg(Color::Rgb(48, 72, 106)),
         );
         hits.push(HitRegion {
             rect: Rect {
                 x: btn_x,
                 y: sp_y,
                 width: btn_w,
-                height: 1,
+                height: 2,
             },
             target: HitTarget::NewSpacePrompt,
         });
@@ -1218,7 +1236,7 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
             tab_y,
             &pad_to_width(" ▎ + New Tab    ^b c ", btn_w_usize),
             Style::default()
-                .bg(Color::Rgb(26, 42, 38))
+                .bg(Color::Rgb(28, 48, 42))
                 .fg(Color::Rgb(158, 206, 106))
                 .add_modifier(Modifier::BOLD),
         );
@@ -1236,7 +1254,7 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
             tab_y + 1,
             &pad_to_width(" ▎ + New Space  ^b C ", btn_w_usize),
             Style::default()
-                .bg(Color::Rgb(26, 36, 52))
+                .bg(Color::Rgb(26, 38, 56))
                 .fg(Color::Rgb(125, 207, 255))
                 .add_modifier(Modifier::BOLD),
         );
@@ -1875,19 +1893,19 @@ mod tests {
             .iter()
             .any(|h| h.target == HitTarget::ToggleHelp && h.rect.height == 2));
 
-        // Sidebar footer has padded [+ New Tab] and [+ New Space] buttons with 1-row separator gaps
+        // Sidebar footer has 2-row tall [+ New Tab] and [+ New Space] buttons with tight margin
         let new_tab_hit = hits
             .iter()
-            .find(|h| h.target == HitTarget::NewTab)
-            .expect("expected NewTab hit in sidebar");
+            .find(|h| h.target == HitTarget::NewTab && h.rect.height == 2)
+            .expect("expected 2-row NewTab hit in sidebar");
         let new_space_hit = hits
             .iter()
-            .find(|h| h.target == HitTarget::NewSpacePrompt)
-            .expect("expected NewSpacePrompt hit in sidebar");
+            .find(|h| h.target == HitTarget::NewSpacePrompt && h.rect.height == 2)
+            .expect("expected 2-row NewSpacePrompt hit in sidebar");
         assert!(new_tab_hit.rect.x >= 1);
         assert_eq!(
             new_space_hit.rect.y,
-            new_tab_hit.rect.y + new_tab_hit.rect.height + 1
+            new_tab_hit.rect.y + new_tab_hit.rect.height
         );
         assert!(22 >= new_space_hit.rect.y + new_space_hit.rect.height + 1);
     }
