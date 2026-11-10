@@ -26,12 +26,14 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
+use std::borrow::Cow;
 use std::io::{self, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const SCROLLBACK_LINES: usize = 5000;
-const MAX_MSGS_PER_TICK: usize = 64;
+const SCROLLBACK_LINES: usize = 2000;
+const ATTACH_HISTORY_LINES: usize = 80;
+const MAX_MSGS_PER_TICK: usize = 256;
 
 struct TerminalCleanupGuard;
 
@@ -85,14 +87,17 @@ struct AttachedTerminal {
     rows: u16,
 }
 
-fn sanitize_vt_bytes(payload: &[u8]) -> Vec<u8> {
+fn sanitize_vt_bytes(payload: &[u8]) -> Cow<'_, [u8]> {
+    if !payload.windows(7).any(|w| w == b"\x1b[?9001") {
+        return Cow::Borrowed(payload);
+    }
     let mut out = payload.to_vec();
     for seq in [&b"\x1b[?9001h"[..], b"\x1b[?9001l"] {
         while let Some(pos) = out.windows(seq.len()).position(|w| w == seq) {
             out.drain(pos..pos + seq.len());
         }
     }
-    out
+    Cow::Owned(out)
 }
 
 fn base64_encode(input: &[u8]) -> String {
@@ -320,7 +325,7 @@ fn sync_attached_terminal(
     attached: &mut Option<AttachedTerminal>,
     term_rect: Rect,
     scrollback_offset: &mut usize,
-) {
+) -> bool {
     let cols = term_rect.width.max(1);
     let rows = term_rect.height.max(1);
     let want_addr = world.active_terminal_address();
@@ -329,7 +334,7 @@ fn sync_attached_terminal(
         if let Some(prev) = attached.take() {
             core.detach_channel(prev.channel);
         }
-        return;
+        return false;
     };
 
     if let Some(cur) = attached.as_mut() {
@@ -340,14 +345,14 @@ fn sync_attached_terminal(
                 cur.parser.set_size(rows, cols);
                 core.resize_channel(cur.channel, cols, rows);
             }
-            return;
+            return false;
         }
         core.detach_channel(cur.channel);
         *attached = None;
     }
 
     *scrollback_offset = 0;
-    if let Ok(ch) = core.attach_terminal(&addr, cols, rows, 200) {
+    if let Ok(ch) = core.attach_terminal(&addr, cols, rows, ATTACH_HISTORY_LINES) {
         let parser = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
         *attached = Some(AttachedTerminal {
             address: addr,
@@ -357,7 +362,9 @@ fn sync_attached_terminal(
             rows,
         });
         world.mark_active_seen(core);
+        return true;
     }
+    false
 }
 
 fn execute_action(
@@ -512,7 +519,7 @@ fn run_app(
         let term_rect = compute_terminal_rect(area, *sidebar_open, sidebar_width, touch_mode);
 
         let prev_addr = attached.as_ref().map(|a| a.address.clone());
-        sync_attached_terminal(
+        let newly_attached = sync_attached_terminal(
             core,
             world,
             &mut attached,
@@ -522,54 +529,36 @@ fn run_app(
         if attached.as_ref().map(|a| &a.address) != prev_addr.as_ref() {
             selection = None;
             selection_screen = None;
+            dirty = true;
         }
 
-        if let Some(att) = attached.as_mut() {
-            att.parser.set_scrollback(scrollback_offset);
-            scrollback_offset = att.parser.screen().scrollback();
-        }
-
-        if dirty {
-            let scr_ref = if selection.as_ref().is_some_and(|s| s.active) {
-                selection_screen
-                    .as_ref()
-                    .or_else(|| attached.as_ref().map(|a| a.parser.screen()))
-            } else {
-                attached.as_ref().map(|a| a.parser.screen())
-            };
-            let copied_flash = copied_until.is_some();
-            terminal.draw(|f| {
-                let geom = render_ui(
-                    f,
-                    world,
-                    scr_ref,
-                    *sidebar_open,
-                    sidebar_width,
-                    touch_mode,
-                    prefix_active,
-                    ctrl_active,
-                    alt_active,
-                    scrollback_offset,
-                    selection.as_ref(),
-                    copied_flash,
-                    &modal,
-                );
-                last_hits = geom.hits;
-            })?;
-            dirty = false;
-        }
-
-        // Drain pending messages from `herdr-core` with a per-tick count and time budget
-        // so high-volume PTY output cannot starve rendering or keyboard input.
+        // Drain pending messages from `herdr-core` BEFORE rendering so that initial attach
+        // history replays and multi-frame output bursts are coalesced into a single screen draw
+        // without flashing a blank screen or intermediate scrollback frames.
         let drain_start = Instant::now();
         let mut drained = 0usize;
         let mut more_messages = false;
-        while let Ok(msg) = core_rx.try_recv() {
+        let mut coalesce_burst = newly_attached;
+        loop {
+            let next_msg = if drained == 0 && newly_attached {
+                core_rx.recv_timeout(Duration::from_millis(25)).ok()
+            } else if let Ok(msg) = core_rx.try_recv() {
+                Some(msg)
+            } else if coalesce_burst && drain_start.elapsed() < Duration::from_millis(14) {
+                core_rx.recv_timeout(Duration::from_millis(2)).ok()
+            } else {
+                None
+            };
+            let Some(msg) = next_msg else {
+                break;
+            };
             dirty = true;
             drained += 1;
             match msg {
                 CoreMessage::TerminalData { channel, data } => {
-                    core.ack_credit(channel, data.len() as u32);
+                    if data.len() >= 4096 {
+                        coalesce_burst = true;
+                    }
                     if let Some(att) = attached.as_mut() {
                         if att.channel == channel {
                             let clean = sanitize_vt_bytes(&data);
@@ -621,7 +610,7 @@ fn run_app(
                 CoreMessage::Disconnected => return Ok(()),
             }
             if drained >= MAX_MSGS_PER_TICK
-                || drain_start.elapsed() >= Duration::from_millis(8)
+                || drain_start.elapsed() >= Duration::from_millis(16)
             {
                 more_messages = true;
                 break;
@@ -647,10 +636,45 @@ fn run_app(
             }
         }
 
+        if let Some(att) = attached.as_mut() {
+            att.parser.set_scrollback(scrollback_offset);
+            scrollback_offset = att.parser.screen().scrollback();
+        }
+
+        if dirty {
+            let scr_ref = if selection.as_ref().is_some_and(|s| s.active) {
+                selection_screen
+                    .as_ref()
+                    .or_else(|| attached.as_ref().map(|a| a.parser.screen()))
+            } else {
+                attached.as_ref().map(|a| a.parser.screen())
+            };
+            let copied_flash = copied_until.is_some();
+            terminal.draw(|f| {
+                let geom = render_ui(
+                    f,
+                    world,
+                    scr_ref,
+                    *sidebar_open,
+                    sidebar_width,
+                    touch_mode,
+                    prefix_active,
+                    ctrl_active,
+                    alt_active,
+                    scrollback_offset,
+                    selection.as_ref(),
+                    copied_flash,
+                    &modal,
+                );
+                last_hits = geom.hits;
+            })?;
+            dirty = false;
+        }
+
         let poll_timeout = if more_messages {
             Duration::ZERO
         } else {
-            Duration::from_millis(16)
+            Duration::from_millis(4)
         };
         if !event::poll(poll_timeout)? {
             continue;
@@ -878,7 +902,7 @@ fn run_app(
                             let rel_col = mx.saturating_sub(term_rect.x);
                             let rel_row = my.saturating_sub(term_rect.y);
                             selection = Some(TerminalSelection::new(rel_row, rel_col));
-                            selection_screen = attached.as_ref().map(|a| a.parser.screen().clone());
+                            selection_screen = None;
                         } else {
                             selection = None;
                             selection_screen = None;
@@ -896,6 +920,10 @@ fn run_app(
                                     .saturating_sub(term_rect.y)
                                     .min(term_rect.height.saturating_sub(1));
                                 sel.head = (rel_row, rel_col);
+                                if sel.is_non_empty() && selection_screen.is_none() {
+                                    selection_screen =
+                                        attached.as_ref().map(|a| a.parser.screen().clone());
+                                }
                             }
                         }
                     }
