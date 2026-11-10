@@ -750,7 +750,7 @@ fn render_bottom_touchbar(
         x += 1;
     }
 
-    // 3. Constant-width Herdr App-style Touchbar Keys (`[^B]`, `[Esc]`, `[Ctrl]`, `[Alt]`, `[Tab]`, `[←]`, `[↓]`, `[↑]`, `[→]`, `[⎘]`)
+    // 3. Constant-width Herdr App-style Touchbar Keys (`[^B]`, `[Esc]`, `[Ctrl]`, `[Alt]`, `[Tab]`, `[←]`, `[↓]`, `[↑]`, `[→]`, `⎘`)
     // `[^C]` is intentionally omitted to prevent accidental process interruption.
     // All labels have invariant character widths for a given `rect.width` so toggling `^B`/`Ctrl`/`Alt`
     // or scrolling never causes horizontal jitter.
@@ -802,7 +802,7 @@ fn render_bottom_touchbar(
             false,
         ),
         (
-            if wide_keys { " [⎘] " } else { "[⎘]" },
+            if wide_keys { "  ⎘  " } else { " ⎘ " },
             HitTarget::PasteClipboard,
             false,
         ),
@@ -1465,7 +1465,7 @@ fn render_help_modal(f: &mut Frame, area: Rect, hits: &mut Vec<HitRegion>) {
         Line::from("  Tap ● ○ ✓ on Touchbar    Switch directly to Tab (no body swipe conflict)"),
         Line::from("  Tap ▾ / ▸ on Space       Collapse / expand Space's child Tabs in sidebar"),
         Line::from("  Prefix / Modifiers       Tap [^B], [Ctrl], or [Alt] on bottom touchbar"),
-        Line::from("  Clipboard Copy / Paste   Drag text to copy (OSC 52); Tap [⎘] to paste"),
+        Line::from("  Clipboard Copy / Paste   Drag text to copy (OSC 52); Tap ⎘ to paste"),
         Line::from("  Next / Prev Tab          ^b n / ^b p   or  Alt+Right / Alt+Left"),
         Line::from("  Switch Tab 1..9          ^b 1..9       or  Alt+1..9"),
         Line::from("  New Tab in Space         ^b c          or  Tap [+ New Tab] in sidebar"),
