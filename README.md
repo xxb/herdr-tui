@@ -17,7 +17,10 @@ A fast, lightweight **multi-tab TUI client** for [`herdr-core` (`hc`)](https://g
   - **Top Bar (1 row)**: Shows sidebar toggle `[≡]`, active `[Space]`, numbered tabs with live Agent status indicators (`◉` blocked, `●` working, `✓` done, `○` idle), and a `[+]` new-tab button.
   - **Left Sidebar (`^b b`)**: Displays the full tree of Spaces, Tabs, and Agent statuses. Automatically collapses on narrow screens (`< 80` cols) and can be toggled anytime via `Ctrl+b b` or tapping `[≡]`.
 - **Touch & Mouse Friendly for iPad / Mobile SSH (触控与鼠标丝滑切换)**
-  Tap any tab on the top bar, tap `[+]` to open a new tab, tap `[≡]` to toggle the sidebar, or tap any Space/Tab in the sidebar.
+  - **Tap Top Bar**: Tap any tab to switch, tap `[+]` to open a new tab, tap `[≡]` to toggle the sidebar, tap `[^B]` to toggle the `Ctrl+b` prefix key without a hardware keyboard, tap `[SCROLL ▼]` to jump back to the bottom of scrollback, or tap `[ ? ]` to open the **Touch Quick Actions** panel.
+  - **Swipe Terminal Body**: Swipe left/right inside the main terminal body to switch to the Next/Previous Tab (automatically ignores the leftmost/rightmost 2 screen columns to avoid conflicting with iPadOS edge-back gestures).
+  - **2-Row Large Touch Mode (`hct --touch`)**: Doubles the height of the top bar (2 rows) for larger finger hit targets on tablets.
+  - **Touch-Interactive Modals**: Directly tap items in the Fuzzy Switcher (`^b w`), tap Confirm/Cancel buttons in dialogs, or tap any of the 12 quick-action buttons in the `[ ? ]` panel.
 - **Classic `herdr` Keybindings (兼容旧版 `herdr` 快捷键)**
   Compatible with `~/.config/herdr/config.toml` and `~/.config/herdr-tui/config.toml`.
 - **Shared Attention (`herdr.seen`)**

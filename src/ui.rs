@@ -1,6 +1,7 @@
 //! TUI rendering (`ratatui` + `vt100`) with Top Tab Bar, Collapsible Left Sidebar,
 //! touch/mouse hit-testing regions, and modal overlays.
 
+use crate::keys::Action;
 use crate::model::{AgentState, World};
 use ratatui::{
     buffer::Buffer,
@@ -12,7 +13,7 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HitTarget {
     ToggleSidebar,
     NextSpace,
@@ -20,13 +21,32 @@ pub enum HitTarget {
     SelectTab { space_id: String, tab_id: String },
     NewTab,
     NewSpacePrompt,
+    TogglePrefix,
+    ExitScrollback,
     ToggleHelp,
+    ConfirmCloseYes { tab_id: String },
+    SubmitPrompt,
+    CancelModal,
+    ModalNoop,
+    TriggerAction(Action),
 }
 
 #[derive(Clone, Debug)]
 pub struct HitRegion {
     pub rect: Rect,
     pub target: HitTarget,
+}
+
+pub fn find_hit_target(hits: &[HitRegion], col: u16, row: u16) -> Option<HitTarget> {
+    hits.iter()
+        .rev()
+        .find(|h| {
+            col >= h.rect.x
+                && col < h.rect.x.saturating_add(h.rect.width)
+                && row >= h.rect.y
+                && row < h.rect.y.saturating_add(h.rect.height)
+        })
+        .map(|h| h.target.clone())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,9 +191,25 @@ pub struct UiGeometry {
     pub hits: Vec<HitRegion>,
 }
 
-pub fn compute_terminal_rect(area: Rect, sidebar_open: bool, sidebar_width: u16) -> Rect {
-    let body_height = area.height.saturating_sub(1).max(1);
-    let body_y = area.y + 1;
+pub fn top_bar_height(area: Rect, touch_mode: bool) -> u16 {
+    if area.height == 0 {
+        0
+    } else if touch_mode && area.height >= 6 {
+        2
+    } else {
+        1
+    }
+}
+
+pub fn compute_terminal_rect(
+    area: Rect,
+    sidebar_open: bool,
+    sidebar_width: u16,
+    touch_mode: bool,
+) -> Rect {
+    let tb_h = top_bar_height(area, touch_mode);
+    let body_height = area.height.saturating_sub(tb_h).max(1);
+    let body_y = area.y + tb_h.min(area.height.saturating_sub(1));
     let sw = if sidebar_open && area.width > sidebar_width + 20 {
         sidebar_width
     } else {
@@ -187,24 +223,27 @@ pub fn compute_terminal_rect(area: Rect, sidebar_open: bool, sidebar_width: u16)
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn render_ui(
     f: &mut Frame,
     world: &World,
     screen: Option<&vt100::Screen>,
     sidebar_open: bool,
     sidebar_width: u16,
+    touch_mode: bool,
     prefix_active: bool,
     scrollback_offset: usize,
     modal: &Modal,
 ) -> UiGeometry {
     let area = f.area();
     let mut hits = Vec::new();
+    let tb_h = top_bar_height(area, touch_mode);
 
     let top_rect = Rect {
         x: area.x,
         y: area.y,
         width: area.width,
-        height: 1.min(area.height),
+        height: tb_h,
     };
 
     render_top_bar(
@@ -217,15 +256,15 @@ pub fn render_ui(
         &mut hits,
     );
 
-    let term_rect = compute_terminal_rect(area, sidebar_open, sidebar_width);
+    let term_rect = compute_terminal_rect(area, sidebar_open, sidebar_width, touch_mode);
     let actual_sidebar_w = term_rect.x.saturating_sub(area.x);
 
-    if actual_sidebar_w > 0 && area.height > 1 {
+    if actual_sidebar_w > 0 && area.height > tb_h {
         let side_rect = Rect {
             x: area.x,
-            y: area.y + 1,
+            y: area.y + tb_h,
             width: actual_sidebar_w,
-            height: area.height - 1,
+            height: area.height - tb_h,
         };
         render_sidebar(f, side_rect, world, &mut hits);
     }
@@ -249,17 +288,57 @@ pub fn render_ui(
 
     match modal {
         Modal::None => {}
-        Modal::Help => render_help_modal(f, area),
-        Modal::ConfirmCloseTab { tab_title, .. } => render_confirm_close_modal(f, area, tab_title),
-        Modal::Prompt { kind, input } => render_prompt_modal(f, area, kind, input),
+        Modal::Help => render_help_modal(f, area, &mut hits),
+        Modal::ConfirmCloseTab {
+            tab_id,
+            tab_title,
+        } => render_confirm_close_modal(f, area, tab_id, tab_title, &mut hits),
+        Modal::Prompt { kind, input } => render_prompt_modal(f, area, kind, input, &mut hits),
         Modal::Fuzzy {
             query,
             selected,
             selected_tab_id,
-        } => render_fuzzy_modal(f, area, world, query, *selected, selected_tab_id.as_deref()),
+        } => render_fuzzy_modal(
+            f,
+            area,
+            world,
+            query,
+            *selected,
+            selected_tab_id.as_deref(),
+            &mut hits,
+        ),
     }
 
     UiGeometry { term_rect, hits }
+}
+
+fn draw_top_bar_pill(
+    buf: &mut Buffer,
+    x: u16,
+    rect: Rect,
+    label: &str,
+    style: Style,
+    emphasized_underline: bool,
+) {
+    if rect.height == 0 {
+        return;
+    }
+    let lw = label.width() as u16;
+    buf.set_string(x, rect.y, label, style);
+    if rect.height >= 2 && lw > 0 {
+        let line_ch = if emphasized_underline { "═" } else { "─" };
+        let mut bottom = String::with_capacity(lw as usize * 3);
+        if lw >= 2 {
+            bottom.push(' ');
+            for _ in 0..(lw - 2) {
+                bottom.push_str(line_ch);
+            }
+            bottom.push(' ');
+        } else {
+            bottom.push_str(line_ch);
+        }
+        buf.set_string(x, rect.y + 1, &bottom, style);
+    }
 }
 
 fn render_top_bar(
@@ -271,6 +350,9 @@ fn render_top_bar(
     scrollback_offset: usize,
     hits: &mut Vec<HitRegion>,
 ) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
     let bg_bar = Style::default().bg(Color::Rgb(24, 24, 36)).fg(Color::Gray);
     f.render_widget(Block::default().style(bg_bar), rect);
 
@@ -290,13 +372,13 @@ fn render_top_bar(
             })
             .fg(Color::White)
             .add_modifier(Modifier::BOLD);
-        buf.set_string(x, rect.y, sb_label, style);
+        draw_top_bar_pill(buf, x, rect, sb_label, style, sidebar_open);
         hits.push(HitRegion {
             rect: Rect {
                 x,
                 y: rect.y,
                 width: sb_w,
-                height: 1,
+                height: rect.height,
             },
             target: HitTarget::ToggleSidebar,
         });
@@ -312,15 +394,15 @@ fn render_top_bar(
         if x + bw <= max_x {
             let style = Style::default()
                 .bg(Color::Rgb(42, 46, 68))
-                .fg( Color::Cyan )
+                .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD);
-            buf.set_string(x, rect.y, &badge, style);
+            draw_top_bar_pill(buf, x, rect, &badge, style, true);
             hits.push(HitRegion {
                 rect: Rect {
                     x,
                     y: rect.y,
                     width: bw,
-                    height: 1,
+                    height: rect.height,
                 },
                 target: HitTarget::NextSpace,
             });
@@ -328,16 +410,20 @@ fn render_top_bar(
         }
     }
 
-    // Reserve right status area width
-    let right_text = if prefix_active {
-        " PREFIX (^b) "
-    } else if scrollback_offset > 0 {
-        " SCROLL (q:exit) "
+    // Reserve right touch buttons: optional `[SCROLL -N ▼]`, `[^B]`, and `[ ? ]`
+    let scroll_lbl = if scrollback_offset > 0 {
+        Some(format!(" [SCROLL -{scrollback_offset} ▼] "))
     } else {
-        " ^b ?:Help "
+        None
     };
-    let right_w = right_text.width() as u16;
-    let avail_end = max_x.saturating_sub(right_w);
+    let prefix_lbl = if prefix_active { " [^B*] " } else { " [^B] " };
+    let help_lbl = " [ ? ] ";
+
+    let scroll_w = scroll_lbl.as_ref().map_or(0, |s| s.width() as u16);
+    let prefix_w = prefix_lbl.width() as u16;
+    let help_w = help_lbl.width() as u16;
+    let total_right_w = scroll_w + prefix_w + help_w;
+    let avail_end = max_x.saturating_sub(total_right_w);
 
     // 3. Tabs strip in active Space (scrolled so active_tab_index is visible)
     if let Some(space) = world.active_space() {
@@ -405,7 +491,7 @@ fn render_top_bar(
             if is_active {
                 style = style.add_modifier(Modifier::BOLD);
             }
-            buf.set_string(x, rect.y, &rendered_lbl, style);
+            draw_top_bar_pill(buf, x, rect, &rendered_lbl, style, is_active);
 
             // Colorize the status dot inside the tab pill if it wasn't truncated out
             let num_prefix = format!(" {}:", ti + 1);
@@ -424,7 +510,7 @@ fn render_top_bar(
                     x,
                     y: rect.y,
                     width: lw,
-                    height: 1,
+                    height: rect.height,
                 },
                 target: HitTarget::SelectTab {
                     space_id: space_id.clone(),
@@ -434,7 +520,9 @@ fn render_top_bar(
             x += lw;
 
             if x < avail_end {
-                buf.set_string(x, rect.y, "│", bg_bar.fg(Color::Rgb(60, 60, 80)));
+                for r in 0..rect.height {
+                    buf.set_string(x, rect.y + r, "│", bg_bar.fg(Color::Rgb(60, 60, 80)));
+                }
                 x += 1;
             }
         }
@@ -443,49 +531,82 @@ fn render_top_bar(
         let plus_lbl = " [+] ";
         let pw = plus_lbl.width() as u16;
         if x + pw <= avail_end {
-            buf.set_string(
-                x,
-                rect.y,
-                plus_lbl,
-                Style::default()
-                    .bg(Color::Rgb(36, 56, 46))
-                    .fg(Color::LightGreen)
-                    .add_modifier(Modifier::BOLD),
-            );
+            let pstyle = Style::default()
+                .bg(Color::Rgb(36, 56, 46))
+                .fg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD);
+            draw_top_bar_pill(buf, x, rect, plus_lbl, pstyle, false);
             hits.push(HitRegion {
                 rect: Rect {
                     x,
                     y: rect.y,
                     width: pw,
-                    height: 1,
+                    height: rect.height,
                 },
                 target: HitTarget::NewTab,
             });
         }
     }
 
-    // 5. Right status pill
-    if avail_end + right_w <= max_x {
-        let rstyle = if prefix_active {
+    // 5. Right touch buttons: `[SCROLL -N ▼]`, `[^B]`, and `[ ? ]`
+    let mut rx = avail_end;
+    if let Some(ref slbl) = scroll_lbl {
+        if rx + scroll_w <= max_x {
+            let sstyle = Style::default()
+                .bg(Color::LightCyan)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD);
+            draw_top_bar_pill(buf, rx, rect, slbl, sstyle, true);
+            hits.push(HitRegion {
+                rect: Rect {
+                    x: rx,
+                    y: rect.y,
+                    width: scroll_w,
+                    height: rect.height,
+                },
+                target: HitTarget::ExitScrollback,
+            });
+            rx += scroll_w;
+        }
+    }
+
+    if rx + prefix_w <= max_x {
+        let pstyle = if prefix_active {
             Style::default()
                 .bg(Color::LightYellow)
                 .fg(Color::Black)
                 .add_modifier(Modifier::BOLD)
-        } else if scrollback_offset > 0 {
-            Style::default()
-                .bg(Color::LightCyan)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().bg(Color::Rgb(36, 36, 54)).fg(Color::Gray)
+            Style::default()
+                .bg(Color::Rgb(44, 46, 68))
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
         };
-        buf.set_string(avail_end, rect.y, right_text, rstyle);
+        draw_top_bar_pill(buf, rx, rect, prefix_lbl, pstyle, prefix_active);
         hits.push(HitRegion {
             rect: Rect {
-                x: avail_end,
+                x: rx,
                 y: rect.y,
-                width: right_w,
-                height: 1,
+                width: prefix_w,
+                height: rect.height,
+            },
+            target: HitTarget::TogglePrefix,
+        });
+        rx += prefix_w;
+    }
+
+    if rx + help_w <= max_x {
+        let hstyle = Style::default()
+            .bg(Color::Rgb(36, 36, 54))
+            .fg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD);
+        draw_top_bar_pill(buf, rx, rect, help_lbl, hstyle, false);
+        hits.push(HitRegion {
+            rect: Rect {
+                x: rx,
+                y: rect.y,
+                width: help_w,
+                height: rect.height,
             },
             target: HitTarget::ToggleHelp,
         });
@@ -721,86 +842,333 @@ fn centered_rect(width: u16, height: u16, r: Rect) -> Rect {
     }
 }
 
-fn render_help_modal(f: &mut Frame, area: Rect) {
-    let popup = centered_rect(64, 21, area);
+fn draw_modal_close_button(buf: &mut Buffer, popup: Rect, hits: &mut Vec<HitRegion>) {
+    let close_lbl = " [ ✕ ] ";
+    let cw = close_lbl.width() as u16;
+    if popup.width > cw + 4 {
+        let cx = popup.x + popup.width - cw - 2;
+        let cy = popup.y;
+        buf.set_string(
+            cx,
+            cy,
+            close_lbl,
+            Style::default()
+                .bg(Color::Rgb(85, 36, 46))
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        );
+        hits.push(HitRegion {
+            rect: Rect {
+                x: cx,
+                y: cy,
+                width: cw,
+                height: 1,
+            },
+            target: HitTarget::CancelModal,
+        });
+    }
+}
+
+fn render_help_modal(f: &mut Frame, area: Rect, hits: &mut Vec<HitRegion>) {
+    hits.clear();
+    let popup = centered_rect(68, 26, area);
     f.render_widget(Clear, popup);
+    hits.push(HitRegion {
+        rect: popup,
+        target: HitTarget::ModalNoop,
+    });
+
     let lines = vec![
         Line::from(Span::styled(
-            "herdr-tui (hct) Keyboard & Touch Shortcuts",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            "  Touch Quick Actions (Tap to execute):",
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("  Prefix Key               Ctrl+b (press twice to send literal ^b)"),
+        Line::from(""),
+        Line::from(""),
+        Line::from(""),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Keyboard & Touch Gesture Shortcuts:",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )),
+        Line::from("  Swipe Left / Right       In terminal body -> Next / Prev Tab"),
+        Line::from("  Prefix Key               Ctrl+b or Tap [^B] on top bar"),
         Line::from("  Next / Prev Tab          ^b n / ^b p   or  Alt+Right / Alt+Left"),
         Line::from("  Switch Tab 1..9          ^b 1..9       or  Alt+1..9"),
         Line::from("  New Tab in Space         ^b c          or  Tap [+] on top bar"),
-        Line::from("  Rename Current Tab       ^b ,"),
-        Line::from("  Close Current Tab        ^b x"),
+        Line::from("  Rename / Close Tab       ^b , (rename) /   ^b x (close)"),
         Line::from("  Next / Prev Space        ^b Down / Up  or  Alt+Down / Alt+Up"),
         Line::from("  New / Rename Space       ^b C (new)    /   ^b $ (rename)"),
         Line::from("  Toggle Left Sidebar      ^b b          or  Tap [≡] on top bar"),
         Line::from("  Quick Fuzzy Switcher     ^b w          or  ^b f"),
         Line::from("  Jump Next Alert Agent    ^b a          (◉ blocked / ✓ done)"),
-        Line::from("  Cycle Pane in Split Tab  ^b o"),
-        Line::from("  Scrollback / History     ^b [          or  Mouse Wheel Up/Down"),
+        Line::from("  Scrollback / History     ^b [          or  Tap [SCROLL ▼] to exit"),
         Line::from("  Detach (keep running)    ^b q / ^b d   or  Ctrl+\\"),
         Line::from(""),
         Line::from(Span::styled(
-            "Press Esc, Enter, or ? to close",
+            "  Tap outside, [ ✕ ], Esc, Enter, or ? to close",
             Style::default().fg(Color::DarkGray),
         )),
     ];
     let block = Block::default()
-        .title(" Help ")
+        .title(" Quick Actions & Help ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .style(Style::default().bg(Color::Rgb(22, 24, 36)).fg(Color::White));
+    let inner = block.inner(popup);
     f.render_widget(Paragraph::new(lines).block(block), popup);
+
+    let buf = f.buffer_mut();
+    draw_modal_close_button(buf, popup, hits);
+
+    // Render 4x3 grid of touch quick-action buttons in rows 1..=4 of `inner`
+    let quick_rows: [[(&str, HitTarget); 3]; 4] = [
+        [
+            (" [ + New Tab    ] ", HitTarget::TriggerAction(Action::NewTab)),
+            (
+                " [ ✕ Close Tab  ] ",
+                HitTarget::TriggerAction(Action::CloseTab),
+            ),
+            (
+                " [ ✎ Rename Tab ] ",
+                HitTarget::TriggerAction(Action::RenameTab),
+            ),
+        ],
+        [
+            (
+                " [ 🔍 Fuzzy Find ] ",
+                HitTarget::TriggerAction(Action::FuzzyFinder),
+            ),
+            (
+                " [ ⚡ Next Alert ] ",
+                HitTarget::TriggerAction(Action::JumpAlertAgent),
+            ),
+            (
+                " [ ⇕ Scrollback ] ",
+                HitTarget::TriggerAction(Action::EnterScrollback),
+            ),
+        ],
+        [
+            (
+                " [ + New Space  ] ",
+                HitTarget::TriggerAction(Action::NewSpace),
+            ),
+            (
+                " [ ✎ Ren Space  ] ",
+                HitTarget::TriggerAction(Action::RenameSpace),
+            ),
+            (
+                " [ ⇄ Next Space ] ",
+                HitTarget::TriggerAction(Action::NextSpace),
+            ),
+        ],
+        [
+            (
+                " [ ◧ Sidebar    ] ",
+                HitTarget::TriggerAction(Action::ToggleSidebar),
+            ),
+            (" [ ⏏ Detach hct ] ", HitTarget::TriggerAction(Action::Detach)),
+            (" [ ✕ Close Help ] ", HitTarget::CancelModal),
+        ],
+    ];
+
+    for (r_idx, row_btns) in quick_rows.into_iter().enumerate() {
+        let by = inner.y + 1 + r_idx as u16;
+        if by >= inner.y + inner.height {
+            break;
+        }
+        let mut bx = inner.x + 2;
+        for (lbl, target) in row_btns {
+            let bw = lbl.width() as u16;
+            if bx + bw > inner.x + inner.width {
+                break;
+            }
+            let bstyle = Style::default()
+                .bg(Color::Rgb(42, 52, 82))
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD);
+            buf.set_string(bx, by, lbl, bstyle);
+            hits.push(HitRegion {
+                rect: Rect {
+                    x: bx,
+                    y: by,
+                    width: bw,
+                    height: 1,
+                },
+                target,
+            });
+            bx += bw + 2;
+        }
+    }
 }
 
-fn render_confirm_close_modal(f: &mut Frame, area: Rect, tab_title: &str) {
-    let popup = centered_rect(50, 7, area);
+fn render_confirm_close_modal(
+    f: &mut Frame,
+    area: Rect,
+    tab_id: &str,
+    tab_title: &str,
+    hits: &mut Vec<HitRegion>,
+) {
+    hits.clear();
+    let popup = centered_rect(56, 8, area);
     f.render_widget(Clear, popup);
+    hits.push(HitRegion {
+        rect: popup,
+        target: HitTarget::ModalNoop,
+    });
+
     let lines = vec![
         Line::from(""),
         Line::from(format!("  Close tab \"{tab_title}\" and kill its terminal?")),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  [y / Enter] Confirm     [n / Esc] Cancel",
-            Style::default().fg(Color::LightYellow),
-        )),
     ];
     let block = Block::default()
         .title(" Close Tab ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::LightRed))
         .style(Style::default().bg(Color::Rgb(28, 20, 28)).fg(Color::White));
+    let inner = block.inner(popup);
     f.render_widget(Paragraph::new(lines).block(block), popup);
+
+    let buf = f.buffer_mut();
+    draw_modal_close_button(buf, popup, hits);
+
+    if inner.height >= 4 {
+        let by = inner.y + 3;
+        let yes_lbl = " [ ✓ Confirm Close (Y) ] ";
+        let no_lbl = " [ ✕ Cancel (N) ] ";
+        let yw = yes_lbl.width() as u16;
+        let nw = no_lbl.width() as u16;
+        let bx = inner.x + 2;
+        if bx + yw <= inner.x + inner.width {
+            buf.set_string(
+                bx,
+                by,
+                yes_lbl,
+                Style::default()
+                    .bg(Color::Rgb(110, 36, 44))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            );
+            hits.push(HitRegion {
+                rect: Rect {
+                    x: bx,
+                    y: by,
+                    width: yw,
+                    height: 1,
+                },
+                target: HitTarget::ConfirmCloseYes {
+                    tab_id: tab_id.to_string(),
+                },
+            });
+        }
+        let nx = bx + yw + 3;
+        if nx + nw <= inner.x + inner.width {
+            buf.set_string(
+                nx,
+                by,
+                no_lbl,
+                Style::default()
+                    .bg(Color::Rgb(48, 52, 72))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            );
+            hits.push(HitRegion {
+                rect: Rect {
+                    x: nx,
+                    y: by,
+                    width: nw,
+                    height: 1,
+                },
+                target: HitTarget::CancelModal,
+            });
+        }
+    }
 }
 
-fn render_prompt_modal(f: &mut Frame, area: Rect, kind: &PromptKind, input: &str) {
-    let popup = centered_rect(52, 6, area);
+fn render_prompt_modal(
+    f: &mut Frame,
+    area: Rect,
+    kind: &PromptKind,
+    input: &str,
+    hits: &mut Vec<HitRegion>,
+) {
+    hits.clear();
+    let popup = centered_rect(56, 8, area);
     f.render_widget(Clear, popup);
+    hits.push(HitRegion {
+        rect: popup,
+        target: HitTarget::ModalNoop,
+    });
+
     let title = match kind {
         PromptKind::RenameTab { .. } => " Rename Tab (empty = auto) ",
         PromptKind::RenameSpace { .. } => " Rename Space (empty = folder name) ",
         PromptKind::NewSpace => " New Space Name ",
     };
-    let lines = vec![
-        Line::from(""),
-        Line::from(format!("  > {input}▏")),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  [Enter] Save     [Esc] Cancel",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
+    let lines = vec![Line::from(""), Line::from(format!("  > {input}▏"))];
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .style(Style::default().bg(Color::Rgb(22, 24, 36)).fg(Color::White));
+    let inner = block.inner(popup);
     f.render_widget(Paragraph::new(lines).block(block), popup);
+
+    let buf = f.buffer_mut();
+    draw_modal_close_button(buf, popup, hits);
+
+    if inner.height >= 4 {
+        let by = inner.y + 3;
+        let ok_lbl = " [ ✓ Confirm (Enter) ] ";
+        let cancel_lbl = " [ ✕ Cancel (Esc) ] ";
+        let ow = ok_lbl.width() as u16;
+        let cw = cancel_lbl.width() as u16;
+        let bx = inner.x + 2;
+        if bx + ow <= inner.x + inner.width {
+            buf.set_string(
+                bx,
+                by,
+                ok_lbl,
+                Style::default()
+                    .bg(Color::Rgb(36, 82, 58))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            );
+            hits.push(HitRegion {
+                rect: Rect {
+                    x: bx,
+                    y: by,
+                    width: ow,
+                    height: 1,
+                },
+                target: HitTarget::SubmitPrompt,
+            });
+        }
+        let cx = bx + ow + 3;
+        if cx + cw <= inner.x + inner.width {
+            buf.set_string(
+                cx,
+                by,
+                cancel_lbl,
+                Style::default()
+                    .bg(Color::Rgb(48, 52, 72))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            );
+            hits.push(HitRegion {
+                rect: Rect {
+                    x: cx,
+                    y: by,
+                    width: cw,
+                    height: 1,
+                },
+                target: HitTarget::CancelModal,
+            });
+        }
+    }
 }
 
 fn render_fuzzy_modal(
@@ -810,9 +1178,16 @@ fn render_fuzzy_modal(
     query: &str,
     selected: usize,
     selected_tab_id: Option<&str>,
+    hits: &mut Vec<HitRegion>,
 ) {
+    hits.clear();
     let popup = centered_rect(72, 18, area);
     f.render_widget(Clear, popup);
+    hits.push(HitRegion {
+        rect: popup,
+        target: HitTarget::ModalNoop,
+    });
+
     let block = Block::default()
         .title(" Quick Switch Space / Tab (^b w) ")
         .borders(Borders::ALL)
@@ -867,4 +1242,118 @@ fn render_fuzzy_modal(
         list_state.select(Some(sel));
     }
     f.render_stateful_widget(List::new(list_items), chunks[1], &mut list_state);
+
+    let buf = f.buffer_mut();
+    draw_modal_close_button(buf, popup, hits);
+
+    // Register touch hit regions for each visible row in the Fuzzy list
+    let offset = list_state.offset();
+    for row_idx in 0..(chunks[1].height as usize) {
+        if let Some(it) = items.get(offset + row_idx) {
+            hits.push(HitRegion {
+                rect: Rect {
+                    x: chunks[1].x,
+                    y: chunks[1].y + row_idx as u16,
+                    width: chunks[1].width,
+                    height: 1,
+                },
+                target: HitTarget::SelectTab {
+                    space_id: it.space_id.clone(),
+                    tab_id: it.tab_id.clone(),
+                },
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    #[test]
+    fn top_bar_touch_mode_doubles_hit_height_and_exposes_buttons() {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let world = World::default();
+        let mut hits = Vec::new();
+
+        terminal
+            .draw(|f| {
+                let geom = render_ui(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    true, // touch_mode = true (2-row top bar)
+                    false,
+                    42, // scrollback_offset > 0
+                    &Modal::None,
+                );
+                hits = geom.hits;
+                assert_eq!(geom.term_rect.y, 2);
+            })
+            .unwrap();
+
+        // Sidebar toggle on row 0 and row 1 should both hit ToggleSidebar
+        assert_eq!(
+            find_hit_target(&hits, 1, 0),
+            Some(HitTarget::ToggleSidebar)
+        );
+        assert_eq!(
+            find_hit_target(&hits, 1, 1),
+            Some(HitTarget::ToggleSidebar)
+        );
+
+        // Scrollback badge, Prefix button, and Help button should all be present with height 2
+        assert!(hits
+            .iter()
+            .any(|h| h.target == HitTarget::ExitScrollback && h.rect.height == 2));
+        assert!(hits
+            .iter()
+            .any(|h| h.target == HitTarget::TogglePrefix && h.rect.height == 2));
+        assert!(hits
+            .iter()
+            .any(|h| h.target == HitTarget::ToggleHelp && h.rect.height == 2));
+    }
+
+    #[test]
+    fn modals_capture_hits_and_expose_action_buttons() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let world = World::default();
+        let mut hits = Vec::new();
+
+        terminal
+            .draw(|f| {
+                let geom = render_ui(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    0,
+                    &Modal::ConfirmCloseTab {
+                        tab_id: "tab-123".to_string(),
+                        tab_title: "zsh".to_string(),
+                    },
+                );
+                hits = geom.hits;
+            })
+            .unwrap();
+
+        // Top bar hits are cleared while modal is open so clicks outside dismiss the modal
+        assert_eq!(find_hit_target(&hits, 0, 0), None);
+        assert!(hits.iter().any(|h| {
+            h.target
+                == HitTarget::ConfirmCloseYes {
+                    tab_id: "tab-123".to_string(),
+                }
+        }));
+        assert!(hits.iter().any(|h| h.target == HitTarget::CancelModal));
+    }
 }
