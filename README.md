@@ -18,7 +18,7 @@ A fast, lightweight **multi-tab TUI client** for [`herdr-core` (`hc`)](https://g
   - **Bottom Touchbar**: Inspired by the Herdr mobile app and legacy Herdr status dots, provides a compact `◄≡` / `≡►` sidebar toggle, left-side clickable Tab status dots (`● ○ ✓`), constant-width `[^B]` sticky prefix key and terminal shortcut keys (`[Esc]`, `[Tab]`, `[ ^C ]`, `[←]`, `[↓]`, `[↑]`, `[→]`) that never jitter, `[▼ BOT]` jump-to-bottom badge when scrolled, and `[ ? ]` Quick Actions button.
 - **Touch & Mouse Friendly for iPad / Mobile SSH (触控与鼠标丝滑切换)**
   - **Tap Bottom Touchbar & Left Sidebar**: Tap any 2-row Space/Tab card in the left sidebar, tap the left-side `● ○ ✓` status dots on the touchbar, or tap terminal keys (`Esc`, `Tab`, `^C`, arrows) and `[^B]` directly on the bottom touchbar.
-  - **No Terminal Selection Conflict**: Dragging a finger inside the terminal viewport never triggers tab switching, preserving native finger text selection on SSH clients; horizontal swipe tab switching is restricted to the bottom touchbar row.
+  - **No Terminal Selection Conflict**: Dragging a finger inside the terminal viewport never triggers tab switching, preserving native finger text selection on SSH clients.
   - **2-Row Large Touch Mode (`hct --touch`)**: Doubles the height of the bottom touchbar (2 rows) for even larger finger hit targets on tablets.
   - **Touch-Interactive Modals**: Directly tap items in the Fuzzy Switcher (`^b w`), tap Confirm/Cancel buttons in dialogs, or tap any of the 12 quick-action buttons in the `[ ? ]` panel.
 - **Classic `herdr` Keybindings (兼容旧版 `herdr` 快捷键)**

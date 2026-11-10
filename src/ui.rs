@@ -470,53 +470,79 @@ fn render_bottom_touchbar(
     }
 
     // 2. Left Tab Status Dots (` ● ○ ✓ `, similar to legacy Herdr):
-    // Fixed minimum zone width on >=76 col terminals so key buttons never jitter when tabs are 1..3.
+    // Reserve budget for the core terminal keys first so a large number of tabs never crowds out `[^B]`/`[Esc]`,
+    // and window the visible dots around `active_ti` within a fixed width on >=76 col terminals so keys never jitter.
     let dots_start_x = x;
-    if let Some(space) = world.active_space() {
-        let active_ti = world.active_tab_index();
-        let space_id = space.id.clone();
-        let compact_dots = space.tabs.len() > 3;
-        for (ti, tab) in space.tabs.iter().enumerate() {
-            let st = world.tab_state(tab);
-            let pill = if compact_dots {
-                format!("{} ", st.symbol())
+    let min_key_reserve: u16 = 29; // Enough for `[^B]│[Esc]│[Tab]│[^C]`
+    let dots_budget = if rect.width >= 76 {
+        9.min(avail_end.saturating_sub(dots_start_x))
+    } else {
+        avail_end
+            .saturating_sub(dots_start_x)
+            .saturating_sub(min_key_reserve)
+            .min(9)
+    };
+    let dots_limit_x = dots_start_x + dots_budget;
+
+    if dots_budget >= 2 {
+        if let Some(space) = world.active_space() {
+            let active_ti = world.active_tab_index();
+            let space_id = space.id.clone();
+            let total_tabs = space.tabs.len();
+            let compact_dots = total_tabs > 3 || (dots_budget as usize) < total_tabs * 3;
+            let dot_step: usize = if compact_dots { 2 } else { 3 };
+            let max_visible_dots = (dots_budget as usize / dot_step).max(1);
+            let start_ti = if total_tabs <= max_visible_dots || active_ti < max_visible_dots {
+                0
             } else {
-                format!(" {} ", st.symbol())
+                (active_ti + 1 - max_visible_dots).min(total_tabs.saturating_sub(max_visible_dots))
             };
-            let pw = pill.width() as u16;
-            if x + pw > avail_end {
-                break;
-            }
-            let is_active = ti == active_ti;
-            let pstyle = Style::default()
-                .bg(if is_active {
-                    Color::Rgb(68, 78, 128)
+
+            for (ti, tab) in space
+                .tabs
+                .iter()
+                .enumerate()
+                .skip(start_ti)
+                .take(max_visible_dots)
+            {
+                let st = world.tab_state(tab);
+                let pill = if compact_dots {
+                    format!("{} ", st.symbol())
                 } else {
-                    Color::Rgb(20, 22, 34)
-                })
-                .fg(state_color(st))
-                .add_modifier(Modifier::BOLD);
-            draw_touchbar_pill(buf, x, rect, &pill, pstyle, is_active);
-            hits.push(HitRegion {
-                rect: Rect {
-                    x,
-                    y: rect.y,
-                    width: pw,
-                    height: rect.height,
-                },
-                target: HitTarget::SelectTab {
-                    space_id: space_id.clone(),
-                    tab_id: tab.id.clone(),
-                },
-            });
-            x += pw;
+                    format!(" {} ", st.symbol())
+                };
+                let pw = pill.width() as u16;
+                if x + pw > dots_limit_x {
+                    break;
+                }
+                let is_active = ti == active_ti;
+                let pstyle = Style::default()
+                    .bg(if is_active {
+                        Color::Rgb(68, 78, 128)
+                    } else {
+                        Color::Rgb(20, 22, 34)
+                    })
+                    .fg(state_color(st))
+                    .add_modifier(Modifier::BOLD);
+                draw_touchbar_pill(buf, x, rect, &pill, pstyle, is_active);
+                hits.push(HitRegion {
+                    rect: Rect {
+                        x,
+                        y: rect.y,
+                        width: pw,
+                        height: rect.height,
+                    },
+                    target: HitTarget::SelectTab {
+                        space_id: space_id.clone(),
+                        tab_id: tab.id.clone(),
+                    },
+                });
+                x += pw;
+            }
         }
     }
-    if rect.width >= 76 {
-        let min_dots_end = (dots_start_x + 9).min(avail_end);
-        if x < min_dots_end {
-            x = min_dots_end;
-        }
+    if rect.width >= 76 && x < dots_limit_x {
+        x = dots_limit_x;
     }
     if x > dots_start_x && x < avail_end {
         for r in 0..rect.height {
@@ -1141,27 +1167,115 @@ fn draw_modal_close_button(buf: &mut Buffer, popup: Rect, hits: &mut Vec<HitRegi
 
 fn render_help_modal(f: &mut Frame, area: Rect, hits: &mut Vec<HitRegion>) {
     hits.clear();
-    let popup = centered_rect(68, 26, area);
+    let popup = centered_rect(68, 28, area);
     f.render_widget(Clear, popup);
     hits.push(HitRegion {
         rect: popup,
         target: HitTarget::ModalNoop,
     });
 
-    let lines = vec![
+    let block = Block::default()
+        .title(" Quick Actions & Help ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::Rgb(22, 24, 36)).fg(Color::White));
+    let inner = block.inner(popup);
+
+    // Reflow the 12 touch quick-action buttons across available inner width so narrow mobile
+    // viewports wrap buttons onto additional rows instead of dropping right-hand columns.
+    let compact_btns = inner.width < 58;
+    let quick_actions: [(&str, &str, HitTarget); 12] = [
+        (
+            " [ + New Tab    ] ",
+            " [+Tab] ",
+            HitTarget::TriggerAction(Action::NewTab),
+        ),
+        (
+            " [ ✕ Close Tab  ] ",
+            " [✕Tab] ",
+            HitTarget::TriggerAction(Action::CloseTab),
+        ),
+        (
+            " [ ✎ Rename Tab ] ",
+            " [✎Tab] ",
+            HitTarget::TriggerAction(Action::RenameTab),
+        ),
+        (
+            " [ 🔍 Fuzzy Find ] ",
+            " [🔍Find] ",
+            HitTarget::TriggerAction(Action::FuzzyFinder),
+        ),
+        (
+            " [ ⚡ Next Alert ] ",
+            " [⚡Alert] ",
+            HitTarget::TriggerAction(Action::JumpAlertAgent),
+        ),
+        (
+            " [ ⇕ Scrollback ] ",
+            " [⇕Scrl] ",
+            HitTarget::TriggerAction(Action::EnterScrollback),
+        ),
+        (
+            " [ + New Space  ] ",
+            " [+Spc] ",
+            HitTarget::TriggerAction(Action::NewSpace),
+        ),
+        (
+            " [ ✎ Ren Space  ] ",
+            " [✎Spc] ",
+            HitTarget::TriggerAction(Action::RenameSpace),
+        ),
+        (
+            " [ ⇄ Next Space ] ",
+            " [⇄Spc] ",
+            HitTarget::TriggerAction(Action::NextSpace),
+        ),
+        (
+            " [ ◧ Sidebar    ] ",
+            " [◧Bar] ",
+            HitTarget::TriggerAction(Action::ToggleSidebar),
+        ),
+        (
+            " [ ⏏ Detach hct ] ",
+            " [⏏Exit] ",
+            HitTarget::TriggerAction(Action::Detach),
+        ),
+        (
+            " [ ✕ Close Help ] ",
+            " [✕Help] ",
+            HitTarget::CancelModal,
+        ),
+    ];
+
+    let pad_x: u16 = if compact_btns { 1 } else { 2 };
+    let gap_x: u16 = if compact_btns { 1 } else { 2 };
+    let mut placed_btns: Vec<(u16, u16, &str, HitTarget)> = Vec::with_capacity(quick_actions.len());
+    let mut cur_row: u16 = 0;
+    let mut cur_x: u16 = pad_x;
+    for (wide_lbl, short_lbl, target) in quick_actions {
+        let lbl = if compact_btns { short_lbl } else { wide_lbl };
+        let bw = lbl.width() as u16;
+        if cur_x > pad_x && cur_x + bw > inner.width {
+            cur_row += 1;
+            cur_x = pad_x;
+        }
+        placed_btns.push((cur_x, cur_row, lbl, target));
+        cur_x += bw + gap_x;
+    }
+    let btn_rows_count = (cur_row + 1) as usize;
+
+    let mut lines = vec![Line::from(Span::styled(
+        "  Touch Quick Actions (Tap to execute):",
+        Style::default()
+            .fg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    for _ in 0..=btn_rows_count {
+        lines.push(Line::from(""));
+    }
+    lines.extend([
         Line::from(Span::styled(
-            "  Touch Quick Actions (Tap to execute):",
-            Style::default()
-                .fg(Color::LightCyan)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(""),
-        Line::from(""),
-        Line::from(""),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  Keyboard & Touch Gesture Shortcuts:",
+            "  Keyboard & Touch Shortcuts:",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )),
         Line::from("  Tap ● ○ ✓ on Touchbar    Switch directly to Tab (no body swipe conflict)"),
@@ -1183,96 +1297,36 @@ fn render_help_modal(f: &mut Frame, area: Rect, hits: &mut Vec<HitRegion>) {
             "  Tap outside, [ ✕ ], Esc, Enter, or ? to close",
             Style::default().fg(Color::DarkGray),
         )),
-    ];
-    let block = Block::default()
-        .title(" Quick Actions & Help ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Rgb(22, 24, 36)).fg(Color::White));
-    let inner = block.inner(popup);
+    ]);
     f.render_widget(Paragraph::new(lines).block(block), popup);
 
     let buf = f.buffer_mut();
     draw_modal_close_button(buf, popup, hits);
 
-    // Render 4x3 grid of touch quick-action buttons in rows 1..=4 of `inner`
-    let quick_rows: [[(&str, HitTarget); 3]; 4] = [
-        [
-            (" [ + New Tab    ] ", HitTarget::TriggerAction(Action::NewTab)),
-            (
-                " [ ✕ Close Tab  ] ",
-                HitTarget::TriggerAction(Action::CloseTab),
-            ),
-            (
-                " [ ✎ Rename Tab ] ",
-                HitTarget::TriggerAction(Action::RenameTab),
-            ),
-        ],
-        [
-            (
-                " [ 🔍 Fuzzy Find ] ",
-                HitTarget::TriggerAction(Action::FuzzyFinder),
-            ),
-            (
-                " [ ⚡ Next Alert ] ",
-                HitTarget::TriggerAction(Action::JumpAlertAgent),
-            ),
-            (
-                " [ ⇕ Scrollback ] ",
-                HitTarget::TriggerAction(Action::EnterScrollback),
-            ),
-        ],
-        [
-            (
-                " [ + New Space  ] ",
-                HitTarget::TriggerAction(Action::NewSpace),
-            ),
-            (
-                " [ ✎ Ren Space  ] ",
-                HitTarget::TriggerAction(Action::RenameSpace),
-            ),
-            (
-                " [ ⇄ Next Space ] ",
-                HitTarget::TriggerAction(Action::NextSpace),
-            ),
-        ],
-        [
-            (
-                " [ ◧ Sidebar    ] ",
-                HitTarget::TriggerAction(Action::ToggleSidebar),
-            ),
-            (" [ ⏏ Detach hct ] ", HitTarget::TriggerAction(Action::Detach)),
-            (" [ ✕ Close Help ] ", HitTarget::CancelModal),
-        ],
-    ];
-
-    for (r_idx, row_btns) in quick_rows.into_iter().enumerate() {
-        let by = inner.y + 1 + r_idx as u16;
+    for (rel_x, rel_row, lbl, target) in placed_btns {
+        let by = inner.y + 1 + rel_row;
         if by >= inner.y + inner.height {
             break;
         }
-        let mut bx = inner.x + 2;
-        for (lbl, target) in row_btns {
-            let bw = lbl.width() as u16;
-            if bx + bw > inner.x + inner.width {
-                break;
-            }
-            let bstyle = Style::default()
-                .bg(Color::Rgb(42, 52, 82))
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD);
-            buf.set_string(bx, by, lbl, bstyle);
-            hits.push(HitRegion {
-                rect: Rect {
-                    x: bx,
-                    y: by,
-                    width: bw,
-                    height: 1,
-                },
-                target,
-            });
-            bx += bw + 2;
+        let bx = inner.x + rel_x;
+        let bw = lbl.width() as u16;
+        if bx + bw > inner.x + inner.width {
+            continue;
         }
+        let bstyle = Style::default()
+            .bg(Color::Rgb(42, 52, 82))
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD);
+        buf.set_string(bx, by, lbl, bstyle);
+        hits.push(HitRegion {
+            rect: Rect {
+                x: bx,
+                y: by,
+                width: bw,
+                height: 1,
+            },
+            target,
+        });
     }
 }
 
@@ -1707,5 +1761,43 @@ mod tests {
             find_hit_target(&hits, 1, 11),
             Some(HitTarget::ToggleSidebar)
         );
+    }
+
+    #[test]
+    fn narrow_terminal_reflows_all_help_quick_actions() {
+        let backend = TestBackend::new(40, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let world = World::default();
+        let mut hits = Vec::new();
+
+        terminal
+            .draw(|f| {
+                let geom = render_ui(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    0,
+                    &Modal::Help,
+                );
+                hits = geom.hits;
+            })
+            .unwrap();
+
+        assert!(hits
+            .iter()
+            .any(|h| h.target == HitTarget::TriggerAction(Action::CloseTab)));
+        assert!(hits
+            .iter()
+            .any(|h| h.target == HitTarget::TriggerAction(Action::RenameTab)));
+        assert!(hits
+            .iter()
+            .any(|h| h.target == HitTarget::TriggerAction(Action::RenameSpace)));
+        assert!(hits
+            .iter()
+            .any(|h| h.target == HitTarget::TriggerAction(Action::Detach)));
     }
 }

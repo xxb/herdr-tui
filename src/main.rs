@@ -76,65 +76,6 @@ struct Cli {
     no_touch: bool,
 }
 
-#[derive(Clone, Debug)]
-struct TouchSwipeState {
-    start_col: u16,
-    start_row: u16,
-    last_col: u16,
-    last_row: u16,
-    consumed: bool,
-}
-
-impl TouchSwipeState {
-    fn try_begin(col: u16, row: u16, term_rect: Rect, screen_width: u16) -> Option<Self> {
-        // Ignore gestures starting within the leftmost/rightmost 2 columns so they
-        // never conflict with iPadOS / mobile system screen-edge back gestures.
-        if col < 2 || col >= screen_width.saturating_sub(2) {
-            return None;
-        }
-        // Never intercept drags inside the terminal viewport (`row < term_rect.y + term_rect.height`),
-        // so finger text selection in the terminal body never conflicts with switching tabs.
-        // Only allow horizontal swipe along the bottom touchbar rows.
-        if row < term_rect.y.saturating_add(term_rect.height) {
-            return None;
-        }
-        Some(Self {
-            start_col: col,
-            start_row: row,
-            last_col: col,
-            last_row: row,
-            consumed: false,
-        })
-    }
-
-    fn update_and_eval(
-        &mut self,
-        col: u16,
-        row: u16,
-        swipe_threshold: u16,
-        natural_swipe: bool,
-    ) -> Option<Action> {
-        self.last_col = col;
-        self.last_row = row;
-        if self.consumed {
-            return None;
-        }
-        let dx = i32::from(self.last_col) - i32::from(self.start_col);
-        let dy = i32::from(self.last_row) - i32::from(self.start_row);
-        if dx.unsigned_abs() as u16 >= swipe_threshold && dx.abs() >= dy.abs().saturating_mul(2) {
-            self.consumed = true;
-            let swipe_left = dx < 0;
-            if swipe_left == natural_swipe {
-                Some(Action::NextTab)
-            } else {
-                Some(Action::PrevTab)
-            }
-        } else {
-            None
-        }
-    }
-}
-
 struct AttachedTerminal {
     address: String,
     channel: u32,
@@ -170,8 +111,6 @@ fn main() -> Result<()> {
     } else {
         file_cfg.ui.touch_mode.unwrap_or(false)
     };
-    let swipe_threshold = file_cfg.ui.swipe_threshold.unwrap_or(8).clamp(3, 40);
-    let natural_swipe = file_cfg.ui.natural_swipe.unwrap_or(true);
 
     let (core, core_rx) = CoreClient::connect(cli.session.as_deref())?;
     let snapshot = core.subscribe_events()?;
@@ -215,8 +154,6 @@ fn main() -> Result<()> {
         sidebar_width,
         mobile_threshold,
         touch_mode,
-        swipe_threshold,
-        natural_swipe,
     );
 
     // Restore terminal cleanly
@@ -398,15 +335,12 @@ fn run_app(
     sidebar_width: u16,
     mobile_threshold: u16,
     touch_mode: bool,
-    swipe_threshold: u16,
-    natural_swipe: bool,
 ) -> Result<()> {
     let mut attached: Option<AttachedTerminal> = None;
     let mut prefix_active = false;
     let mut scrollback_offset: usize = 0;
     let mut modal = Modal::None;
     let mut last_hits: Vec<HitRegion> = Vec::new();
-    let mut swipe_state: Option<TouchSwipeState> = None;
     let mut dirty = true;
     let mut prev_width = terminal.size()?.width;
 
@@ -586,7 +520,6 @@ fn run_app(
             Event::Mouse(mev) => {
                 match mev.kind {
                     MouseEventKind::Down(MouseButton::Left) => {
-                        swipe_state = None;
                         let mx = mev.column;
                         let my = mev.row;
                         if let Some(target) = find_hit_target(&last_hits, mx, my) {
@@ -716,57 +649,6 @@ fn run_app(
                             }
                         } else if !matches!(modal, Modal::None) {
                             modal = Modal::None;
-                        } else {
-                            swipe_state =
-                                TouchSwipeState::try_begin(mx, my, term_rect, size.width);
-                        }
-                    }
-                    MouseEventKind::Drag(MouseButton::Left) => {
-                        if let Some(ref mut st) = swipe_state {
-                            if let Some(act) = st.update_and_eval(
-                                mev.column,
-                                mev.row,
-                                swipe_threshold,
-                                natural_swipe,
-                            ) {
-                                prefix_active = false;
-                                if execute_action(
-                                    act,
-                                    core,
-                                    world,
-                                    &attached,
-                                    prefix_spec,
-                                    sidebar_open,
-                                    &mut scrollback_offset,
-                                    &mut modal,
-                                )? {
-                                    return Ok(());
-                                }
-                            }
-                        }
-                    }
-                    MouseEventKind::Up(MouseButton::Left) => {
-                        if let Some(mut st) = swipe_state.take() {
-                            if let Some(act) = st.update_and_eval(
-                                mev.column,
-                                mev.row,
-                                swipe_threshold,
-                                natural_swipe,
-                            ) {
-                                prefix_active = false;
-                                if execute_action(
-                                    act,
-                                    core,
-                                    world,
-                                    &attached,
-                                    prefix_spec,
-                                    sidebar_open,
-                                    &mut scrollback_offset,
-                                    &mut modal,
-                                )? {
-                                    return Ok(());
-                                }
-                            }
                         }
                     }
                     MouseEventKind::ScrollUp => {
@@ -1039,42 +921,4 @@ fn handle_key_event(
         }
     }
     Ok(false)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn touch_swipe_only_on_bottom_touchbar_never_conflicts_with_terminal_selection() {
-        let term_rect = Rect::new(0, 0, 100, 23);
-
-        // Starting inside the terminal body (`row < 23`) is ignored so finger text selection never switches tabs
-        assert!(TouchSwipeState::try_begin(20, 0, term_rect, 100).is_none());
-        assert!(TouchSwipeState::try_begin(40, 10, term_rect, 100).is_none());
-        assert!(TouchSwipeState::try_begin(40, 22, term_rect, 100).is_none());
-
-        // Starting within leftmost or rightmost 2 columns is ignored (avoids iPadOS system back gesture)
-        assert!(TouchSwipeState::try_begin(0, 23, term_rect, 100).is_none());
-        assert!(TouchSwipeState::try_begin(1, 23, term_rect, 100).is_none());
-        assert!(TouchSwipeState::try_begin(98, 23, term_rect, 100).is_none());
-        assert!(TouchSwipeState::try_begin(99, 23, term_rect, 100).is_none());
-
-        // Natural swipe left (dx = -10, dy = 0) on the bottom touchbar (`row == 23`) -> NextTab once
-        let mut swipe = TouchSwipeState::try_begin(40, 23, term_rect, 100).unwrap();
-        assert_eq!(swipe.update_and_eval(35, 23, 8, true), None);
-        assert_eq!(
-            swipe.update_and_eval(30, 23, 8, true),
-            Some(Action::NextTab)
-        );
-        // Subsequent drag events in the same gesture do not fire a second switch
-        assert_eq!(swipe.update_and_eval(20, 23, 8, true), None);
-
-        // Natural swipe right (dx = +10, dy = 0) on bottom touchbar -> PrevTab
-        let mut swipe_r = TouchSwipeState::try_begin(20, 23, term_rect, 100).unwrap();
-        assert_eq!(
-            swipe_r.update_and_eval(30, 23, 8, true),
-            Some(Action::PrevTab)
-        );
-    }
 }
