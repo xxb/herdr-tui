@@ -170,9 +170,6 @@ fn copy_to_clipboard(text: &str) {
 }
 
 fn read_clipboard_text(fallback: &str) -> String {
-    if !fallback.is_empty() {
-        return fallback.to_string();
-    }
     if std::env::var_os("SSH_CONNECTION").is_none() && std::env::var_os("SSH_TTY").is_none() {
         let local_cmds: &[(&str, &[&str])] = &[
             ("pbpaste", &[]),
@@ -201,7 +198,7 @@ fn read_clipboard_text(fallback: &str) -> String {
             }
         }
     }
-    String::new()
+    fallback.to_string()
 }
 
 fn paste_text_into_app(
@@ -492,6 +489,7 @@ fn run_app(
     let mut modal = Modal::None;
     let mut last_hits: Vec<HitRegion> = Vec::new();
     let mut selection: Option<TerminalSelection> = None;
+    let mut selection_screen: Option<vt100::Screen> = None;
     let mut clipboard_buffer = String::new();
     let mut copied_until: Option<Instant> = None;
     let mut dirty = true;
@@ -513,6 +511,7 @@ fn run_app(
         let area = Rect::new(0, 0, size.width, size.height);
         let term_rect = compute_terminal_rect(area, *sidebar_open, sidebar_width, touch_mode);
 
+        let prev_addr = attached.as_ref().map(|a| a.address.clone());
         sync_attached_terminal(
             core,
             world,
@@ -520,6 +519,10 @@ fn run_app(
             term_rect,
             &mut scrollback_offset,
         );
+        if attached.as_ref().map(|a| &a.address) != prev_addr.as_ref() {
+            selection = None;
+            selection_screen = None;
+        }
 
         if let Some(att) = attached.as_mut() {
             att.parser.set_scrollback(scrollback_offset);
@@ -527,7 +530,13 @@ fn run_app(
         }
 
         if dirty {
-            let scr_ref = attached.as_ref().map(|a| a.parser.screen());
+            let scr_ref = if selection.is_some() {
+                selection_screen
+                    .as_ref()
+                    .or_else(|| attached.as_ref().map(|a| a.parser.screen()))
+            } else {
+                attached.as_ref().map(|a| a.parser.screen())
+            };
             let copied_flash = copied_until.is_some();
             terminal.draw(|f| {
                 let geom = render_ui(
@@ -565,6 +574,10 @@ fn run_app(
                         if att.channel == channel {
                             let clean = sanitize_vt_bytes(&data);
                             att.parser.process(&clean);
+                            if selection.as_ref().is_some_and(|s| !s.active) {
+                                selection = None;
+                                selection_screen = None;
+                            }
                         }
                     }
                 }
@@ -673,6 +686,7 @@ fn run_app(
                         let my = mev.row;
                         if let Some(target) = find_hit_target(&last_hits, mx, my) {
                             selection = None;
+                            selection_screen = None;
                             match target {
                                 HitTarget::ModalNoop => {}
                                 HitTarget::CancelModal => {
@@ -864,8 +878,10 @@ fn run_app(
                             let rel_col = mx.saturating_sub(term_rect.x);
                             let rel_row = my.saturating_sub(term_rect.y);
                             selection = Some(TerminalSelection::new(rel_row, rel_col));
+                            selection_screen = attached.as_ref().map(|a| a.parser.screen().clone());
                         } else {
                             selection = None;
+                            selection_screen = None;
                         }
                     }
                     MouseEventKind::Drag(MouseButton::Left) => {
@@ -899,8 +915,11 @@ fn run_app(
                                 }
                                 sel.active = false;
                                 if sel.is_non_empty() {
-                                    if let Some(att) = &attached {
-                                        let text = sel.extract_text(att.parser.screen());
+                                    let scr = selection_screen
+                                        .as_ref()
+                                        .or_else(|| attached.as_ref().map(|a| a.parser.screen()));
+                                    if let Some(screen) = scr {
+                                        let text = sel.extract_text(screen);
                                         if !text.is_empty() {
                                             clipboard_buffer = text.clone();
                                             copy_to_clipboard(&text);
@@ -910,6 +929,7 @@ fn run_app(
                                     }
                                 } else {
                                     selection = None;
+                                    selection_screen = None;
                                 }
                             }
                         }
@@ -931,6 +951,8 @@ fn run_app(
                             *selected = cur_sel.saturating_sub(1);
                             *selected_tab_id = items.get(*selected).map(|it| it.tab_id.clone());
                         } else if matches!(modal, Modal::None) {
+                            selection = None;
+                            selection_screen = None;
                             scrollback_offset = scrollback_offset.saturating_add(3);
                         }
                     }
@@ -954,6 +976,8 @@ fn run_app(
                                     items.get(*selected).map(|it| it.tab_id.clone());
                             }
                         } else if matches!(modal, Modal::None) {
+                            selection = None;
+                            selection_screen = None;
                             scrollback_offset = scrollback_offset.saturating_sub(3);
                         }
                     }
@@ -962,6 +986,7 @@ fn run_app(
             }
             Event::Key(kev) if kev.kind == KeyEventKind::Press => {
                 selection = None;
+                selection_screen = None;
                 if handle_key_event(
                     kev,
                     core,
