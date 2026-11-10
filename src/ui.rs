@@ -190,8 +190,9 @@ pub fn state_color(state: AgentState) -> Color {
     }
 }
 
-pub const DPAD_DISC_WIDTH: u16 = 11;
-pub const DPAD_DISC_HEIGHT: u16 = 5;
+pub const DPAD_DISC_WIDTH: u16 = 15;
+pub const DPAD_DISC_HEIGHT: u16 = 9;
+pub const DPAD_COMPACT_HEIGHT: u16 = 6;
 
 #[allow(dead_code)]
 pub struct UiGeometry {
@@ -201,19 +202,24 @@ pub struct UiGeometry {
 }
 
 pub fn resolve_dpad_disc_rect(term_rect: Rect, custom_pos: Option<(u16, u16)>) -> Option<Rect> {
-    if term_rect.width < DPAD_DISC_WIDTH || term_rect.height < DPAD_DISC_HEIGHT {
+    if term_rect.width < DPAD_DISC_WIDTH || term_rect.height < DPAD_COMPACT_HEIGHT {
         return None;
     }
+    let pad_h = if term_rect.height >= DPAD_DISC_HEIGHT {
+        DPAD_DISC_HEIGHT
+    } else {
+        DPAD_COMPACT_HEIGHT
+    };
     let max_x = term_rect.x + term_rect.width.saturating_sub(DPAD_DISC_WIDTH);
-    let max_y = term_rect.y + term_rect.height.saturating_sub(DPAD_DISC_HEIGHT);
-    let default_x = max_x.saturating_sub(2).max(term_rect.x);
+    let max_y = term_rect.y + term_rect.height.saturating_sub(pad_h);
+    let default_x = max_x.saturating_sub(1).max(term_rect.x);
     let default_y = max_y.saturating_sub(1).max(term_rect.y);
     let (px, py) = custom_pos.unwrap_or((default_x, default_y));
     Some(Rect {
         x: px.clamp(term_rect.x, max_x),
         y: py.clamp(term_rect.y, max_y),
         width: DPAD_DISC_WIDTH,
-        height: DPAD_DISC_HEIGHT,
+        height: pad_h,
     })
 }
 
@@ -221,16 +227,7 @@ pub fn is_on_dpad_disc(disc_rect: Option<Rect>, col: u16, row: u16) -> bool {
     let Some(r) = disc_rect else {
         return false;
     };
-    if col < r.x || col >= r.x + r.width || row < r.y || row >= r.y + r.height {
-        return false;
-    }
-    let rel_c = col - r.x;
-    let rel_r = row - r.y;
-    if rel_r == 0 || rel_r == DPAD_DISC_HEIGHT - 1 {
-        (1..=9).contains(&rel_c)
-    } else {
-        rel_c <= 10
-    }
+    col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1101,89 +1098,106 @@ fn render_floating_dpad(
     let disc = resolve_dpad_disc_rect(term_rect, dpad_pos)?;
     let buf = f.buffer_mut();
 
-    let ring_tint = if dragging {
-        (44, 56, 92)
+    let row_h = disc.height / 3; // 3 rows per tile on normal screens (or 2 on tiny test screens)
+    let mid_sub_y = row_h / 2;
+
+    let corner_tint = if dragging {
+        (30, 36, 58)
     } else {
-        (28, 34, 56)
+        (22, 26, 40)
     };
-    let ring_alpha = if dragging { 76 } else { 64 };
+    let corner_alpha = if dragging { 62 } else { 50 };
+
+    let arrow_tint = if dragging {
+        (58, 76, 124)
+    } else {
+        (42, 56, 94)
+    };
+    let arrow_alpha = if dragging { 82 } else { 72 };
+
     let center_tint = if dragging {
-        (48, 96, 112)
+        (48, 106, 122)
     } else {
-        (34, 72, 86)
+        (36, 84, 98)
     };
-    let center_alpha = if dragging { 84 } else { 76 };
+    let center_alpha = if dragging { 86 } else { 78 };
 
     let border_fg = if dragging {
         Color::Rgb(125, 207, 255)
     } else {
         Color::Rgb(106, 124, 178)
     };
-    let sep_fg = Color::Rgb(72, 86, 132);
-    let arrow_fg = Color::Rgb(226, 234, 255);
-    let paste_fg = Color::Rgb(198, 246, 226);
+    let grip_fg = Color::Rgb(84, 98, 144);
+    let arrow_fg = Color::Rgb(230, 238, 255);
+    let paste_fg = Color::Rgb(198, 248, 228);
 
-    // 11x5 stepped circular mask:
-    //   01234567890
-    // 0  ╭───────╮ 
-    // 1 ╭┘   ↑   └╮
-    // 2 │ ← ▕⎘▏ → │
-    // 3 ╰┐   ↓   ┌╯
-    // 4  ╰───────╯ 
-    for dy in 0..DPAD_DISC_HEIGHT {
-        for dx in 0..DPAD_DISC_WIDTH {
-            if (dy == 0 || dy == 4) && (dx == 0 || dx == 10) {
-                continue;
-            }
+    // 15x9 square 3x3 grid (each of the 3x3 tiles is 5 columns wide x 3 rows tall):
+    // - Top-center (col_tile=1, row_tile=0):    ↑  (5x3)
+    // - Middle-left (col_tile=0, row_tile=1):   ←  (5x3)
+    // - Middle-center (col_tile=1, row_tile=1): ⎘  (5x3)
+    // - Middle-right (col_tile=2, row_tile=1):  →  (5x3)
+    // - Bottom-center (col_tile=1, row_tile=2): ↓  (5x3)
+    // - 4 corners: semi-transparent frosted glass frame + drag handles
+    for dy in 0..disc.height {
+        for dx in 0..disc.width {
             let x = disc.x + dx;
             let y = disc.y + dy;
             if x >= buf.area.width || y >= buf.area.height {
                 continue;
             }
-            let is_center = dy == 2 && (4..=6).contains(&dx);
+            let col_tile = (dx / 5).min(2);
+            let row_tile = (dy / row_h).min(2);
+            let sub_x = dx % 5;
+            let sub_y = dy % row_h;
+
+            let is_center = col_tile == 1 && row_tile == 1;
+            let is_arrow = (col_tile == 1 && (row_tile == 0 || row_tile == 2))
+                || (row_tile == 1 && (col_tile == 0 || col_tile == 2));
+
             let cell = &mut buf[(x, y)];
             let base_bg = color_to_rgb(cell.bg, (18, 20, 30));
             let base_fg = color_to_rgb(cell.fg, (169, 177, 214));
-            let blended_bg = if is_center {
-                blend_rgb(base_bg, center_tint, center_alpha)
+            let (tint, alpha) = if is_center {
+                (center_tint, center_alpha)
+            } else if is_arrow {
+                (arrow_tint, arrow_alpha)
             } else {
-                blend_rgb(base_bg, ring_tint, ring_alpha)
+                (corner_tint, corner_alpha)
             };
+            let blended_bg = blend_rgb(base_bg, tint, alpha);
 
-            let glyph: Option<(&str, Color, bool)> = match (dy, dx) {
-                // Row 0 top bezel
-                (0, 1) => Some(("╭", border_fg, false)),
-                (0, 2..=8) => Some(("─", border_fg, false)),
-                (0, 9) => Some(("╮", border_fg, false)),
-                // Row 1 upper step + Up arrow
-                (1, 0) => Some(("╭", border_fg, false)),
-                (1, 1) => Some(("┘", border_fg, false)),
-                (1, 3) => Some(("╲", sep_fg, false)),
-                (1, 5) => Some(("↑", arrow_fg, true)),
-                (1, 7) => Some(("╱", sep_fg, false)),
-                (1, 9) => Some(("└", border_fg, false)),
-                (1, 10) => Some(("╮", border_fg, false)),
-                // Row 2 Left + Center Paste + Right
-                (2, 0) => Some(("│", border_fg, false)),
-                (2, 2) => Some(("←", arrow_fg, true)),
-                (2, 4) => Some(("▕", sep_fg, false)),
-                (2, 5) => Some(("⎘", paste_fg, true)),
-                (2, 6) => Some(("▏", sep_fg, false)),
-                (2, 8) => Some(("→", arrow_fg, true)),
-                (2, 10) => Some(("│", border_fg, false)),
-                // Row 3 lower step + Down arrow
-                (3, 0) => Some(("╰", border_fg, false)),
-                (3, 1) => Some(("┐", border_fg, false)),
-                (3, 3) => Some(("╱", sep_fg, false)),
-                (3, 5) => Some(("↓", arrow_fg, true)),
-                (3, 7) => Some(("╲", sep_fg, false)),
-                (3, 9) => Some(("┌", border_fg, false)),
-                (3, 10) => Some(("╯", border_fg, false)),
-                // Row 4 bottom bezel
-                (4, 1) => Some(("╰", border_fg, false)),
-                (4, 2..=8) => Some(("─", border_fg, false)),
-                (4, 9) => Some(("╯", border_fg, false)),
-                _ => None,
+            let glyph: Option<(&str, Color, bool)> = if is_center && sub_x == 2 && sub_y == mid_sub_y
+            {
+                Some(("⎘", paste_fg, true))
+            } else if col_tile == 1 && row_tile == 0 && sub_x == 2 && sub_y == mid_sub_y {
+                Some(("↑", arrow_fg, true))
+            } else if col_tile == 1 && row_tile == 2 && sub_x == 2 && sub_y == mid_sub_y {
+                Some(("↓", arrow_fg, true))
+            } else if col_tile == 0 && row_tile == 1 && sub_x == 2 && sub_y == mid_sub_y {
+                Some(("←", arrow_fg, true))
+            } else if col_tile == 2 && row_tile == 1 && sub_x == 2 && sub_y == mid_sub_y {
+                Some(("→", arrow_fg, true))
+            } else if !is_arrow && !is_center {
+                // Outer square border and corner grip dots
+                if dy == 0 && dx == 0 {
+                    Some(("╭", border_fg, false))
+                } else if dy == 0 && dx == disc.width - 1 {
+                    Some(("╮", border_fg, false))
+                } else if dy == disc.height - 1 && dx == 0 {
+                    Some(("╰", border_fg, false))
+                } else if dy == disc.height - 1 && dx == disc.width - 1 {
+                    Some(("╯", border_fg, false))
+                } else if dy == 0 || dy == disc.height - 1 {
+                    Some(("─", border_fg, false))
+                } else if dx == 0 || dx == disc.width - 1 {
+                    Some(("│", border_fg, false))
+                } else if sub_x == 2 && sub_y == mid_sub_y {
+                    Some(("·", grip_fg, false))
+                } else {
+                    None
+                }
+            } else {
+                None
             };
 
             cell.set_bg(blended_bg);
@@ -1196,107 +1210,64 @@ fn render_floating_dpad(
                     cell.modifier.remove(Modifier::BOLD);
                 }
             } else {
-                // Keep 1-column underlying terminal character faintly visible through the glass
                 if cell.symbol().width() != 1 {
                     cell.set_symbol(" ");
                 }
-                let ghost_fg = blend_rgb(base_fg, ring_tint, 55);
+                let ghost_fg = blend_rgb(base_fg, tint, 55);
                 cell.set_fg(ghost_fg);
                 cell.modifier.remove(Modifier::BOLD);
             }
         }
     }
 
-    // Register 5 sector hit regions covering the entire circular disc:
-    // Top sector (Up)
-    let up_target = HitTarget::SendKey(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    // Register full 5x3 (or 5x2) hit regions for each of the 5 buttons in the 3x3 square:
+    // Top-center (Up)
     hits.push(HitRegion {
         rect: Rect {
-            x: disc.x + 1,
+            x: disc.x + 5,
             y: disc.y,
-            width: 9,
-            height: 1,
-        },
-        target: up_target.clone(),
-    });
-    hits.push(HitRegion {
-        rect: Rect {
-            x: disc.x + 3,
-            y: disc.y + 1,
             width: 5,
-            height: 1,
+            height: row_h,
         },
-        target: up_target,
+        target: HitTarget::SendKey(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
     });
-
-    // Bottom sector (Down)
-    let down_target = HitTarget::SendKey(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    // Bottom-center (Down)
     hits.push(HitRegion {
         rect: Rect {
-            x: disc.x + 3,
-            y: disc.y + 3,
+            x: disc.x + 5,
+            y: disc.y + row_h * 2,
             width: 5,
-            height: 1,
+            height: row_h,
         },
-        target: down_target.clone(),
+        target: HitTarget::SendKey(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
     });
-    hits.push(HitRegion {
-        rect: Rect {
-            x: disc.x + 1,
-            y: disc.y + 4,
-            width: 9,
-            height: 1,
-        },
-        target: down_target,
-    });
-
-    // Left sector (Left)
+    // Middle-left (Left)
     hits.push(HitRegion {
         rect: Rect {
             x: disc.x,
-            y: disc.y + 1,
-            width: 3,
-            height: 3,
+            y: disc.y + row_h,
+            width: 5,
+            height: row_h,
         },
         target: HitTarget::SendKey(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
     });
+    // Middle-right (Right)
     hits.push(HitRegion {
         rect: Rect {
-            x: disc.x + 3,
-            y: disc.y + 2,
-            width: 1,
-            height: 1,
-        },
-        target: HitTarget::SendKey(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
-    });
-
-    // Right sector (Right)
-    hits.push(HitRegion {
-        rect: Rect {
-            x: disc.x + 8,
-            y: disc.y + 1,
-            width: 3,
-            height: 3,
+            x: disc.x + 10,
+            y: disc.y + row_h,
+            width: 5,
+            height: row_h,
         },
         target: HitTarget::SendKey(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
     });
+    // Middle-center (PasteClipboard)
     hits.push(HitRegion {
         rect: Rect {
-            x: disc.x + 7,
-            y: disc.y + 2,
-            width: 1,
-            height: 1,
-        },
-        target: HitTarget::SendKey(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
-    });
-
-    // Center sector (PasteClipboard)
-    hits.push(HitRegion {
-        rect: Rect {
-            x: disc.x + 4,
-            y: disc.y + 2,
-            width: 3,
-            height: 1,
+            x: disc.x + 5,
+            y: disc.y + row_h,
+            width: 5,
+            height: row_h,
         },
         target: HitTarget::PasteClipboard,
     });
@@ -2294,10 +2265,12 @@ mod tests {
             .any(|h| h.target == HitTarget::ToggleAlt && h.rect.height == 3));
         assert!(hits
             .iter()
-            .any(|h| h.target == HitTarget::PasteClipboard && h.rect.width == 3 && h.rect.height == 1));
+            .any(|h| h.target == HitTarget::PasteClipboard && h.rect.width == 5 && h.rect.height == 3));
         for arrow in [KeyCode::Left, KeyCode::Down, KeyCode::Up, KeyCode::Right] {
             assert!(hits.iter().any(|h| {
                 h.target == HitTarget::SendKey(KeyEvent::new(arrow, KeyModifiers::NONE))
+                    && h.rect.width == 5
+                    && h.rect.height == 3
             }));
         }
         assert!(!hits.iter().any(|h| {
@@ -2470,7 +2443,7 @@ mod tests {
     }
 
     #[test]
-    fn floating_circular_dpad_exposes_four_directions_and_centered_paste_and_clamps_position() {
+    fn floating_square_dpad_exposes_four_directions_and_centered_paste_and_clamps_position() {
         for width in [64u16, 42u16, 30u16] {
             let backend = TestBackend::new(width, 20);
             let mut terminal = Terminal::new(backend).unwrap();
@@ -2506,43 +2479,44 @@ mod tests {
             assert!(disc.x + disc.width <= geom.term_rect.x + geom.term_rect.width);
             assert!(disc.y + disc.height <= geom.term_rect.y + geom.term_rect.height);
 
-            // Verify 5 sectors on the disc: Up (top), Down (bottom), Left, Right, and centered Paste
+            // Verify 5 large 5x3 sectors on the 15x9 square pad:
+            // Up (top-center), Down (bottom-center), Left (mid-left), Right (mid-right), Paste (mid-center)
             assert_eq!(
-                find_hit_target(&geom.hits, disc.x + 5, disc.y + 1),
+                find_hit_target(&geom.hits, disc.x + 7, disc.y + 1),
                 Some(HitTarget::SendKey(KeyEvent::new(
                     KeyCode::Up,
                     KeyModifiers::NONE
                 )))
             );
             assert_eq!(
-                find_hit_target(&geom.hits, disc.x + 5, disc.y + 3),
+                find_hit_target(&geom.hits, disc.x + 7, disc.y + 7),
                 Some(HitTarget::SendKey(KeyEvent::new(
                     KeyCode::Down,
                     KeyModifiers::NONE
                 )))
             );
             assert_eq!(
-                find_hit_target(&geom.hits, disc.x + 2, disc.y + 2),
+                find_hit_target(&geom.hits, disc.x + 2, disc.y + 4),
                 Some(HitTarget::SendKey(KeyEvent::new(
                     KeyCode::Left,
                     KeyModifiers::NONE
                 )))
             );
             assert_eq!(
-                find_hit_target(&geom.hits, disc.x + 8, disc.y + 2),
+                find_hit_target(&geom.hits, disc.x + 12, disc.y + 4),
                 Some(HitTarget::SendKey(KeyEvent::new(
                     KeyCode::Right,
                     KeyModifiers::NONE
                 )))
             );
             assert_eq!(
-                find_hit_target(&geom.hits, disc.x + 5, disc.y + 2),
+                find_hit_target(&geom.hits, disc.x + 7, disc.y + 4),
                 Some(HitTarget::PasteClipboard)
             );
-            // Cut corners (0,0) and (10,4) are outside the circular mask
-            assert!(!is_on_dpad_disc(Some(disc), disc.x, disc.y));
-            assert!(!is_on_dpad_disc(Some(disc), disc.x + 10, disc.y + 4));
-            assert!(is_on_dpad_disc(Some(disc), disc.x + 5, disc.y + 2));
+            // All cells inside the 15x9 square (including corners) are draggable via is_on_dpad_disc
+            assert!(is_on_dpad_disc(Some(disc), disc.x, disc.y));
+            assert!(is_on_dpad_disc(Some(disc), disc.x + 14, disc.y + 8));
+            assert!(is_on_dpad_disc(Some(disc), disc.x + 7, disc.y + 4));
         }
     }
 
