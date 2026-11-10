@@ -86,6 +86,32 @@ struct AttachedTerminal {
     parser: vt100::Parser,
     cols: u16,
     rows: u16,
+    utf8_tail: Vec<u8>,
+    prev_width1_symbol: bool,
+}
+
+impl AttachedTerminal {
+    fn new(channel: u32, cols: u16, rows: u16) -> Self {
+        Self {
+            channel,
+            parser: vt100::Parser::new(rows, cols, SCROLLBACK_LINES),
+            cols,
+            rows,
+            utf8_tail: Vec::new(),
+            prev_width1_symbol: false,
+        }
+    }
+
+    fn process_vt_bytes(&mut self, payload: &[u8]) {
+        let clean = sanitize_vt_stream(
+            payload,
+            &mut self.utf8_tail,
+            &mut self.prev_width1_symbol,
+        );
+        if !clean.is_empty() {
+            self.parser.process(&clean);
+        }
+    }
 }
 
 fn last_utf8_char(buf: &[u8]) -> Option<char> {
@@ -99,40 +125,121 @@ fn last_utf8_char(buf: &[u8]) -> Option<char> {
     std::str::from_utf8(&buf[start..]).ok()?.chars().next_back()
 }
 
-fn sanitize_vt_bytes(payload: &[u8]) -> Cow<'_, [u8]> {
-    let has_9001 = payload.windows(7).any(|w| w == b"\x1b[?9001");
-    let has_fe0f = payload.windows(3).any(|w| w == b"\xef\xb8\x8f");
+fn trailing_incomplete_utf8_len(buf: &[u8]) -> usize {
+    let max_back = buf.len().min(3);
+    for back in 1..=max_back {
+        let idx = buf.len() - back;
+        let b = buf[idx];
+        if (b & 0b1100_0000) != 0b1000_0000 {
+            if b >= 0xC2
+                && std::str::from_utf8(&buf[idx..])
+                    .err()
+                    .is_some_and(|e| e.error_len().is_none())
+            {
+                return back;
+            }
+            return 0;
+        }
+    }
+    0
+}
 
-    if !has_9001 && !has_fe0f {
-        return Cow::Borrowed(payload);
+fn next_utf8_char(slice: &[u8]) -> Option<(char, usize)> {
+    let max_len = slice.len().min(4);
+    match std::str::from_utf8(&slice[..max_len]) {
+        Ok(s) => {
+            let ch = s.chars().next()?;
+            Some((ch, ch.len_utf8()))
+        }
+        Err(e) if e.valid_up_to() > 0 => {
+            let s = std::str::from_utf8(&slice[..e.valid_up_to()]).ok()?;
+            let ch = s.chars().next()?;
+            Some((ch, ch.len_utf8()))
+        }
+        Err(_) => None,
+    }
+}
+
+fn is_width1_non_ascii(ch: char) -> bool {
+    !ch.is_ascii() && UnicodeWidthChar::width(ch) == Some(1)
+}
+
+fn sanitize_vt_stream<'a>(
+    payload: &'a [u8],
+    utf8_tail: &mut Vec<u8>,
+    prev_width1_symbol: &mut bool,
+) -> Cow<'a, [u8]> {
+    let combined: Cow<'a, [u8]> = if utf8_tail.is_empty() {
+        Cow::Borrowed(payload)
+    } else {
+        let mut buf = Vec::with_capacity(utf8_tail.len() + payload.len());
+        buf.extend_from_slice(utf8_tail);
+        buf.extend_from_slice(payload);
+        utf8_tail.clear();
+        Cow::Owned(buf)
+    };
+
+    let trailing = trailing_incomplete_utf8_len(&combined);
+    let valid_len = combined.len() - trailing;
+    if trailing > 0 {
+        utf8_tail.extend_from_slice(&combined[valid_len..]);
+    }
+    let slice = &combined[..valid_len];
+    if slice.is_empty() {
+        return Cow::Borrowed(&[]);
     }
 
-    let mut out = Vec::with_capacity(payload.len());
+    let has_9001 = slice.windows(7).any(|w| w == b"\x1b[?9001");
+    let has_fe0f = slice.windows(3).any(|w| w == b"\xef\xb8\x8f");
+
+    if !has_9001 && !has_fe0f {
+        *prev_width1_symbol = last_utf8_char(slice).is_some_and(is_width1_non_ascii);
+        return match combined {
+            Cow::Borrowed(b) => Cow::Borrowed(&b[..valid_len]),
+            Cow::Owned(mut v) => {
+                v.truncate(valid_len);
+                Cow::Owned(v)
+            }
+        };
+    }
+
+    let mut out = Vec::with_capacity(slice.len());
     let mut i = 0;
-    while i < payload.len() {
+    while i < slice.len() {
         if has_9001
-            && i + 8 <= payload.len()
-            && (&payload[i..i + 8] == b"\x1b[?9001h" || &payload[i..i + 8] == b"\x1b[?9001l")
+            && i + 8 <= slice.len()
+            && (&slice[i..i + 8] == b"\x1b[?9001h" || &slice[i..i + 8] == b"\x1b[?9001l")
         {
+            *prev_width1_symbol = false;
             i += 8;
             continue;
         }
-        if has_fe0f && i + 3 <= payload.len() && &payload[i..i + 3] == b"\xef\xb8\x8f" {
+        if has_fe0f && i + 3 <= slice.len() && &slice[i..i + 3] == b"\xef\xb8\x8f" {
             // U+FE0F (Variation Selector-16) requests 2-column emoji presentation for preceding
             // 1-column symbols (such as U+2699 '⚙' or U+26A0 '⚠'). Because the `vt100` crate
             // measures codepoints individually via `unicode-width` (where '⚙' is width 1 and
             // U+FE0F is width 0), replacing U+FE0F with an ASCII space after a width-1 non-ASCII
             // symbol keeps column positions aligned with Ghostty, modern terminals, and CLI tools.
-            if last_utf8_char(&out)
-                .is_some_and(|ch| !ch.is_ascii() && UnicodeWidthChar::width(ch) == Some(1))
-            {
+            if *prev_width1_symbol {
                 out.push(b' ');
+                *prev_width1_symbol = false;
             }
             i += 3;
             continue;
         }
-        out.push(payload[i]);
-        i += 1;
+        if slice[i].is_ascii() {
+            out.push(slice[i]);
+            *prev_width1_symbol = false;
+            i += 1;
+        } else if let Some((ch, ch_len)) = next_utf8_char(&slice[i..]) {
+            out.extend_from_slice(&slice[i..i + ch_len]);
+            *prev_width1_symbol = is_width1_non_ascii(ch);
+            i += ch_len;
+        } else {
+            out.push(slice[i]);
+            *prev_width1_symbol = false;
+            i += 1;
+        }
     }
     Cow::Owned(out)
 }
@@ -401,16 +508,7 @@ fn sync_attached_terminals(
             }
         } else if let Ok(ch) = core.attach_terminal(addr, cols, rows, ATTACH_HISTORY_LINES) {
             core.set_focus(ch, true);
-            let parser = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
-            attached_map.insert(
-                addr.clone(),
-                AttachedTerminal {
-                    channel: ch,
-                    parser,
-                    cols,
-                    rows,
-                },
-            );
+            attached_map.insert(addr.clone(), AttachedTerminal::new(ch, cols, rows));
             world.mark_active_seen(core);
             newly_attached_active = true;
         }
@@ -446,16 +544,7 @@ fn sync_attached_terminals(
             } else if world.terminals.contains_key(&sib_addr) {
                 if let Ok(ch) = core.attach_terminal(&sib_addr, cols, rows, ATTACH_HISTORY_LINES) {
                     core.set_focus(ch, false);
-                    let parser = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
-                    attached_map.insert(
-                        sib_addr,
-                        AttachedTerminal {
-                            channel: ch,
-                            parser,
-                            cols,
-                            rows,
-                        },
-                    );
+                    attached_map.insert(sib_addr, AttachedTerminal::new(ch, cols, rows));
                     attached_any_sibling = true;
                 }
             }
@@ -676,8 +765,7 @@ fn run_app(
                         }
                     }
                     if let Some(att) = attached_map.values_mut().find(|a| a.channel == channel) {
-                        let clean = sanitize_vt_bytes(&data);
-                        att.parser.process(&clean);
+                        att.process_vt_bytes(&data);
                         if is_active && selection.as_ref().is_some_and(|s| !s.active) {
                             selection = None;
                             selection_screen = None;
@@ -1404,15 +1492,26 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_vt_bytes_aligns_vs16_emoji_box_borders() {
-        let mut parser = vt100::Parser::new(4, 20, 0);
-        let frame = "\x1b[H╭──────╮\r\n│ ⚙️ a │\r\n╰──────╯\x1b[J";
-        let sanitized = sanitize_vt_bytes(frame.as_bytes());
-        parser.process(&sanitized);
-        let screen = parser.screen();
-        // Top, middle, and bottom right borders must all land on column 7
-        assert_eq!(screen.cell(0, 7).unwrap().contents(), "╮");
-        assert_eq!(screen.cell(1, 7).unwrap().contents(), "│");
-        assert_eq!(screen.cell(2, 7).unwrap().contents(), "╯");
+    fn sanitize_vt_stream_aligns_vs16_emoji_across_arbitrary_frame_boundaries() {
+        let frame = "\x1b[H╭──────╮\r\n│ ⚙️ a │\r\n╰──────╯\x1b[J".as_bytes();
+
+        // 1. Single-frame delivery
+        let mut att_whole = AttachedTerminal::new(1, 20, 4);
+        att_whole.process_vt_bytes(frame);
+        let screen_whole = att_whole.parser.screen();
+        assert_eq!(screen_whole.cell(0, 7).unwrap().contents(), "╮");
+        assert_eq!(screen_whole.cell(1, 7).unwrap().contents(), "│");
+        assert_eq!(screen_whole.cell(2, 7).unwrap().contents(), "╯");
+
+        // 2. Split specifically between '⚙' (\xe2\x9a\x99) and U+FE0F (\xef\xb8\x8f),
+        // and also test 1-byte-at-a-time streaming across partial UTF-8 sequences.
+        let mut att_bytewise = AttachedTerminal::new(2, 20, 4);
+        for b in frame {
+            att_bytewise.process_vt_bytes(std::slice::from_ref(b));
+        }
+        let screen_bytewise = att_bytewise.parser.screen();
+        assert_eq!(screen_bytewise.cell(0, 7).unwrap().contents(), "╮");
+        assert_eq!(screen_bytewise.cell(1, 7).unwrap().contents(), "│");
+        assert_eq!(screen_bytewise.cell(2, 7).unwrap().contents(), "╯");
     }
 }
