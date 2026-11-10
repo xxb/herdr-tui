@@ -889,11 +889,6 @@ fn run_app(
                 );
                 last_hits = geom.hits;
                 last_dpad_rect = geom.dpad_rect;
-                if let Some(r) = geom.dpad_rect {
-                    if dpad_pos.is_some() {
-                        dpad_pos = Some((r.x, r.y));
-                    }
-                }
             })?;
             dirty = false;
             if !first_frame_drawn {
@@ -1189,7 +1184,7 @@ fn run_app(
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
                         if let Some(drag) = dpad_drag.take() {
-                            if !drag.moved {
+                            if !drag.moved && matches!(modal, Modal::None) {
                                 match drag.tap_target {
                                     Some(HitTarget::PasteClipboard) => {
                                         prefix_active = false;
@@ -1326,6 +1321,7 @@ fn run_app(
                 }
             }
             Event::Key(kev) if kev.kind == KeyEventKind::Press => {
+                dpad_drag = None;
                 selection = None;
                 selection_screen = None;
                 if handle_key_event(
