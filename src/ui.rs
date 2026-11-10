@@ -9,7 +9,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Widget},
     Frame,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -475,18 +475,14 @@ fn draw_touchbar_pill(
     let lw = label.width() as u16;
     buf.set_string(x, rect.y, label, style);
     if rect.height >= 2 && lw > 0 {
-        let line_ch = if emphasized { "═" } else { "─" };
-        let mut sub = String::with_capacity(lw as usize * 3);
-        if lw >= 2 {
-            sub.push(' ');
-            for _ in 0..(lw - 2) {
-                sub.push_str(line_ch);
-            }
-            sub.push(' ');
+        let bevel_ch = if emphasized { "▂" } else { "▁" };
+        let bevel_fg = if emphasized {
+            Color::Rgb(245, 194, 118)
         } else {
-            sub.push_str(line_ch);
-        }
-        buf.set_string(x, rect.y + 1, &sub, style);
+            Color::Rgb(59, 66, 97)
+        };
+        let sub = bevel_ch.repeat(lw as usize);
+        buf.set_string(x, rect.y + 1, &sub, style.fg(bevel_fg));
     }
 }
 
@@ -505,27 +501,29 @@ fn render_bottom_touchbar(
     if rect.width == 0 || rect.height == 0 {
         return;
     }
-    let bg_bar = Style::default().bg(Color::Rgb(20, 22, 34)).fg(Color::Gray);
+    let bg_bar = Style::default()
+        .bg(Color::Rgb(16, 18, 27))
+        .fg(Color::Rgb(169, 177, 214));
     f.render_widget(Block::default().style(bg_bar), rect);
 
     let mut x = rect.x;
     let max_x = rect.x + rect.width;
     let buf = f.buffer_mut();
 
-    // Reserve right-side space for optional `[✓ Copied]`, `[▼ BOT]`, and `[ ? ]`
+    // Reserve right-side space for optional `✓ Copied`, `▼ BOT`, and `?` keycaps
     let copied_lbl = if copied_flash {
-        Some(" [✓ Copied] ")
+        Some(" ✓ Copied ")
     } else {
         None
     };
     let scroll_lbl = if scrollback_offset > 0 {
-        Some(" [▼ BOT] ")
+        Some(" ▼ BOT ")
     } else {
         None
     };
-    let help_lbl = " [ ? ] ";
-    let copied_w = copied_lbl.map_or(0, |s| s.width() as u16);
-    let scroll_w = scroll_lbl.map_or(0, |s| s.width() as u16);
+    let help_lbl = "  ?  ";
+    let copied_w = copied_lbl.map_or(0, |s| s.width() as u16 + 1);
+    let scroll_w = scroll_lbl.map_or(0, |s| s.width() as u16 + 1);
     let help_w = help_lbl.width() as u16;
     let right_reserved = (copied_w + scroll_w + help_w).min(rect.width.saturating_sub(4));
     let avail_end = max_x.saturating_sub(right_reserved);
@@ -542,11 +540,11 @@ fn render_bottom_touchbar(
     if sb_w > 0 && x + sb_w <= max_x {
         let style = Style::default()
             .bg(if sidebar_open {
-                Color::Rgb(52, 58, 92)
+                Color::Rgb(51, 59, 94)
             } else {
-                Color::Rgb(36, 40, 62)
+                Color::Rgb(31, 35, 53)
             })
-            .fg(Color::White)
+            .fg(Color::Rgb(192, 202, 245))
             .add_modifier(Modifier::BOLD);
         draw_touchbar_pill(buf, x, rect, &sb_label, style, sidebar_open);
         hits.push(HitRegion {
@@ -562,19 +560,16 @@ fn render_bottom_touchbar(
     }
 
     if x < avail_end {
-        for r in 0..rect.height {
-            buf.set_string(x, rect.y + r, "│", bg_bar.fg(Color::Rgb(55, 60, 82)));
-        }
         x += 1;
     }
 
     // 2. Left Space Name + Hollow/Solid Tab Circles (`●` = active tab, `○` = inactive tab):
     // When `rect.height >= 2`, row 0 shows the current Space name and row 1 underneath it shows `● ○ ○`.
-    // Compute `dots_budget` strictly from the state-independent `base_end` so `[^B]` and all key buttons
+    // Compute `dots_budget` strictly from the state-independent `base_end` so `^B` and all key buttons
     // stay at the exact same column regardless of `copied_flash` or `scrollback_offset`.
     let dots_start_x = x;
     let base_end = max_x.saturating_sub(help_w.min(rect.width.saturating_sub(4)));
-    let min_key_reserve: u16 = 29; // Enough for `[^B]│[Esc]│[Tab]│[^C]`
+    let min_key_reserve: u16 = 29;
     let dots_budget = base_end
         .saturating_sub(dots_start_x)
         .saturating_sub(min_key_reserve)
@@ -588,8 +583,8 @@ fn render_bottom_touchbar(
             let space_id = space.id.clone();
             let total_tabs = space.tabs.len();
             let zone_bg = Style::default()
-                .bg(Color::Rgb(28, 32, 52))
-                .fg(Color::Cyan)
+                .bg(Color::Rgb(24, 27, 42))
+                .fg(Color::Rgb(125, 207, 255))
                 .add_modifier(Modifier::BOLD);
 
             if rect.height >= 2 {
@@ -601,7 +596,7 @@ fn render_bottom_touchbar(
                     dots_start_x,
                     rect.y + 1,
                     &" ".repeat(dots_budget as usize),
-                    Style::default().bg(Color::Rgb(28, 32, 52)),
+                    Style::default().bg(Color::Rgb(24, 27, 42)),
                 );
                 // Default hit target across the Space+Dots widget cycles to the next tab
                 hits.push(HitRegion {
@@ -646,14 +641,14 @@ fn render_bottom_touchbar(
                     }
                     let st = world.tab_state(tab);
                     let fg_col = if is_active {
-                        Color::White
+                        Color::Rgb(125, 207, 255)
                     } else if matches!(st, AgentState::Blocked | AgentState::Done) {
                         state_color(st)
                     } else {
-                        Color::Rgb(150, 160, 195)
+                        Color::Rgb(105, 115, 152)
                     };
                     let dstyle = Style::default()
-                        .bg(Color::Rgb(28, 32, 52))
+                        .bg(Color::Rgb(24, 27, 42))
                         .fg(fg_col)
                         .add_modifier(if is_active {
                             Modifier::BOLD
@@ -681,7 +676,7 @@ fn render_bottom_touchbar(
                 }
                 x = dots_limit_x;
             } else {
-                // 1-row fallback (`--no-touch`): compact Space prefix + `●`/`○` circles
+                // 1-row fallback (`--no-touch`): compact `●`/`○` circles
                 let compact_dots = total_tabs > 3 || (dots_budget as usize) < total_tabs * 3;
                 let dot_step: usize = if compact_dots { 2 } else { 3 };
                 let max_visible_dots = (dots_budget as usize / dot_step).max(1);
@@ -712,14 +707,14 @@ fn render_bottom_touchbar(
                     }
                     let pstyle = Style::default()
                         .bg(if is_active {
-                            Color::Rgb(68, 78, 128)
+                            Color::Rgb(51, 59, 94)
                         } else {
-                            Color::Rgb(28, 32, 52)
+                            Color::Rgb(24, 27, 42)
                         })
                         .fg(if is_active {
-                            Color::White
+                            Color::Rgb(125, 207, 255)
                         } else {
-                            Color::Rgb(150, 160, 195)
+                            Color::Rgb(105, 115, 152)
                         })
                         .add_modifier(Modifier::BOLD);
                     draw_touchbar_pill(buf, x, rect, &pill, pstyle, is_active);
@@ -744,85 +739,104 @@ fn render_bottom_touchbar(
         x = dots_limit_x;
     }
     if x > dots_start_x && x < avail_end {
-        for r in 0..rect.height {
-            buf.set_string(x, rect.y + r, "│", bg_bar.fg(Color::Rgb(55, 60, 82)));
-        }
         x += 1;
     }
 
-    // 3. Constant-width Herdr App-style Touchbar Keys (`[^B]`, `[Esc]`, `[Ctrl]`, `[Alt]`, `[Tab]`, `[←]`, `[↓]`, `[↑]`, `[→]`, `⎘`)
-    // `[^C]` is intentionally omitted to prevent accidental process interruption.
-    // All labels have invariant character widths for a given `rect.width` so toggling `^B`/`Ctrl`/`Alt`
-    // or scrolling never causes horizontal jitter.
-    let wide_keys = rect.width >= 115;
-    let key_buttons: [(&str, HitTarget, bool); 10] = [
+    // 3. Modern Keycap Pills (`^B`, `Esc`, `Ctrl`, `Alt`, `Tab`, `←`, `↓`, `↑`, `→`, `⎘`)
+    // Clean rounded/beveled keycap look without ASCII `[]` brackets or `│` pipes.
+    let wide_keys = rect.width >= 108;
+    let key_buttons: [(&str, HitTarget, bool, u8); 10] = [
         (
-            if wide_keys { " [^B] " } else { "[^B]" },
+            if wide_keys { "  ^B  " } else { " ^B " },
             HitTarget::TogglePrefix,
             prefix_active,
+            1, // modifier keycap
         ),
         (
-            if wide_keys { " [Esc] " } else { "[Esc]" },
+            if wide_keys { " Esc " } else { " Esc " },
             HitTarget::SendKey(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             false,
+            0,
         ),
         (
-            if wide_keys { " [Ctrl] " } else { "[Ctrl]" },
+            if wide_keys { " Ctrl " } else { " Ctrl " },
             HitTarget::ToggleCtrl,
             ctrl_active,
+            1, // modifier keycap
         ),
         (
-            if wide_keys { " [Alt] " } else { "[Alt]" },
+            if wide_keys { " Alt " } else { " Alt " },
             HitTarget::ToggleAlt,
             alt_active,
+            1, // modifier keycap
         ),
         (
-            if wide_keys { " [Tab] " } else { "[Tab]" },
+            if wide_keys { " Tab " } else { " Tab " },
             HitTarget::SendKey(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
             false,
+            0,
         ),
         (
-            if wide_keys { " [←] " } else { "[←]" },
+            if wide_keys { "  ←  " } else { " ← " },
             HitTarget::SendKey(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
             false,
+            2, // arrow keycap
         ),
         (
-            if wide_keys { " [↓] " } else { "[↓]" },
+            if wide_keys { "  ↓  " } else { " ↓ " },
             HitTarget::SendKey(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
             false,
+            2,
         ),
         (
-            if wide_keys { " [↑] " } else { "[↑]" },
+            if wide_keys { "  ↑  " } else { " ↑ " },
             HitTarget::SendKey(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
             false,
+            2,
         ),
         (
-            if wide_keys { " [→] " } else { "[→]" },
+            if wide_keys { "  →  " } else { " → " },
             HitTarget::SendKey(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
             false,
+            2,
         ),
         (
             if wide_keys { "  ⎘  " } else { " ⎘ " },
             HitTarget::PasteClipboard,
             false,
+            3, // paste action keycap
         ),
     ];
 
-    for (lbl, target, active_highlight) in key_buttons {
+    for (lbl, target, active_highlight, kind) in key_buttons {
         let kw = lbl.width() as u16;
         if x + kw > avail_end {
             break;
         }
         let kstyle = if active_highlight {
             Style::default()
-                .bg(Color::LightYellow)
-                .fg(Color::Black)
+                .bg(Color::Rgb(224, 175, 104))
+                .fg(Color::Rgb(20, 22, 32))
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default()
-                .bg(Color::Rgb(34, 38, 58))
-                .fg(Color::Rgb(220, 225, 240))
-                .add_modifier(Modifier::BOLD)
+            match kind {
+                1 => Style::default()
+                    .bg(Color::Rgb(38, 42, 64))
+                    .fg(Color::Rgb(187, 154, 247))
+                    .add_modifier(Modifier::BOLD),
+                2 => Style::default()
+                    .bg(Color::Rgb(29, 33, 50))
+                    .fg(Color::Rgb(192, 202, 245))
+                    .add_modifier(Modifier::BOLD),
+                3 => Style::default()
+                    .bg(Color::Rgb(28, 44, 54))
+                    .fg(Color::Rgb(115, 218, 202))
+                    .add_modifier(Modifier::BOLD),
+                _ => Style::default()
+                    .bg(Color::Rgb(34, 38, 57))
+                    .fg(Color::Rgb(192, 202, 245))
+                    .add_modifier(Modifier::BOLD),
+            }
         };
         draw_touchbar_pill(buf, x, rect, lbl, kstyle, active_highlight);
         hits.push(HitRegion {
@@ -837,49 +851,48 @@ fn render_bottom_touchbar(
         x += kw;
 
         if x < avail_end {
-            for r in 0..rect.height {
-                buf.set_string(x, rect.y + r, "│", bg_bar.fg(Color::Rgb(50, 54, 74)));
-            }
             x += 1;
         }
     }
 
-    // 4. Right: optional `[✓ Copied]`, `[▼ BOT]`, and `[ ? ]`
+    // 4. Right: optional `✓ Copied`, `▼ BOT`, and `?` keycaps
     let mut rx = avail_end;
     if let Some(clbl) = copied_lbl {
-        if rx + copied_w <= max_x {
+        let cw = clbl.width() as u16;
+        if rx + cw <= max_x {
             let cstyle = Style::default()
-                .bg(Color::LightGreen)
-                .fg(Color::Black)
+                .bg(Color::Rgb(158, 206, 106))
+                .fg(Color::Rgb(20, 22, 32))
                 .add_modifier(Modifier::BOLD);
             draw_touchbar_pill(buf, rx, rect, clbl, cstyle, true);
-            rx += copied_w;
+            rx = (rx + cw + 1).min(max_x);
         }
     }
     if let Some(slbl) = scroll_lbl {
-        if rx + scroll_w <= max_x {
+        let sw = slbl.width() as u16;
+        if rx + sw <= max_x {
             let sstyle = Style::default()
-                .bg(Color::LightCyan)
-                .fg(Color::Black)
+                .bg(Color::Rgb(125, 207, 255))
+                .fg(Color::Rgb(20, 22, 32))
                 .add_modifier(Modifier::BOLD);
             draw_touchbar_pill(buf, rx, rect, slbl, sstyle, true);
             hits.push(HitRegion {
                 rect: Rect {
                     x: rx,
                     y: rect.y,
-                    width: scroll_w,
+                    width: sw,
                     height: rect.height,
                 },
                 target: HitTarget::ExitScrollback,
             });
-            rx += scroll_w;
+            rx = (rx + sw + 1).min(max_x);
         }
     }
 
     if rx + help_w <= max_x {
         let hstyle = Style::default()
-            .bg(Color::Rgb(38, 42, 64))
-            .fg(Color::LightCyan)
+            .bg(Color::Rgb(34, 40, 62))
+            .fg(Color::Rgb(125, 207, 255))
             .add_modifier(Modifier::BOLD);
         draw_touchbar_pill(buf, rx, rect, help_lbl, hstyle, false);
         hits.push(HitRegion {
@@ -943,14 +956,14 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
 
     // Header (1 row)
     if y < max_y {
-        let hdr = pad_to_width(" SPACES & TABS", w);
+        let hdr = pad_to_width(" ❖ WORKSPACES", w);
         buf.set_string(
             inner.x,
             y,
             &hdr,
             Style::default()
-                .bg(Color::Rgb(26, 28, 44))
-                .fg(Color::Cyan)
+                .bg(Color::Rgb(22, 24, 37))
+                .fg(Color::Rgb(122, 162, 247))
                 .add_modifier(Modifier::BOLD),
         );
         y += 1;
@@ -1107,6 +1120,16 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
         buf.set_string(inner.x, y, &pad_to_width(&card.row1, w), r1_style);
         buf.set_string(inner.x, y + 1, &pad_to_width(&card.row2, w), r2_style);
 
+        if card.is_active {
+            let accent = if card.is_space {
+                Color::Rgb(125, 207, 255)
+            } else {
+                Color::Rgb(122, 162, 247)
+            };
+            buf.set_string(inner.x, y, "▍", r1_style.fg(accent));
+            buf.set_string(inner.x, y + 1, "▍", r2_style.fg(accent));
+        }
+
         if let Some((dot_off, st)) = card.dot_col {
             if inner.x + dot_off < inner.x + inner.width {
                 buf.set_string(
@@ -1153,10 +1176,10 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
         buf.set_string(
             btn_x,
             tab_y,
-            &pad_to_width(" + New Tab   (^b c) ", btn_w_usize),
+            &pad_to_width(" ▎ + New Tab    ^b c ", btn_w_usize),
             Style::default()
-                .bg(Color::Rgb(32, 54, 46))
-                .fg(Color::LightGreen)
+                .bg(Color::Rgb(26, 42, 38))
+                .fg(Color::Rgb(158, 206, 106))
                 .add_modifier(Modifier::BOLD),
         );
         hits.push(HitRegion {
@@ -1173,10 +1196,10 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
         buf.set_string(
             btn_x,
             sp_y,
-            &pad_to_width(" + New Space (^b C) ", btn_w_usize),
+            &pad_to_width(" ▎ + New Space  ^b C ", btn_w_usize),
             Style::default()
-                .bg(Color::Rgb(30, 44, 62))
-                .fg(Color::LightCyan)
+                .bg(Color::Rgb(26, 36, 52))
+                .fg(Color::Rgb(125, 207, 255))
                 .add_modifier(Modifier::BOLD),
         );
         hits.push(HitRegion {
@@ -1193,10 +1216,10 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
         buf.set_string(
             btn_x,
             tab_y,
-            &pad_to_width(" + New Tab   (^b c) ", btn_w_usize),
+            &pad_to_width(" ▎ + New Tab    ^b c ", btn_w_usize),
             Style::default()
-                .bg(Color::Rgb(32, 54, 46))
-                .fg(Color::LightGreen)
+                .bg(Color::Rgb(26, 42, 38))
+                .fg(Color::Rgb(158, 206, 106))
                 .add_modifier(Modifier::BOLD),
         );
         hits.push(HitRegion {
@@ -1211,10 +1234,10 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
         buf.set_string(
             btn_x,
             tab_y + 1,
-            &pad_to_width(" + New Space (^b C) ", btn_w_usize),
+            &pad_to_width(" ▎ + New Space  ^b C ", btn_w_usize),
             Style::default()
-                .bg(Color::Rgb(30, 44, 62))
-                .fg(Color::LightCyan)
+                .bg(Color::Rgb(26, 36, 52))
+                .fg(Color::Rgb(125, 207, 255))
                 .add_modifier(Modifier::BOLD),
         );
         hits.push(HitRegion {
@@ -1323,7 +1346,7 @@ fn centered_rect(width: u16, height: u16, r: Rect) -> Rect {
 }
 
 fn draw_modal_close_button(buf: &mut Buffer, popup: Rect, hits: &mut Vec<HitRegion>) {
-    let close_lbl = " [ ✕ ] ";
+    let close_lbl = " ✕ ";
     let cw = close_lbl.width() as u16;
     if popup.width > cw + 4 {
         let cx = popup.x + popup.width - cw - 2;
@@ -1333,7 +1356,7 @@ fn draw_modal_close_button(buf: &mut Buffer, popup: Rect, hits: &mut Vec<HitRegi
             cy,
             close_lbl,
             Style::default()
-                .bg(Color::Rgb(85, 36, 46))
+                .bg(Color::Rgb(96, 38, 52))
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         );
@@ -1361,8 +1384,9 @@ fn render_help_modal(f: &mut Frame, area: Rect, hits: &mut Vec<HitRegion>) {
     let block = Block::default()
         .title(" Quick Actions & Help ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Rgb(22, 24, 36)).fg(Color::White));
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Rgb(122, 162, 247)))
+        .style(Style::default().bg(Color::Rgb(20, 22, 34)).fg(Color::White));
     let inner = block.inner(popup);
 
     // Reflow the 12 touch quick-action buttons across available inner width so narrow mobile
@@ -1370,63 +1394,63 @@ fn render_help_modal(f: &mut Frame, area: Rect, hits: &mut Vec<HitRegion>) {
     let compact_btns = inner.width < 58;
     let quick_actions: [(&str, &str, HitTarget); 12] = [
         (
-            " [ + New Tab    ] ",
-            " [+Tab] ",
+            "  + New Tab     ",
+            " +Tab ",
             HitTarget::TriggerAction(Action::NewTab),
         ),
         (
-            " [ ✕ Close Tab  ] ",
-            " [✕Tab] ",
+            "  ✕ Close Tab   ",
+            " ✕Tab ",
             HitTarget::TriggerAction(Action::CloseTab),
         ),
         (
-            " [ ✎ Rename Tab ] ",
-            " [✎Tab] ",
+            "  ✎ Rename Tab  ",
+            " ✎Tab ",
             HitTarget::TriggerAction(Action::RenameTab),
         ),
         (
-            " [ 🔍 Fuzzy Find ] ",
-            " [🔍Find] ",
+            "  🔍 Fuzzy Find  ",
+            " 🔍Find ",
             HitTarget::TriggerAction(Action::FuzzyFinder),
         ),
         (
-            " [ ⚡ Next Alert ] ",
-            " [⚡Alert] ",
+            "  ⚡ Next Alert  ",
+            " ⚡Alert ",
             HitTarget::TriggerAction(Action::JumpAlertAgent),
         ),
         (
-            " [ ⇕ Scrollback ] ",
-            " [⇕Scrl] ",
+            "  ⇕ Scrollback  ",
+            " ⇕Scrl ",
             HitTarget::TriggerAction(Action::EnterScrollback),
         ),
         (
-            " [ + New Space  ] ",
-            " [+Spc] ",
+            "  + New Space   ",
+            " +Spc ",
             HitTarget::TriggerAction(Action::NewSpace),
         ),
         (
-            " [ ✎ Ren Space  ] ",
-            " [✎Spc] ",
+            "  ✎ Ren Space   ",
+            " ✎Spc ",
             HitTarget::TriggerAction(Action::RenameSpace),
         ),
         (
-            " [ ⇄ Next Space ] ",
-            " [⇄Spc] ",
+            "  ⇄ Next Space  ",
+            " ⇄Spc ",
             HitTarget::TriggerAction(Action::NextSpace),
         ),
         (
-            " [ ◧ Sidebar    ] ",
-            " [◧Bar] ",
+            "  ◧ Sidebar     ",
+            " ◧Bar ",
             HitTarget::TriggerAction(Action::ToggleSidebar),
         ),
         (
-            " [ ⏏ Detach hct ] ",
-            " [⏏Exit] ",
+            "  ⏏ Detach hct  ",
+            " ⏏Exit ",
             HitTarget::TriggerAction(Action::Detach),
         ),
         (
-            " [ ✕ Close Help ] ",
-            " [✕Help] ",
+            "  ✕ Close Help  ",
+            " ✕Help ",
             HitTarget::CancelModal,
         ),
     ];
@@ -1537,6 +1561,7 @@ fn render_confirm_close_modal(
     let block = Block::default()
         .title(" Close Tab ")
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::LightRed))
         .style(Style::default().bg(Color::Rgb(28, 20, 28)).fg(Color::White));
     let inner = block.inner(popup);
@@ -1547,8 +1572,8 @@ fn render_confirm_close_modal(
 
     if inner.height >= 4 {
         let by = inner.y + 3;
-        let yes_lbl = " [ ✓ Confirm Close (Y) ] ";
-        let no_lbl = " [ ✕ Cancel (N) ] ";
+        let yes_lbl = "  ✓ Confirm Close (Y)  ";
+        let no_lbl = "  ✕ Cancel (N)  ";
         let yw = yes_lbl.width() as u16;
         let nw = no_lbl.width() as u16;
         let bx = inner.x + 2;
@@ -1622,8 +1647,9 @@ fn render_prompt_modal(
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Rgb(22, 24, 36)).fg(Color::White));
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Rgb(122, 162, 247)))
+        .style(Style::default().bg(Color::Rgb(20, 22, 34)).fg(Color::White));
     let inner = block.inner(popup);
     f.render_widget(Paragraph::new(lines).block(block), popup);
 
@@ -1632,8 +1658,8 @@ fn render_prompt_modal(
 
     if inner.height >= 4 {
         let by = inner.y + 3;
-        let ok_lbl = " [ ✓ Confirm (Enter) ] ";
-        let cancel_lbl = " [ ✕ Cancel (Esc) ] ";
+        let ok_lbl = "  ✓ Confirm (Enter)  ";
+        let cancel_lbl = "  ✕ Cancel (Esc)  ";
         let ow = ok_lbl.width() as u16;
         let cw = cancel_lbl.width() as u16;
         let bx = inner.x + 2;
@@ -1701,8 +1727,9 @@ fn render_fuzzy_modal(
     let block = Block::default()
         .title(" Quick Switch Space / Tab (^b w) ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Rgb(22, 24, 36)).fg(Color::White));
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Rgb(122, 162, 247)))
+        .style(Style::default().bg(Color::Rgb(20, 22, 34)).fg(Color::White));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
