@@ -11,8 +11,8 @@ use crate::keys::{
 };
 use crate::model::World;
 use crate::ui::{
-    collect_fuzzy_items, compute_terminal_rect, render_ui, resolve_fuzzy_selection, HitRegion,
-    HitTarget, Modal, PromptKind,
+    collect_fuzzy_items, compute_terminal_rect, find_hit_target, render_ui,
+    resolve_fuzzy_selection, HitRegion, HitTarget, Modal, PromptKind, TerminalSelection,
 };
 use anyhow::Result;
 use clap::Parser;
@@ -20,13 +20,14 @@ use crossterm::{
     cursor::Show,
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
-use std::io;
+use std::io::{self, Write};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const SCROLLBACK_LINES: usize = 5000;
@@ -66,6 +67,14 @@ struct Cli {
     /// Start with the left sidebar collapsed
     #[arg(long, conflicts_with = "sidebar")]
     no_sidebar: bool,
+
+    /// Enable 2-row large touch top bar mode for iPad / tablet SSH clients
+    #[arg(long)]
+    touch: bool,
+
+    /// Disable 2-row large touch top bar mode
+    #[arg(long, conflicts_with = "touch")]
+    no_touch: bool,
 }
 
 struct AttachedTerminal {
@@ -86,6 +95,150 @@ fn sanitize_vt_bytes(payload: &[u8]) -> Vec<u8> {
     out
 }
 
+fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(b2 & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+fn copy_to_clipboard(text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    // 1. Emit OSC 52 clipboard escape sequence directly to the outer SSH / terminal stdout
+    // so remote SSH clients (iPad Termius, Blink, ShellFish, WezTerm, Kitty, iTerm2, Ghostty)
+    // automatically update the client device's native clipboard.
+    let b64 = base64_encode(text.as_bytes());
+    let mut stdout = io::stdout();
+    if std::env::var_os("TMUX").is_some() {
+        let _ = write!(
+            stdout,
+            "\x1bPtmux;\x1b\x1b]52;c;{b64}\x07\x1b\\\x1b]52;c;{b64}\x07"
+        );
+    } else {
+        let _ = write!(stdout, "\x1b]52;c;{b64}\x07\x1b]52;;{b64}\x07");
+    }
+    let _ = stdout.flush();
+
+    // 2. Also attempt local clipboard helper in a detached background thread when a local display server is active
+    let owned = text.to_string();
+    std::thread::spawn(move || {
+        let local_cmds: &[(&str, &[&str])] = &[
+            ("pbcopy", &[]),
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+        ];
+        for (prog, args) in local_cmds {
+            if *prog == "wl-copy" && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+                continue;
+            }
+            if *prog == "xclip" && std::env::var_os("DISPLAY").is_none() {
+                continue;
+            }
+            if let Ok(mut child) = Command::new(prog)
+                .args(*args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(owned.as_bytes());
+                }
+                let _ = child.wait();
+                break;
+            }
+        }
+    });
+}
+
+fn read_clipboard_text(fallback: &str) -> String {
+    if std::env::var_os("SSH_CONNECTION").is_none() && std::env::var_os("SSH_TTY").is_none() {
+        let local_cmds: &[(&str, &[&str])] = &[
+            ("pbpaste", &[]),
+            ("wl-paste", &["--no-newline"]),
+            ("xclip", &["-selection", "clipboard", "-o"]),
+        ];
+        for (prog, args) in local_cmds {
+            if *prog == "wl-paste" && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+                continue;
+            }
+            if *prog == "xclip" && std::env::var_os("DISPLAY").is_none() {
+                continue;
+            }
+            if let Ok(output) = Command::new(prog)
+                .args(*args)
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+            {
+                if output.status.success() {
+                    let s = String::from_utf8_lossy(&output.stdout).into_owned();
+                    if !s.is_empty() {
+                        return s;
+                    }
+                }
+            }
+        }
+    }
+    fallback.to_string()
+}
+
+fn paste_text_into_app(
+    text: &str,
+    core: &CoreClient,
+    world: &World,
+    attached: &Option<AttachedTerminal>,
+    scrollback_offset: &mut usize,
+    modal: &mut Modal,
+) {
+    if text.is_empty() {
+        return;
+    }
+    if matches!(modal, Modal::None) {
+        *scrollback_offset = 0;
+        if let Some(att) = attached {
+            if att.parser.screen().bracketed_paste() {
+                let mut payload = b"\x1b[200~".to_vec();
+                payload.extend_from_slice(text.as_bytes());
+                payload.extend_from_slice(b"\x1b[201~");
+                core.send_input(att.channel, &payload);
+            } else {
+                core.send_input(att.channel, text.as_bytes());
+            }
+        }
+    } else if let Modal::Prompt { input, .. } = modal {
+        input.push_str(text);
+    } else if let Modal::Fuzzy {
+        query,
+        selected,
+        selected_tab_id,
+    } = modal
+    {
+        query.push_str(text);
+        *selected = 0;
+        let items = collect_fuzzy_items(world, query);
+        *selected_tab_id = items.first().map(|it| it.tab_id.clone());
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let file_cfg = FileConfig::load();
@@ -96,6 +249,13 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| "ctrl+b".to_string());
     let sidebar_width = file_cfg.ui.sidebar_width.unwrap_or(24).clamp(16, 48);
     let mobile_threshold = file_cfg.ui.mobile_width_threshold.unwrap_or(80);
+    let touch_mode = if cli.touch {
+        true
+    } else if cli.no_touch {
+        false
+    } else {
+        file_cfg.ui.touch_mode.unwrap_or(true)
+    };
 
     let (core, core_rx) = CoreClient::connect(cli.session.as_deref())?;
     let snapshot = core.subscribe_events()?;
@@ -138,6 +298,7 @@ fn main() -> Result<()> {
         &mut sidebar_open,
         sidebar_width,
         mobile_threshold,
+        touch_mode,
     );
 
     // Restore terminal cleanly
@@ -308,25 +469,37 @@ fn execute_action(
     Ok(false)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     core: &CoreClient,
-    core_rx: & std::sync::mpsc::Receiver<CoreMessage>,
+    core_rx: &std::sync::mpsc::Receiver<CoreMessage>,
     world: &mut World,
     prefix_spec: &str,
     sidebar_open: &mut bool,
     sidebar_width: u16,
     mobile_threshold: u16,
+    touch_mode: bool,
 ) -> Result<()> {
     let mut attached: Option<AttachedTerminal> = None;
     let mut prefix_active = false;
+    let mut ctrl_active = false;
+    let mut alt_active = false;
     let mut scrollback_offset: usize = 0;
     let mut modal = Modal::None;
     let mut last_hits: Vec<HitRegion> = Vec::new();
+    let mut selection: Option<TerminalSelection> = None;
+    let mut selection_screen: Option<vt100::Screen> = None;
+    let mut clipboard_buffer = String::new();
+    let mut copied_until: Option<Instant> = None;
     let mut dirty = true;
     let mut prev_width = terminal.size()?.width;
 
     loop {
+        if copied_until.is_some_and(|t| Instant::now() >= t) {
+            copied_until = None;
+            dirty = true;
+        }
         let size = terminal.size()?;
         if size.width != prev_width {
             if size.width < mobile_threshold {
@@ -336,8 +509,9 @@ fn run_app(
             dirty = true;
         }
         let area = Rect::new(0, 0, size.width, size.height);
-        let term_rect = compute_terminal_rect(area, *sidebar_open, sidebar_width);
+        let term_rect = compute_terminal_rect(area, *sidebar_open, sidebar_width, touch_mode);
 
+        let prev_addr = attached.as_ref().map(|a| a.address.clone());
         sync_attached_terminal(
             core,
             world,
@@ -345,6 +519,10 @@ fn run_app(
             term_rect,
             &mut scrollback_offset,
         );
+        if attached.as_ref().map(|a| &a.address) != prev_addr.as_ref() {
+            selection = None;
+            selection_screen = None;
+        }
 
         if let Some(att) = attached.as_mut() {
             att.parser.set_scrollback(scrollback_offset);
@@ -352,7 +530,14 @@ fn run_app(
         }
 
         if dirty {
-            let scr_ref = attached.as_ref().map(|a| a.parser.screen());
+            let scr_ref = if selection.as_ref().is_some_and(|s| s.active) {
+                selection_screen
+                    .as_ref()
+                    .or_else(|| attached.as_ref().map(|a| a.parser.screen()))
+            } else {
+                attached.as_ref().map(|a| a.parser.screen())
+            };
+            let copied_flash = copied_until.is_some();
             terminal.draw(|f| {
                 let geom = render_ui(
                     f,
@@ -360,8 +545,13 @@ fn run_app(
                     scr_ref,
                     *sidebar_open,
                     sidebar_width,
+                    touch_mode,
                     prefix_active,
+                    ctrl_active,
+                    alt_active,
                     scrollback_offset,
+                    selection.as_ref(),
+                    copied_flash,
                     &modal,
                 );
                 last_hits = geom.hits;
@@ -384,6 +574,10 @@ fn run_app(
                         if att.channel == channel {
                             let clean = sanitize_vt_bytes(&data);
                             att.parser.process(&clean);
+                            if selection.as_ref().is_some_and(|s| !s.active) {
+                                selection = None;
+                                selection_screen = None;
+                            }
                         }
                     }
                 }
@@ -473,85 +667,324 @@ fn run_app(
                 prev_width = w;
             }
             Event::Paste(text) => {
-                if matches!(modal, Modal::None) && scrollback_offset == 0 {
-                    if let Some(att) = &attached {
-                        if att.parser.screen().bracketed_paste() {
-                            let mut payload = b"\x1b[200~".to_vec();
-                            payload.extend_from_slice(text.as_bytes());
-                            payload.extend_from_slice(b"\x1b[201~");
-                            core.send_input(att.channel, &payload);
-                        } else {
-                            core.send_input(att.channel, text.as_bytes());
-                        }
-                    }
-                } else if let Modal::Prompt { input, .. } = &mut modal {
-                    input.push_str(&text);
-                } else if let Modal::Fuzzy {
-                    query,
-                    selected,
-                    selected_tab_id,
-                } = &mut modal
-                {
-                    query.push_str(&text);
-                    *selected = 0;
-                    let items = collect_fuzzy_items(world, query);
-                    *selected_tab_id = items.first().map(|it| it.tab_id.clone());
+                if !text.is_empty() {
+                    clipboard_buffer = text.clone();
                 }
+                paste_text_into_app(
+                    &text,
+                    core,
+                    world,
+                    &attached,
+                    &mut scrollback_offset,
+                    &mut modal,
+                );
             }
             Event::Mouse(mev) => {
                 match mev.kind {
                     MouseEventKind::Down(MouseButton::Left) => {
                         let mx = mev.column;
                         let my = mev.row;
-                        if let Some(hit) = last_hits.iter().find(|h| {
-                            mx >= h.rect.x
-                                && mx < h.rect.x + h.rect.width
-                                && my >= h.rect.y
-                                && my < h.rect.y + h.rect.height
-                        }) {
-                            let target = hit.target.clone();
-                            modal = Modal::None;
-                            prefix_active = false;
+                        if let Some(target) = find_hit_target(&last_hits, mx, my) {
+                            selection = None;
+                            selection_screen = None;
                             match target {
-                                HitTarget::ToggleSidebar => *sidebar_open = !*sidebar_open,
-                                HitTarget::NextSpace => {
-                                    world.next_space();
-                                    world.mark_active_seen(core);
+                                HitTarget::ModalNoop => {}
+                                HitTarget::CancelModal => {
+                                    modal = Modal::None;
+                                    prefix_active = false;
+                                    ctrl_active = false;
+                                    alt_active = false;
+                                }
+                                HitTarget::ConfirmCloseYes { tab_id } => {
+                                    modal = Modal::None;
+                                    prefix_active = false;
+                                    ctrl_active = false;
+                                    alt_active = false;
+                                    let _ = world.close_tab_by_id(core, &tab_id);
+                                }
+                                HitTarget::SubmitPrompt => {
+                                    prefix_active = false;
+                                    ctrl_active = false;
+                                    alt_active = false;
+                                    if let Modal::Prompt { kind, input } =
+                                        std::mem::replace(&mut modal, Modal::None)
+                                    {
+                                        match kind {
+                                            PromptKind::RenameTab { tab_id } => {
+                                                let _ = world.rename_tab_by_id(core, &tab_id, &input);
+                                            }
+                                            PromptKind::RenameSpace { space_id } => {
+                                                let _ =
+                                                    world.rename_space_by_id(core, &space_id, &input);
+                                            }
+                                            PromptKind::NewSpace => {
+                                                let _ = world.create_new_space(core, &input);
+                                            }
+                                        }
+                                    }
+                                }
+                                HitTarget::TriggerAction(act) => {
+                                    modal = Modal::None;
+                                    prefix_active = false;
+                                    ctrl_active = false;
+                                    alt_active = false;
+                                    if execute_action(
+                                        act,
+                                        core,
+                                        world,
+                                        &attached,
+                                        prefix_spec,
+                                        sidebar_open,
+                                        &mut scrollback_offset,
+                                        &mut modal,
+                                    )? {
+                                        return Ok(());
+                                    }
+                                }
+                                HitTarget::TogglePrefix => {
+                                    modal = Modal::None;
+                                    ctrl_active = false;
+                                    alt_active = false;
+                                    if prefix_active {
+                                        prefix_active = false;
+                                        if let Some(att) = &attached {
+                                            let bytes = prefix_bytes(prefix_spec);
+                                            core.send_input(att.channel, &bytes);
+                                        }
+                                    } else {
+                                        prefix_active = true;
+                                    }
+                                }
+                                HitTarget::ToggleCtrl => {
+                                    modal = Modal::None;
+                                    prefix_active = false;
+                                    ctrl_active = !ctrl_active;
+                                }
+                                HitTarget::ToggleAlt => {
+                                    modal = Modal::None;
+                                    prefix_active = false;
+                                    alt_active = !alt_active;
+                                }
+                                HitTarget::PasteClipboard => {
+                                    prefix_active = false;
+                                    ctrl_active = false;
+                                    alt_active = false;
+                                    let text = read_clipboard_text(&clipboard_buffer);
+                                    if !text.is_empty() {
+                                        paste_text_into_app(
+                                            &text,
+                                            core,
+                                            world,
+                                            &attached,
+                                            &mut scrollback_offset,
+                                            &mut modal,
+                                        );
+                                    }
+                                }
+                                HitTarget::ExitScrollback => {
+                                    modal = Modal::None;
+                                    prefix_active = false;
+                                    ctrl_active = false;
+                                    alt_active = false;
+                                    scrollback_offset = 0;
+                                }
+                                HitTarget::ToggleSidebar => {
+                                    modal = Modal::None;
+                                    prefix_active = false;
+                                    ctrl_active = false;
+                                    alt_active = false;
+                                    *sidebar_open = !*sidebar_open;
+                                }
+                                HitTarget::ToggleSpaceCollapse(space_id) => {
+                                    modal = Modal::None;
+                                    prefix_active = false;
+                                    ctrl_active = false;
+                                    alt_active = false;
+                                    world.toggle_space_collapsed(&space_id);
                                 }
                                 HitTarget::SelectSpace(space_id) => {
+                                    modal = Modal::None;
+                                    prefix_active = false;
+                                    ctrl_active = false;
+                                    alt_active = false;
                                     if world.select_space_by_id(&space_id) {
                                         world.mark_active_seen(core);
                                     }
                                 }
                                 HitTarget::SelectTab { space_id, tab_id } => {
+                                    modal = Modal::None;
+                                    prefix_active = false;
+                                    ctrl_active = false;
+                                    alt_active = false;
                                     if world.select_tab_by_id(&space_id, &tab_id) {
                                         world.mark_active_seen(core);
                                     }
                                 }
                                 HitTarget::NewTab => {
+                                    modal = Modal::None;
+                                    prefix_active = false;
+                                    ctrl_active = false;
+                                    alt_active = false;
                                     let _ = world.create_new_tab(core);
                                 }
                                 HitTarget::NewSpacePrompt => {
+                                    prefix_active = false;
+                                    ctrl_active = false;
+                                    alt_active = false;
                                     modal = Modal::Prompt {
                                         kind: PromptKind::NewSpace,
                                         input: String::new(),
                                     };
                                 }
                                 HitTarget::ToggleHelp => {
-                                    modal = Modal::Help;
+                                    prefix_active = false;
+                                    ctrl_active = false;
+                                    alt_active = false;
+                                    modal = if matches!(modal, Modal::Help) {
+                                        Modal::None
+                                    } else {
+                                        Modal::Help
+                                    };
+                                }
+                                HitTarget::SendKey(kev) => {
+                                    if handle_key_event(
+                                        kev,
+                                        core,
+                                        world,
+                                        &attached,
+                                        prefix_spec,
+                                        sidebar_open,
+                                        &mut prefix_active,
+                                        &mut ctrl_active,
+                                        &mut alt_active,
+                                        &mut scrollback_offset,
+                                        &mut modal,
+                                        term_rect,
+                                    )? {
+                                        return Ok(());
+                                    }
                                 }
                             }
                         } else if !matches!(modal, Modal::None) {
                             modal = Modal::None;
+                            prefix_active = false;
+                            ctrl_active = false;
+                            alt_active = false;
+                        } else if mx >= term_rect.x
+                            && mx < term_rect.x.saturating_add(term_rect.width)
+                            && my >= term_rect.y
+                            && my < term_rect.y.saturating_add(term_rect.height)
+                        {
+                            let rel_col = mx.saturating_sub(term_rect.x);
+                            let rel_row = my.saturating_sub(term_rect.y);
+                            selection = Some(TerminalSelection::new(rel_row, rel_col));
+                            selection_screen = attached.as_ref().map(|a| a.parser.screen().clone());
+                        } else {
+                            selection = None;
+                            selection_screen = None;
+                        }
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        if let Some(ref mut sel) = selection {
+                            if sel.active && term_rect.width > 0 && term_rect.height > 0 {
+                                let rel_col = mev
+                                    .column
+                                    .saturating_sub(term_rect.x)
+                                    .min(term_rect.width.saturating_sub(1));
+                                let rel_row = mev
+                                    .row
+                                    .saturating_sub(term_rect.y)
+                                    .min(term_rect.height.saturating_sub(1));
+                                sel.head = (rel_row, rel_col);
+                            }
+                        }
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        if let Some(ref mut sel) = selection {
+                            if sel.active {
+                                if term_rect.width > 0 && term_rect.height > 0 {
+                                    let rel_col = mev
+                                        .column
+                                        .saturating_sub(term_rect.x)
+                                        .min(term_rect.width.saturating_sub(1));
+                                    let rel_row = mev
+                                        .row
+                                        .saturating_sub(term_rect.y)
+                                        .min(term_rect.height.saturating_sub(1));
+                                    sel.head = (rel_row, rel_col);
+                                }
+                                sel.active = false;
+                                let snap = selection_screen.take();
+                                if sel.is_non_empty() {
+                                    let scr = snap
+                                        .as_ref()
+                                        .or_else(|| attached.as_ref().map(|a| a.parser.screen()));
+                                    if let Some(screen) = scr {
+                                        let text = sel.extract_text(screen);
+                                        if !text.is_empty() {
+                                            clipboard_buffer = text.clone();
+                                            copy_to_clipboard(&text);
+                                            copied_until =
+                                                Some(Instant::now() + Duration::from_secs(2));
+                                        }
+                                    }
+                                    if snap.as_ref().is_some_and(|s| {
+                                        attached.as_ref().is_some_and(|a| {
+                                            s.contents() != a.parser.screen().contents()
+                                        })
+                                    }) {
+                                        selection = None;
+                                    }
+                                } else {
+                                    selection = None;
+                                }
+                            }
                         }
                     }
                     MouseEventKind::ScrollUp => {
-                        if matches!(modal, Modal::None) {
+                        if let Modal::Fuzzy {
+                            ref query,
+                            ref mut selected,
+                            ref mut selected_tab_id,
+                        } = modal
+                        {
+                            let items = collect_fuzzy_items(world, query);
+                            let cur_sel = resolve_fuzzy_selection(
+                                &items,
+                                *selected,
+                                selected_tab_id.as_deref(),
+                            )
+                            .unwrap_or(0);
+                            *selected = cur_sel.saturating_sub(1);
+                            *selected_tab_id = items.get(*selected).map(|it| it.tab_id.clone());
+                        } else if matches!(modal, Modal::None) {
+                            selection = None;
+                            selection_screen = None;
                             scrollback_offset = scrollback_offset.saturating_add(3);
                         }
                     }
                     MouseEventKind::ScrollDown => {
-                        if matches!(modal, Modal::None) {
+                        if let Modal::Fuzzy {
+                            ref query,
+                            ref mut selected,
+                            ref mut selected_tab_id,
+                        } = modal
+                        {
+                            let items = collect_fuzzy_items(world, query);
+                            if !items.is_empty() {
+                                let cur_sel = resolve_fuzzy_selection(
+                                    &items,
+                                    *selected,
+                                    selected_tab_id.as_deref(),
+                                )
+                                .unwrap_or(0);
+                                *selected = (cur_sel + 1).min(items.len() - 1);
+                                *selected_tab_id =
+                                    items.get(*selected).map(|it| it.tab_id.clone());
+                            }
+                        } else if matches!(modal, Modal::None) {
+                            selection = None;
+                            selection_screen = None;
                             scrollback_offset = scrollback_offset.saturating_sub(3);
                         }
                     }
@@ -559,207 +992,263 @@ fn run_app(
                 }
             }
             Event::Key(kev) if kev.kind == KeyEventKind::Press => {
-                // 1. Handle active Modal first
-                match &mut modal {
-                    Modal::Help => {
-                        modal = Modal::None;
-                        continue;
-                    }
-                    Modal::ConfirmCloseTab { tab_id, .. } => {
-                        let target_id = tab_id.clone();
-                        match kev.code {
-                            KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
-                                modal = Modal::None;
-                                let _ = world.close_tab_by_id(core, &target_id);
-                            }
-                            KeyCode::Char('n' | 'N') | KeyCode::Esc => {
-                                modal = Modal::None;
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-                    Modal::Prompt { kind, input } => {
-                        let k = kind.clone();
-                        match kev.code {
-                            KeyCode::Esc => {
-                                modal = Modal::None;
-                            }
-                            KeyCode::Enter => {
-                                let text = input.clone();
-                                modal = Modal::None;
-                                match k {
-                                    PromptKind::RenameTab { tab_id } => {
-                                        let _ = world.rename_tab_by_id(core, &tab_id, &text);
-                                    }
-                                    PromptKind::RenameSpace { space_id } => {
-                                        let _ = world.rename_space_by_id(core, &space_id, &text);
-                                    }
-                                    PromptKind::NewSpace => {
-                                        let _ = world.create_new_space(core, &text);
-                                    }
-                                }
-                            }
-                            KeyCode::Backspace => {
-                                input.pop();
-                            }
-                            KeyCode::Char(c) if !kev.modifiers.contains(KeyModifiers::CONTROL) => {
-                                input.push(c);
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-                    Modal::Fuzzy {
-                        query,
-                        selected,
-                        selected_tab_id,
-                    } => {
-                        let items = collect_fuzzy_items(world, query);
-                        let cur_sel =
-                            resolve_fuzzy_selection(&items, *selected, selected_tab_id.as_deref())
-                                .unwrap_or(0);
-                        match kev.code {
-                            KeyCode::Esc => {
-                                modal = Modal::None;
-                            }
-                            KeyCode::Up => {
-                                *selected = cur_sel.saturating_sub(1);
-                                *selected_tab_id = items.get(*selected).map(|it| it.tab_id.clone());
-                            }
-                            KeyCode::Down => {
-                                if !items.is_empty() {
-                                    *selected = (cur_sel + 1).min(items.len() - 1);
-                                    *selected_tab_id =
-                                        items.get(*selected).map(|it| it.tab_id.clone());
-                                }
-                            }
-                            KeyCode::Char('p') if kev.modifiers.contains(KeyModifiers::CONTROL) => {
-                                *selected = cur_sel.saturating_sub(1);
-                                *selected_tab_id = items.get(*selected).map(|it| it.tab_id.clone());
-                            }
-                            KeyCode::Char('n') if kev.modifiers.contains(KeyModifiers::CONTROL) => {
-                                if !items.is_empty() {
-                                    *selected = (cur_sel + 1).min(items.len() - 1);
-                                    *selected_tab_id =
-                                        items.get(*selected).map(|it| it.tab_id.clone());
-                                }
-                            }
-                            KeyCode::Enter => {
-                                if let Some(ref tid) = *selected_tab_id {
-                                    if let Some(chosen) = items.iter().find(|it| &it.tab_id == tid)
-                                    {
-                                        if world.select_tab_by_id(&chosen.space_id, &chosen.tab_id)
-                                        {
-                                            world.mark_active_seen(core);
-                                        }
-                                    }
-                                }
-                                modal = Modal::None;
-                            }
-                            KeyCode::Backspace => {
-                                query.pop();
-                                *selected = 0;
-                                let next_items = collect_fuzzy_items(world, query);
-                                *selected_tab_id = next_items.first().map(|it| it.tab_id.clone());
-                            }
-                            KeyCode::Char(c) if !kev.modifiers.contains(KeyModifiers::CONTROL) => {
-                                query.push(c);
-                                *selected = 0;
-                                let next_items = collect_fuzzy_items(world, query);
-                                *selected_tab_id = next_items.first().map(|it| it.tab_id.clone());
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-                    Modal::None => {}
-                }
-
-                // 2. Prefix mode active (`Ctrl+b` pressed previously)
-                if prefix_active {
-                    prefix_active = false;
-                    if let Some(action) = match_prefix_action(&kev, prefix_spec) {
-                        if execute_action(
-                            action,
-                            core,
-                            world,
-                            &attached,
-                            prefix_spec,
-                            sidebar_open,
-                            &mut scrollback_offset,
-                            &mut modal,
-                        )? {
-                            return Ok(());
-                        }
-                    }
-                    continue;
-                }
-
-                // 3. Check if prefix key was pressed
-                if is_prefix_key(&kev, prefix_spec) {
-                    prefix_active = true;
-                    continue;
-                }
-
-                // 4. Direct global shortcuts (`Alt+Left/Right/Up/Down/1..9`, `Ctrl+\`)
-                if let Some(action) = match_direct_action(&kev) {
-                    if execute_action(
-                        action,
-                        core,
-                        world,
-                        &attached,
-                        prefix_spec,
-                        sidebar_open,
-                        &mut scrollback_offset,
-                        &mut modal,
-                    )? {
-                        return Ok(());
-                    }
-                    continue;
-                }
-
-                // 5. Scrollback mode navigation
-                if scrollback_offset > 0 {
-                    match kev.code {
-                        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
-                            scrollback_offset = 0;
-                        }
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            scrollback_offset = scrollback_offset.saturating_add(1);
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            scrollback_offset = scrollback_offset.saturating_sub(1);
-                        }
-                        KeyCode::PageUp | KeyCode::Char('u') => {
-                            scrollback_offset =
-                                scrollback_offset.saturating_add((term_rect.height as usize / 2).max(1));
-                        }
-                        KeyCode::PageDown | KeyCode::Char('d') => {
-                            scrollback_offset =
-                                scrollback_offset.saturating_sub((term_rect.height as usize / 2).max(1));
-                        }
-                        KeyCode::Char('g') => {
-                            scrollback_offset = SCROLLBACK_LINES;
-                        }
-                        KeyCode::Char('G') => {
-                            scrollback_offset = 0;
-                        }
-                        _ => {}
-                    }
-                    continue;
-                }
-
-                // 6. Forward regular keyboard input to the active terminal
-                if let Some(att) = &attached {
-                    let app_cursor = att.parser.screen().application_cursor();
-                    let bytes = encode_key_event(&kev, app_cursor);
-                    if !bytes.is_empty() {
-                        core.send_input(att.channel, &bytes);
-                    }
+                selection = None;
+                selection_screen = None;
+                if handle_key_event(
+                    kev,
+                    core,
+                    world,
+                    &attached,
+                    prefix_spec,
+                    sidebar_open,
+                    &mut prefix_active,
+                    &mut ctrl_active,
+                    &mut alt_active,
+                    &mut scrollback_offset,
+                    &mut modal,
+                    term_rect,
+                )? {
+                    return Ok(());
                 }
             }
             _ => {}
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_key_event(
+    mut kev: KeyEvent,
+    core: &CoreClient,
+    world: &mut World,
+    attached: &Option<AttachedTerminal>,
+    prefix_spec: &str,
+    sidebar_open: &mut bool,
+    prefix_active: &mut bool,
+    ctrl_active: &mut bool,
+    alt_active: &mut bool,
+    scrollback_offset: &mut usize,
+    modal: &mut Modal,
+    term_rect: Rect,
+) -> Result<bool> {
+    if *ctrl_active {
+        kev.modifiers.insert(KeyModifiers::CONTROL);
+        *ctrl_active = false;
+    }
+    if *alt_active {
+        kev.modifiers.insert(KeyModifiers::ALT);
+        *alt_active = false;
+    }
+    // 1. Handle active Modal first
+    match modal {
+        Modal::Help => {
+            *modal = Modal::None;
+            return Ok(false);
+        }
+        Modal::ConfirmCloseTab { tab_id, .. } => {
+            let target_id = tab_id.clone();
+            match kev.code {
+                KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
+                    *modal = Modal::None;
+                    let _ = world.close_tab_by_id(core, &target_id);
+                }
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                    *modal = Modal::None;
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+        Modal::Prompt { kind, input } => {
+            let k = kind.clone();
+            match kev.code {
+                KeyCode::Esc => {
+                    *modal = Modal::None;
+                }
+                KeyCode::Enter => {
+                    let text = input.clone();
+                    *modal = Modal::None;
+                    match k {
+                        PromptKind::RenameTab { tab_id } => {
+                            let _ = world.rename_tab_by_id(core, &tab_id, &text);
+                        }
+                        PromptKind::RenameSpace { space_id } => {
+                            let _ = world.rename_space_by_id(core, &space_id, &text);
+                        }
+                        PromptKind::NewSpace => {
+                            let _ = world.create_new_space(core, &text);
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                }
+                KeyCode::Char(c)
+                    if !kev
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    input.push(c);
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+        Modal::Fuzzy {
+            query,
+            selected,
+            selected_tab_id,
+        } => {
+            let items = collect_fuzzy_items(world, query);
+            let cur_sel = resolve_fuzzy_selection(&items, *selected, selected_tab_id.as_deref())
+                .unwrap_or(0);
+            match kev.code {
+                KeyCode::Esc => {
+                    *modal = Modal::None;
+                }
+                KeyCode::Up => {
+                    *selected = cur_sel.saturating_sub(1);
+                    *selected_tab_id = items.get(*selected).map(|it| it.tab_id.clone());
+                }
+                KeyCode::Down => {
+                    if !items.is_empty() {
+                        *selected = (cur_sel + 1).min(items.len() - 1);
+                        *selected_tab_id = items.get(*selected).map(|it| it.tab_id.clone());
+                    }
+                }
+                KeyCode::Char('p') if kev.modifiers.contains(KeyModifiers::CONTROL) => {
+                    *selected = cur_sel.saturating_sub(1);
+                    *selected_tab_id = items.get(*selected).map(|it| it.tab_id.clone());
+                }
+                KeyCode::Char('n') if kev.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if !items.is_empty() {
+                        *selected = (cur_sel + 1).min(items.len() - 1);
+                        *selected_tab_id = items.get(*selected).map(|it| it.tab_id.clone());
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(ref tid) = *selected_tab_id {
+                        if let Some(chosen) = items.iter().find(|it| &it.tab_id == tid) {
+                            if world.select_tab_by_id(&chosen.space_id, &chosen.tab_id) {
+                                world.mark_active_seen(core);
+                            }
+                        }
+                    }
+                    *modal = Modal::None;
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                    *selected = 0;
+                    let next_items = collect_fuzzy_items(world, query);
+                    *selected_tab_id = next_items.first().map(|it| it.tab_id.clone());
+                }
+                KeyCode::Char(c)
+                    if !kev
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    query.push(c);
+                    *selected = 0;
+                    let next_items = collect_fuzzy_items(world, query);
+                    *selected_tab_id = next_items.first().map(|it| it.tab_id.clone());
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+        Modal::None => {}
+    }
+
+    // 2. Prefix mode active (`Ctrl+b` pressed previously or `[^B]` tapped)
+    if *prefix_active {
+        *prefix_active = false;
+        if let Some(action) = match_prefix_action(&kev, prefix_spec) {
+            return execute_action(
+                action,
+                core,
+                world,
+                attached,
+                prefix_spec,
+                sidebar_open,
+                scrollback_offset,
+                modal,
+            );
+        }
+        return Ok(false);
+    }
+
+    // 3. Check if prefix key was pressed
+    if is_prefix_key(&kev, prefix_spec) {
+        *prefix_active = true;
+        return Ok(false);
+    }
+
+    // 4. Direct global shortcuts (`Alt+Left/Right/Up/Down/1..9`, `Ctrl+\`)
+    if let Some(action) = match_direct_action(&kev) {
+        return execute_action(
+            action,
+            core,
+            world,
+            attached,
+            prefix_spec,
+            sidebar_open,
+            scrollback_offset,
+            modal,
+        );
+    }
+
+    // 5. Scrollback mode navigation
+    if *scrollback_offset > 0 {
+        match kev.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+                *scrollback_offset = 0;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                *scrollback_offset = scrollback_offset.saturating_add(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                *scrollback_offset = scrollback_offset.saturating_sub(1);
+            }
+            KeyCode::PageUp | KeyCode::Char('u') => {
+                *scrollback_offset =
+                    scrollback_offset.saturating_add((term_rect.height as usize / 2).max(1));
+            }
+            KeyCode::PageDown | KeyCode::Char('d') => {
+                *scrollback_offset =
+                    scrollback_offset.saturating_sub((term_rect.height as usize / 2).max(1));
+            }
+            KeyCode::Char('g') => {
+                *scrollback_offset = SCROLLBACK_LINES;
+            }
+            KeyCode::Char('G') => {
+                *scrollback_offset = 0;
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+
+    // 6. Forward regular keyboard input to the active terminal
+    if let Some(att) = attached {
+        let app_cursor = att.parser.screen().application_cursor();
+        let bytes = encode_key_event(&kev, app_cursor);
+        if !bytes.is_empty() {
+            core.send_input(att.channel, &bytes);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_encodes_osc52_payloads_accurately() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"hello world"), "aGVsbG8gd29ybGQ=");
     }
 }

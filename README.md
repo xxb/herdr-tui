@@ -13,11 +13,14 @@ A fast, lightweight **multi-tab TUI client** for [`herdr-core` (`hc`)](https://g
 
 - **Bidirectional Official Client Sync (与官方客户端双向实时同步)**
   Reads and writes `herdr-core`'s `doc("herdr-app")` layout document directly. Spaces and Tabs created, renamed, or closed in `hct` immediately appear in the official Herdr Android / Desktop client, and vice versa.
-- **Top Tab Bar + Collapsible Left Sidebar (顶栏多标签 + 可折叠左侧边栏)**
-  - **Top Bar (1 row)**: Shows sidebar toggle `[≡]`, active `[Space]`, numbered tabs with live Agent status indicators (`◉` blocked, `●` working, `✓` done, `○` idle), and a `[+]` new-tab button.
-  - **Left Sidebar (`^b b`)**: Displays the full tree of Spaces, Tabs, and Agent statuses. Automatically collapses on narrow screens (`< 80` cols) and can be toggled anytime via `Ctrl+b b` or tapping `[≡]`.
+- **Collapsible 2-Row Left Sidebar + Bottom Touchbar (加高左侧边栏 + 底部 Touchbar)**
+  - **Left Sidebar (`^b b`)**: Displays the full tree of Spaces, Tabs, and live Agent status indicators (`◉` blocked, `●` working, `✓` done, `○` idle). Each Space and Tab entry is rendered as a 2-row-tall touch card with path/CWD subtitles, collapsible Space child tabs (tap `▾` / `▸` on any Space to fold/unfold its tabs), and spaced-out 2-row `[+ New Tab]` and `[+ New Space]` buttons at the bottom.
+  - **Bottom Touchbar**: Inspired by the Herdr mobile app and legacy Herdr status dots, provides a compact `◄≡` / `≡►` sidebar toggle, a 2-row Space/Tab indicator (current Space name on top, solid `●` and hollow `○` Tab circles on the bottom), constant-width `[^B]`, `[Ctrl]`, and `[Alt]` sticky modifier keys plus terminal shortcut keys (`[Esc]`, `[Tab]`, `[←]`, `[↓]`, `[↑]`, `[→]`, `⎘`) that never jitter (with `[^C]` intentionally omitted to avoid accidental taps), `[✓ Copied]` / `[▼ BOT]` badges, and `[ ? ]` Quick Actions button.
 - **Touch & Mouse Friendly for iPad / Mobile SSH (触控与鼠标丝滑切换)**
-  Tap any tab on the top bar, tap `[+]` to open a new tab, tap `[≡]` to toggle the sidebar, or tap any Space/Tab in the sidebar.
+  - **Tap Bottom Touchbar & Left Sidebar**: Tap any 2-row Space/Tab card in the left sidebar, tap the `● ○ ○` Tab circles under the Space name on the touchbar, or tap terminal keys (`Esc`, `Ctrl`, `Alt`, `Tab`, arrows, `⎘` paste) and `[^B]` directly on the bottom touchbar.
+  - **Touch Drag Text Selection + Auto Copy over SSH (手指拖动选字自动复制)**: Drag across terminal text with your finger (or mouse) to highlight text in real time; releasing automatically copies the selected text to the remote SSH client's system clipboard via OSC 52 (and local clipboard when available) and flashes `[✓ Copied]`.
+  - **2-Row Large Touch Mode (Default, `--no-touch` for 1-row)**: Uses a 2-row bottom touchbar by default for comfortable finger hit targets and 2-line Space/dot display.
+  - **Touch-Interactive Modals**: Directly tap items in the Fuzzy Switcher (`^b w`), tap Confirm/Cancel buttons in dialogs, or tap any of the 12 quick-action buttons in the `[ ? ]` panel.
 - **Classic `herdr` Keybindings (兼容旧版 `herdr` 快捷键)**
   Compatible with `~/.config/herdr/config.toml` and `~/.config/herdr-tui/config.toml`.
 - **Shared Attention (`herdr.seen`)**
@@ -31,18 +34,18 @@ A fast, lightweight **multi-tab TUI client** for [`herdr-core` (`hc`)](https://g
 |---|---|---|
 | **Next / Previous Tab** (切换标签页) | `^b n` / `^b p` | `Alt+Right` / `Alt+Left` or Tap Tab |
 | **Select Tab 1..9** (跳转标签页 1..9) | `^b 1` .. `^b 9` | `Alt+1` .. `Alt+9` |
-| **New Tab in Space** (新建标签页) | `^b c` | Tap `[+]` on top bar |
+| **New Tab in Space** (新建标签页) | `^b c` | Tap `[+ New Tab]` in sidebar |
 | **Rename Current Tab** (重命名标签页) | `^b ,` | — |
 | **Close Current Tab** (关闭当前标签页) | `^b x` | — |
 | **Next / Previous Space** (切换工作区) | `^b Down` / `^b Up` | `Alt+Down` / `Alt+Up` or Tap Space |
 | **New Space** (新建工作区) | `^b C` (or `^b s`) | Tap `[+ New Space]` in sidebar |
 | **Rename Current Space** (重命名工作区) | `^b $` (or `^b R`) | — |
-| **Toggle Left Sidebar** (展开/收起侧边栏) | `^b b` | Tap `[≡]` on top bar |
+| **Toggle Left Sidebar** (展开/收起侧边栏) | `^b b` | Tap `◄≡` / `≡►` on bottom touchbar |
 | **Quick Fuzzy Switcher** (模糊搜索跳转) | `^b w` (or `^b f`) | — |
 | **Jump to Alert Agent** (跳转待处理 Agent) | `^b a` | — |
 | **Cycle Pane in Split Tab** (多窗格轮换) | `^b o` | — |
 | **Scrollback Mode** (历史回滚查看) | `^b [` | Mouse Wheel Up / Down |
-| **Help Overlay** (快捷键帮助) | `^b ?` | Tap `^b ?:Help` on top bar |
+| **Help Overlay** (快捷键帮助) | `^b ?` | Tap `[ ? ]` on bottom touchbar |
 | **Detach `hct`** (脱离并保持后台运行) | `^b q` (or `^b d`) | `Ctrl+\` |
 
 ---
