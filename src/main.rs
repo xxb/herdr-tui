@@ -213,17 +213,21 @@ fn execute_action(
             let _ = world.create_new_tab(core);
         }
         Action::CloseTab => {
-            *modal = Modal::ConfirmCloseTab;
+            if let (Some(space), Some(tab)) = (world.active_space(), world.active_tab()) {
+                let tab_id = tab.id.clone();
+                let tab_title = world.tab_display_name(space, world.active_tab_index());
+                *modal = Modal::ConfirmCloseTab { tab_id, tab_title };
+            }
         }
         Action::RenameTab => {
-            let current = world
-                .active_tab()
-                .map(|t| t.name.clone())
-                .unwrap_or_default();
-            *modal = Modal::Prompt {
-                kind: PromptKind::RenameTab,
-                input: current,
-            };
+            if let Some(tab) = world.active_tab() {
+                *modal = Modal::Prompt {
+                    kind: PromptKind::RenameTab {
+                        tab_id: tab.id.clone(),
+                    },
+                    input: tab.name.clone(),
+                };
+            }
         }
         Action::NextSpace => {
             world.next_space();
@@ -240,14 +244,14 @@ fn execute_action(
             };
         }
         Action::RenameSpace => {
-            let current = world
-                .active_space()
-                .map(|s| s.name.clone())
-                .unwrap_or_default();
-            *modal = Modal::Prompt {
-                kind: PromptKind::RenameSpace,
-                input: current,
-            };
+            if let Some(space) = world.active_space() {
+                *modal = Modal::Prompt {
+                    kind: PromptKind::RenameSpace {
+                        space_id: space.id.clone(),
+                    },
+                    input: space.name.clone(),
+                };
+            }
         }
         Action::ToggleSidebar => {
             *sidebar_open = !*sidebar_open;
@@ -403,6 +407,13 @@ fn run_app(
             }
         }
 
+        if let Modal::ConfirmCloseTab { ref tab_id, .. } = modal {
+            if !world.has_tab(tab_id) {
+                modal = Modal::None;
+                dirty = true;
+            }
+        }
+
         let poll_timeout = if more_messages {
             Duration::ZERO
         } else {
@@ -507,11 +518,12 @@ fn run_app(
                         modal = Modal::None;
                         continue;
                     }
-                    Modal::ConfirmCloseTab => {
+                    Modal::ConfirmCloseTab { tab_id, .. } => {
+                        let target_id = tab_id.clone();
                         match kev.code {
                             KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
                                 modal = Modal::None;
-                                let _ = world.close_active_tab(core);
+                                let _ = world.close_tab_by_id(core, &target_id);
                             }
                             KeyCode::Char('n' | 'N') | KeyCode::Esc => {
                                 modal = Modal::None;
@@ -521,7 +533,7 @@ fn run_app(
                         continue;
                     }
                     Modal::Prompt { kind, input } => {
-                        let k = *kind;
+                        let k = kind.clone();
                         match kev.code {
                             KeyCode::Esc => {
                                 modal = Modal::None;
@@ -530,11 +542,11 @@ fn run_app(
                                 let text = input.clone();
                                 modal = Modal::None;
                                 match k {
-                                    PromptKind::RenameTab => {
-                                        let _ = world.rename_active_tab(core, &text);
+                                    PromptKind::RenameTab { tab_id } => {
+                                        let _ = world.rename_tab_by_id(core, &tab_id, &text);
                                     }
-                                    PromptKind::RenameSpace => {
-                                        let _ = world.rename_active_space(core, &text);
+                                    PromptKind::RenameSpace { space_id } => {
+                                        let _ = world.rename_space_by_id(core, &space_id, &text);
                                     }
                                     PromptKind::NewSpace => {
                                         let _ = world.create_new_space(core, &text);

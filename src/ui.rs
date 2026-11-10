@@ -33,7 +33,10 @@ pub struct HitRegion {
 pub enum Modal {
     None,
     Help,
-    ConfirmCloseTab,
+    ConfirmCloseTab {
+        tab_id: String,
+        tab_title: String,
+    },
     Prompt {
         kind: PromptKind,
         input: String,
@@ -44,10 +47,10 @@ pub enum Modal {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PromptKind {
-    RenameTab,
-    RenameSpace,
+    RenameTab { tab_id: String },
+    RenameSpace { space_id: String },
     NewSpace,
 }
 
@@ -205,8 +208,8 @@ pub fn render_ui(
     match modal {
         Modal::None => {}
         Modal::Help => render_help_modal(f, area),
-        Modal::ConfirmCloseTab => render_confirm_close_modal(f, area, world),
-        Modal::Prompt { kind, input } => render_prompt_modal(f, area, *kind, input),
+        Modal::ConfirmCloseTab { tab_title, .. } => render_confirm_close_modal(f, area, tab_title),
+        Modal::Prompt { kind, input } => render_prompt_modal(f, area, kind, input),
         Modal::Fuzzy { query, selected } => render_fuzzy_modal(f, area, world, query, *selected),
     }
 
@@ -701,13 +704,9 @@ fn render_help_modal(f: &mut Frame, area: Rect) {
     f.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
-fn render_confirm_close_modal(f: &mut Frame, area: Rect, world: &World) {
+fn render_confirm_close_modal(f: &mut Frame, area: Rect, tab_title: &str) {
     let popup = centered_rect(50, 7, area);
     f.render_widget(Clear, popup);
-    let tab_title = world
-        .active_space()
-        .map(|s| world.tab_display_name(s, world.active_tab_index()))
-        .unwrap_or_else(|| "current tab".to_string());
     let lines = vec![
         Line::from(""),
         Line::from(format!("  Close tab \"{tab_title}\" and kill its terminal?")),
@@ -725,12 +724,12 @@ fn render_confirm_close_modal(f: &mut Frame, area: Rect, world: &World) {
     f.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
-fn render_prompt_modal(f: &mut Frame, area: Rect, kind: PromptKind, input: &str) {
+fn render_prompt_modal(f: &mut Frame, area: Rect, kind: &PromptKind, input: &str) {
     let popup = centered_rect(52, 6, area);
     f.render_widget(Clear, popup);
     let title = match kind {
-        PromptKind::RenameTab => " Rename Tab (empty = auto) ",
-        PromptKind::RenameSpace => " Rename Space (empty = folder name) ",
+        PromptKind::RenameTab { .. } => " Rename Tab (empty = auto) ",
+        PromptKind::RenameSpace { .. } => " Rename Space (empty = folder name) ",
         PromptKind::NewSpace => " New Space Name ",
     };
     let lines = vec![

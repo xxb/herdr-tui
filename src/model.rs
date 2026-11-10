@@ -2,7 +2,7 @@
 //! Bidirectionally compatible with official Herdr Desktop & Android clients.
 
 use crate::core::CoreClient;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashSet};
@@ -370,16 +370,14 @@ impl World {
 
     pub fn fetch_doc(&mut self, core: &CoreClient) -> Result<()> {
         let res = core.call("doc.get", json!({ "name": "herdr-app" }))?;
-        self.doc_version = res.get("version").and_then(Value::as_u64).unwrap_or(0);
-        if let Some(val) = res.get("value") {
-            if !val.is_null() {
-                if let Ok(parsed) = serde_json::from_value::<AppDocument>(val.clone()) {
-                    self.doc = parsed;
-                }
-            } else {
-                self.doc = AppDocument::default();
-            }
-        }
+        let new_version = res.get("version").and_then(Value::as_u64).unwrap_or(0);
+        let new_doc = match res.get("value") {
+            Some(val) if !val.is_null() => serde_json::from_value::<AppDocument>(val.clone())
+                .context("failed to decode doc(\"herdr-app\")")?,
+            _ => AppDocument::default(),
+        };
+        self.doc = new_doc;
+        self.doc_version = new_version;
         // If the fetched document references any terminal address absent from our
         // local snapshot (e.g. created by another client after our last `terminal.list`),
         // refresh `self.terminals` before reconciling so we never mistake a newly
@@ -918,13 +916,23 @@ impl World {
         Ok(())
     }
 
-    /// Close the currently active Tab (and kill its underlying terminal(s)).
-    pub fn close_active_tab(&mut self, core: &CoreClient) -> Result<()> {
-        let Some(space) = self.doc.spaces.get(self.active_space_idx) else {
-            return Ok(());
-        };
-        let tab_idx = self.active_tab_index();
-        let Some(tab) = space.tabs.get(tab_idx).cloned() else {
+    pub fn has_tab(&self, tab_id: &str) -> bool {
+        self.doc
+            .spaces
+            .iter()
+            .any(|s| s.tabs.iter().any(|t| t.id == tab_id))
+    }
+
+    /// Close a specific Tab by ID (and kill its underlying terminal(s)).
+    pub fn close_tab_by_id(&mut self, core: &CoreClient, tab_id: &str) -> Result<()> {
+        let Some(tab) = self
+            .doc
+            .spaces
+            .iter()
+            .flat_map(|s| s.tabs.iter())
+            .find(|t| t.id == tab_id)
+            .cloned()
+        else {
             return Ok(());
         };
         let closed_tab_id = tab.id.clone();
@@ -942,14 +950,12 @@ impl World {
         Ok(())
     }
 
-    pub fn rename_active_tab(&mut self, core: &CoreClient, new_name: &str) -> Result<()> {
-        let Some(tab_id) = self.active_tab().map(|t| t.id.clone()) else {
-            return Ok(());
-        };
+    pub fn rename_tab_by_id(&mut self, core: &CoreClient, tab_id: &str, new_name: &str) -> Result<()> {
+        let target_id = tab_id.to_string();
         let trimmed = new_name.trim().to_string();
         self.mutate_doc(core, |world| {
             for space in &mut world.doc.spaces {
-                if let Some(tab) = space.tabs.iter_mut().find(|t| t.id == tab_id) {
+                if let Some(tab) = space.tabs.iter_mut().find(|t| t.id == target_id) {
                     tab.name = trimmed.clone();
                 }
             }
@@ -957,13 +963,11 @@ impl World {
         Ok(())
     }
 
-    pub fn rename_active_space(&mut self, core: &CoreClient, new_name: &str) -> Result<()> {
-        let Some(space_id) = self.active_space().map(|s| s.id.clone()) else {
-            return Ok(());
-        };
+    pub fn rename_space_by_id(&mut self, core: &CoreClient, space_id: &str, new_name: &str) -> Result<()> {
+        let target_id = space_id.to_string();
         let trimmed = new_name.trim().to_string();
         self.mutate_doc(core, |world| {
-            if let Some(space) = world.doc.spaces.iter_mut().find(|s| s.id == space_id) {
+            if let Some(space) = world.doc.spaces.iter_mut().find(|s| s.id == target_id) {
                 space.name = trimmed.clone();
             }
         })?;
