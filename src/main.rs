@@ -25,9 +25,10 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SCROLLBACK_LINES: usize = 5000;
+const MAX_MSGS_PER_TICK: usize = 64;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -116,6 +117,7 @@ fn main() -> Result<()> {
         &prefix_spec,
         &mut sidebar_open,
         sidebar_width,
+        mobile_threshold,
     );
 
     // Restore terminal cleanly
@@ -287,6 +289,7 @@ fn run_app(
     prefix_spec: &str,
     sidebar_open: &mut bool,
     sidebar_width: u16,
+    mobile_threshold: u16,
 ) -> Result<()> {
     let mut attached: Option<AttachedTerminal> = None;
     let mut prefix_active = false;
@@ -294,9 +297,17 @@ fn run_app(
     let mut modal = Modal::None;
     let mut last_hits: Vec<HitRegion> = Vec::new();
     let mut dirty = true;
+    let mut prev_width = terminal.size()?.width;
 
     loop {
         let size = terminal.size()?;
+        if size.width != prev_width {
+            if size.width < mobile_threshold {
+                *sidebar_open = false;
+            }
+            prev_width = size.width;
+            dirty = true;
+        }
         let area = Rect::new(0, 0, size.width, size.height);
         let term_rect = compute_terminal_rect(area, *sidebar_open, sidebar_width);
 
@@ -331,11 +342,17 @@ fn run_app(
             dirty = false;
         }
 
-        // Drain all pending messages from `herdr-core`
+        // Drain pending messages from `herdr-core` with a per-tick count and time budget
+        // so high-volume PTY output cannot starve rendering or keyboard input.
+        let drain_start = Instant::now();
+        let mut drained = 0usize;
+        let mut more_messages = false;
         while let Ok(msg) = core_rx.try_recv() {
             dirty = true;
+            drained += 1;
             match msg {
                 CoreMessage::TerminalData { channel, data } => {
+                    core.ack_credit(channel, data.len() as u32);
                     if let Some(att) = attached.as_mut() {
                         if att.channel == channel {
                             let clean = sanitize_vt_bytes(&data);
@@ -375,9 +392,20 @@ fn run_app(
                 }
                 CoreMessage::Disconnected => return Ok(()),
             }
+            if drained >= MAX_MSGS_PER_TICK
+                || drain_start.elapsed() >= Duration::from_millis(8)
+            {
+                more_messages = true;
+                break;
+            }
         }
 
-        if !event::poll(Duration::from_millis(16))? {
+        let poll_timeout = if more_messages {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(16)
+        };
+        if !event::poll(poll_timeout)? {
             continue;
         }
 
@@ -385,8 +413,11 @@ fn run_app(
         dirty = true;
 
         match ev {
-            Event::Resize(_, _) => {
-                // Handled at top of loop via `sync_attached_terminal`
+            Event::Resize(w, _) => {
+                if w < mobile_threshold {
+                    *sidebar_open = false;
+                }
+                prev_width = w;
             }
             Event::Paste(text) => {
                 if matches!(modal, Modal::None) && scrollback_offset == 0 {

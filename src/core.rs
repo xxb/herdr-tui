@@ -32,7 +32,7 @@ pub struct CoreClient {
     _child: Child,
     writer: Arc<Mutex<ChildStdin>>,
     next_id: AtomicU64,
-    pending: Arc<Mutex<HashMap<u64, Sender<Value>>>>,
+    pending: Arc<Mutex<HashMap<u64, (String, Sender<Value>)>>>,
     events_channel: Arc<Mutex<Option<u32>>>,
 }
 
@@ -95,7 +95,8 @@ impl CoreClient {
         }
 
         let writer = Arc::new(Mutex::new(stdin));
-        let pending: Arc<Mutex<HashMap<u64, Sender<Value>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let pending: Arc<Mutex<HashMap<u64, (String, Sender<Value>)>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let events_channel: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
 
         let (msg_tx, msg_rx) = mpsc::channel();
@@ -111,11 +112,26 @@ impl CoreClient {
                     if ch == 0 && kind == wire::DATA {
                         if let Ok(val) = serde_json::from_slice::<Value>(&payload) {
                             if let Some(id) = val.get("id").and_then(Value::as_u64) {
-                                if let Some(tx) = pending_clone
+                                if let Some((method, tx)) = pending_clone
                                     .lock()
                                     .unwrap_or_else(|e| e.into_inner())
                                     .remove(&id)
                                 {
+                                    // Register the event stream channel immediately on the reader thread
+                                    // before reading subsequent frames so early event frames are never
+                                    // misclassified as TerminalData.
+                                    if method == "events.subscribe" {
+                                        if let Some(sub_ch) = val
+                                            .get("result")
+                                            .and_then(|r| r.get("channel"))
+                                            .and_then(Value::as_u64)
+                                        {
+                                            *events_ch_clone
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner()) =
+                                                Some(sub_ch as u32);
+                                        }
+                                    }
                                     let _ = tx.send(val);
                                 }
                             } else if val.get("method").is_some() {
@@ -130,7 +146,7 @@ impl CoreClient {
 
                     if is_events_ch {
                         if kind == wire::DATA {
-                            // Acknowledge flow-control credit immediately
+                            // Acknowledge flow-control credit immediately for low-volume JSON event lines
                             let credit = wire::encode(ch, wire::CREDIT, &(payload.len() as u32).to_le_bytes());
                             let _ = writer_clone
                                 .lock()
@@ -150,11 +166,6 @@ impl CoreClient {
 
                     match kind {
                         wire::DATA => {
-                            let credit = wire::encode(ch, wire::CREDIT, &(payload.len() as u32).to_le_bytes());
-                            let _ = writer_clone
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .write_all(&credit);
                             let _ = msg_tx.send(CoreMessage::TerminalData {
                                 channel: ch,
                                 data: payload,
@@ -203,7 +214,7 @@ impl CoreClient {
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(id, tx);
+            .insert(id, (method.to_string(), tx));
 
         let req = json!({
             "jsonrpc": "2.0",
@@ -272,6 +283,13 @@ impl CoreClient {
     /// Close an attached stream channel without killing the underlying terminal.
     pub fn detach_channel(&self, channel: u32) {
         let _ = self.send_frame(channel, wire::CLOSE, &[]);
+    }
+
+    /// Acknowledge flow-control credit on a stream channel after consuming `bytes` of output.
+    pub fn ack_credit(&self, channel: u32, bytes: u32) {
+        if bytes > 0 {
+            let _ = self.send_frame(channel, wire::CREDIT, &bytes.to_le_bytes());
+        }
     }
 
     /// Send input bytes to an attached terminal channel.

@@ -7,7 +7,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Widget},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget},
     Frame,
 };
 use unicode_width::UnicodeWidthStr;
@@ -802,5 +802,9 @@ fn render_fuzzy_modal(f: &mut Frame, area: Rect, world: &World, query: &str, sel
         })
         .collect();
 
-    f.render_widget(List::new(list_items), chunks[1]);
+    let mut list_state = ListState::default();
+    if !list_items.is_empty() {
+        list_state.select(Some(sel));
+    }
+    f.render_stateful_widget(List::new(list_items), chunks[1], &mut list_state);
 }

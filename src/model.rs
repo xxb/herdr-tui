@@ -367,11 +367,21 @@ impl World {
                 self.doc = AppDocument::default();
             }
         }
+        self.clamp_selection();
         Ok(())
     }
 
-    pub fn save_doc(&mut self, core: &CoreClient) -> Result<()> {
+    /// Apply a local document mutation and persist via `doc.set` with CAS retry.
+    /// On conflict, fetches the latest remote document (`self.doc` + `self.doc_version`)
+    /// and reapplies `mutate` onto the refreshed document so other clients' edits are preserved.
+    pub fn mutate_doc<F>(&mut self, core: &CoreClient, mut mutate: F) -> Result<()>
+    where
+        F: FnMut(&mut Self),
+    {
+        let mut last_err = None;
         for _ in 0..3 {
+            mutate(self);
+            self.clamp_selection();
             let val = serde_json::to_value(&self.doc)?;
             match core.call(
                 "doc.set",
@@ -388,21 +398,23 @@ impl World {
                     return Ok(());
                 }
                 Err(e) if e.to_string().starts_with("conflict:") => {
-                    // Re-read version and retry
-                    let res = core.call("doc.get", json!({ "name": "herdr-app" }))?;
-                    self.doc_version = res.get("version").and_then(Value::as_u64).unwrap_or(0);
+                    last_err = Some(e);
+                    self.fetch_doc(core)?;
                 }
                 Err(e) => return Err(e),
             }
         }
+        if let Some(err) = last_err {
+            return Err(err);
+        }
         Ok(())
     }
 
-    /// Reconcile `doc("herdr-app")` with live terminals in `herdr-core`:
+    /// Pure in-memory reconciliation of `self.doc` against `self.terminals`:
     /// 1. Prunes dead terminals from tabs and drops tabs that have zero live terminals.
     /// 2. Adopts any live orphan terminals into a matching Space (by cwd) or a default Space.
-    /// 3. Ensures at least one Space and one live Terminal Tab exist.
-    pub fn reconcile_and_sync(&mut self, core: &CoreClient) -> Result<bool> {
+    /// 3. Removes empty spaces when non-empty spaces exist.
+    pub fn reconcile_doc_in_place(&mut self) -> bool {
         let mut changed = false;
 
         // 1. Prune dead terminals from existing tabs
@@ -488,70 +500,81 @@ impl World {
             changed = true;
         }
 
-        // 3. If no spaces exist at all, or the active space has no tabs, spawn one terminal
-        if self.doc.spaces.is_empty() {
-            let cwd = std::env::current_dir()
-                .ok()
-                .and_then(|p| p.to_str().map(String::from))
-                .unwrap_or_else(|| "/".to_string());
-            let run_res = core.call("terminal.run", json!({ "cwd": cwd, "bg": true }))?;
-            if let Some(info) = TerminalInfo::from_json(&run_res) {
-                let addr = info.address.clone();
-                self.terminals.insert(addr.clone(), info);
-                let tab_id = fresh_id("tb");
-                let tab = make_single_terminal_tab(&tab_id, "", &addr);
-                let space_id = fresh_id("sp");
-                self.doc.spaces.push(SharedSpace {
-                    id: space_id.clone(),
-                    name: String::new(),
-                    folder: cwd,
-                    tabs: vec![tab],
-                    rest: Map::new(),
-                });
-                self.active_space_idx = 0;
-                self.active_tab_by_space.insert(space_id, tab_id);
+        // 3. Remove empty spaces when non-empty spaces exist
+        if self.doc.spaces.len() > 1 && self.doc.spaces.iter().any(|s| !s.tabs.is_empty()) {
+            let before = self.doc.spaces.len();
+            self.doc.spaces.retain(|s| !s.tabs.is_empty());
+            if self.doc.spaces.len() != before {
                 changed = true;
-            }
-        } else {
-            // Ensure every space has at least one tab, or remove empty spaces if others exist
-            if self.doc.spaces.len() > 1 {
-                let before = self.doc.spaces.len();
-                self.doc.spaces.retain(|s| !s.tabs.is_empty());
-                if self.doc.spaces.len() != before {
-                    changed = true;
-                }
-            }
-            if self.doc.spaces.is_empty() {
-                return self.reconcile_and_sync(core);
-            }
-            if self.doc.spaces[0].tabs.is_empty() {
-                let cwd = if self.doc.spaces[0].folder.is_empty() {
-                    std::env::current_dir()
-                        .ok()
-                        .and_then(|p| p.to_str().map(String::from))
-                        .unwrap_or_else(|| "/".to_string())
-                } else {
-                    self.doc.spaces[0].folder.clone()
-                };
-                let run_res = core.call("terminal.run", json!({ "cwd": cwd, "bg": true }))?;
-                if let Some(info) = TerminalInfo::from_json(&run_res) {
-                    let addr = info.address.clone();
-                    self.terminals.insert(addr.clone(), info);
-                    let tab_id = fresh_id("tb");
-                    let tab = make_single_terminal_tab(&tab_id, "", &addr);
-                    self.doc.spaces[0].tabs.push(tab);
-                    changed = true;
-                }
             }
         }
 
         self.clamp_selection();
+        changed
+    }
 
-        if changed {
-            let _ = self.save_doc(core);
+    /// Reconcile `doc("herdr-app")` with live terminals in `herdr-core` and persist with CAS rebase.
+    pub fn reconcile_and_sync(&mut self, core: &CoreClient) -> Result<bool> {
+        let mut any_changed = self.reconcile_doc_in_place();
+
+        // Ensure at least one live terminal exists if all spaces/tabs are empty
+        let needs_spawn =
+            self.doc.spaces.is_empty() || self.doc.spaces.iter().all(|s| s.tabs.is_empty());
+        if needs_spawn {
+            let cwd = self
+                .doc
+                .spaces
+                .first()
+                .map(|s| s.folder.clone())
+                .filter(|f| !f.is_empty())
+                .unwrap_or_else(|| {
+                    std::env::current_dir()
+                        .ok()
+                        .and_then(|p| p.to_str().map(String::from))
+                        .unwrap_or_else(|| "/".to_string())
+                });
+            let run_res = core.call("terminal.run", json!({ "cwd": cwd, "bg": true }))?;
+            if let Some(info) = TerminalInfo::from_json(&run_res) {
+                self.terminals.insert(info.address.clone(), info);
+                if self.reconcile_doc_in_place() {
+                    any_changed = true;
+                }
+            }
         }
 
-        Ok(changed)
+        if !any_changed {
+            return Ok(false);
+        }
+
+        // Save with CAS conflict rebase: if another client updated `doc("herdr-app")`,
+        // fetch the latest remote document and re-run `reconcile_doc_in_place` on top of it.
+        for attempt in 0..3 {
+            if attempt > 0 {
+                let _ = self.reconcile_doc_in_place();
+            }
+            let val = serde_json::to_value(&self.doc)?;
+            match core.call(
+                "doc.set",
+                json!({
+                    "name": "herdr-app",
+                    "version": self.doc_version,
+                    "value": val,
+                }),
+            ) {
+                Ok(res) => {
+                    if let Some(v) = res.get("version").and_then(Value::as_u64) {
+                        self.doc_version = v;
+                    }
+                    return Ok(true);
+                }
+                Err(e) if e.to_string().starts_with("conflict:") => {
+                    self.fetch_doc(core)?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(any_changed)
     }
 
     pub fn clamp_selection(&mut self) {
@@ -800,14 +823,22 @@ impl World {
         let tab_id = fresh_id("tb");
         let tab = make_single_terminal_tab(&tab_id, "", &addr);
         let cur_tab_idx = self.active_tab_index();
+        let target_space_id = self.active_space().map(|s| s.id.clone());
 
-        if let Some(space) = self.doc.spaces.get_mut(self.active_space_idx) {
-            let insert_at = (cur_tab_idx + 1).min(space.tabs.len());
-            space.tabs.insert(insert_at, tab);
-            let space_id = space.id.clone();
-            self.active_tab_by_space.insert(space_id, tab_id);
-            self.save_doc(core)?;
-        }
+        self.mutate_doc(core, |world| {
+            let idx = target_space_id
+                .as_ref()
+                .and_then(|sid| world.doc.spaces.iter().position(|s| &s.id == sid))
+                .unwrap_or(world.active_space_idx);
+            if let Some(space) = world.doc.spaces.get_mut(idx) {
+                if !space.tabs.iter().any(|t| t.id == tab_id) {
+                    let insert_at = (cur_tab_idx + 1).min(space.tabs.len());
+                    space.tabs.insert(insert_at, tab.clone());
+                }
+                let space_id = space.id.clone();
+                world.active_tab_by_space.insert(space_id, tab_id.clone());
+            }
+        })?;
         Ok(())
     }
 
@@ -842,16 +873,25 @@ impl World {
         let tab_id = fresh_id("tb");
         let tab = make_single_terminal_tab(&tab_id, "", &addr);
         let space_id = fresh_id("sp");
-        self.doc.spaces.push(SharedSpace {
-            id: space_id.clone(),
-            name: name.trim().to_string(),
-            folder: cwd,
-            tabs: vec![tab],
-            rest: Map::new(),
-        });
-        self.active_space_idx = self.doc.spaces.len() - 1;
-        self.active_tab_by_space.insert(space_id, tab_id);
-        self.save_doc(core)?;
+        let space_name = name.trim().to_string();
+
+        self.mutate_doc(core, |world| {
+            if !world.doc.spaces.iter().any(|s| s.id == space_id) {
+                world.doc.spaces.push(SharedSpace {
+                    id: space_id.clone(),
+                    name: space_name.clone(),
+                    folder: cwd.clone(),
+                    tabs: vec![tab.clone()],
+                    rest: Map::new(),
+                });
+            }
+            if let Some(pos) = world.doc.spaces.iter().position(|s| s.id == space_id) {
+                world.active_space_idx = pos;
+            }
+            world
+                .active_tab_by_space
+                .insert(space_id.clone(), tab_id.clone());
+        })?;
         Ok(())
     }
 
@@ -864,37 +904,46 @@ impl World {
         let Some(tab) = space.tabs.get(tab_idx).cloned() else {
             return Ok(());
         };
+        let closed_tab_id = tab.id.clone();
         let terms = self.tab_terminals(&tab);
         for addr in terms {
             let _ = core.call("terminal.kill", json!({ "terminal": addr }));
             self.terminals.remove(&addr);
         }
-        if let Some(space_mut) = self.doc.spaces.get_mut(self.active_space_idx) {
-            if tab_idx < space_mut.tabs.len() {
-                space_mut.tabs.remove(tab_idx);
+        self.mutate_doc(core, |world| {
+            for s in &mut world.doc.spaces {
+                s.tabs.retain(|t| t.id != closed_tab_id);
             }
-        }
+        })?;
         self.reconcile_and_sync(core)?;
-        self.save_doc(core)?;
         Ok(())
     }
 
     pub fn rename_active_tab(&mut self, core: &CoreClient, new_name: &str) -> Result<()> {
-        let tab_idx = self.active_tab_index();
-        if let Some(space) = self.doc.spaces.get_mut(self.active_space_idx) {
-            if let Some(tab) = space.tabs.get_mut(tab_idx) {
-                tab.name = new_name.trim().to_string();
-                self.save_doc(core)?;
+        let Some(tab_id) = self.active_tab().map(|t| t.id.clone()) else {
+            return Ok(());
+        };
+        let trimmed = new_name.trim().to_string();
+        self.mutate_doc(core, |world| {
+            for space in &mut world.doc.spaces {
+                if let Some(tab) = space.tabs.iter_mut().find(|t| t.id == tab_id) {
+                    tab.name = trimmed.clone();
+                }
             }
-        }
+        })?;
         Ok(())
     }
 
     pub fn rename_active_space(&mut self, core: &CoreClient, new_name: &str) -> Result<()> {
-        if let Some(space) = self.doc.spaces.get_mut(self.active_space_idx) {
-            space.name = new_name.trim().to_string();
-            self.save_doc(core)?;
-        }
+        let Some(space_id) = self.active_space().map(|s| s.id.clone()) else {
+            return Ok(());
+        };
+        let trimmed = new_name.trim().to_string();
+        self.mutate_doc(core, |world| {
+            if let Some(space) = world.doc.spaces.iter_mut().find(|s| s.id == space_id) {
+                space.name = trimmed.clone();
+            }
+        })?;
         Ok(())
     }
 
