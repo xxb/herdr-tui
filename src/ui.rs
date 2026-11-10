@@ -193,6 +193,18 @@ pub fn state_color(state: AgentState) -> Color {
 pub const DPAD_DISC_WIDTH: u16 = 15;
 pub const DPAD_DISC_HEIGHT: u16 = 7;
 
+fn dpad_cross_metrics(r: Rect) -> (u16, u16, u16) {
+    let arm_w = (r.width / 3).max(1);
+    let (arm_h, mid_h) = if r.height >= 7 {
+        (2, 3)
+    } else if r.height >= 5 {
+        (1, 3)
+    } else {
+        (1, 1)
+    };
+    (arm_w, arm_h, mid_h)
+}
+
 #[allow(dead_code)]
 pub struct UiGeometry {
     pub term_rect: Rect,
@@ -201,19 +213,33 @@ pub struct UiGeometry {
 }
 
 pub fn resolve_dpad_disc_rect(term_rect: Rect, custom_pos: Option<(u16, u16)>) -> Option<Rect> {
-    if term_rect.width < DPAD_DISC_WIDTH || term_rect.height < DPAD_DISC_HEIGHT {
+    if term_rect.width < 3 || term_rect.height < 3 {
         return None;
     }
-    let max_x = term_rect.x + term_rect.width.saturating_sub(DPAD_DISC_WIDTH);
-    let max_y = term_rect.y + term_rect.height.saturating_sub(DPAD_DISC_HEIGHT);
+    let pad_w = if term_rect.width >= DPAD_DISC_WIDTH {
+        DPAD_DISC_WIDTH
+    } else if term_rect.width >= 9 {
+        9
+    } else {
+        3
+    };
+    let pad_h = if term_rect.height >= DPAD_DISC_HEIGHT {
+        DPAD_DISC_HEIGHT
+    } else if term_rect.height >= 5 {
+        5
+    } else {
+        3
+    };
+    let max_x = term_rect.x + term_rect.width.saturating_sub(pad_w);
+    let max_y = term_rect.y + term_rect.height.saturating_sub(pad_h);
     let default_x = max_x.saturating_sub(1).max(term_rect.x);
     let default_y = max_y.saturating_sub(1).max(term_rect.y);
     let (px, py) = custom_pos.unwrap_or((default_x, default_y));
     Some(Rect {
         x: px.clamp(term_rect.x, max_x),
         y: py.clamp(term_rect.y, max_y),
-        width: DPAD_DISC_WIDTH,
-        height: DPAD_DISC_HEIGHT,
+        width: pad_w,
+        height: pad_h,
     })
 }
 
@@ -226,7 +252,8 @@ pub fn is_on_dpad_disc(disc_rect: Option<Rect>, col: u16, row: u16) -> bool {
     }
     let dx = col - r.x;
     let dy = row - r.y;
-    (5..10).contains(&dx) || (2..5).contains(&dy)
+    let (arm_w, arm_h, mid_h) = dpad_cross_metrics(r);
+    (arm_w..arm_w * 2).contains(&dx) || (arm_h..arm_h + mid_h).contains(&dy)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -443,6 +470,7 @@ pub fn render_ui_with_dpad(
     // or render bottom touchbar then modal overlay when a modal is active.
     match modal {
         Modal::None => {
+            dpad_rect = render_floating_dpad(f, term_rect, dpad_pos, dpad_dragging, &mut hits);
             render_bottom_touchbar(
                 f,
                 bottom_rect,
@@ -453,9 +481,9 @@ pub fn render_ui_with_dpad(
                 alt_active,
                 scrollback_offset,
                 copied_flash,
+                dpad_rect.is_none(),
                 &mut hits,
             );
-            dpad_rect = render_floating_dpad(f, term_rect, dpad_pos, dpad_dragging, &mut hits);
         }
         Modal::Help => {
             render_bottom_touchbar(
@@ -468,6 +496,7 @@ pub fn render_ui_with_dpad(
                 alt_active,
                 scrollback_offset,
                 copied_flash,
+                false,
                 &mut hits,
             );
             render_help_modal(f, area, &mut hits);
@@ -486,6 +515,7 @@ pub fn render_ui_with_dpad(
                 alt_active,
                 scrollback_offset,
                 copied_flash,
+                false,
                 &mut hits,
             );
             render_confirm_close_modal(f, area, tab_id, tab_title, &mut hits);
@@ -501,6 +531,7 @@ pub fn render_ui_with_dpad(
                 alt_active,
                 scrollback_offset,
                 copied_flash,
+                false,
                 &mut hits,
             );
             render_prompt_modal(f, area, kind, input, &mut hits);
@@ -520,6 +551,7 @@ pub fn render_ui_with_dpad(
                 alt_active,
                 scrollback_offset,
                 copied_flash,
+                false,
                 &mut hits,
             );
             render_fuzzy_modal(
@@ -587,6 +619,7 @@ fn draw_touchbar_pill(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_bottom_touchbar(
     f: &mut Frame,
     rect: Rect,
@@ -597,6 +630,7 @@ fn render_bottom_touchbar(
     alt_active: bool,
     scrollback_offset: usize,
     copied_flash: bool,
+    include_dpad_fallback: bool,
     hits: &mut Vec<HitRegion>,
 ) {
     if rect.width == 0 || rect.height == 0 {
@@ -911,7 +945,7 @@ fn render_bottom_touchbar(
 
     let full_mods = rect.width >= 48;
     let wide_mods = rect.width >= 72;
-    let key_buttons: [(&str, HitTarget, bool, u8); 5] = [
+    let mut key_buttons: Vec<(&str, HitTarget, bool, u8)> = vec![
         (
             if narrow_bar {
                 "^B"
@@ -975,6 +1009,36 @@ fn render_bottom_touchbar(
             0,
         ),
     ];
+
+    if include_dpad_fallback {
+        key_buttons.extend([
+            (
+                "←",
+                HitTarget::SendKey(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+                false,
+                2,
+            ),
+            (
+                "↓",
+                HitTarget::SendKey(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+                false,
+                0,
+            ),
+            (
+                "↑",
+                HitTarget::SendKey(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+                false,
+                2,
+            ),
+            (
+                "→",
+                HitTarget::SendKey(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+                false,
+                0,
+            ),
+            ("⎘", HitTarget::PasteClipboard, false, 3),
+        ]);
+    }
 
     for (i, (lbl, target, active_highlight, kind)) in key_buttons.into_iter().enumerate() {
         let kw = lbl.width() as u16;
@@ -1119,7 +1183,8 @@ fn render_floating_dpad(
     let arrow_fg = Color::Rgb(230, 238, 255);
     let paste_fg = Color::Rgb(198, 248, 228);
 
-    // 15x7 Compact Cross (+), with 4 hollow corners (100% transparent, no wasted space):
+    // 15x7 Compact Cross (+) (or scaled 9/15 x 3/5/7 cross on constrained viewports),
+    // with 4 hollow corners (100% transparent, no wasted space):
     // col: 012345678901234
     // r0:       ╭───╮     
     // r1:       │ ↑ │     
@@ -1128,9 +1193,20 @@ fn render_floating_dpad(
     // r4:  ╰───╯├───┤╰───╯
     // r5:       │ ↓ │     
     // r6:       ╰───╯     
-    for dy in 0..DPAD_DISC_HEIGHT {
-        for dx in 0..DPAD_DISC_WIDTH {
-            let in_cross = (5..10).contains(&dx) || (2..5).contains(&dy);
+    let (arm_w, arm_h, mid_h) = dpad_cross_metrics(disc);
+    let mid_col_end = arm_w * 2;
+    let mid_row_end = arm_h + mid_h;
+    let up_label_y = arm_h.saturating_sub(1);
+    let mid_label_y = arm_h + mid_h / 2;
+    let down_label_y = mid_row_end;
+    let left_label_x = arm_w / 2;
+    let center_label_x = arm_w + arm_w / 2;
+    let right_label_x = mid_col_end + arm_w / 2;
+    let full_15x7 = disc.width == DPAD_DISC_WIDTH && disc.height == DPAD_DISC_HEIGHT;
+
+    for dy in 0..disc.height {
+        for dx in 0..disc.width {
+            let in_cross = (arm_w..mid_col_end).contains(&dx) || (arm_h..mid_row_end).contains(&dy);
             if !in_cross {
                 continue;
             }
@@ -1139,7 +1215,8 @@ fn render_floating_dpad(
             if x >= buf.area.width || y >= buf.area.height {
                 continue;
             }
-            let is_center = (5..10).contains(&dx) && (2..5).contains(&dy);
+            let is_center =
+                (arm_w..mid_col_end).contains(&dx) && (arm_h..mid_row_end).contains(&dy);
             let cell = &mut buf[(x, y)];
             let base_bg = color_to_rgb(cell.bg, (18, 20, 30));
             let base_fg = color_to_rgb(cell.fg, (169, 177, 214));
@@ -1150,41 +1227,55 @@ fn render_floating_dpad(
             };
             let blended_bg = blend_rgb(base_bg, tint, alpha);
 
-            let glyph: Option<(&str, Color, bool)> = match (dy, dx) {
-                // Row 0: top of Up box
-                (0, 5) => Some(("╭", border_fg, false)),
-                (0, 6..=8) => Some(("─", border_fg, false)),
-                (0, 9) => Some(("╮", border_fg, false)),
-                // Row 1: Up label
-                (1, 5) | (1, 9) => Some(("│", border_fg, false)),
-                (1, 7) => Some(("↑", arrow_fg, true)),
-                // Row 2: top of Left / Center / Right
-                (2, 0) | (2, 10) => Some(("╭", border_fg, false)),
-                (2, 4) | (2, 14) => Some(("╮", border_fg, false)),
-                (2, 5) => Some(("├", border_fg, false)),
-                (2, 9) => Some(("┤", border_fg, false)),
-                (2, 1..=3) | (2, 6..=8) | (2, 11..=13) => Some(("─", border_fg, false)),
-                // Row 3: Left / Paste / Right labels
-                (3, 0) | (3, 4) | (3, 5) | (3, 9) | (3, 10) | (3, 14) => {
-                    Some(("│", border_fg, false))
+            let glyph: Option<(&str, Color, bool)> = if full_15x7 {
+                match (dy, dx) {
+                    // Row 0: top of Up box
+                    (0, 5) => Some(("╭", border_fg, false)),
+                    (0, 6..=8) => Some(("─", border_fg, false)),
+                    (0, 9) => Some(("╮", border_fg, false)),
+                    // Row 1: Up label
+                    (1, 5) | (1, 9) => Some(("│", border_fg, false)),
+                    (1, 7) => Some(("↑", arrow_fg, true)),
+                    // Row 2: top of Left / Center / Right
+                    (2, 0) | (2, 10) => Some(("╭", border_fg, false)),
+                    (2, 4) | (2, 14) => Some(("╮", border_fg, false)),
+                    (2, 5) => Some(("├", border_fg, false)),
+                    (2, 9) => Some(("┤", border_fg, false)),
+                    (2, 1..=3) | (2, 6..=8) | (2, 11..=13) => Some(("─", border_fg, false)),
+                    // Row 3: Left / Paste / Right labels
+                    (3, 0) | (3, 4) | (3, 5) | (3, 9) | (3, 10) | (3, 14) => {
+                        Some(("│", border_fg, false))
+                    }
+                    (3, 2) => Some(("←", arrow_fg, true)),
+                    (3, 7) => Some(("⎘", paste_fg, true)),
+                    (3, 12) => Some(("→", arrow_fg, true)),
+                    // Row 4: bottom of Left / Center / Right
+                    (4, 0) | (4, 10) => Some(("╰", border_fg, false)),
+                    (4, 4) | (4, 14) => Some(("╯", border_fg, false)),
+                    (4, 5) => Some(("├", border_fg, false)),
+                    (4, 9) => Some(("┤", border_fg, false)),
+                    (4, 1..=3) | (4, 6..=8) | (4, 11..=13) => Some(("─", border_fg, false)),
+                    // Row 5: Down label
+                    (5, 5) | (5, 9) => Some(("│", border_fg, false)),
+                    (5, 7) => Some(("↓", arrow_fg, true)),
+                    // Row 6: bottom of Down box
+                    (6, 5) => Some(("╰", border_fg, false)),
+                    (6, 6..=8) => Some(("─", border_fg, false)),
+                    (6, 9) => Some(("╯", border_fg, false)),
+                    _ => None,
                 }
-                (3, 2) => Some(("←", arrow_fg, true)),
-                (3, 7) => Some(("⎘", paste_fg, true)),
-                (3, 12) => Some(("→", arrow_fg, true)),
-                // Row 4: bottom of Left / Center / Right
-                (4, 0) | (4, 10) => Some(("╰", border_fg, false)),
-                (4, 4) | (4, 14) => Some(("╯", border_fg, false)),
-                (4, 5) => Some(("├", border_fg, false)),
-                (4, 9) => Some(("┤", border_fg, false)),
-                (4, 1..=3) | (4, 6..=8) | (4, 11..=13) => Some(("─", border_fg, false)),
-                // Row 5: Down label
-                (5, 5) | (5, 9) => Some(("│", border_fg, false)),
-                (5, 7) => Some(("↓", arrow_fg, true)),
-                // Row 6: bottom of Down box
-                (6, 5) => Some(("╰", border_fg, false)),
-                (6, 6..=8) => Some(("─", border_fg, false)),
-                (6, 9) => Some(("╯", border_fg, false)),
-                _ => None,
+            } else if dy == up_label_y && dx == center_label_x {
+                Some(("↑", arrow_fg, true))
+            } else if dy == down_label_y && dx == center_label_x {
+                Some(("↓", arrow_fg, true))
+            } else if dy == mid_label_y && dx == left_label_x {
+                Some(("←", arrow_fg, true))
+            } else if dy == mid_label_y && dx == center_label_x {
+                Some(("⎘", paste_fg, true))
+            } else if dy == mid_label_y && dx == right_label_x {
+                Some(("→", arrow_fg, true))
+            } else {
+                None
             };
 
             cell.set_bg(blended_bg);
@@ -1208,53 +1299,53 @@ fn render_floating_dpad(
     }
 
     // Register 5 hit regions covering 100% of the Compact Cross (+):
-    // Top arm (Up): dx in 5..10, dy in 0..2
+    // Top arm (Up)
     hits.push(HitRegion {
         rect: Rect {
-            x: disc.x + 5,
+            x: disc.x + arm_w,
             y: disc.y,
-            width: 5,
-            height: 2,
+            width: arm_w,
+            height: arm_h,
         },
         target: HitTarget::SendKey(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
     });
-    // Bottom arm (Down): dx in 5..10, dy in 5..7
+    // Bottom arm (Down)
     hits.push(HitRegion {
         rect: Rect {
-            x: disc.x + 5,
-            y: disc.y + 5,
-            width: 5,
-            height: 2,
+            x: disc.x + arm_w,
+            y: disc.y + mid_row_end,
+            width: arm_w,
+            height: arm_h,
         },
         target: HitTarget::SendKey(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
     });
-    // Left arm (Left): dx in 0..5, dy in 2..5
+    // Left arm (Left)
     hits.push(HitRegion {
         rect: Rect {
             x: disc.x,
-            y: disc.y + 2,
-            width: 5,
-            height: 3,
+            y: disc.y + arm_h,
+            width: arm_w,
+            height: mid_h,
         },
         target: HitTarget::SendKey(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
     });
-    // Right arm (Right): dx in 10..15, dy in 2..5
+    // Right arm (Right)
     hits.push(HitRegion {
         rect: Rect {
-            x: disc.x + 10,
-            y: disc.y + 2,
-            width: 5,
-            height: 3,
+            x: disc.x + mid_col_end,
+            y: disc.y + arm_h,
+            width: arm_w,
+            height: mid_h,
         },
         target: HitTarget::SendKey(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
     });
-    // Center square (PasteClipboard): dx in 5..10, dy in 2..5
+    // Center square (PasteClipboard)
     hits.push(HitRegion {
         rect: Rect {
-            x: disc.x + 5,
-            y: disc.y + 2,
-            width: 5,
-            height: 3,
+            x: disc.x + arm_w,
+            y: disc.y + arm_h,
+            width: arm_w,
+            height: mid_h,
         },
         target: HitTarget::PasteClipboard,
     });
@@ -2504,6 +2595,47 @@ mod tests {
             assert!(!is_on_dpad_disc(Some(disc), disc.x, disc.y));
             assert!(!is_on_dpad_disc(Some(disc), disc.x + 14, disc.y + 6));
             assert!(is_on_dpad_disc(Some(disc), disc.x + 7, disc.y + 3));
+        }
+
+        // Constrained viewports (e.g. 80x9 with 3-row touchbar -> 6-row viewport, or 30x8 with open sidebar)
+        // scale down the + cross so all 4 directions and centered Paste remain accessible.
+        for (w, h, sidebar_open) in [(80u16, 9u16, false), (30u16, 8u16, true)] {
+            let backend = TestBackend::new(w, h);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let world = World::default();
+            let mut geom_out = None;
+            terminal
+                .draw(|f| {
+                    geom_out = Some(render_ui_with_dpad(
+                        f,
+                        &world,
+                        None,
+                        sidebar_open,
+                        24,
+                        true,
+                        false,
+                        false,
+                        false,
+                        0,
+                        None,
+                        false,
+                        &Modal::None,
+                        None,
+                        false,
+                    ));
+                })
+                .unwrap();
+            let geom = geom_out.unwrap();
+            assert!(geom.dpad_rect.is_some());
+            for arrow in [KeyCode::Up, KeyCode::Down, KeyCode::Left, KeyCode::Right] {
+                assert!(geom.hits.iter().any(|hit| {
+                    hit.target == HitTarget::SendKey(KeyEvent::new(arrow, KeyModifiers::NONE))
+                }));
+            }
+            assert!(geom
+                .hits
+                .iter()
+                .any(|hit| hit.target == HitTarget::PasteClipboard));
         }
     }
 
