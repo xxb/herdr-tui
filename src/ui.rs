@@ -1,8 +1,9 @@
-//! TUI rendering (`ratatui` + `vt100`) with Top Tab Bar, Collapsible Left Sidebar,
-//! touch/mouse hit-testing regions, and modal overlays.
+//! TUI rendering (`ratatui` + `vt100`) with Collapsible 2-Row Left Sidebar,
+//! Herdr-style Bottom Touchbar, touch/mouse hit-testing regions, and modal overlays.
 
 use crate::keys::Action;
 use crate::model::{AgentState, World};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -16,7 +17,6 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HitTarget {
     ToggleSidebar,
-    NextSpace,
     SelectSpace(String),
     SelectTab { space_id: String, tab_id: String },
     NewTab,
@@ -29,6 +29,7 @@ pub enum HitTarget {
     CancelModal,
     ModalNoop,
     TriggerAction(Action),
+    SendKey(KeyEvent),
 }
 
 #[derive(Clone, Debug)]
@@ -191,8 +192,8 @@ pub struct UiGeometry {
     pub hits: Vec<HitRegion>,
 }
 
-pub fn top_bar_height(area: Rect, touch_mode: bool) -> u16 {
-    if area.height == 0 {
+pub fn bottom_bar_height(area: Rect, touch_mode: bool) -> u16 {
+    if area.height <= 1 {
         0
     } else if touch_mode && area.height >= 6 {
         2
@@ -207,9 +208,8 @@ pub fn compute_terminal_rect(
     sidebar_width: u16,
     touch_mode: bool,
 ) -> Rect {
-    let tb_h = top_bar_height(area, touch_mode);
-    let body_height = area.height.saturating_sub(tb_h).max(1);
-    let body_y = area.y + tb_h.min(area.height.saturating_sub(1));
+    let bb_h = bottom_bar_height(area, touch_mode);
+    let body_height = area.height.saturating_sub(bb_h).max(1);
     let sw = if sidebar_open && area.width > sidebar_width + 20 {
         sidebar_width
     } else {
@@ -217,9 +217,21 @@ pub fn compute_terminal_rect(
     };
     Rect {
         x: area.x + sw,
-        y: body_y,
+        y: area.y,
         width: area.width.saturating_sub(sw).max(1),
         height: body_height,
+    }
+}
+
+fn pad_to_width(s: &str, width: usize) -> String {
+    let truncated = truncate_to_width(s, width);
+    let cur_w = truncated.width();
+    if cur_w < width {
+        let mut out = truncated;
+        out.extend(std::iter::repeat_n(' ', width - cur_w));
+        out
+    } else {
+        truncated
     }
 }
 
@@ -237,34 +249,17 @@ pub fn render_ui(
 ) -> UiGeometry {
     let area = f.area();
     let mut hits = Vec::new();
-    let tb_h = top_bar_height(area, touch_mode);
-
-    let top_rect = Rect {
-        x: area.x,
-        y: area.y,
-        width: area.width,
-        height: tb_h,
-    };
-
-    render_top_bar(
-        f,
-        top_rect,
-        world,
-        sidebar_open,
-        prefix_active,
-        scrollback_offset,
-        &mut hits,
-    );
+    let bb_h = bottom_bar_height(area, touch_mode);
 
     let term_rect = compute_terminal_rect(area, sidebar_open, sidebar_width, touch_mode);
     let actual_sidebar_w = term_rect.x.saturating_sub(area.x);
 
-    if actual_sidebar_w > 0 && area.height > tb_h {
+    if actual_sidebar_w > 0 && term_rect.height > 0 {
         let side_rect = Rect {
             x: area.x,
-            y: area.y + tb_h,
+            y: area.y,
             width: actual_sidebar_w,
-            height: area.height - tb_h,
+            height: term_rect.height,
         };
         render_sidebar(f, side_rect, world, &mut hits);
     }
@@ -286,39 +281,102 @@ pub fn render_ui(
         f.render_widget(placeholder, term_rect);
     }
 
+    let bottom_rect = Rect {
+        x: area.x,
+        y: area.y + term_rect.height,
+        width: area.width,
+        height: bb_h,
+    };
+
+    // Render bottom touchbar first when no modal is open, or render modal then bottom touchbar
+    // so bottom touchbar terminal keys (Esc, arrows, etc.) remain usable or visually anchored.
     match modal {
-        Modal::None => {}
-        Modal::Help => render_help_modal(f, area, &mut hits),
+        Modal::None => {
+            render_bottom_touchbar(
+                f,
+                bottom_rect,
+                world,
+                sidebar_open,
+                prefix_active,
+                scrollback_offset,
+                &mut hits,
+            );
+        }
+        Modal::Help => {
+            render_bottom_touchbar(
+                f,
+                bottom_rect,
+                world,
+                sidebar_open,
+                prefix_active,
+                scrollback_offset,
+                &mut hits,
+            );
+            render_help_modal(f, area, &mut hits);
+        }
         Modal::ConfirmCloseTab {
             tab_id,
             tab_title,
-        } => render_confirm_close_modal(f, area, tab_id, tab_title, &mut hits),
-        Modal::Prompt { kind, input } => render_prompt_modal(f, area, kind, input, &mut hits),
+        } => {
+            render_bottom_touchbar(
+                f,
+                bottom_rect,
+                world,
+                sidebar_open,
+                prefix_active,
+                scrollback_offset,
+                &mut hits,
+            );
+            render_confirm_close_modal(f, area, tab_id, tab_title, &mut hits);
+        }
+        Modal::Prompt { kind, input } => {
+            render_bottom_touchbar(
+                f,
+                bottom_rect,
+                world,
+                sidebar_open,
+                prefix_active,
+                scrollback_offset,
+                &mut hits,
+            );
+            render_prompt_modal(f, area, kind, input, &mut hits);
+        }
         Modal::Fuzzy {
             query,
             selected,
             selected_tab_id,
-        } => render_fuzzy_modal(
-            f,
-            area,
-            world,
-            query,
-            *selected,
-            selected_tab_id.as_deref(),
-            &mut hits,
-        ),
+        } => {
+            render_bottom_touchbar(
+                f,
+                bottom_rect,
+                world,
+                sidebar_open,
+                prefix_active,
+                scrollback_offset,
+                &mut hits,
+            );
+            render_fuzzy_modal(
+                f,
+                area,
+                world,
+                query,
+                *selected,
+                selected_tab_id.as_deref(),
+                &mut hits,
+            );
+        }
     }
 
     UiGeometry { term_rect, hits }
 }
 
-fn draw_top_bar_pill(
+fn draw_touchbar_pill(
     buf: &mut Buffer,
     x: u16,
     rect: Rect,
     label: &str,
     style: Style,
-    emphasized_underline: bool,
+    emphasized: bool,
 ) {
     if rect.height == 0 {
         return;
@@ -326,22 +384,22 @@ fn draw_top_bar_pill(
     let lw = label.width() as u16;
     buf.set_string(x, rect.y, label, style);
     if rect.height >= 2 && lw > 0 {
-        let line_ch = if emphasized_underline { "═" } else { "─" };
-        let mut bottom = String::with_capacity(lw as usize * 3);
+        let line_ch = if emphasized { "═" } else { "─" };
+        let mut sub = String::with_capacity(lw as usize * 3);
         if lw >= 2 {
-            bottom.push(' ');
+            sub.push(' ');
             for _ in 0..(lw - 2) {
-                bottom.push_str(line_ch);
+                sub.push_str(line_ch);
             }
-            bottom.push(' ');
+            sub.push(' ');
         } else {
-            bottom.push_str(line_ch);
+            sub.push_str(line_ch);
         }
-        buf.set_string(x, rect.y + 1, &bottom, style);
+        buf.set_string(x, rect.y + 1, &sub, style);
     }
 }
 
-fn render_top_bar(
+fn render_bottom_touchbar(
     f: &mut Frame,
     rect: Rect,
     world: &World,
@@ -353,26 +411,51 @@ fn render_top_bar(
     if rect.width == 0 || rect.height == 0 {
         return;
     }
-    let bg_bar = Style::default().bg(Color::Rgb(24, 24, 36)).fg(Color::Gray);
+    let bg_bar = Style::default().bg(Color::Rgb(20, 22, 34)).fg(Color::Gray);
     f.render_widget(Block::default().style(bg_bar), rect);
 
     let mut x = rect.x;
     let max_x = rect.x + rect.width;
     let buf = f.buffer_mut();
 
-    // 1. Sidebar toggle button `[≡]`
-    let sb_label = if sidebar_open { " ◄≡ " } else { " ≡► " };
+    // 1. Left: `[≡]` Sidebar Toggle + current Space:Tab indicator
+    let icon = if sidebar_open { "◄≡" } else { "≡►" };
+    let (sb_label, active_state, dot_offset) = if let Some(space) = world.active_space() {
+        let sname = truncate_to_width(&world.space_display_name(space), 10);
+        let ti = world.active_tab_index();
+        let tname = truncate_to_width(&world.tab_display_name(space, ti), 12);
+        let st = world
+            .active_tab()
+            .map_or_else(|| world.space_state(space), |t| world.tab_state(t));
+        let prefix_part = format!(" {icon} {sname} {}:", ti + 1);
+        let dot_off = prefix_part.width() as u16;
+        let full = format!("{prefix_part}{} {tname} ", st.symbol());
+        (full, Some(st), dot_off)
+    } else {
+        (format!(" {icon} Spaces "), None, 0)
+    };
+
     let sb_w = sb_label.width() as u16;
     if x + sb_w <= max_x {
         let style = Style::default()
             .bg(if sidebar_open {
-                Color::Rgb(55, 55, 85)
+                Color::Rgb(52, 58, 92)
             } else {
-                Color::Rgb(36, 36, 54)
+                Color::Rgb(36, 40, 62)
             })
             .fg(Color::White)
             .add_modifier(Modifier::BOLD);
-        draw_top_bar_pill(buf, x, rect, sb_label, style, sidebar_open);
+        draw_touchbar_pill(buf, x, rect, &sb_label, style, sidebar_open);
+        if let Some(st) = active_state {
+            if x + dot_offset < x + sb_w {
+                buf.set_string(
+                    x + dot_offset,
+                    rect.y,
+                    st.symbol(),
+                    style.fg(state_color(st)).add_modifier(Modifier::BOLD),
+                );
+            }
+        }
         hits.push(HitRegion {
             rect: Rect {
                 x,
@@ -385,170 +468,110 @@ fn render_top_bar(
         x += sb_w;
     }
 
-    // 2. Active Space badge `[Space]`
-    if let Some(space) = world.active_space() {
-        let sname = truncate_to_width(&world.space_display_name(space), 14);
-        let sstate = world.space_state(space);
-        let badge = format!(" [{} {}] ", sstate.symbol(), sname);
-        let bw = badge.width() as u16;
-        if x + bw <= max_x {
-            let style = Style::default()
-                .bg(Color::Rgb(42, 46, 68))
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD);
-            draw_top_bar_pill(buf, x, rect, &badge, style, true);
-            hits.push(HitRegion {
-                rect: Rect {
-                    x,
-                    y: rect.y,
-                    width: bw,
-                    height: rect.height,
-                },
-                target: HitTarget::NextSpace,
-            });
-            x += bw;
+    if x < max_x {
+        for r in 0..rect.height {
+            buf.set_string(x, rect.y + r, "│", bg_bar.fg(Color::Rgb(55, 60, 82)));
         }
+        x += 1;
     }
 
-    // Reserve right touch buttons: optional `[SCROLL -N ▼]`, `[^B]`, and `[ ? ]`
+    // Reserve right-side space for optional `[ ▼ SCROLL -N ]` and `[ ? ]`
     let scroll_lbl = if scrollback_offset > 0 {
-        Some(format!(" [SCROLL -{scrollback_offset} ▼] "))
+        Some(format!(" [ ▼ SCROLL -{scrollback_offset} ] "))
     } else {
         None
     };
-    let prefix_lbl = if prefix_active { " [^B*] " } else { " [^B] " };
     let help_lbl = " [ ? ] ";
-
     let scroll_w = scroll_lbl.as_ref().map_or(0, |s| s.width() as u16);
-    let prefix_w = prefix_lbl.width() as u16;
     let help_w = help_lbl.width() as u16;
-    let total_right_w = scroll_w + prefix_w + help_w;
-    let avail_end = max_x.saturating_sub(total_right_w);
+    let avail_end = max_x.saturating_sub(scroll_w + help_w);
 
-    // 3. Tabs strip in active Space (scrolled so active_tab_index is visible)
-    if let Some(space) = world.active_space() {
-        let active_ti = world.active_tab_index();
-        let space_id = space.id.clone();
+    // 2. Center: Herdr App-style Touchbar Keys (`^B`, `Esc`, `Tab`, `^C`, `←`, `↓`, `↑`, `→`)
+    let wide = avail_end.saturating_sub(x) >= 62;
+    let key_buttons: [(String, HitTarget, bool); 8] = [
+        (
+            if prefix_active {
+                " [^B*] ".to_string()
+            } else {
+                " [^B] ".to_string()
+            },
+            HitTarget::TogglePrefix,
+            prefix_active,
+        ),
+        (
+            if wide { " [ Esc ] " } else { " [Esc] " }.to_string(),
+            HitTarget::SendKey(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            false,
+        ),
+        (
+            if wide { " [ Tab ] " } else { " [Tab] " }.to_string(),
+            HitTarget::SendKey(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            false,
+        ),
+        (
+            if wide { " [ ^C ] " } else { " [^C] " }.to_string(),
+            HitTarget::SendKey(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            false,
+        ),
+        (
+            if wide { " [  ←  ] " } else { " [ ← ] " }.to_string(),
+            HitTarget::SendKey(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            false,
+        ),
+        (
+            if wide { " [  ↓  ] " } else { " [ ↓ ] " }.to_string(),
+            HitTarget::SendKey(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            false,
+        ),
+        (
+            if wide { " [  ↑  ] " } else { " [ ↑ ] " }.to_string(),
+            HitTarget::SendKey(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            false,
+        ),
+        (
+            if wide { " [  →  ] " } else { " [ → ] " }.to_string(),
+            HitTarget::SendKey(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            false,
+        ),
+    ];
 
-        // Precompute tab labels
-        let tab_items: Vec<(usize, String, String, AgentState, bool)> = space
-            .tabs
-            .iter()
-            .enumerate()
-            .map(|(ti, tab)| {
-                let name = truncate_to_width(&world.tab_display_name(space, ti), 18);
-                let panes = world.tab_terminals(tab).len();
-                let pane_suffix = if panes > 1 {
-                    format!("({panes})")
-                } else {
-                    String::new()
-                };
-                let st = world.tab_state(tab);
-                let label = format!(" {}:{} {}{} ", ti + 1, st.symbol(), name, pane_suffix);
-                (ti, tab.id.clone(), label, st, ti == active_ti)
-            })
-            .collect();
-
-        // Find start index so that active_ti fits in `avail_end - x - 5`
-        let plus_w = 5u16; // ` [+] `
-        let budget = avail_end.saturating_sub(x).saturating_sub(plus_w);
-        let mut start_idx = 0;
-        if !tab_items.is_empty() {
-            let mut sum = 0u16;
-            for &(ti, _, ref lbl, _, _) in &tab_items[..=active_ti.min(tab_items.len() - 1)] {
-                sum += lbl.width() as u16 + 1;
-                while sum > budget && start_idx < ti {
-                    sum = sum.saturating_sub(tab_items[start_idx].2.width() as u16 + 1);
-                    start_idx += 1;
-                }
-            }
+    for (lbl, target, active_highlight) in key_buttons {
+        let kw = lbl.width() as u16;
+        if x + kw > avail_end {
+            break;
         }
+        let kstyle = if active_highlight {
+            Style::default()
+                .bg(Color::LightYellow)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .bg(Color::Rgb(34, 38, 58))
+                .fg(Color::Rgb(220, 225, 240))
+                .add_modifier(Modifier::BOLD)
+        };
+        draw_touchbar_pill(buf, x, rect, &lbl, kstyle, active_highlight);
+        hits.push(HitRegion {
+            rect: Rect {
+                x,
+                y: rect.y,
+                width: kw,
+                height: rect.height,
+            },
+            target,
+        });
+        x += kw;
 
-        let max_tab_end = avail_end.saturating_sub(plus_w);
-        for (vis_idx, &(ti, ref tid, ref lbl, st, is_active)) in
-            tab_items.iter().skip(start_idx).enumerate()
-        {
-            let remaining = max_tab_end.saturating_sub(x);
-            let rendered_lbl = if (lbl.width() as u16) <= remaining {
-                lbl.clone()
-            } else if vis_idx == 0 && remaining >= 4 {
-                truncate_to_width(lbl, remaining as usize)
-            } else {
-                break;
-            };
-            let lw = rendered_lbl.width() as u16;
-            let tab_bg = if is_active {
-                Color::Rgb(72, 82, 130)
-            } else {
-                Color::Rgb(32, 34, 48)
-            };
-            let tab_fg = if is_active {
-                Color::White
-            } else {
-                Color::Rgb(190, 195, 215)
-            };
-            let mut style = Style::default().bg(tab_bg).fg(tab_fg);
-            if is_active {
-                style = style.add_modifier(Modifier::BOLD);
+        if x < avail_end {
+            for r in 0..rect.height {
+                buf.set_string(x, rect.y + r, "│", bg_bar.fg(Color::Rgb(50, 54, 74)));
             }
-            draw_top_bar_pill(buf, x, rect, &rendered_lbl, style, is_active);
-
-            // Colorize the status dot inside the tab pill if it wasn't truncated out
-            let num_prefix = format!(" {}:", ti + 1);
-            let dot_x = x + (num_prefix.width() as u16);
-            if dot_x < x + lw {
-                buf.set_string(
-                    dot_x,
-                    rect.y,
-                    st.symbol(),
-                    style.fg(state_color(st)).add_modifier(Modifier::BOLD),
-                );
-            }
-
-            hits.push(HitRegion {
-                rect: Rect {
-                    x,
-                    y: rect.y,
-                    width: lw,
-                    height: rect.height,
-                },
-                target: HitTarget::SelectTab {
-                    space_id: space_id.clone(),
-                    tab_id: tid.clone(),
-                },
-            });
-            x += lw;
-
-            if x < avail_end {
-                for r in 0..rect.height {
-                    buf.set_string(x, rect.y + r, "│", bg_bar.fg(Color::Rgb(60, 60, 80)));
-                }
-                x += 1;
-            }
-        }
-
-        // 4. `[+]` New Tab button
-        let plus_lbl = " [+] ";
-        let pw = plus_lbl.width() as u16;
-        if x + pw <= avail_end {
-            let pstyle = Style::default()
-                .bg(Color::Rgb(36, 56, 46))
-                .fg(Color::LightGreen)
-                .add_modifier(Modifier::BOLD);
-            draw_top_bar_pill(buf, x, rect, plus_lbl, pstyle, false);
-            hits.push(HitRegion {
-                rect: Rect {
-                    x,
-                    y: rect.y,
-                    width: pw,
-                    height: rect.height,
-                },
-                target: HitTarget::NewTab,
-            });
+            x += 1;
         }
     }
 
-    // 5. Right touch buttons: `[SCROLL -N ▼]`, `[^B]`, and `[ ? ]`
+    // 3. Right: optional `[ ▼ SCROLL -N ]` and `[ ? ]`
     let mut rx = avail_end;
     if let Some(ref slbl) = scroll_lbl {
         if rx + scroll_w <= max_x {
@@ -556,7 +579,7 @@ fn render_top_bar(
                 .bg(Color::LightCyan)
                 .fg(Color::Black)
                 .add_modifier(Modifier::BOLD);
-            draw_top_bar_pill(buf, rx, rect, slbl, sstyle, true);
+            draw_touchbar_pill(buf, rx, rect, slbl, sstyle, true);
             hits.push(HitRegion {
                 rect: Rect {
                     x: rx,
@@ -570,37 +593,12 @@ fn render_top_bar(
         }
     }
 
-    if rx + prefix_w <= max_x {
-        let pstyle = if prefix_active {
-            Style::default()
-                .bg(Color::LightYellow)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-                .bg(Color::Rgb(44, 46, 68))
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD)
-        };
-        draw_top_bar_pill(buf, rx, rect, prefix_lbl, pstyle, prefix_active);
-        hits.push(HitRegion {
-            rect: Rect {
-                x: rx,
-                y: rect.y,
-                width: prefix_w,
-                height: rect.height,
-            },
-            target: HitTarget::TogglePrefix,
-        });
-        rx += prefix_w;
-    }
-
     if rx + help_w <= max_x {
         let hstyle = Style::default()
-            .bg(Color::Rgb(36, 36, 54))
+            .bg(Color::Rgb(38, 42, 64))
             .fg(Color::LightCyan)
             .add_modifier(Modifier::BOLD);
-        draw_top_bar_pill(buf, rx, rect, help_lbl, hstyle, false);
+        draw_touchbar_pill(buf, rx, rect, help_lbl, hstyle, false);
         hits.push(HitRegion {
             rect: Rect {
                 x: rx,
@@ -613,9 +611,35 @@ fn render_top_bar(
     }
 }
 
+struct SidebarCard {
+    row1: String,
+    row2: String,
+    dot_col: Option<(u16, AgentState)>,
+    is_active: bool,
+    is_space: bool,
+    target: HitTarget,
+}
+
+fn shorten_home_path(path: &str) -> String {
+    if path.is_empty() {
+        return "~".to_string();
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() && path.starts_with(&home) {
+            let rest = &path[home.len()..];
+            return if rest.is_empty() {
+                "~".to_string()
+            } else {
+                format!("~{rest}")
+            };
+        }
+    }
+    path.to_string()
+}
+
 fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRegion>) {
     let bg = Style::default()
-        .bg(Color::Rgb(20, 22, 32))
+        .bg(Color::Rgb(18, 20, 30))
         .fg(Color::Rgb(200, 205, 220));
     let block = Block::default()
         .borders(Borders::RIGHT)
@@ -631,56 +655,59 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
     let buf = f.buffer_mut();
     let mut y = inner.y;
     let max_y = inner.y + inner.height;
+    let w = inner.width as usize;
 
-    // Header
+    // Header (1 row)
     if y < max_y {
-        let hdr = " SPACES & AGENTS";
+        let hdr = pad_to_width(" SPACES & TABS", w);
         buf.set_string(
             inner.x,
             y,
-            hdr,
+            &hdr,
             Style::default()
+                .bg(Color::Rgb(26, 28, 44))
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         );
         y += 1;
     }
 
+    // Reserve footer space for 2-row `[+ New Tab]` and `[+ New Space]` buttons
+    let footer_rows = if max_y.saturating_sub(y) >= 8 {
+        4
+    } else if max_y.saturating_sub(y) >= 4 {
+        2
+    } else {
+        0
+    };
+    let list_end_y = max_y.saturating_sub(footer_rows);
+
+    // Build 2-row cards for all Spaces and Tabs
+    let mut cards: Vec<SidebarCard> = Vec::new();
+    let mut active_card_idx: usize = 0;
+
     for (si, space) in world.doc.spaces.iter().enumerate() {
-        if y >= max_y.saturating_sub(1) {
-            break;
-        }
         let is_active_space = si == world.active_space_idx;
+        if is_active_space {
+            active_card_idx = cards.len();
+        }
         let sname = world.space_display_name(space);
         let sstate = world.space_state(space);
         let arrow = if is_active_space { "▾" } else { "▸" };
-        let line = format!(" {arrow} {} {sname}", sstate.symbol());
-        let clipped: String = line.chars().take(inner.width as usize).collect();
+        let prefix = format!(" {arrow} ");
+        let dot_x = prefix.width() as u16;
+        let row1 = format!("{prefix}{} {sname}", sstate.symbol());
+        let folder = shorten_home_path(&space.folder);
+        let row2 = format!("     {folder}");
 
-        let s_style = if is_active_space {
-            Style::default()
-                .bg(Color::Rgb(42, 48, 76))
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Rgb(180, 185, 205))
-        };
-        buf.set_string(
-            inner.x,
-            y,
-            &format!("{:<width$}", clipped, width = inner.width as usize),
-            s_style,
-        );
-        hits.push(HitRegion {
-            rect: Rect {
-                x: inner.x,
-                y,
-                width: inner.width,
-                height: 1,
-            },
+        cards.push(SidebarCard {
+            row1,
+            row2,
+            dot_col: Some((dot_x, sstate)),
+            is_active: is_active_space,
+            is_space: true,
             target: HitTarget::SelectSpace(space.id.clone()),
         });
-        y += 1;
 
         let active_ti = if is_active_space {
             Some(world.active_tab_index())
@@ -689,72 +716,217 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
         };
 
         for (ti, tab) in space.tabs.iter().enumerate() {
-            if y >= max_y.saturating_sub(1) {
-                break;
-            }
             let is_active_tab = active_ti == Some(ti);
+            if is_active_tab {
+                active_card_idx = cards.len();
+            }
             let tname = world.tab_display_name(space, ti);
             let st = world.tab_state(tab);
-            let row_str = format!("   {}:{} {}", ti + 1, st.symbol(), tname);
-            let row_clipped: String = row_str.chars().take(inner.width as usize).collect();
-
-            let t_style = if is_active_tab {
-                Style::default()
-                    .bg(Color::Rgb(68, 78, 125))
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD)
+            let panes = world.tab_terminals(tab).len();
+            let pane_suffix = if panes > 1 {
+                format!(" ({panes})")
             } else {
-                Style::default().fg(Color::Rgb(165, 170, 190))
+                String::new()
             };
-            buf.set_string(
-                inner.x,
-                y,
-                &format!("{:<width$}", row_clipped, width = inner.width as usize),
-                t_style,
-            );
-            // Highlight status dot
-            let prefix_len = format!("   {}:", ti + 1).width() as u16;
-            if inner.x + prefix_len < inner.x + inner.width {
-                buf.set_string(
-                    inner.x + prefix_len,
-                    y,
-                    st.symbol(),
-                    t_style.fg(state_color(st)).add_modifier(Modifier::BOLD),
-                );
-            }
+            let prefix = format!("   {}:", ti + 1);
+            let dot_x = prefix.width() as u16;
+            let row1 = format!("{prefix}{} {tname}{pane_suffix}", st.symbol());
 
-            hits.push(HitRegion {
-                rect: Rect {
-                    x: inner.x,
-                    y,
-                    width: inner.width,
-                    height: 1,
-                },
+            let subtitle = world
+                .active_terminal_for_tab(tab)
+                .and_then(|addr| {
+                    world.terminals.get(&addr).map(|info| {
+                        let cwd = shorten_home_path(info.effective_cwd());
+                        format!("      {addr} · {cwd}")
+                    })
+                })
+                .unwrap_or_else(|| "      shell".to_string());
+
+            cards.push(SidebarCard {
+                row1,
+                row2: subtitle,
+                dot_col: Some((dot_x, st)),
+                is_active: is_active_tab,
+                is_space: false,
                 target: HitTarget::SelectTab {
                     space_id: space.id.clone(),
                     tab_id: tab.id.clone(),
                 },
             });
-            y += 1;
         }
     }
 
-    // Footer button `[+ New Space]`
-    if y < max_y {
-        let btn = " [+ New Space (^b C)]";
-        let clipped: String = btn.chars().take(inner.width as usize).collect();
+    // Calculate visible 2-row card window so `active_card_idx` stays in view
+    let avail_rows = list_end_y.saturating_sub(y) as usize;
+    let visible_cards = avail_rows / 2;
+    let start_card = if visible_cards == 0 || active_card_idx < visible_cards {
+        0
+    } else {
+        active_card_idx + 1 - visible_cards
+    };
+
+    for card in cards.into_iter().skip(start_card) {
+        if y + 2 > list_end_y {
+            break;
+        }
+        let (r1_style, r2_style) = match (card.is_space, card.is_active) {
+            (true, true) => (
+                Style::default()
+                    .bg(Color::Rgb(42, 48, 76))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+                Style::default()
+                    .bg(Color::Rgb(42, 48, 76))
+                    .fg(Color::Rgb(150, 165, 200)),
+            ),
+            (true, false) => (
+                Style::default()
+                    .bg(Color::Rgb(26, 30, 46))
+                    .fg(Color::Rgb(190, 198, 220))
+                    .add_modifier(Modifier::BOLD),
+                Style::default()
+                    .bg(Color::Rgb(26, 30, 46))
+                    .fg(Color::Rgb(120, 130, 155)),
+            ),
+            (false, true) => (
+                Style::default()
+                    .bg(Color::Rgb(68, 78, 128))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+                Style::default()
+                    .bg(Color::Rgb(68, 78, 128))
+                    .fg(Color::Rgb(200, 210, 240)),
+            ),
+            (false, false) => (
+                Style::default()
+                    .bg(Color::Rgb(20, 22, 34))
+                    .fg(Color::Rgb(170, 178, 200)),
+                Style::default()
+                    .bg(Color::Rgb(20, 22, 34))
+                    .fg(Color::Rgb(110, 118, 142)),
+            ),
+        };
+
+        buf.set_string(inner.x, y, &pad_to_width(&card.row1, w), r1_style);
+        buf.set_string(inner.x, y + 1, &pad_to_width(&card.row2, w), r2_style);
+
+        if let Some((dot_off, st)) = card.dot_col {
+            if inner.x + dot_off < inner.x + inner.width {
+                buf.set_string(
+                    inner.x + dot_off,
+                    y,
+                    st.symbol(),
+                    r1_style.fg(state_color(st)).add_modifier(Modifier::BOLD),
+                );
+            }
+        }
+
+        hits.push(HitRegion {
+            rect: Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 2,
+            },
+            target: card.target,
+        });
+        y += 2;
+    }
+
+    // Render 2-row Footer Buttons (`[+ New Tab]` and `[+ New Space]`)
+    if footer_rows == 4 {
+        let tab_y = max_y - 4;
+        let tab_r1 = pad_to_width(" [ + New Tab    (^b c) ]", w);
+        let tab_r2 = pad_to_width("   open shell in space", w);
         buf.set_string(
             inner.x,
-            max_y - 1,
-            &format!("{:<width$}", clipped, width = inner.width as usize),
+            tab_y,
+            &tab_r1,
             Style::default()
-                .bg(Color::Rgb(30, 44, 38))
-                .fg(Color::LightGreen),
+                .bg(Color::Rgb(32, 54, 46))
+                .fg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD),
+        );
+        buf.set_string(
+            inner.x,
+            tab_y + 1,
+            &tab_r2,
+            Style::default()
+                .bg(Color::Rgb(32, 54, 46))
+                .fg(Color::Rgb(140, 190, 165)),
         );
         hits.push(HitRegion {
             rect: Rect {
                 x: inner.x,
-                y: max_y - 1,
+                y: tab_y,
+                width: inner.width,
+                height: 2,
+            },
+            target: HitTarget::NewTab,
+        });
+
+        let sp_y = max_y - 2;
+        let sp_r1 = pad_to_width(" [ + New Space  (^b C) ]", w);
+        let sp_r2 = pad_to_width("   create workspace", w);
+        buf.set_string(
+            inner.x,
+            sp_y,
+            &sp_r1,
+            Style::default()
+                .bg(Color::Rgb(30, 44, 62))
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        );
+        buf.set_string(
+            inner.x,
+            sp_y + 1,
+            &sp_r2,
+            Style::default()
+                .bg(Color::Rgb(30, 44, 62))
+                .fg(Color::Rgb(140, 175, 205)),
+        );
+        hits.push(HitRegion {
+            rect: Rect {
+                x: inner.x,
+                y: sp_y,
+                width: inner.width,
+                height: 2,
+            },
+            target: HitTarget::NewSpacePrompt,
+        });
+    } else if footer_rows == 2 {
+        let tab_y = max_y - 2;
+        buf.set_string(
+            inner.x,
+            tab_y,
+            &pad_to_width(" [ + New Tab (^b c) ]", w),
+            Style::default()
+                .bg(Color::Rgb(32, 54, 46))
+                .fg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD),
+        );
+        hits.push(HitRegion {
+            rect: Rect {
+                x: inner.x,
+                y: tab_y,
+                width: inner.width,
+                height: 1,
+            },
+            target: HitTarget::NewTab,
+        });
+        buf.set_string(
+            inner.x,
+            tab_y + 1,
+            &pad_to_width(" [ + New Space (^b C) ]", w),
+            Style::default()
+                .bg(Color::Rgb(30, 44, 62))
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        );
+        hits.push(HitRegion {
+            rect: Rect {
+                x: inner.x,
+                y: tab_y + 1,
                 width: inner.width,
                 height: 1,
             },
@@ -895,17 +1067,17 @@ fn render_help_modal(f: &mut Frame, area: Rect, hits: &mut Vec<HitRegion>) {
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )),
         Line::from("  Swipe Left / Right       In terminal body -> Next / Prev Tab"),
-        Line::from("  Prefix Key               Ctrl+b or Tap [^B] on top bar"),
+        Line::from("  Prefix Key               Ctrl+b or Tap [^B] on bottom touchbar"),
         Line::from("  Next / Prev Tab          ^b n / ^b p   or  Alt+Right / Alt+Left"),
         Line::from("  Switch Tab 1..9          ^b 1..9       or  Alt+1..9"),
-        Line::from("  New Tab in Space         ^b c          or  Tap [+] on top bar"),
+        Line::from("  New Tab in Space         ^b c          or  Tap [+ New Tab] in sidebar"),
         Line::from("  Rename / Close Tab       ^b , (rename) /   ^b x (close)"),
         Line::from("  Next / Prev Space        ^b Down / Up  or  Alt+Down / Alt+Up"),
         Line::from("  New / Rename Space       ^b C (new)    /   ^b $ (rename)"),
-        Line::from("  Toggle Left Sidebar      ^b b          or  Tap [≡] on top bar"),
+        Line::from("  Toggle Left Sidebar      ^b b          or  Tap [≡] on bottom touchbar"),
         Line::from("  Quick Fuzzy Switcher     ^b w          or  ^b f"),
         Line::from("  Jump Next Alert Agent    ^b a          (◉ blocked / ✓ done)"),
-        Line::from("  Scrollback / History     ^b [          or  Tap [SCROLL ▼] to exit"),
+        Line::from("  Scrollback / History     ^b [          or  Tap [▼ SCROLL] to exit"),
         Line::from("  Detach (keep running)    ^b q / ^b d   or  Ctrl+\\"),
         Line::from(""),
         Line::from(Span::styled(
@@ -1273,7 +1445,7 @@ mod tests {
     use ratatui::Terminal;
 
     #[test]
-    fn top_bar_touch_mode_doubles_hit_height_and_exposes_buttons() {
+    fn bottom_touchbar_and_2row_sidebar_expose_touch_hits() {
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let world = World::default();
@@ -1285,38 +1457,50 @@ mod tests {
                     f,
                     &world,
                     None,
-                    false,
+                    true, // sidebar_open = true
                     24,
-                    true, // touch_mode = true (2-row top bar)
+                    true, // touch_mode = true (2-row bottom touchbar)
                     false,
                     42, // scrollback_offset > 0
                     &Modal::None,
                 );
                 hits = geom.hits;
-                assert_eq!(geom.term_rect.y, 2);
+                assert_eq!(geom.term_rect.y, 0);
+                assert_eq!(geom.term_rect.height, 22);
             })
             .unwrap();
 
-        // Sidebar toggle on row 0 and row 1 should both hit ToggleSidebar
+        // Sidebar toggle on the bottom touchbar (rows 22 and 23) should hit ToggleSidebar
         assert_eq!(
-            find_hit_target(&hits, 1, 0),
+            find_hit_target(&hits, 1, 22),
             Some(HitTarget::ToggleSidebar)
         );
         assert_eq!(
-            find_hit_target(&hits, 1, 1),
+            find_hit_target(&hits, 1, 23),
             Some(HitTarget::ToggleSidebar)
         );
 
-        // Scrollback badge, Prefix button, and Help button should all be present with height 2
+        // Scrollback badge, Prefix button, terminal keys (Esc/Tab/^C/Arrows), and Help button are on the bottom touchbar
         assert!(hits
             .iter()
             .any(|h| h.target == HitTarget::ExitScrollback && h.rect.height == 2));
         assert!(hits
             .iter()
             .any(|h| h.target == HitTarget::TogglePrefix && h.rect.height == 2));
+        assert!(hits.iter().any(|h| {
+            h.target == HitTarget::SendKey(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        }));
         assert!(hits
             .iter()
             .any(|h| h.target == HitTarget::ToggleHelp && h.rect.height == 2));
+
+        // Sidebar footer has 2-row tall [+ New Tab] and [+ New Space] buttons
+        assert!(hits
+            .iter()
+            .any(|h| h.target == HitTarget::NewTab && h.rect.height == 2));
+        assert!(hits
+            .iter()
+            .any(|h| h.target == HitTarget::NewSpacePrompt && h.rect.height == 2));
     }
 
     #[test]

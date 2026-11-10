@@ -20,7 +20,7 @@ use crossterm::{
     cursor::Show,
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -659,12 +659,6 @@ fn run_app(
                                     prefix_active = false;
                                     *sidebar_open = !*sidebar_open;
                                 }
-                                HitTarget::NextSpace => {
-                                    modal = Modal::None;
-                                    prefix_active = false;
-                                    world.next_space();
-                                    world.mark_active_seen(core);
-                                }
                                 HitTarget::SelectSpace(space_id) => {
                                     modal = Modal::None;
                                     prefix_active = false;
@@ -698,6 +692,22 @@ fn run_app(
                                     } else {
                                         Modal::Help
                                     };
+                                }
+                                HitTarget::SendKey(kev) => {
+                                    if handle_key_event(
+                                        kev,
+                                        core,
+                                        world,
+                                        &attached,
+                                        prefix_spec,
+                                        sidebar_open,
+                                        &mut prefix_active,
+                                        &mut scrollback_offset,
+                                        &mut modal,
+                                        term_rect,
+                                    )? {
+                                        return Ok(());
+                                    }
                                 }
                             }
                         } else if !matches!(modal, Modal::None) {
@@ -802,209 +812,229 @@ fn run_app(
                 }
             }
             Event::Key(kev) if kev.kind == KeyEventKind::Press => {
-                // 1. Handle active Modal first
-                match &mut modal {
-                    Modal::Help => {
-                        modal = Modal::None;
-                        continue;
-                    }
-                    Modal::ConfirmCloseTab { tab_id, .. } => {
-                        let target_id = tab_id.clone();
-                        match kev.code {
-                            KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
-                                modal = Modal::None;
-                                let _ = world.close_tab_by_id(core, &target_id);
-                            }
-                            KeyCode::Char('n' | 'N') | KeyCode::Esc => {
-                                modal = Modal::None;
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-                    Modal::Prompt { kind, input } => {
-                        let k = kind.clone();
-                        match kev.code {
-                            KeyCode::Esc => {
-                                modal = Modal::None;
-                            }
-                            KeyCode::Enter => {
-                                let text = input.clone();
-                                modal = Modal::None;
-                                match k {
-                                    PromptKind::RenameTab { tab_id } => {
-                                        let _ = world.rename_tab_by_id(core, &tab_id, &text);
-                                    }
-                                    PromptKind::RenameSpace { space_id } => {
-                                        let _ = world.rename_space_by_id(core, &space_id, &text);
-                                    }
-                                    PromptKind::NewSpace => {
-                                        let _ = world.create_new_space(core, &text);
-                                    }
-                                }
-                            }
-                            KeyCode::Backspace => {
-                                input.pop();
-                            }
-                            KeyCode::Char(c) if !kev.modifiers.contains(KeyModifiers::CONTROL) => {
-                                input.push(c);
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-                    Modal::Fuzzy {
-                        query,
-                        selected,
-                        selected_tab_id,
-                    } => {
-                        let items = collect_fuzzy_items(world, query);
-                        let cur_sel =
-                            resolve_fuzzy_selection(&items, *selected, selected_tab_id.as_deref())
-                                .unwrap_or(0);
-                        match kev.code {
-                            KeyCode::Esc => {
-                                modal = Modal::None;
-                            }
-                            KeyCode::Up => {
-                                *selected = cur_sel.saturating_sub(1);
-                                *selected_tab_id = items.get(*selected).map(|it| it.tab_id.clone());
-                            }
-                            KeyCode::Down => {
-                                if !items.is_empty() {
-                                    *selected = (cur_sel + 1).min(items.len() - 1);
-                                    *selected_tab_id =
-                                        items.get(*selected).map(|it| it.tab_id.clone());
-                                }
-                            }
-                            KeyCode::Char('p') if kev.modifiers.contains(KeyModifiers::CONTROL) => {
-                                *selected = cur_sel.saturating_sub(1);
-                                *selected_tab_id = items.get(*selected).map(|it| it.tab_id.clone());
-                            }
-                            KeyCode::Char('n') if kev.modifiers.contains(KeyModifiers::CONTROL) => {
-                                if !items.is_empty() {
-                                    *selected = (cur_sel + 1).min(items.len() - 1);
-                                    *selected_tab_id =
-                                        items.get(*selected).map(|it| it.tab_id.clone());
-                                }
-                            }
-                            KeyCode::Enter => {
-                                if let Some(ref tid) = *selected_tab_id {
-                                    if let Some(chosen) = items.iter().find(|it| &it.tab_id == tid)
-                                    {
-                                        if world.select_tab_by_id(&chosen.space_id, &chosen.tab_id)
-                                        {
-                                            world.mark_active_seen(core);
-                                        }
-                                    }
-                                }
-                                modal = Modal::None;
-                            }
-                            KeyCode::Backspace => {
-                                query.pop();
-                                *selected = 0;
-                                let next_items = collect_fuzzy_items(world, query);
-                                *selected_tab_id = next_items.first().map(|it| it.tab_id.clone());
-                            }
-                            KeyCode::Char(c) if !kev.modifiers.contains(KeyModifiers::CONTROL) => {
-                                query.push(c);
-                                *selected = 0;
-                                let next_items = collect_fuzzy_items(world, query);
-                                *selected_tab_id = next_items.first().map(|it| it.tab_id.clone());
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-                    Modal::None => {}
-                }
-
-                // 2. Prefix mode active (`Ctrl+b` pressed previously)
-                if prefix_active {
-                    prefix_active = false;
-                    if let Some(action) = match_prefix_action(&kev, prefix_spec) {
-                        if execute_action(
-                            action,
-                            core,
-                            world,
-                            &attached,
-                            prefix_spec,
-                            sidebar_open,
-                            &mut scrollback_offset,
-                            &mut modal,
-                        )? {
-                            return Ok(());
-                        }
-                    }
-                    continue;
-                }
-
-                // 3. Check if prefix key was pressed
-                if is_prefix_key(&kev, prefix_spec) {
-                    prefix_active = true;
-                    continue;
-                }
-
-                // 4. Direct global shortcuts (`Alt+Left/Right/Up/Down/1..9`, `Ctrl+\`)
-                if let Some(action) = match_direct_action(&kev) {
-                    if execute_action(
-                        action,
-                        core,
-                        world,
-                        &attached,
-                        prefix_spec,
-                        sidebar_open,
-                        &mut scrollback_offset,
-                        &mut modal,
-                    )? {
-                        return Ok(());
-                    }
-                    continue;
-                }
-
-                // 5. Scrollback mode navigation
-                if scrollback_offset > 0 {
-                    match kev.code {
-                        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
-                            scrollback_offset = 0;
-                        }
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            scrollback_offset = scrollback_offset.saturating_add(1);
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            scrollback_offset = scrollback_offset.saturating_sub(1);
-                        }
-                        KeyCode::PageUp | KeyCode::Char('u') => {
-                            scrollback_offset =
-                                scrollback_offset.saturating_add((term_rect.height as usize / 2).max(1));
-                        }
-                        KeyCode::PageDown | KeyCode::Char('d') => {
-                            scrollback_offset =
-                                scrollback_offset.saturating_sub((term_rect.height as usize / 2).max(1));
-                        }
-                        KeyCode::Char('g') => {
-                            scrollback_offset = SCROLLBACK_LINES;
-                        }
-                        KeyCode::Char('G') => {
-                            scrollback_offset = 0;
-                        }
-                        _ => {}
-                    }
-                    continue;
-                }
-
-                // 6. Forward regular keyboard input to the active terminal
-                if let Some(att) = &attached {
-                    let app_cursor = att.parser.screen().application_cursor();
-                    let bytes = encode_key_event(&kev, app_cursor);
-                    if !bytes.is_empty() {
-                        core.send_input(att.channel, &bytes);
-                    }
+                if handle_key_event(
+                    kev,
+                    core,
+                    world,
+                    &attached,
+                    prefix_spec,
+                    sidebar_open,
+                    &mut prefix_active,
+                    &mut scrollback_offset,
+                    &mut modal,
+                    term_rect,
+                )? {
+                    return Ok(());
                 }
             }
             _ => {}
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_key_event(
+    kev: KeyEvent,
+    core: &CoreClient,
+    world: &mut World,
+    attached: &Option<AttachedTerminal>,
+    prefix_spec: &str,
+    sidebar_open: &mut bool,
+    prefix_active: &mut bool,
+    scrollback_offset: &mut usize,
+    modal: &mut Modal,
+    term_rect: Rect,
+) -> Result<bool> {
+    // 1. Handle active Modal first
+    match modal {
+        Modal::Help => {
+            *modal = Modal::None;
+            return Ok(false);
+        }
+        Modal::ConfirmCloseTab { tab_id, .. } => {
+            let target_id = tab_id.clone();
+            match kev.code {
+                KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
+                    *modal = Modal::None;
+                    let _ = world.close_tab_by_id(core, &target_id);
+                }
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                    *modal = Modal::None;
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+        Modal::Prompt { kind, input } => {
+            let k = kind.clone();
+            match kev.code {
+                KeyCode::Esc => {
+                    *modal = Modal::None;
+                }
+                KeyCode::Enter => {
+                    let text = input.clone();
+                    *modal = Modal::None;
+                    match k {
+                        PromptKind::RenameTab { tab_id } => {
+                            let _ = world.rename_tab_by_id(core, &tab_id, &text);
+                        }
+                        PromptKind::RenameSpace { space_id } => {
+                            let _ = world.rename_space_by_id(core, &space_id, &text);
+                        }
+                        PromptKind::NewSpace => {
+                            let _ = world.create_new_space(core, &text);
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                }
+                KeyCode::Char(c) if !kev.modifiers.contains(KeyModifiers::CONTROL) => {
+                    input.push(c);
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+        Modal::Fuzzy {
+            query,
+            selected,
+            selected_tab_id,
+        } => {
+            let items = collect_fuzzy_items(world, query);
+            let cur_sel = resolve_fuzzy_selection(&items, *selected, selected_tab_id.as_deref())
+                .unwrap_or(0);
+            match kev.code {
+                KeyCode::Esc => {
+                    *modal = Modal::None;
+                }
+                KeyCode::Up => {
+                    *selected = cur_sel.saturating_sub(1);
+                    *selected_tab_id = items.get(*selected).map(|it| it.tab_id.clone());
+                }
+                KeyCode::Down => {
+                    if !items.is_empty() {
+                        *selected = (cur_sel + 1).min(items.len() - 1);
+                        *selected_tab_id = items.get(*selected).map(|it| it.tab_id.clone());
+                    }
+                }
+                KeyCode::Char('p') if kev.modifiers.contains(KeyModifiers::CONTROL) => {
+                    *selected = cur_sel.saturating_sub(1);
+                    *selected_tab_id = items.get(*selected).map(|it| it.tab_id.clone());
+                }
+                KeyCode::Char('n') if kev.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if !items.is_empty() {
+                        *selected = (cur_sel + 1).min(items.len() - 1);
+                        *selected_tab_id = items.get(*selected).map(|it| it.tab_id.clone());
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(ref tid) = *selected_tab_id {
+                        if let Some(chosen) = items.iter().find(|it| &it.tab_id == tid) {
+                            if world.select_tab_by_id(&chosen.space_id, &chosen.tab_id) {
+                                world.mark_active_seen(core);
+                            }
+                        }
+                    }
+                    *modal = Modal::None;
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                    *selected = 0;
+                    let next_items = collect_fuzzy_items(world, query);
+                    *selected_tab_id = next_items.first().map(|it| it.tab_id.clone());
+                }
+                KeyCode::Char(c) if !kev.modifiers.contains(KeyModifiers::CONTROL) => {
+                    query.push(c);
+                    *selected = 0;
+                    let next_items = collect_fuzzy_items(world, query);
+                    *selected_tab_id = next_items.first().map(|it| it.tab_id.clone());
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+        Modal::None => {}
+    }
+
+    // 2. Prefix mode active (`Ctrl+b` pressed previously or `[^B]` tapped)
+    if *prefix_active {
+        *prefix_active = false;
+        if let Some(action) = match_prefix_action(&kev, prefix_spec) {
+            return execute_action(
+                action,
+                core,
+                world,
+                attached,
+                prefix_spec,
+                sidebar_open,
+                scrollback_offset,
+                modal,
+            );
+        }
+        return Ok(false);
+    }
+
+    // 3. Check if prefix key was pressed
+    if is_prefix_key(&kev, prefix_spec) {
+        *prefix_active = true;
+        return Ok(false);
+    }
+
+    // 4. Direct global shortcuts (`Alt+Left/Right/Up/Down/1..9`, `Ctrl+\`)
+    if let Some(action) = match_direct_action(&kev) {
+        return execute_action(
+            action,
+            core,
+            world,
+            attached,
+            prefix_spec,
+            sidebar_open,
+            scrollback_offset,
+            modal,
+        );
+    }
+
+    // 5. Scrollback mode navigation
+    if *scrollback_offset > 0 {
+        match kev.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+                *scrollback_offset = 0;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                *scrollback_offset = scrollback_offset.saturating_add(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                *scrollback_offset = scrollback_offset.saturating_sub(1);
+            }
+            KeyCode::PageUp | KeyCode::Char('u') => {
+                *scrollback_offset =
+                    scrollback_offset.saturating_add((term_rect.height as usize / 2).max(1));
+            }
+            KeyCode::PageDown | KeyCode::Char('d') => {
+                *scrollback_offset =
+                    scrollback_offset.saturating_sub((term_rect.height as usize / 2).max(1));
+            }
+            KeyCode::Char('g') => {
+                *scrollback_offset = SCROLLBACK_LINES;
+            }
+            KeyCode::Char('G') => {
+                *scrollback_offset = 0;
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+
+    // 6. Forward regular keyboard input to the active terminal
+    if let Some(att) = attached {
+        let app_cursor = att.parser.screen().application_cursor();
+        let bytes = encode_key_event(&kev, app_cursor);
+        if !bytes.is_empty() {
+            core.send_input(att.channel, &bytes);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
