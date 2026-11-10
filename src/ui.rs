@@ -511,17 +511,18 @@ fn render_bottom_touchbar(
     let buf = f.buffer_mut();
 
     // Reserve right-side space for optional `✓ Copied`, `▼ BOT`, and `?` keycaps
+    let narrow_bar = rect.width < 76;
     let copied_lbl = if copied_flash {
-        Some(" ✓ Copied ")
+        Some(if narrow_bar { " ✓ " } else { " ✓ Copied " })
     } else {
         None
     };
     let scroll_lbl = if scrollback_offset > 0 {
-        Some(" ▼ BOT ")
+        Some(if narrow_bar { " ▼ " } else { " ▼ BOT " })
     } else {
         None
     };
-    let help_lbl = "  ?  ";
+    let help_lbl = if narrow_bar { " ? " } else { "  ?  " };
     let copied_w = copied_lbl.map_or(0, |s| s.width() as u16 + 1);
     let scroll_w = scroll_lbl.map_or(0, |s| s.width() as u16 + 1);
     let help_w = help_lbl.width() as u16;
@@ -744,76 +745,10 @@ fn render_bottom_touchbar(
 
     // 3. Modern Keycap Pills (`^B`, `Esc`, `Ctrl`, `Alt`, `Tab`, `←`, `↓`, `↑`, `→`, `⎘`)
     // Clean rounded/beveled keycap look without ASCII `[]` brackets or `│` pipes.
-    let wide_keys = rect.width >= 108;
-    let key_buttons: [(&str, HitTarget, bool, u8); 10] = [
-        (
-            if wide_keys { "  ^B  " } else { " ^B " },
-            HitTarget::TogglePrefix,
-            prefix_active,
-            1, // modifier keycap
-        ),
-        (
-            if wide_keys { " Esc " } else { " Esc " },
-            HitTarget::SendKey(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-            false,
-            0,
-        ),
-        (
-            if wide_keys { " Ctrl " } else { " Ctrl " },
-            HitTarget::ToggleCtrl,
-            ctrl_active,
-            1, // modifier keycap
-        ),
-        (
-            if wide_keys { " Alt " } else { " Alt " },
-            HitTarget::ToggleAlt,
-            alt_active,
-            1, // modifier keycap
-        ),
-        (
-            if wide_keys { " Tab " } else { " Tab " },
-            HitTarget::SendKey(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
-            false,
-            0,
-        ),
-        (
-            if wide_keys { "  ←  " } else { " ← " },
-            HitTarget::SendKey(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
-            false,
-            2, // arrow keycap
-        ),
-        (
-            if wide_keys { "  ↓  " } else { " ↓ " },
-            HitTarget::SendKey(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-            false,
-            2,
-        ),
-        (
-            if wide_keys { "  ↑  " } else { " ↑ " },
-            HitTarget::SendKey(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
-            false,
-            2,
-        ),
-        (
-            if wide_keys { "  →  " } else { " → " },
-            HitTarget::SendKey(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
-            false,
-            2,
-        ),
-        (
-            if wide_keys { "  ⎘  " } else { " ⎘ " },
-            HitTarget::PasteClipboard,
-            false,
-            3, // paste action keycap
-        ),
-    ];
-
-    for (lbl, target, active_highlight, kind) in key_buttons {
-        let kw = lbl.width() as u16;
-        if x + kw > avail_end {
-            break;
-        }
-        let kstyle = if active_highlight {
+    // On narrow mobile viewports (`rect.width < 76`), reflow across the 2 touchbar rows (or compact
+    // 1-row pills when `--no-touch`) so all 10 keys remain reachable even on 40-column screens.
+    let keycap_style = |active_highlight: bool, kind: u8| -> Style {
+        if active_highlight {
             Style::default()
                 .bg(Color::Rgb(224, 175, 104))
                 .fg(Color::Rgb(20, 22, 32))
@@ -837,21 +772,204 @@ fn render_bottom_touchbar(
                     .fg(Color::Rgb(192, 202, 245))
                     .add_modifier(Modifier::BOLD),
             }
-        };
-        draw_touchbar_pill(buf, x, rect, lbl, kstyle, active_highlight);
-        hits.push(HitRegion {
-            rect: Rect {
-                x,
-                y: rect.y,
-                width: kw,
-                height: rect.height,
-            },
-            target,
-        });
-        x += kw;
+        }
+    };
 
-        if x < avail_end {
-            x += 1;
+    if narrow_bar && rect.height >= 2 {
+        let top_keys: [(&str, HitTarget, bool, u8); 5] = [
+            ("^B", HitTarget::TogglePrefix, prefix_active, 1),
+            (
+                "Esc",
+                HitTarget::SendKey(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                false,
+                0,
+            ),
+            ("Ctl", HitTarget::ToggleCtrl, ctrl_active, 1),
+            ("Alt", HitTarget::ToggleAlt, alt_active, 1),
+            (
+                "Tab",
+                HitTarget::SendKey(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                false,
+                0,
+            ),
+        ];
+        let bot_keys: [(&str, HitTarget, bool, u8); 5] = [
+            (
+                " ← ",
+                HitTarget::SendKey(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+                false,
+                2,
+            ),
+            (
+                " ↓ ",
+                HitTarget::SendKey(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+                false,
+                2,
+            ),
+            (
+                " ↑ ",
+                HitTarget::SendKey(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+                false,
+                2,
+            ),
+            (
+                " → ",
+                HitTarget::SendKey(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+                false,
+                2,
+            ),
+            (" ⎘ ", HitTarget::PasteClipboard, false, 3),
+        ];
+        for (row_off, row_keys) in [(0u16, top_keys), (1u16, bot_keys)] {
+            let mut kx = x;
+            for (lbl, target, active_highlight, kind) in row_keys {
+                let kw = lbl.width() as u16;
+                if kx + kw > avail_end {
+                    break;
+                }
+                let kstyle = keycap_style(active_highlight, kind);
+                buf.set_string(kx, rect.y + row_off, lbl, kstyle);
+                hits.push(HitRegion {
+                    rect: Rect {
+                        x: kx,
+                        y: rect.y + row_off,
+                        width: kw,
+                        height: 1,
+                    },
+                    target,
+                });
+                kx += kw;
+                if kx < avail_end {
+                    kx += 1;
+                }
+            }
+        }
+    } else {
+        let wide_keys = rect.width >= 108;
+        let key_buttons: [(&str, HitTarget, bool, u8); 10] = [
+            (
+                if narrow_bar {
+                    "^B"
+                } else if wide_keys {
+                    "  ^B  "
+                } else {
+                    " ^B "
+                },
+                HitTarget::TogglePrefix,
+                prefix_active,
+                1,
+            ),
+            (
+                if narrow_bar { "Es" } else { " Esc " },
+                HitTarget::SendKey(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                false,
+                0,
+            ),
+            (
+                if narrow_bar { "Ct" } else { " Ctrl " },
+                HitTarget::ToggleCtrl,
+                ctrl_active,
+                1,
+            ),
+            (
+                if narrow_bar { "Al" } else { " Alt " },
+                HitTarget::ToggleAlt,
+                alt_active,
+                1,
+            ),
+            (
+                if narrow_bar { "Tb" } else { " Tab " },
+                HitTarget::SendKey(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                false,
+                0,
+            ),
+            (
+                if narrow_bar {
+                    "←"
+                } else if wide_keys {
+                    "  ←  "
+                } else {
+                    " ← "
+                },
+                HitTarget::SendKey(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+                false,
+                2,
+            ),
+            (
+                if narrow_bar {
+                    "↓"
+                } else if wide_keys {
+                    "  ↓  "
+                } else {
+                    " ↓ "
+                },
+                HitTarget::SendKey(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+                false,
+                2,
+            ),
+            (
+                if narrow_bar {
+                    "↑"
+                } else if wide_keys {
+                    "  ↑  "
+                } else {
+                    " ↑ "
+                },
+                HitTarget::SendKey(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+                false,
+                2,
+            ),
+            (
+                if narrow_bar {
+                    "→"
+                } else if wide_keys {
+                    "  →  "
+                } else {
+                    " → "
+                },
+                HitTarget::SendKey(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+                false,
+                2,
+            ),
+            (
+                if narrow_bar {
+                    "⎘"
+                } else if wide_keys {
+                    "  ⎘  "
+                } else {
+                    " ⎘ "
+                },
+                HitTarget::PasteClipboard,
+                false,
+                3,
+            ),
+        ];
+
+        for (i, (lbl, target, active_highlight, kind)) in key_buttons.into_iter().enumerate() {
+            let kw = lbl.width() as u16;
+            if x + kw > avail_end {
+                break;
+            }
+            let kstyle = if narrow_bar && !active_highlight && i % 2 == 1 {
+                keycap_style(false, 2)
+            } else {
+                keycap_style(active_highlight, kind)
+            };
+            draw_touchbar_pill(buf, x, rect, lbl, kstyle, active_highlight);
+            hits.push(HitRegion {
+                rect: Rect {
+                    x,
+                    y: rect.y,
+                    width: kw,
+                    height: rect.height,
+                },
+                target,
+            });
+            x += kw;
+
+            if !narrow_bar && x < avail_end {
+                x += 1;
+            }
         }
     }
 
@@ -2047,6 +2165,9 @@ mod tests {
             find_hit_target(&hits, 1, 11),
             Some(HitTarget::ToggleSidebar)
         );
+        assert!(hits
+            .iter()
+            .any(|h| h.target == HitTarget::PasteClipboard));
     }
 
     #[test]
