@@ -102,15 +102,12 @@ fn last_utf8_char(buf: &[u8]) -> Option<char> {
 fn sanitize_vt_bytes(payload: &[u8]) -> Cow<'_, [u8]> {
     let has_9001 = payload.windows(7).any(|w| w == b"\x1b[?9001");
     let has_fe0f = payload.windows(3).any(|w| w == b"\xef\xb8\x8f");
-    let is_home_redraw = payload.starts_with(b"\x1b[H")
-        && payload.ends_with(b"\x1b[J")
-        && !payload.windows(4).any(|w| w == b"\x1b[2J");
 
-    if !has_9001 && !has_fe0f && !is_home_redraw {
+    if !has_9001 && !has_fe0f {
         return Cow::Borrowed(payload);
     }
 
-    let mut out = Vec::with_capacity(payload.len() + if is_home_redraw { 64 } else { 0 });
+    let mut out = Vec::with_capacity(payload.len());
     let mut i = 0;
     while i < payload.len() {
         if has_9001
@@ -132,11 +129,6 @@ fn sanitize_vt_bytes(payload: &[u8]) -> Cow<'_, [u8]> {
                 out.push(b' ');
             }
             i += 3;
-            continue;
-        }
-        if is_home_redraw && i + 2 <= payload.len() && &payload[i..i + 2] == b"\r\n" {
-            out.extend_from_slice(b"\x1b[K\r\n");
-            i += 2;
             continue;
         }
         out.push(payload[i]);
@@ -1412,10 +1404,8 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_vt_bytes_aligns_vs16_emoji_and_clears_home_redraw_remnants() {
+    fn sanitize_vt_bytes_aligns_vs16_emoji_box_borders() {
         let mut parser = vt100::Parser::new(4, 20, 0);
-        // Simulate leftover wide line on row 1 before a shorter `\x1b[H ... \x1b[J` redraw
-        parser.process(b"01234567890123456789\r\nLEFT_OVER_TEXT_12345");
         let frame = "\x1b[H╭──────╮\r\n│ ⚙️ a │\r\n╰──────╯\x1b[J";
         let sanitized = sanitize_vt_bytes(frame.as_bytes());
         parser.process(&sanitized);
@@ -1424,9 +1414,5 @@ mod tests {
         assert_eq!(screen.cell(0, 7).unwrap().contents(), "╮");
         assert_eq!(screen.cell(1, 7).unwrap().contents(), "│");
         assert_eq!(screen.cell(2, 7).unwrap().contents(), "╯");
-        // Characters to the right of the box on row 1 must be cleared
-        for col in 8..20 {
-            assert_eq!(screen.cell(1, col).unwrap().contents(), "");
-        }
     }
 }
