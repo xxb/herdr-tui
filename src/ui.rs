@@ -750,11 +750,11 @@ fn render_bottom_touchbar(
         x += 1;
     }
 
-    // 3. Constant-width Herdr App-style Touchbar Keys (`[^B]`, `[Esc]`, `[Ctrl]`, `[Alt]`, `[Tab]`, `[←]`, `[↓]`, `[↑]`, `[→]`, `[粘貼]`)
+    // 3. Constant-width Herdr App-style Touchbar Keys (`[^B]`, `[Esc]`, `[Ctrl]`, `[Alt]`, `[Tab]`, `[←]`, `[↓]`, `[↑]`, `[→]`, `[⎘]`)
     // `[^C]` is intentionally omitted to prevent accidental process interruption.
     // All labels have invariant character widths for a given `rect.width` so toggling `^B`/`Ctrl`/`Alt`
     // or scrolling never causes horizontal jitter.
-    let wide_keys = rect.width >= 118;
+    let wide_keys = rect.width >= 115;
     let key_buttons: [(&str, HitTarget, bool); 10] = [
         (
             if wide_keys { " [^B] " } else { "[^B]" },
@@ -802,7 +802,7 @@ fn render_bottom_touchbar(
             false,
         ),
         (
-            if wide_keys { " [粘貼] " } else { "[粘貼]" },
+            if wide_keys { " [⎘] " } else { "[⎘]" },
             HitTarget::PasteClipboard,
             false,
         ),
@@ -956,12 +956,10 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
         y += 1;
     }
 
-    // Reserve footer space with vertical separation rows between `[+ New Tab]`, `[+ New Space]`,
-    // and the bottom touchbar's `◄≡` collapse button to prevent accidental mis-taps.
-    let footer_rows = if max_y.saturating_sub(y) >= 10 {
-        7
-    } else if max_y.saturating_sub(y) >= 6 {
-        4
+    // Reserve footer space with compact padding around `[+ New Tab]` and `[+ New Space]`
+    // and above the bottom touchbar's `◄≡` collapse button to prevent accidental mis-taps.
+    let footer_rows = if max_y.saturating_sub(y) >= 7 {
+        5
     } else if max_y.saturating_sub(y) >= 4 {
         2
     } else {
@@ -1143,93 +1141,39 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
         y += 2;
     }
 
-    // Render Footer Buttons (`[+ New Tab]` and `[+ New Space]`) with empty separator rows
-    // between them and above the bottom touchbar's `◄≡` collapse button.
-    if footer_rows == 7 {
-        let tab_y = max_y - 6;
-        let tab_r1 = pad_to_width(" [ + New Tab    (^b c) ]", w);
-        let tab_r2 = pad_to_width("   open shell in space", w);
+    // Render Footer Buttons (`[+ New Tab]` and `[+ New Space]`) with horizontal padding
+    // and a 1-row vertical gap between them and above the bottom touchbar's `◄≡` button.
+    let pad_x: u16 = if inner.width > 6 { 1 } else { 0 };
+    let btn_x = inner.x + pad_x;
+    let btn_w = inner.width.saturating_sub(pad_x * 2);
+    let btn_w_usize = btn_w as usize;
+
+    if footer_rows == 5 && btn_w > 0 {
+        let tab_y = max_y - 4;
         buf.set_string(
-            inner.x,
+            btn_x,
             tab_y,
-            &tab_r1,
+            &pad_to_width(" + New Tab   (^b c) ", btn_w_usize),
             Style::default()
                 .bg(Color::Rgb(32, 54, 46))
                 .fg(Color::LightGreen)
                 .add_modifier(Modifier::BOLD),
         );
-        buf.set_string(
-            inner.x,
-            tab_y + 1,
-            &tab_r2,
-            Style::default()
-                .bg(Color::Rgb(32, 54, 46))
-                .fg(Color::Rgb(140, 190, 165)),
-        );
         hits.push(HitRegion {
             rect: Rect {
-                x: inner.x,
+                x: btn_x,
                 y: tab_y,
-                width: inner.width,
-                height: 2,
+                width: btn_w,
+                height: 1,
             },
             target: HitTarget::NewTab,
         });
 
-        let sp_y = max_y - 3;
-        let sp_r1 = pad_to_width(" [ + New Space  (^b C) ]", w);
-        let sp_r2 = pad_to_width("   create workspace", w);
-        buf.set_string(
-            inner.x,
-            sp_y,
-            &sp_r1,
-            Style::default()
-                .bg(Color::Rgb(30, 44, 62))
-                .fg(Color::LightCyan)
-                .add_modifier(Modifier::BOLD),
-        );
-        buf.set_string(
-            inner.x,
-            sp_y + 1,
-            &sp_r2,
-            Style::default()
-                .bg(Color::Rgb(30, 44, 62))
-                .fg(Color::Rgb(140, 175, 205)),
-        );
-        hits.push(HitRegion {
-            rect: Rect {
-                x: inner.x,
-                y: sp_y,
-                width: inner.width,
-                height: 2,
-            },
-            target: HitTarget::NewSpacePrompt,
-        });
-    } else if footer_rows == 4 {
-        let tab_y = max_y - 4;
-        buf.set_string(
-            inner.x,
-            tab_y,
-            &pad_to_width(" [ + New Tab (^b c) ]", w),
-            Style::default()
-                .bg(Color::Rgb(32, 54, 46))
-                .fg(Color::LightGreen)
-                .add_modifier(Modifier::BOLD),
-        );
-        hits.push(HitRegion {
-            rect: Rect {
-                x: inner.x,
-                y: tab_y,
-                width: inner.width,
-                height: 1,
-            },
-            target: HitTarget::NewTab,
-        });
         let sp_y = max_y - 2;
         buf.set_string(
-            inner.x,
+            btn_x,
             sp_y,
-            &pad_to_width(" [ + New Space (^b C) ]", w),
+            &pad_to_width(" + New Space (^b C) ", btn_w_usize),
             Style::default()
                 .bg(Color::Rgb(30, 44, 62))
                 .fg(Color::LightCyan)
@@ -1237,19 +1181,19 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
         );
         hits.push(HitRegion {
             rect: Rect {
-                x: inner.x,
+                x: btn_x,
                 y: sp_y,
-                width: inner.width,
+                width: btn_w,
                 height: 1,
             },
             target: HitTarget::NewSpacePrompt,
         });
-    } else if footer_rows == 2 {
+    } else if footer_rows == 2 && btn_w > 0 {
         let tab_y = max_y - 2;
         buf.set_string(
-            inner.x,
+            btn_x,
             tab_y,
-            &pad_to_width(" [ + New Tab (^b c) ]", w),
+            &pad_to_width(" + New Tab   (^b c) ", btn_w_usize),
             Style::default()
                 .bg(Color::Rgb(32, 54, 46))
                 .fg(Color::LightGreen)
@@ -1257,17 +1201,17 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
         );
         hits.push(HitRegion {
             rect: Rect {
-                x: inner.x,
+                x: btn_x,
                 y: tab_y,
-                width: inner.width,
+                width: btn_w,
                 height: 1,
             },
             target: HitTarget::NewTab,
         });
         buf.set_string(
-            inner.x,
+            btn_x,
             tab_y + 1,
-            &pad_to_width(" [ + New Space (^b C) ]", w),
+            &pad_to_width(" + New Space (^b C) ", btn_w_usize),
             Style::default()
                 .bg(Color::Rgb(30, 44, 62))
                 .fg(Color::LightCyan)
@@ -1275,9 +1219,9 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
         );
         hits.push(HitRegion {
             rect: Rect {
-                x: inner.x,
+                x: btn_x,
                 y: tab_y + 1,
-                width: inner.width,
+                width: btn_w,
                 height: 1,
             },
             target: HitTarget::NewSpacePrompt,
@@ -1521,7 +1465,7 @@ fn render_help_modal(f: &mut Frame, area: Rect, hits: &mut Vec<HitRegion>) {
         Line::from("  Tap ● ○ ✓ on Touchbar    Switch directly to Tab (no body swipe conflict)"),
         Line::from("  Tap ▾ / ▸ on Space       Collapse / expand Space's child Tabs in sidebar"),
         Line::from("  Prefix / Modifiers       Tap [^B], [Ctrl], or [Alt] on bottom touchbar"),
-        Line::from("  Clipboard Copy / Paste   Drag text to copy (OSC 52); Tap [粘貼] to paste"),
+        Line::from("  Clipboard Copy / Paste   Drag text to copy (OSC 52); Tap [⎘] to paste"),
         Line::from("  Next / Prev Tab          ^b n / ^b p   or  Alt+Right / Alt+Left"),
         Line::from("  Switch Tab 1..9          ^b 1..9       or  Alt+1..9"),
         Line::from("  New Tab in Space         ^b c          or  Tap [+ New Tab] in sidebar"),
@@ -1904,16 +1848,20 @@ mod tests {
             .iter()
             .any(|h| h.target == HitTarget::ToggleHelp && h.rect.height == 2));
 
-        // Sidebar footer has 2-row tall [+ New Tab] and [+ New Space] buttons with 1-row separator gaps
+        // Sidebar footer has padded [+ New Tab] and [+ New Space] buttons with 1-row separator gaps
         let new_tab_hit = hits
             .iter()
-            .find(|h| h.target == HitTarget::NewTab && h.rect.height == 2)
-            .expect("expected 2-row NewTab hit in sidebar");
+            .find(|h| h.target == HitTarget::NewTab)
+            .expect("expected NewTab hit in sidebar");
         let new_space_hit = hits
             .iter()
-            .find(|h| h.target == HitTarget::NewSpacePrompt && h.rect.height == 2)
-            .expect("expected 2-row NewSpacePrompt hit in sidebar");
-        assert!(new_space_hit.rect.y >= new_tab_hit.rect.y + new_tab_hit.rect.height + 1);
+            .find(|h| h.target == HitTarget::NewSpacePrompt)
+            .expect("expected NewSpacePrompt hit in sidebar");
+        assert!(new_tab_hit.rect.x >= 1);
+        assert_eq!(
+            new_space_hit.rect.y,
+            new_tab_hit.rect.y + new_tab_hit.rect.height + 1
+        );
         assert!(22 >= new_space_hit.rect.y + new_space_hit.rect.height + 1);
     }
 
