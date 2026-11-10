@@ -476,28 +476,25 @@ fn draw_touchbar_pill(
     }
     let lw = label.width() as u16;
     if rect.height >= 3 && lw > 0 {
-        // 2.0-row visual keycap centered inside the 3-row Touch Bar using half-blocks (`▄` + label + `▀`),
-        // identical to the sidebar `+ New Tab` / `+ New Space` buttons:
-        // - Row 0 (`rect.y`): bottom half (`▄`, 0.5 row) painted in `keycap_bg`, top half in `bar_bg`
-        // - Row 1 (`rect.y + 1`): dead-center button label (1.0 row) in `style`
-        // - Row 2 (`rect.y + 2`): top half (`▀`, 0.5 row) painted in `keycap_bg`, bottom half in `bar_bg`
-        let keycap_bg = style.bg.unwrap_or(Color::Rgb(34, 38, 57));
-        let bar_bg = Color::Rgb(12, 14, 22);
-        let half_top = "▄".repeat(lw as usize);
-        let half_bot = "▀".repeat(lw as usize);
-        buf.set_string(
-            x,
-            rect.y,
-            &half_top,
-            Style::default().fg(keycap_bg).bg(bar_bg),
-        );
+        // 3-row keycap pill with zero black border above/below:
+        // - Row 0 (`rect.y`): continuous highlighted top divider line (`▔`) on `style` (`keycap_bg`)
+        // - Row 1 (`rect.y + 1`): dead-center button label on `style` (`keycap_bg`)
+        // - Row 2 (`rect.y + 2`): subtle bottom bevel (`▁`) on `style` (`keycap_bg`)
+        let top_fg = if emphasized {
+            Color::Rgb(245, 194, 118)
+        } else {
+            Color::Rgb(118, 162, 247)
+        };
+        let bot_fg = if emphasized {
+            Color::Rgb(210, 155, 80)
+        } else {
+            Color::Rgb(54, 62, 92)
+        };
+        let top_line = "▔".repeat(lw as usize);
+        let bot_line = "▁".repeat(lw as usize);
+        buf.set_string(x, rect.y, &top_line, style.fg(top_fg));
         buf.set_string(x, rect.y + 1, label, style);
-        buf.set_string(
-            x,
-            rect.y + 2,
-            &half_bot,
-            Style::default().fg(keycap_bg).bg(bar_bg),
-        );
+        buf.set_string(x, rect.y + 2, &bot_line, style.fg(bot_fg));
     } else if rect.height == 2 && lw > 0 {
         let top_fg = if emphasized {
             Color::Rgb(245, 194, 118)
@@ -641,8 +638,10 @@ fn render_bottom_touchbar(
                     buf.set_string(
                         dots_start_x,
                         rect.y,
-                        &"▄".repeat(dots_budget as usize),
-                        Style::default().fg(zone_color).bg(Color::Rgb(12, 14, 22)),
+                        &"▔".repeat(dots_budget as usize),
+                        Style::default()
+                            .bg(zone_color)
+                            .fg(Color::Rgb(118, 162, 247)),
                     );
                     (rect.y + 1, rect.y + 2)
                 } else {
