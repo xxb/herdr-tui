@@ -373,28 +373,32 @@ fn run_app(
                     }
                 }
                 CoreMessage::Event(ev) => {
+                    let method = ev
+                        .get("method")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
                     let ev_type = ev
                         .get("params")
                         .and_then(|p| p.get("type"))
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("");
-                    match ev_type {
-                        "doc" | "missed" => {
-                            if world.fetch_doc(core).is_ok() && world.refresh_terminals(core).is_ok()
-                            {
-                                let _ = world.reconcile_and_sync(core);
+                    if method == "missed" || ev_type == "doc" || ev_type == "missed" {
+                        if world.fetch_doc(core).is_ok() && world.refresh_terminals(core).is_ok() {
+                            let _ = world.reconcile_and_sync(core);
+                        }
+                    } else {
+                        match ev_type {
+                            "created" | "started" | "finished" => {
+                                if world.refresh_terminals(core).is_ok() {
+                                    let _ = world.reconcile_and_sync(core);
+                                }
                             }
-                        }
-                        "started" | "finished" => {
-                            if world.refresh_terminals(core).is_ok() {
-                                let _ = world.reconcile_and_sync(core);
+                            "status" | "turn" | "title" | "labels" => {
+                                let _ = world.refresh_terminals(core);
+                                world.mark_active_seen(core);
                             }
+                            _ => {}
                         }
-                        "status" | "turn" | "title" | "labels" => {
-                            let _ = world.refresh_terminals(core);
-                            world.mark_active_seen(core);
-                        }
-                        _ => {}
                     }
                 }
                 CoreMessage::Disconnected => return Ok(()),

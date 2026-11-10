@@ -399,6 +399,7 @@ impl World {
     }
 
     pub fn fetch_doc(&mut self, core: &CoreClient) -> Result<()> {
+        let prev_space_id = self.active_space().map(|s| s.id.clone());
         let res = core.call("doc.get", json!({ "name": "herdr-app" }))?;
         let new_version = res.get("version").and_then(Value::as_u64).unwrap_or(0);
         let new_doc = match res.get("value") {
@@ -408,6 +409,11 @@ impl World {
         };
         self.doc = new_doc;
         self.doc_version = new_version;
+        if let Some(sid) = prev_space_id {
+            if let Some(pos) = self.doc.spaces.iter().position(|s| s.id == sid) {
+                self.active_space_idx = pos;
+            }
+        }
         // If the fetched document references any terminal address absent from our
         // local snapshot (e.g. created by another client after our last `terminal.list`),
         // refresh `self.terminals` before reconciling so we never mistake a newly
@@ -550,10 +556,16 @@ impl World {
 
         // 3. Remove empty spaces when non-empty spaces exist
         if self.doc.spaces.len() > 1 && self.doc.spaces.iter().any(|s| !s.tabs.is_empty()) {
+            let prev_space_id = self.active_space().map(|s| s.id.clone());
             let before = self.doc.spaces.len();
             self.doc.spaces.retain(|s| !s.tabs.is_empty());
             if self.doc.spaces.len() != before {
                 changed = true;
+            }
+            if let Some(sid) = prev_space_id {
+                if let Some(pos) = self.doc.spaces.iter().position(|s| s.id == sid) {
+                    self.active_space_idx = pos;
+                }
             }
         }
 
@@ -760,7 +772,9 @@ impl World {
                 "terminal.label",
                 json!({
                     "terminal": addr,
-                    "labels": [format!("herdr.seen={turn}")],
+                    "labels": {
+                        "herdr.seen": turn.to_string(),
+                    },
                 }),
             );
         }
@@ -862,7 +876,9 @@ impl World {
             json!({
                 "cwd": cwd,
                 "bg": true,
-                "labels": ["herdr.seen=0"],
+                "labels": {
+                    "herdr.seen": "0",
+                },
             }),
         )?;
         let Some(info) = TerminalInfo::from_json(&run_res) else {
@@ -945,7 +961,9 @@ impl World {
             json!({
                 "cwd": cwd,
                 "bg": true,
-                "labels": ["herdr.seen=0"],
+                "labels": {
+                    "herdr.seen": "0",
+                },
             }),
         )?;
         let Some(info) = TerminalInfo::from_json(&run_res) else {
