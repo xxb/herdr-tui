@@ -530,7 +530,7 @@ fn run_app(
         }
 
         if dirty {
-            let scr_ref = if selection.is_some() {
+            let scr_ref = if selection.as_ref().is_some_and(|s| s.active) {
                 selection_screen
                     .as_ref()
                     .or_else(|| attached.as_ref().map(|a| a.parser.screen()))
@@ -914,8 +914,9 @@ fn run_app(
                                     sel.head = (rel_row, rel_col);
                                 }
                                 sel.active = false;
+                                let snap = selection_screen.take();
                                 if sel.is_non_empty() {
-                                    let scr = selection_screen
+                                    let scr = snap
                                         .as_ref()
                                         .or_else(|| attached.as_ref().map(|a| a.parser.screen()));
                                     if let Some(screen) = scr {
@@ -927,9 +928,15 @@ fn run_app(
                                                 Some(Instant::now() + Duration::from_secs(2));
                                         }
                                     }
+                                    if snap.as_ref().is_some_and(|s| {
+                                        attached.as_ref().is_some_and(|a| {
+                                            s.contents() != a.parser.screen().contents()
+                                        })
+                                    }) {
+                                        selection = None;
+                                    }
                                 } else {
                                     selection = None;
-                                    selection_screen = None;
                                 }
                             }
                         }
