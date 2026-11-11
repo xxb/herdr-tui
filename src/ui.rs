@@ -621,10 +621,7 @@ pub fn render_ui_with_pads_and_quota(
         Modal::Help => {
             render_help_modal(f, area, &mut hits);
         }
-        Modal::ConfirmCloseTab {
-            tab_id,
-            tab_title,
-        } => {
+        Modal::ConfirmCloseTab { tab_id, tab_title } => {
             render_confirm_close_modal(f, area, tab_id, tab_title, &mut hits);
         }
         Modal::Prompt { kind, input } => {
@@ -792,11 +789,7 @@ fn render_top_tabbar(
 
     // Subtle slash divider between Space button and Tab pills
     if x + 1 < avail_end {
-        let div_y = if rect.height >= 2 {
-            rect.y + 1
-        } else {
-            rect.y
-        };
+        let div_y = if rect.height >= 2 { rect.y + 1 } else { rect.y };
         buf.set_string(
             x,
             div_y,
@@ -830,8 +823,10 @@ fn render_top_tabbar(
             let is_active = ti == active_ti;
             let st = world.tab_state(tab);
             let tname = truncate_to_width(&world.tab_display_name(space, ti), max_tab_name_w);
-            let icon = if matches!(st, AgentState::Blocked | AgentState::Working | AgentState::Done)
-            {
+            let icon = if matches!(
+                st,
+                AgentState::Blocked | AgentState::Working | AgentState::Done
+            ) {
                 st.symbol()
             } else if is_active {
                 "●"
@@ -904,13 +899,14 @@ fn render_top_tabbar(
             } else {
                 Color::Rgb(24, 28, 44)
             };
-            let tstyle = Style::default().bg(bg_col).fg(fg_col).add_modifier(
-                if is_active {
+            let tstyle = Style::default()
+                .bg(bg_col)
+                .fg(fg_col)
+                .add_modifier(if is_active {
                     Modifier::BOLD
                 } else {
                     Modifier::empty()
-                },
-            );
+                });
             draw_touchbar_pill(buf, x, rect, &lbl, tstyle, is_active);
             hits.push(HitRegion {
                 rect: Rect {
@@ -1253,13 +1249,13 @@ fn render_floating_mod_cross(
 
     // 15x7 Compact Cross (+) for Modifier Keys with 4 hollow corners:
     // col: 012345678901234
-    // r0:       ╭───╮     
-    // r1:       │Esc│     
+    // r0:       ╭───╮
+    // r1:       │Esc│
     // r2:  ╭───╮├───┤╭───╮
     // r3:  │Ctl││^B ││Alt│
     // r4:  ╰───╯├───┤╰───╯
-    // r5:       │Tab│     
-    // r6:       ╰───╯     
+    // r5:       │Tab│
+    // r6:       ╰───╯
     let (arm_w, arm_h, mid_h) = dpad_cross_metrics(disc);
     let mid_col_end = arm_w * 2;
     let mid_row_end = arm_h + mid_h;
@@ -1510,13 +1506,13 @@ fn render_floating_dpad(
     // 15x7 Compact Cross (+) (or scaled 9/15 x 3/5/7 cross on constrained viewports),
     // with 4 hollow corners (100% transparent, no wasted space):
     // col: 012345678901234
-    // r0:       ╭───╮     
-    // r1:       │ ↑ │     
+    // r0:       ╭───╮
+    // r1:       │ ↑ │
     // r2:  ╭───╮├───┤╭───╮
     // r3:  │ ← ││ ⎘ ││ → │
     // r4:  ╰───╯├───┤╰───╯
-    // r5:       │ ↓ │     
-    // r6:       ╰───╯     
+    // r5:       │ ↓ │
+    // r6:       ╰───╯
     let (arm_w, arm_h, mid_h) = dpad_cross_metrics(disc);
     let mid_col_end = arm_w * 2;
     let mid_row_end = arm_h + mid_h;
@@ -1707,7 +1703,9 @@ fn render_space_menu_modal(
     let pop_y = (area.y + top_h).min(area.y + area.height.saturating_sub(3));
     let avail_h = (area.y + area.height).saturating_sub(pop_y);
     let pop_h = desired_h.min(avail_h).max(3.min(avail_h));
-    let pop_w = 40u16.min(area.width.saturating_sub(2)).max(12.min(area.width));
+    let pop_w = 40u16
+        .min(area.width.saturating_sub(2))
+        .max(12.min(area.width));
     let pop_x = (area.x + 1).min(area.x + area.width.saturating_sub(pop_w));
     let popup = Rect {
         x: pop_x,
@@ -1801,9 +1799,9 @@ fn render_space_menu_modal(
             )
         };
 
-        buf.set_string(inner.x, y, &pad_to_width(&row1, w), r1_style);
+        buf.set_string(inner.x, y, pad_to_width(&row1, w), r1_style);
         if use_two_row {
-            buf.set_string(inner.x, y + 1, &pad_to_width(&row2, w), r2_style);
+            buf.set_string(inner.x, y + 1, pad_to_width(&row2, w), r2_style);
         }
         if is_active {
             let accent = Color::Rgb(125, 207, 255);
@@ -1817,7 +1815,9 @@ fn render_space_menu_modal(
                 inner.x + dot_x,
                 y,
                 sstate.symbol(),
-                r1_style.fg(state_color(sstate)).add_modifier(Modifier::BOLD),
+                r1_style
+                    .fg(state_color(sstate))
+                    .add_modifier(Modifier::BOLD),
             );
         }
 
@@ -1871,8 +1871,11 @@ impl Widget for VtScreenWidget<'_> {
         let (scr_rows, scr_cols) = self.screen.size();
         let rows = area.height.min(scr_rows);
         let cols = area.width.min(scr_cols);
+        let active_sel = self.selection.filter(|s| s.is_non_empty());
+        let sel_bounds = active_sel.map(|s| s.normalized());
 
         for r in 0..rows {
+            let row_in_sel = sel_bounds.is_some_and(|((sr, _), (er, _))| r >= sr && r <= er);
             let mut c = 0;
             while c < cols {
                 let Some(cell) = self.screen.cell(r, c) else {
@@ -1885,11 +1888,13 @@ impl Widget for VtScreenWidget<'_> {
                 }
                 let x = area.x + c;
                 let y = area.y + r;
-                let selected = self
-                    .selection
-                    .is_some_and(|sel| sel.contains(r, c) || (cell.is_wide() && sel.contains(r, c + 1)));
+                let is_wide = cell.is_wide();
+                let selected = row_in_sel
+                    && active_sel.is_some_and(|sel| {
+                        sel.contains(r, c) || (is_wide && sel.contains(r, c + 1))
+                    });
 
-                let mut style = if selected {
+                let style = if selected {
                     Style::default()
                         .bg(Color::Rgb(58, 114, 200))
                         .fg(Color::White)
@@ -1913,15 +1918,23 @@ impl Widget for VtScreenWidget<'_> {
                     }
                     st
                 };
-                let _ = &mut style;
 
-                let contents = cell.contents();
-                let sym = if contents.is_empty() { " " } else { &contents };
+                let sym_buf: String;
+                let sym = if cell.has_contents() {
+                    sym_buf = cell.contents();
+                    if sym_buf.is_empty() {
+                        " "
+                    } else {
+                        &sym_buf
+                    }
+                } else {
+                    " "
+                };
                 if let Some(dst) = buf.cell_mut((x, y)) {
                     dst.set_symbol(sym);
                     dst.set_style(style);
                 }
-                if cell.is_wide() && c + 1 < cols {
+                if is_wide && c + 1 < cols {
                     if let Some(dst_next) = buf.cell_mut((x + 1, y)) {
                         dst_next.set_symbol("");
                         dst_next.set_style(style);
@@ -2057,11 +2070,7 @@ fn render_help_modal(f: &mut Frame, area: Rect, hits: &mut Vec<HitRegion>) {
             " ⏏Exit ",
             HitTarget::TriggerAction(Action::Detach),
         ),
-        (
-            "  ✕ Close Help  ",
-            " ✕Help ",
-            HitTarget::CancelModal,
-        ),
+        ("  ✕ Close Help  ", " ✕Help ", HitTarget::CancelModal),
     ];
 
     let pad_x: u16 = if compact_btns { 1 } else { 2 };
@@ -2093,7 +2102,9 @@ fn render_help_modal(f: &mut Frame, area: Rect, hits: &mut Vec<HitRegion>) {
     lines.extend([
         Line::from(Span::styled(
             "  Keyboard & Touch Shortcuts:",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from("  Top Bar [ ▾ Space ]      Open secondary Space popover menu / + New Space"),
         Line::from("  Top Bar [ Tab ] / [ + ]  Switch directly to Tab or add a new Tab"),
@@ -2166,7 +2177,9 @@ fn render_confirm_close_modal(
 
     let lines = vec![
         Line::from(""),
-        Line::from(format!("  Close tab \"{tab_title}\" and kill its terminal?")),
+        Line::from(format!(
+            "  Close tab \"{tab_title}\" and kill its terminal?"
+        )),
     ];
     let block = Block::default()
         .title(" Close Tab ")
@@ -2348,8 +2361,11 @@ fn render_fuzzy_modal(
         .constraints([Constraint::Length(2), Constraint::Min(1)])
         .split(inner);
 
-    let prompt = Paragraph::new(format!(" › {query}▏"))
-        .style(Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD));
+    let prompt = Paragraph::new(format!(" › {query}▏")).style(
+        Style::default()
+            .fg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD),
+    );
     f.render_widget(prompt, chunks[0]);
 
     let items = collect_fuzzy_items(world, query);
@@ -2501,9 +2517,9 @@ mod tests {
             .any(|h| h.target == HitTarget::ToggleHelp && h.rect.height == 3 && h.rect.y == 0));
 
         // Bottom 1-row read-only Agent Status Bar exposes ExitScrollback on row 23
-        assert!(hits
-            .iter()
-            .any(|h| h.target == HitTarget::ExitScrollback && h.rect.y == 23 && h.rect.height == 1));
+        assert!(hits.iter().any(|h| h.target == HitTarget::ExitScrollback
+            && h.rect.y == 23
+            && h.rect.height == 1));
 
         // Left floating Modifier Cross (+) exposes Esc, Ctl, ^B, Alt, Tab
         let mrect = mod_rect_out.expect("expected left modifier cross rect");
@@ -2587,12 +2603,8 @@ mod tests {
         assert!(hits
             .iter()
             .any(|h| matches!(h.target, HitTarget::SelectSpace(_))));
-        assert!(hits
-            .iter()
-            .any(|h| h.target == HitTarget::NewSpacePrompt));
-        assert!(hits
-            .iter()
-            .any(|h| h.target == HitTarget::CancelModal));
+        assert!(hits.iter().any(|h| h.target == HitTarget::NewSpacePrompt));
+        assert!(hits.iter().any(|h| h.target == HitTarget::CancelModal));
     }
 
     #[test]
@@ -3012,9 +3024,9 @@ mod tests {
         assert!(bot_line.contains("▼ BOT (+2)"));
         assert!(!bot_line.contains("WORKING"));
         assert!(!bot_line.contains("turns:"));
-        assert!(hits
-            .iter()
-            .any(|h| h.target == HitTarget::ExitScrollback && h.rect.y == 23 && h.rect.height == 1));
+        assert!(hits.iter().any(|h| h.target == HitTarget::ExitScrollback
+            && h.rect.y == 23
+            && h.rect.height == 1));
 
         // 2. Narrow width (`42x12`): drops optional detail so both 5h and 7d percentages fit on 1 row
         let narrow_backend = TestBackend::new(42, 12);

@@ -67,7 +67,15 @@ pub struct UsageTracker {
 }
 
 impl UsageTracker {
+    #[allow(dead_code)]
     pub fn new(cfg: QuotaFileConfig) -> Self {
+        Self::new_with_waker(cfg, || {})
+    }
+
+    pub fn new_with_waker<F>(cfg: QuotaFileConfig, waker: F) -> Self
+    where
+        F: Fn() + Send + 'static,
+    {
         let cache: Arc<Mutex<HashMap<AgentKind, (Instant, AgentQuota)>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let revision = Arc::new(AtomicU64::new(0));
@@ -76,23 +84,23 @@ impl UsageTracker {
         let rev_bg = Arc::clone(&revision);
 
         std::thread::spawn(move || {
+            let mut claude_cache = ClaudeFileCache::default();
             while let Ok(kind) = req_rx.recv() {
                 let ttl = cache_ttl_for_agent(kind);
                 let should_collect = {
                     let guard = cache_bg.lock().unwrap();
-                    guard
-                        .get(&kind)
-                        .is_none_or(|(ts, _)| ts.elapsed() >= ttl)
+                    guard.get(&kind).is_none_or(|(ts, _)| ts.elapsed() >= ttl)
                 };
                 if !should_collect {
                     continue;
                 }
-                let quota = collect_quota_for_agent(kind, &cfg);
+                let quota = collect_quota_for_agent(kind, &cfg, &mut claude_cache);
                 {
                     let mut guard = cache_bg.lock().unwrap();
                     guard.insert(kind, (Instant::now(), quota));
                 }
                 rev_bg.fetch_add(1, Ordering::Release);
+                waker();
             }
         });
 
@@ -136,8 +144,8 @@ impl UsageTracker {
 }
 
 pub fn detect_focused_agent(world: &World) -> Option<AgentKind> {
-    let addr = world.active_terminal_address()?;
-    let info = world.terminals.get(&addr)?;
+    let addr = world.active_terminal_address_ref()?;
+    let info = world.terminals.get(addr)?;
     detect_agent_from_terminal(info)
 }
 
@@ -257,7 +265,8 @@ pub fn parse_utc_iso8601_secs(s: &str) -> Option<u64> {
     let (time_part, offset_secs): (&str, i64) =
         if let Some(t) = rest.strip_suffix('Z').or_else(|| rest.strip_suffix('z')) {
             (t, 0)
-        } else if let Some(idx) = rest.rfind(['+', '-']) {
+        } else {
+            let idx = rest.rfind(['+', '-'])?;
             let (t, off_str) = rest.split_at(idx);
             let sign: i64 = if off_str.starts_with('-') { -1 } else { 1 };
             let off_body = &off_str[1..];
@@ -272,8 +281,6 @@ pub fn parse_utc_iso8601_secs(s: &str) -> Option<u64> {
                 return None;
             };
             (t, sign * (oh * 3_600 + om * 60))
-        } else {
-            return None;
         };
 
     let mut d_it = date_part.split('-');
@@ -335,11 +342,15 @@ pub fn today_midnight_unix_secs(now_secs: u64, utc_offset_secs: i64) -> u64 {
     local_midnight.saturating_sub(utc_offset_secs).max(0) as u64
 }
 
-fn collect_quota_for_agent(kind: AgentKind, cfg: &QuotaFileConfig) -> AgentQuota {
+fn collect_quota_for_agent(
+    kind: AgentKind,
+    cfg: &QuotaFileConfig,
+    claude_cache: &mut ClaudeFileCache,
+) -> AgentQuota {
     let now_secs = now_unix_secs();
     let metrics = match kind {
         AgentKind::Codex => collect_codex_metrics(now_secs),
-        AgentKind::Claude => collect_claude_metrics(now_secs, cfg),
+        AgentKind::Claude => collect_claude_metrics(now_secs, cfg, claude_cache),
         AgentKind::OpenCode => collect_opencode_metrics(now_secs, cfg),
         AgentKind::Antigravity => collect_antigravity_metrics(now_secs, cfg),
         AgentKind::Freebuff => collect_freebuff_metrics(now_secs),
@@ -350,7 +361,12 @@ fn collect_quota_for_agent(kind: AgentKind, cfg: &QuotaFileConfig) -> AgentQuota
     }
 }
 
-fn collect_recursive_files(dir: &Path, ext: &str, min_mtime: Option<SystemTime>, out: &mut Vec<(SystemTime, PathBuf)>) {
+fn collect_recursive_files(
+    dir: &Path,
+    ext: &str,
+    min_mtime: Option<SystemTime>,
+    out: &mut Vec<(SystemTime, PathBuf)>,
+) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -448,7 +464,9 @@ pub fn parse_codex_rate_limits_snapshot_from_jsonl(
         if !metrics.is_empty() {
             let replace = match &best {
                 None => true,
-                Some((prev_ts, prev_idx, _)) => (event_ts.unwrap_or(0), idx) >= (prev_ts.unwrap_or(0), *prev_idx),
+                Some((prev_ts, prev_idx, _)) => {
+                    (event_ts.unwrap_or(0), idx) >= (prev_ts.unwrap_or(0), *prev_idx)
+                }
             };
             if replace {
                 best = Some((event_ts, idx, metrics));
@@ -570,7 +588,7 @@ pub fn collect_codex_metrics_from_sessions_dir(
     let mut files = Vec::new();
     let min_mtime = UNIX_EPOCH + Duration::from_secs(now_secs.saturating_sub(7 * 86_400));
     collect_recursive_files(sessions_dir, "jsonl", Some(min_mtime), &mut files);
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|a| std::cmp::Reverse(a.0));
 
     let mut best: Option<((u64, SystemTime), Vec<QuotaMetric>)> = None;
     for (mtime, path) in files.into_iter().take(12) {
@@ -671,20 +689,126 @@ print(json.dumps({"day_reqs": day_reqs, "day_toks": day_toks, "five_reqs": five_
         QuotaMetric {
             window_label: "今日".to_string(),
             remaining_percent: (100.0 - day_used_pct).clamp(0.0, 100.0),
-            detail: Some(format!("{day_reqs}/{daily_limit} · {}", format_tokens(day_toks))),
+            detail: Some(format!(
+                "{day_reqs}/{daily_limit} · {}",
+                format_tokens(day_toks)
+            )),
         },
         QuotaMetric {
             window_label: "5h".to_string(),
             remaining_percent: (100.0 - five_used_pct).clamp(0.0, 100.0),
-            detail: Some(format!("{five_reqs}/{limit_5h} · {}", format_tokens(five_toks))),
+            detail: Some(format!(
+                "{five_reqs}/{limit_5h} · {}",
+                format_tokens(five_toks)
+            )),
         },
     ]
 }
 
+type ClaudeFileEntry = (SystemTime, u64, Vec<(String, u64, u64)>);
+
+#[derive(Default)]
+pub struct ClaudeFileCache {
+    entries: HashMap<PathBuf, ClaudeFileEntry>,
+}
+
+fn parse_claude_file_records(
+    path: &Path,
+    mtime_secs: u64,
+    cut_7d: u64,
+) -> Option<Vec<(String, u64, u64)>> {
+    let bytes = fs::read(path).ok()?;
+    let content = String::from_utf8_lossy(&bytes);
+    let path_tag = path.to_string_lossy();
+    let mut file_responses: HashMap<String, (u64, u64)> = HashMap::new();
+
+    for (line_idx, line) in content.lines().enumerate() {
+        if !line.contains("\"usage\"") {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let msg = obj.get("message");
+        let Some(u) = msg
+            .and_then(|m| m.get("usage"))
+            .or_else(|| obj.get("usage"))
+        else {
+            continue;
+        };
+        if !u.is_object() {
+            continue;
+        }
+        let ts = obj
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_utc_iso8601_secs)
+            .or_else(|| obj.get("timestamp").and_then(Value::as_u64))
+            .unwrap_or(mtime_secs);
+        if ts < cut_7d {
+            continue;
+        }
+        let t = u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0)
+            + u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0)
+            + u.get("cache_creation_input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+
+        let msg_id = msg
+            .and_then(|m| m.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let req_id = obj
+            .get("requestId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let resp_key = if !msg_id.is_empty() || !req_id.is_empty() {
+            format!("resp:{msg_id}:{req_id}")
+        } else if let Some(uuid) = obj
+            .get("uuid")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            format!("uuid:{uuid}")
+        } else {
+            format!("anon:{path_tag}:{line_idx}")
+        };
+
+        file_responses
+            .entry(resp_key)
+            .and_modify(|(prev_ts, prev_toks)| {
+                *prev_ts = (*prev_ts).min(ts);
+                *prev_toks = (*prev_toks).max(t);
+            })
+            .or_insert((ts, t));
+    }
+
+    Some(
+        file_responses
+            .into_iter()
+            .map(|(k, (ts, t))| (k, ts, t))
+            .collect(),
+    )
+}
+
+#[allow(dead_code)]
 pub fn collect_claude_metrics_from_dir(
     projects_dir: &Path,
     now_secs: u64,
     cfg: &QuotaFileConfig,
+) -> Vec<QuotaMetric> {
+    let mut cache = ClaudeFileCache::default();
+    collect_claude_metrics_from_dir_cached(projects_dir, now_secs, cfg, &mut cache)
+}
+
+pub fn collect_claude_metrics_from_dir_cached(
+    projects_dir: &Path,
+    now_secs: u64,
+    cfg: &QuotaFileConfig,
+    cache: &mut ClaudeFileCache,
 ) -> Vec<QuotaMetric> {
     if !projects_dir.is_dir() {
         return Vec::new();
@@ -701,79 +825,48 @@ pub fn collect_claude_metrics_from_dir(
     let mut files = Vec::new();
     collect_recursive_files(projects_dir, "jsonl", Some(min_mtime), &mut files);
 
+    if cache.entries.len() > 512 {
+        cache.entries.retain(|_, (mt, _, _)| *mt >= min_mtime);
+    }
+
     // Map response identity (`message.id` / `requestId`) -> (earliest_ts, cumulative_tokens)
     let mut responses: HashMap<String, (u64, u64)> = HashMap::new();
-    for (file_idx, (mtime, path)) in files.into_iter().enumerate() {
+    for (mtime, path) in files {
         let mtime_secs = mtime
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(now_secs);
-        let Ok(bytes) = fs::read(&path) else {
+        let Ok(file_len) = fs::metadata(&path).map(|m| m.len()) else {
             continue;
         };
-        let content = String::from_utf8_lossy(&bytes);
-        for (line_idx, line) in content.lines().enumerate() {
-            if !line.contains("\"usage\"") {
-                continue;
-            }
-            let Ok(obj) = serde_json::from_str::<Value>(line) else {
-                continue;
-            };
-            let msg = obj.get("message");
-            let Some(u) = msg
-                .and_then(|m| m.get("usage"))
-                .or_else(|| obj.get("usage"))
-            else {
-                continue;
-            };
-            if !u.is_object() {
-                continue;
-            }
-            let ts = obj
-                .get("timestamp")
-                .and_then(Value::as_str)
-                .and_then(parse_utc_iso8601_secs)
-                .or_else(|| obj.get("timestamp").and_then(Value::as_u64))
-                .unwrap_or(mtime_secs);
-            if ts < cut_7d {
-                continue;
-            }
-            let t = u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0)
-                + u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0)
-                + u.get("cache_creation_input_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-
-            let msg_id = msg
-                .and_then(|m| m.get("id"))
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim();
-            let req_id = obj
-                .get("requestId")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim();
-            let resp_key = if !msg_id.is_empty() || !req_id.is_empty() {
-                format!("resp:{msg_id}:{req_id}")
-            } else if let Some(uuid) = obj
-                .get("uuid")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
+        let records = match cache.entries.get(&path) {
+            Some((cached_mtime, cached_len, recs))
+                if *cached_mtime == mtime && *cached_len == file_len =>
             {
-                format!("uuid:{uuid}")
-            } else {
-                format!("anon:{file_idx}:{line_idx}")
-            };
+                recs.as_slice()
+            }
+            _ => {
+                let Some(parsed) = parse_claude_file_records(&path, mtime_secs, cut_7d) else {
+                    continue;
+                };
+                cache
+                    .entries
+                    .insert(path.clone(), (mtime, file_len, parsed));
+                cache.entries.get(&path).unwrap().2.as_slice()
+            }
+        };
 
+        for (resp_key, ts, t) in records {
+            if *ts < cut_7d {
+                continue;
+            }
             responses
-                .entry(resp_key)
+                .entry(resp_key.clone())
                 .and_modify(|(prev_ts, prev_toks)| {
-                    *prev_ts = (*prev_ts).min(ts);
-                    *prev_toks = (*prev_toks).max(t);
+                    *prev_ts = (*prev_ts).min(*ts);
+                    *prev_toks = (*prev_toks).max(*t);
                 })
-                .or_insert((ts, t));
+                .or_insert((*ts, *t));
         }
     }
 
@@ -800,17 +893,19 @@ pub fn collect_claude_metrics_from_dir(
         .map(|oldest| (oldest + 5 * 3_600).saturating_sub(now_secs))
         .unwrap_or(0);
 
-    let used_5h = ((tok_5h as f64 / limit_5h_toks as f64)
-        .max(msg_5h as f64 / limit_5h_msgs as f64)
-        * 100.0)
-        .clamp(0.0, 100.0);
-    let used_7d = ((tok_7d as f64 / limit_7d_toks as f64)
-        .max(msg_7d as f64 / limit_7d_msgs as f64)
-        * 100.0)
-        .clamp(0.0, 100.0);
+    let used_5h =
+        ((tok_5h as f64 / limit_5h_toks as f64).max(msg_5h as f64 / limit_5h_msgs as f64) * 100.0)
+            .clamp(0.0, 100.0);
+    let used_7d =
+        ((tok_7d as f64 / limit_7d_toks as f64).max(msg_7d as f64 / limit_7d_msgs as f64) * 100.0)
+            .clamp(0.0, 100.0);
 
     let detail_5h = if reset_5h > 0 {
-        format!("{} · {}", format_tokens(tok_5h), format_duration_short(reset_5h))
+        format!(
+            "{} · {}",
+            format_tokens(tok_5h),
+            format_duration_short(reset_5h)
+        )
     } else {
         format_tokens(tok_5h)
     };
@@ -829,12 +924,16 @@ pub fn collect_claude_metrics_from_dir(
     ]
 }
 
-fn collect_claude_metrics(now_secs: u64, cfg: &QuotaFileConfig) -> Vec<QuotaMetric> {
+fn collect_claude_metrics(
+    now_secs: u64,
+    cfg: &QuotaFileConfig,
+    cache: &mut ClaudeFileCache,
+) -> Vec<QuotaMetric> {
     let Some(home) = home_dir() else {
         return Vec::new();
     };
     let projects_dir = home.join(".claude/projects");
-    collect_claude_metrics_from_dir(&projects_dir, now_secs, cfg)
+    collect_claude_metrics_from_dir_cached(&projects_dir, now_secs, cfg, cache)
 }
 
 pub fn parse_antigravity_quota_summary(text: &str, now_secs: u64) -> Option<Vec<QuotaMetric>> {
@@ -949,7 +1048,7 @@ pub fn parse_antigravity_quota_summary(text: &str, now_secs: u64) -> Option<Vec<
 
 fn fetch_antigravity_api_quota(now_secs: u64) -> Option<Vec<QuotaMetric>> {
     let script = r#"
-import ctypes, datetime, json, os, re, shutil, sys, time, urllib.parse, urllib.request
+import ctypes, datetime, json, mmap, os, re, shutil, sys, time, urllib.parse, urllib.request
 
 def load_agy_token():
     lib = None
@@ -999,9 +1098,9 @@ def load_agy_token():
 def refresh_oauth_token(refresh_token):
     agy_bin = shutil.which("agy") or "/run/current-system/sw/bin/agy"
     with open(agy_bin, "rb") as f:
-        blob = f.read()
-    cid_m = re.search(rb"[0-9]{10,}-[a-z0-9]+\.apps\.googleusercontent\.com", blob)
-    csec_m = re.search(rb"GOCSPX-[A-Za-z0-9_-]{24,36}", blob)
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            cid_m = re.search(rb"[0-9]{10,}-[a-z0-9]+\.apps\.googleusercontent\.com", mm)
+            csec_m = re.search(rb"GOCSPX-[A-Za-z0-9_-]{24,36}", mm)
     if not cid_m or not csec_m:
         return None
     data = urllib.parse.urlencode({
@@ -1135,9 +1234,7 @@ fn collect_antigravity_metrics(now_secs: u64, cfg: &QuotaFileConfig) -> Vec<Quot
     let mut steps_day = 0u64;
     if let Ok(entries) = fs::read_dir(&brain_dir) {
         for entry in entries.flatten() {
-            let log_path = entry
-                .path()
-                .join(".system_generated/logs/transcript.jsonl");
+            let log_path = entry.path().join(".system_generated/logs/transcript.jsonl");
             let Ok(meta) = fs::metadata(&log_path) else {
                 continue;
             };
@@ -1453,10 +1550,8 @@ mod tests {
 
     #[test]
     fn selects_newest_codex_rate_limit_snapshot_across_session_files() {
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "hct_test_codex_sessions_{}",
-            std::process::id()
-        ));
+        let tmp_dir =
+            std::env::temp_dir().join(format!("hct_test_codex_sessions_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp_dir);
         fs::create_dir_all(&tmp_dir).unwrap();
 
@@ -1470,7 +1565,9 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         fs::write(
             &older_snapshot_newer_file,
-            format!("{line_older}\n{{\"timestamp\":\"2026-11-11T10:05:00Z\",\"type\":\"other\"}}\n"),
+            format!(
+                "{line_older}\n{{\"timestamp\":\"2026-11-11T10:05:00Z\",\"type\":\"other\"}}\n"
+            ),
         )
         .unwrap();
 
@@ -1484,10 +1581,8 @@ mod tests {
 
     #[test]
     fn claude_collector_deduplicates_multi_block_responses_and_skips_malformed_lines() {
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "hct_test_claude_projects_{}",
-            std::process::id()
-        ));
+        let tmp_dir =
+            std::env::temp_dir().join(format!("hct_test_claude_projects_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp_dir);
         fs::create_dir_all(&tmp_dir).unwrap();
 
@@ -1537,5 +1632,50 @@ mod tests {
 
         assert!(parse_freebuff_session_quota_json(sample, 2500).is_none());
         assert!(parse_freebuff_session_quota_json("{}", 1000).is_none());
+    }
+
+    #[test]
+    fn claude_file_cache_reuses_unchanged_files_and_invalidates_on_append() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("hct_test_claude_cache_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        let now_secs = parse_utc_iso8601_secs("2026-11-11T10:00:00Z").unwrap();
+        let conv_path = tmp_dir.join("conv.jsonl");
+        fs::write(
+            &conv_path,
+            "{\"timestamp\":\"2026-11-11T09:00:00Z\",\"requestId\":\"r1\",\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":100,\"output_tokens\":100}}}\n",
+        )
+        .unwrap();
+
+        let cfg = QuotaFileConfig {
+            claude_5h_tokens: Some(1_000),
+            claude_5h_messages: Some(100),
+            claude_7d_tokens: Some(10_000),
+            claude_7d_messages: Some(1000),
+            ..Default::default()
+        };
+        let mut cache = ClaudeFileCache::default();
+        let m1 = collect_claude_metrics_from_dir_cached(&tmp_dir, now_secs, &cfg, &mut cache);
+        assert!((m1[0].remaining_percent - 80.0).abs() < 1e-4);
+        assert_eq!(cache.entries.len(), 1);
+
+        // Appending a second turn changes file length and invalidates the cached entry immediately
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(&conv_path)
+            .unwrap();
+        use std::io::Write;
+        writeln!(
+            f,
+            "{{\"timestamp\":\"2026-11-11T09:10:00Z\",\"requestId\":\"r2\",\"message\":{{\"id\":\"m2\",\"usage\":{{\"input_tokens\":200,\"output_tokens\":100}}}}}}"
+        )
+        .unwrap();
+        drop(f);
+
+        let m2 = collect_claude_metrics_from_dir_cached(&tmp_dir, now_secs, &cfg, &mut cache);
+        let _ = fs::remove_dir_all(&tmp_dir);
+        assert!((m2[0].remaining_percent - 50.0).abs() < 1e-4);
     }
 }

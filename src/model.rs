@@ -251,22 +251,31 @@ pub fn make_single_terminal_tab(tab_id: &str, name: &str, terminal_addr: &str) -
     }
 }
 
-/// Extract all terminal addresses referenced inside a `SharedTab.root` layout node.
-pub fn extract_terminals(node: &Value, out: &mut Vec<String>) {
+/// Visit all terminal address slices referenced inside a `SharedTab.root` layout node without allocating.
+pub fn visit_terminals<'a, F: FnMut(&'a str)>(node: &'a Value, f: &mut F) {
     if let Some(term) = node
         .get("content")
         .and_then(|c| c.get("terminal"))
         .and_then(Value::as_str)
     {
-        if !term.is_empty() && !out.iter().any(|t| t == term) {
-            out.push(term.to_string());
+        if !term.is_empty() {
+            f(term);
         }
     }
     if let Some(children) = node.get("children").and_then(Value::as_array) {
         for child in children {
-            extract_terminals(child, out);
+            visit_terminals(child, f);
         }
     }
+}
+
+/// Extract all terminal addresses referenced inside a `SharedTab.root` layout node.
+pub fn extract_terminals(node: &Value, out: &mut Vec<String>) {
+    visit_terminals(node, &mut |term| {
+        if !out.iter().any(|t| t == term) {
+            out.push(term.to_string());
+        }
+    });
 }
 
 /// Remove dead terminal blocks from a `root` node while keeping live ones.
@@ -334,6 +343,7 @@ pub fn folder_basename(folder: &str) -> String {
         .to_string()
 }
 
+#[derive(Default)]
 pub struct World {
     pub doc: AppDocument,
     pub doc_version: u64,
@@ -347,18 +357,18 @@ pub struct World {
     pub collapsed_spaces: HashSet<String>,
 }
 
-impl Default for World {
-    fn default() -> Self {
-        Self {
-            doc: AppDocument::default(),
-            doc_version: 0,
-            terminals: BTreeMap::new(),
-            active_space_idx: 0,
-            active_tab_by_space: BTreeMap::new(),
-            active_term_by_tab: BTreeMap::new(),
-            collapsed_spaces: HashSet::new(),
-        }
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventDisposition {
+    /// Event had no effect on local state (e.g. echoed label/doc version or irrelevant event).
+    Unchanged,
+    /// Event was applied in-place in `O(1)` without needing any RPC.
+    AppliedInPlace,
+    /// Needs a coalesced `refresh_terminals` RPC after draining the current event batch.
+    NeedsTerminalRefresh,
+    /// Needs `refresh_terminals` + `reconcile_and_sync` (`created` / `started` / `finished`).
+    NeedsLifecycleSync,
+    /// Needs `fetch_doc` + `refresh_terminals` + `reconcile_and_sync` (`missed` or external `doc`).
+    NeedsDocSync,
 }
 
 impl World {
@@ -382,6 +392,209 @@ impl World {
         }
     }
 
+    /// Apply a `herdr-core` event incrementally in memory when possible, or classify which
+    /// coalesced RPC refresh is needed after draining the current event batch.
+    pub fn apply_core_event(&mut self, ev: &Value) -> EventDisposition {
+        let method = ev.get("method").and_then(Value::as_str).unwrap_or("");
+        let params = ev.get("params").unwrap_or(ev);
+        let ev_type = params.get("type").and_then(Value::as_str).unwrap_or("");
+
+        if method == "missed" || ev_type == "missed" {
+            return EventDisposition::NeedsDocSync;
+        }
+        if ev_type == "doc" {
+            if let Some(data) = params.get("data") {
+                if let Some(name) = data.get("name").and_then(Value::as_str) {
+                    if name != "herdr-app" {
+                        return EventDisposition::Unchanged;
+                    }
+                }
+                if self.doc_version > 0
+                    && data.get("version").and_then(Value::as_u64) == Some(self.doc_version)
+                {
+                    return EventDisposition::Unchanged;
+                }
+            }
+            return EventDisposition::NeedsDocSync;
+        }
+
+        match ev_type {
+            "created" | "started" | "finished" => EventDisposition::NeedsLifecycleSync,
+            "foreground" | "title" | "renamed" | "turn" | "labels" | "status" => {
+                let Some(addr) = params.get("terminal").and_then(Value::as_str) else {
+                    return EventDisposition::NeedsTerminalRefresh;
+                };
+                let Some(info) = self.terminals.get_mut(addr) else {
+                    return EventDisposition::NeedsTerminalRefresh;
+                };
+                let Some(data) = params.get("data") else {
+                    return EventDisposition::NeedsTerminalRefresh;
+                };
+
+                match ev_type {
+                    "foreground" => {
+                        if data.is_null() {
+                            let changed =
+                                info.fg_cwd.take().is_some() | info.fg_name.take().is_some();
+                            if changed {
+                                EventDisposition::AppliedInPlace
+                            } else {
+                                EventDisposition::Unchanged
+                            }
+                        } else if data.is_object() {
+                            let new_cwd = data.get("cwd").and_then(Value::as_str).map(String::from);
+                            let new_name =
+                                data.get("name").and_then(Value::as_str).map(String::from);
+                            let mut changed = false;
+                            if info.fg_cwd != new_cwd {
+                                info.fg_cwd = new_cwd;
+                                changed = true;
+                            }
+                            if info.fg_name != new_name {
+                                info.fg_name = new_name;
+                                changed = true;
+                            }
+                            if changed {
+                                EventDisposition::AppliedInPlace
+                            } else {
+                                EventDisposition::Unchanged
+                            }
+                        } else {
+                            EventDisposition::NeedsTerminalRefresh
+                        }
+                    }
+                    "title" => {
+                        let new_title = data
+                            .as_str()
+                            .or_else(|| data.get("title").and_then(Value::as_str));
+                        if let Some(t) = new_title {
+                            if info.title == t {
+                                EventDisposition::Unchanged
+                            } else {
+                                info.title = t.to_string();
+                                EventDisposition::AppliedInPlace
+                            }
+                        } else {
+                            EventDisposition::NeedsTerminalRefresh
+                        }
+                    }
+                    "renamed" => {
+                        let parsed_name = if data.is_null() {
+                            Some(None)
+                        } else if let Some(s) = data.as_str() {
+                            Some(Some(s.to_string()))
+                        } else if data.is_object() && data.get("name").is_some() {
+                            Some(data.get("name").and_then(Value::as_str).map(String::from))
+                        } else {
+                            None
+                        };
+                        if let Some(new_name) = parsed_name {
+                            if info.name == new_name {
+                                EventDisposition::Unchanged
+                            } else {
+                                info.name = new_name;
+                                EventDisposition::AppliedInPlace
+                            }
+                        } else {
+                            EventDisposition::NeedsTerminalRefresh
+                        }
+                    }
+                    "turn" => {
+                        let new_turn = data
+                            .as_u64()
+                            .or_else(|| data.get("turn").and_then(Value::as_u64));
+                        if let Some(t) = new_turn {
+                            if info.turn == t {
+                                EventDisposition::Unchanged
+                            } else {
+                                info.turn = t;
+                                EventDisposition::AppliedInPlace
+                            }
+                        } else {
+                            EventDisposition::NeedsTerminalRefresh
+                        }
+                    }
+                    "labels" => {
+                        let labels_obj = data
+                            .get("labels")
+                            .and_then(Value::as_object)
+                            .or_else(|| data.as_object());
+                        if let Some(obj) = labels_obj {
+                            if !info.pinned && obj.len() == 1 {
+                                if let Some(seen) = obj
+                                    .get("herdr.seen")
+                                    .and_then(Value::as_str)
+                                    .and_then(|s| s.parse::<u64>().ok())
+                                {
+                                    if info.seen_turn == Some(seen) {
+                                        return EventDisposition::Unchanged;
+                                    }
+                                    info.seen_turn = Some(seen);
+                                    return EventDisposition::AppliedInPlace;
+                                }
+                            }
+                        }
+                        EventDisposition::NeedsTerminalRefresh
+                    }
+                    "status" => {
+                        if data.is_null() {
+                            let changed = info.status_word.take().is_some()
+                                | info.status_app.take().is_some()
+                                | info.status_msg.take().is_some();
+                            if changed {
+                                EventDisposition::AppliedInPlace
+                            } else {
+                                EventDisposition::Unchanged
+                            }
+                        } else if let Some(st_obj) = data
+                            .get("status")
+                            .and_then(Value::as_object)
+                            .or_else(|| data.as_object())
+                        {
+                            if st_obj.contains_key("state")
+                                || st_obj.contains_key("app")
+                                || st_obj.contains_key("msg")
+                            {
+                                let new_word = st_obj
+                                    .get("state")
+                                    .and_then(Value::as_str)
+                                    .map(String::from);
+                                let new_app =
+                                    st_obj.get("app").and_then(Value::as_str).map(String::from);
+                                let new_msg =
+                                    st_obj.get("msg").and_then(Value::as_str).map(String::from);
+                                let mut changed = false;
+                                if info.status_word != new_word {
+                                    info.status_word = new_word;
+                                    changed = true;
+                                }
+                                if info.status_app != new_app {
+                                    info.status_app = new_app;
+                                    changed = true;
+                                }
+                                if info.status_msg != new_msg {
+                                    info.status_msg = new_msg;
+                                    changed = true;
+                                }
+                                if changed {
+                                    EventDisposition::AppliedInPlace
+                                } else {
+                                    EventDisposition::Unchanged
+                                }
+                            } else {
+                                EventDisposition::NeedsTerminalRefresh
+                            }
+                        } else {
+                            EventDisposition::NeedsTerminalRefresh
+                        }
+                    }
+                    _ => EventDisposition::NeedsTerminalRefresh,
+                }
+            }
+            _ => EventDisposition::Unchanged,
+        }
+    }
+
     pub fn refresh_terminals(&mut self, core: &CoreClient) -> Result<()> {
         let list = core.call("terminal.list", json!({}))?;
         self.apply_terminals_snapshot(&list);
@@ -391,9 +604,13 @@ impl World {
     pub fn doc_has_unseen_terminals(&self) -> bool {
         for space in &self.doc.spaces {
             for tab in &space.tabs {
-                let mut terms = Vec::new();
-                extract_terminals(&tab.root, &mut terms);
-                if terms.iter().any(|t| !self.terminals.contains_key(t)) {
+                let mut missing = false;
+                visit_terminals(&tab.root, &mut |t| {
+                    if !self.terminals.contains_key(t) {
+                        missing = true;
+                    }
+                });
+                if missing {
                     return true;
                 }
             }
@@ -687,27 +904,42 @@ impl World {
 
     pub fn tab_terminals(&self, tab: &SharedTab) -> Vec<String> {
         let mut terms = Vec::new();
-        extract_terminals(&tab.root, &mut terms);
-        terms.retain(|t| self.terminals.contains_key(t));
+        visit_terminals(&tab.root, &mut |t| {
+            if self.terminals.contains_key(t) && !terms.iter().any(|existing| existing == t) {
+                terms.push(t.to_string());
+            }
+        });
         terms
     }
 
-    pub fn active_terminal_for_tab(&self, tab: &SharedTab) -> Option<String> {
-        let terms = self.tab_terminals(tab);
-        if terms.is_empty() {
-            return None;
-        }
-        if let Some(chosen) = self.active_term_by_tab.get(&tab.id) {
-            if terms.iter().any(|t| t == chosen) {
-                return Some(chosen.clone());
+    pub fn active_terminal_for_tab_ref<'a>(&'a self, tab: &'a SharedTab) -> Option<&'a str> {
+        let chosen = self.active_term_by_tab.get(&tab.id).map(String::as_str);
+        let mut first_live: Option<&'a str> = None;
+        let mut matched_chosen: Option<&'a str> = None;
+        visit_terminals(&tab.root, &mut |t| {
+            if self.terminals.contains_key(t) {
+                if first_live.is_none() {
+                    first_live = Some(t);
+                }
+                if chosen == Some(t) {
+                    matched_chosen = Some(t);
+                }
             }
-        }
-        terms.into_iter().next()
+        });
+        matched_chosen.or(first_live)
+    }
+
+    pub fn active_terminal_for_tab(&self, tab: &SharedTab) -> Option<String> {
+        self.active_terminal_for_tab_ref(tab).map(String::from)
+    }
+
+    pub fn active_terminal_address_ref(&self) -> Option<&str> {
+        let tab = self.active_tab()?;
+        self.active_terminal_for_tab_ref(tab)
     }
 
     pub fn active_terminal_address(&self) -> Option<String> {
-        let tab = self.active_tab()?;
-        self.active_terminal_for_tab(tab)
+        self.active_terminal_address_ref().map(String::from)
     }
 
     pub fn space_display_name(&self, space: &SharedSpace) -> String {
@@ -718,8 +950,8 @@ impl World {
             return folder_basename(&space.folder);
         }
         if let Some(first_tab) = space.tabs.first() {
-            if let Some(addr) = self.active_terminal_for_tab(first_tab) {
-                if let Some(info) = self.terminals.get(&addr) {
+            if let Some(addr) = self.active_terminal_for_tab_ref(first_tab) {
+                if let Some(info) = self.terminals.get(addr) {
                     return folder_basename(info.effective_cwd());
                 }
             }
@@ -734,8 +966,8 @@ impl World {
         if !tab.name.is_empty() {
             return tab.name.clone();
         }
-        if let Some(addr) = self.active_terminal_for_tab(tab) {
-            if let Some(info) = self.terminals.get(&addr) {
+        if let Some(addr) = self.active_terminal_for_tab_ref(tab) {
+            if let Some(info) = self.terminals.get(addr) {
                 return info.short_label();
             }
         }
@@ -743,12 +975,16 @@ impl World {
     }
 
     pub fn tab_state(&self, tab: &SharedTab) -> AgentState {
-        self.tab_terminals(tab)
-            .into_iter()
-            .filter_map(|addr| self.terminals.get(&addr))
-            .map(TerminalInfo::agent_state)
-            .max()
-            .unwrap_or(AgentState::None)
+        let mut best = AgentState::None;
+        visit_terminals(&tab.root, &mut |addr| {
+            if let Some(info) = self.terminals.get(addr) {
+                let st = info.agent_state();
+                if st > best {
+                    best = st;
+                }
+            }
+        });
+        best
     }
 
     pub fn space_state(&self, space: &SharedSpace) -> AgentState {
@@ -760,7 +996,7 @@ impl World {
             .unwrap_or(AgentState::None)
     }
 
-    /// Mark the currently focused terminal as seen (`herdr.seen=<turn>`) if needed.
+    /// Mark the currently focused terminal as seen (`herdr.seen=<turn>`) without blocking the UI thread.
     pub fn mark_active_seen(&mut self, core: &CoreClient) {
         let Some(addr) = self.active_terminal_address() else {
             return;
@@ -771,7 +1007,7 @@ impl World {
         if info.turn > 0 && info.seen_turn.is_none_or(|seen| info.turn > seen) {
             let turn = info.turn;
             info.seen_turn = Some(turn);
-            let _ = core.call(
+            core.call_async(
                 "terminal.label",
                 json!({
                     "terminal": addr,
@@ -1086,7 +1322,12 @@ impl World {
         Ok(())
     }
 
-    pub fn rename_tab_by_id(&mut self, core: &CoreClient, tab_id: &str, new_name: &str) -> Result<()> {
+    pub fn rename_tab_by_id(
+        &mut self,
+        core: &CoreClient,
+        tab_id: &str,
+        new_name: &str,
+    ) -> Result<()> {
         let target_id = tab_id.to_string();
         let trimmed = new_name.trim().to_string();
         self.mutate_doc(core, |world| {
@@ -1099,7 +1340,12 @@ impl World {
         Ok(())
     }
 
-    pub fn rename_space_by_id(&mut self, core: &CoreClient, space_id: &str, new_name: &str) -> Result<()> {
+    pub fn rename_space_by_id(
+        &mut self,
+        core: &CoreClient,
+        space_id: &str,
+        new_name: &str,
+    ) -> Result<()> {
         let target_id = space_id.to_string();
         let trimmed = new_name.trim().to_string();
         self.mutate_doc(core, |world| {
@@ -1218,5 +1464,103 @@ mod tests {
         assert_eq!(round_trip["future_doc_field"], "kept");
         assert_eq!(round_trip["spaces"][0]["future_space_field"], 42);
         assert_eq!(round_trip["spaces"][0]["tabs"][0]["future_tab_field"], true);
+    }
+
+    #[test]
+    fn apply_core_event_updates_live_terminal_in_place_and_suppresses_echoed_noop_events() {
+        let mut world = World {
+            doc_version: 7,
+            ..Default::default()
+        };
+        world.terminals.insert(
+            "t1".to_string(),
+            TerminalInfo {
+                address: "t1".to_string(),
+                state: "live".to_string(),
+                cwd: "/work/repo".to_string(),
+                turn: 3,
+                seen_turn: Some(3),
+                ..Default::default()
+            },
+        );
+
+        // Foreground update mutates in-place without RPC; identical repeat is Unchanged
+        let fg_ev = json!({
+            "jsonrpc": "2.0",
+            "method": "event",
+            "params": {
+                "type": "foreground",
+                "terminal": "t1",
+                "data": { "cwd": "/work/repo/sub", "name": "codex" }
+            }
+        });
+        assert_eq!(
+            world.apply_core_event(&fg_ev),
+            EventDisposition::AppliedInPlace
+        );
+        assert_eq!(
+            world.terminals["t1"].fg_cwd.as_deref(),
+            Some("/work/repo/sub")
+        );
+        assert_eq!(world.terminals["t1"].fg_name.as_deref(), Some("codex"));
+        assert_eq!(world.apply_core_event(&fg_ev), EventDisposition::Unchanged);
+
+        // Title and status updates mutate in-place
+        let title_ev = json!({
+            "params": { "type": "title", "terminal": "t1", "data": "codex · working" }
+        });
+        assert_eq!(
+            world.apply_core_event(&title_ev),
+            EventDisposition::AppliedInPlace
+        );
+        assert_eq!(world.terminals["t1"].title, "codex · working");
+
+        let status_ev = json!({
+            "params": {
+                "type": "status",
+                "terminal": "t1",
+                "data": { "state": "working", "app": "codex", "msg": "thinking" }
+            }
+        });
+        assert_eq!(
+            world.apply_core_event(&status_ev),
+            EventDisposition::AppliedInPlace
+        );
+        assert_eq!(world.terminals["t1"].agent_state(), AgentState::Working);
+
+        // Echoed `herdr.seen` label matching local `seen_turn` is suppressed as Unchanged
+        let seen_echo = json!({
+            "params": {
+                "type": "labels",
+                "terminal": "t1",
+                "data": { "herdr.seen": "3" }
+            }
+        });
+        assert_eq!(
+            world.apply_core_event(&seen_echo),
+            EventDisposition::Unchanged
+        );
+
+        // Self-authored `doc` event at current version is skipped; newer version requests sync
+        let own_doc_ev = json!({
+            "params": {
+                "type": "doc",
+                "data": { "name": "herdr-app", "version": 7 }
+            }
+        });
+        assert_eq!(
+            world.apply_core_event(&own_doc_ev),
+            EventDisposition::Unchanged
+        );
+        let remote_doc_ev = json!({
+            "params": {
+                "type": "doc",
+                "data": { "name": "herdr-app", "version": 8 }
+            }
+        });
+        assert_eq!(
+            world.apply_core_event(&remote_doc_ev),
+            EventDisposition::NeedsDocSync
+        );
     }
 }

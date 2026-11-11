@@ -23,11 +23,18 @@ pub const FACTS: u8 = 5;
 #[allow(dead_code)]
 pub const AUTOMATIC_INPUT: u8 = 6;
 
+pub fn encode_header(channel: u32, kind: u8, len: usize) -> [u8; HEADER] {
+    let mut h = [0u8; HEADER];
+    h[0..4].copy_from_slice(&channel.to_le_bytes());
+    h[4] = kind;
+    h[5..9].copy_from_slice(&(len as u32).to_le_bytes());
+    h
+}
+
+#[allow(dead_code)]
 pub fn encode(channel: u32, kind: u8, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER + payload.len());
-    out.extend_from_slice(&channel.to_le_bytes());
-    out.push(kind);
-    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(&encode_header(channel, kind, payload.len()));
     out.extend_from_slice(payload);
     out
 }
