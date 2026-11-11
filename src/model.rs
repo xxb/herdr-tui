@@ -793,6 +793,7 @@ impl World {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_space_collapsed(&self, space_id: &str) -> bool {
         self.collapsed_spaces.contains(space_id)
     }
