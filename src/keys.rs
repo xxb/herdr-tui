@@ -32,6 +32,20 @@ pub struct FileConfig {
     pub ui: UiFileConfig,
     #[serde(default)]
     pub keys: KeysFileConfig,
+    #[serde(default)]
+    pub quota: QuotaFileConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, Default)]
+pub struct QuotaFileConfig {
+    pub claude_5h_tokens: Option<u64>,
+    pub claude_5h_messages: Option<u64>,
+    pub claude_7d_tokens: Option<u64>,
+    pub claude_7d_messages: Option<u64>,
+    pub opencode_daily_requests: Option<u64>,
+    pub opencode_5h_requests: Option<u64>,
+    pub agy_5h_steps: Option<u64>,
+    pub agy_daily_steps: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Default)]

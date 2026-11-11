@@ -2,6 +2,7 @@ mod core;
 mod keys;
 mod model;
 mod ui;
+mod usage;
 mod wire;
 
 use crate::core::{CoreClient, CoreMessage};
@@ -12,9 +13,10 @@ use crate::keys::{
 use crate::model::World;
 use crate::ui::{
     collect_fuzzy_items, compute_terminal_rect, find_hit_target, is_on_dpad_disc,
-    render_ui_with_pads, resolve_dpad_disc_rect, resolve_fuzzy_selection, resolve_mod_cross_rect,
-    HitRegion, HitTarget, Modal, PromptKind, TerminalSelection,
+    render_ui_with_pads_and_quota, resolve_dpad_disc_rect, resolve_fuzzy_selection,
+    resolve_mod_cross_rect, HitRegion, HitTarget, Modal, PromptKind, TerminalSelection,
 };
+use crate::usage::UsageTracker;
 use anyhow::Result;
 use clap::Parser;
 use crossterm::{
@@ -35,7 +37,7 @@ use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthChar;
 
 const SCROLLBACK_LINES: usize = 2000;
-const ATTACH_HISTORY_LINES: usize = 0;
+const ATTACH_HISTORY_LINES: usize = SCROLLBACK_LINES;
 const MAX_MSGS_PER_TICK: usize = 256;
 
 struct TerminalCleanupGuard;
@@ -439,11 +441,14 @@ fn main() -> Result<()> {
         initial_area.width >= mobile_threshold
     };
 
+    let usage_tracker = UsageTracker::new(file_cfg.quota.clone());
+
     let res = run_app(
         &mut terminal,
         &core,
         &core_rx,
         &mut world,
+        &usage_tracker,
         &prefix_spec,
         &mut sidebar_open,
         sidebar_width,
@@ -554,10 +559,45 @@ fn sync_attached_terminals(
             if let Some(act) = active_addr.as_ref().and_then(|a| attached_map.get(a)) {
                 core.set_focus(act.channel, true);
             }
+            newly_attached_active = true;
         }
     }
 
     newly_attached_active
+}
+
+fn encode_wheel_for_terminal(
+    screen: &vt100::Screen,
+    scroll_up: bool,
+    rel_col_1based: u16,
+    rel_row_1based: u16,
+) -> Option<Vec<u8>> {
+    if !screen.alternate_screen() {
+        return None;
+    }
+    if !matches!(screen.mouse_protocol_mode(), vt100::MouseProtocolMode::None) {
+        let btn = if scroll_up { 64u8 } else { 65u8 };
+        let col = rel_col_1based.max(1);
+        let row = rel_row_1based.max(1);
+        if matches!(
+            screen.mouse_protocol_encoding(),
+            vt100::MouseProtocolEncoding::Sgr
+        ) {
+            Some(format!("\x1b[<{btn};{col};{row}M").into_bytes())
+        } else {
+            let cx = (col.min(223) as u8).saturating_add(32);
+            let cy = (row.min(223) as u8).saturating_add(32);
+            Some(vec![0x1b, b'[', b'M', 32 + btn, cx, cy])
+        }
+    } else {
+        let seq: &[u8] = match (scroll_up, screen.application_cursor()) {
+            (true, true) => b"\x1bOA\x1bOA\x1bOA",
+            (true, false) => b"\x1b[A\x1b[A\x1b[A",
+            (false, true) => b"\x1bOB\x1bOB\x1bOB",
+            (false, false) => b"\x1b[B\x1b[B\x1b[B",
+        };
+        Some(seq.to_vec())
+    }
 }
 
 fn execute_action(
@@ -688,6 +728,7 @@ fn run_app(
     core: &CoreClient,
     core_rx: &std::sync::mpsc::Receiver<CoreMessage>,
     world: &mut World,
+    usage_tracker: &UsageTracker,
     prefix_spec: &str,
     sidebar_open: &mut bool,
     sidebar_width: u16,
@@ -712,6 +753,7 @@ fn run_app(
     let mut selection_screen: Option<vt100::Screen> = None;
     let mut clipboard_buffer = String::new();
     let mut copied_until: Option<Instant> = None;
+    let mut last_usage_rev: u64 = 0;
     let mut dirty = true;
     let mut prev_width = terminal.size()?.width;
 
@@ -759,13 +801,19 @@ fn run_app(
         let mut drained = 0usize;
         let mut more_messages = false;
         let mut coalesce_burst = newly_attached;
+        let drain_budget = if newly_attached {
+            Duration::from_millis(80)
+        } else {
+            Duration::from_millis(16)
+        };
         loop {
             let next_msg = if drained == 0 && newly_attached {
-                core_rx.recv_timeout(Duration::from_millis(25)).ok()
+                core_rx.recv_timeout(Duration::from_millis(30)).ok()
             } else if let Ok(msg) = core_rx.try_recv() {
                 Some(msg)
-            } else if coalesce_burst && drain_start.elapsed() < Duration::from_millis(14) {
-                core_rx.recv_timeout(Duration::from_millis(2)).ok()
+            } else if coalesce_burst && drain_start.elapsed() < drain_budget {
+                let wait_ms = if newly_attached { 4 } else { 2 };
+                core_rx.recv_timeout(Duration::from_millis(wait_ms)).ok()
             } else {
                 None
             };
@@ -834,7 +882,7 @@ fn run_app(
                 CoreMessage::Disconnected => return Ok(()),
             }
             if drained >= MAX_MSGS_PER_TICK
-                || drain_start.elapsed() >= Duration::from_millis(16)
+                || drain_start.elapsed() >= drain_budget
             {
                 more_messages = true;
                 break;
@@ -865,6 +913,13 @@ fn run_app(
             scrollback_offset = att.parser.screen().scrollback();
         }
 
+        let focused_quota = usage_tracker.focused_quota(world);
+        let cur_usage_rev = usage_tracker.revision();
+        if cur_usage_rev != last_usage_rev {
+            last_usage_rev = cur_usage_rev;
+            dirty = true;
+        }
+
         if dirty {
             let active_att = active_addr.as_ref().and_then(|a| attached_map.get(a));
             let scr_ref = if selection.as_ref().is_some_and(|s| s.active) {
@@ -878,7 +933,7 @@ fn run_app(
             let mod_dragging = dpad_drag.as_ref().is_some_and(|d| d.is_mod && d.moved);
             let dpad_dragging = dpad_drag.as_ref().is_some_and(|d| !d.is_mod && d.moved);
             terminal.draw(|f| {
-                let geom = render_ui_with_pads(
+                let geom = render_ui_with_pads_and_quota(
                     f,
                     world,
                     scr_ref,
@@ -896,6 +951,7 @@ fn run_app(
                     mod_dragging,
                     dpad_pos,
                     dpad_dragging,
+                    focused_quota.as_ref(),
                 );
                 last_hits = geom.hits;
                 last_mod_rect = geom.mod_rect;
@@ -1348,7 +1404,21 @@ fn run_app(
                         {
                             selection = None;
                             selection_screen = None;
-                            scrollback_offset = scrollback_offset.saturating_add(3);
+                            let rel_col = mev.column.saturating_sub(term_rect.x).saturating_add(1);
+                            let rel_row = mev.row.saturating_sub(term_rect.y).saturating_add(1);
+                            if let Some((ch, bytes)) = active_att.and_then(|att| {
+                                encode_wheel_for_terminal(
+                                    att.parser.screen(),
+                                    true,
+                                    rel_col,
+                                    rel_row,
+                                )
+                                .map(|b| (att.channel, b))
+                            }) {
+                                core.send_input(ch, &bytes);
+                            } else {
+                                scrollback_offset = scrollback_offset.saturating_add(3);
+                            }
                         }
                     }
                     MouseEventKind::ScrollDown => {
@@ -1381,7 +1451,21 @@ fn run_app(
                         {
                             selection = None;
                             selection_screen = None;
-                            scrollback_offset = scrollback_offset.saturating_sub(3);
+                            let rel_col = mev.column.saturating_sub(term_rect.x).saturating_add(1);
+                            let rel_row = mev.row.saturating_sub(term_rect.y).saturating_add(1);
+                            if let Some((ch, bytes)) = active_att.and_then(|att| {
+                                encode_wheel_for_terminal(
+                                    att.parser.screen(),
+                                    false,
+                                    rel_col,
+                                    rel_row,
+                                )
+                                .map(|b| (att.channel, b))
+                            }) {
+                                core.send_input(ch, &bytes);
+                            } else {
+                                scrollback_offset = scrollback_offset.saturating_sub(3);
+                            }
                         }
                     }
                     _ => {}
@@ -1617,7 +1701,15 @@ fn handle_key_event(
         );
     }
 
-    // 5. Scrollback mode navigation
+    // 5. Scrollback mode navigation (or Shift+PageUp to enter scrollback from main screen)
+    if *scrollback_offset == 0
+        && kev.code == KeyCode::PageUp
+        && kev.modifiers.contains(KeyModifiers::SHIFT)
+        && attached.is_none_or(|a| !a.parser.screen().alternate_screen())
+    {
+        *scrollback_offset = (term_rect.height as usize / 2).max(1);
+        return Ok(false);
+    }
     if *scrollback_offset > 0 {
         match kev.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
@@ -1694,5 +1786,44 @@ mod tests {
         assert_eq!(screen_bytewise.cell(0, 7).unwrap().contents(), "╮");
         assert_eq!(screen_bytewise.cell(1, 7).unwrap().contents(), "│");
         assert_eq!(screen_bytewise.cell(2, 7).unwrap().contents(), "╯");
+    }
+
+    #[test]
+    fn wheel_scrolls_main_screen_scrollback_and_forwards_in_alternate_screen() {
+        assert_eq!(ATTACH_HISTORY_LINES, SCROLLBACK_LINES);
+
+        let mut att = AttachedTerminal::new(1, 20, 4);
+        for i in 1..=10 {
+            att.process_vt_bytes(format!("line {i}\r\n").as_bytes());
+        }
+        // Main screen returns None so hct adjusts scrollback_offset naturally
+        assert_eq!(
+            encode_wheel_for_terminal(att.parser.screen(), true, 5, 2),
+            None
+        );
+        att.parser.set_scrollback(3);
+        assert_eq!(att.parser.screen().scrollback(), 3);
+
+        // Alternate screen without mouse capture sends Up/Down arrow keys
+        att.process_vt_bytes(b"\x1b[?1049h");
+        assert_eq!(
+            encode_wheel_for_terminal(att.parser.screen(), true, 5, 2).as_deref(),
+            Some(&b"\x1b[A\x1b[A\x1b[A"[..])
+        );
+        assert_eq!(
+            encode_wheel_for_terminal(att.parser.screen(), false, 5, 2).as_deref(),
+            Some(&b"\x1b[B\x1b[B\x1b[B"[..])
+        );
+
+        // Alternate screen with SGR mouse protocol sends SGR wheel events
+        att.process_vt_bytes(b"\x1b[?1000h\x1b[?1006h");
+        assert_eq!(
+            encode_wheel_for_terminal(att.parser.screen(), true, 10, 3).as_deref(),
+            Some(&b"\x1b[<64;10;3M"[..])
+        );
+        assert_eq!(
+            encode_wheel_for_terminal(att.parser.screen(), false, 10, 3).as_deref(),
+            Some(&b"\x1b[<65;10;3M"[..])
+        );
     }
 }

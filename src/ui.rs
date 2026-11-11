@@ -4,6 +4,7 @@
 
 use crate::keys::Action;
 use crate::model::{AgentState, World};
+use crate::usage::{render_progress_bar, AgentKind, AgentQuota, QuotaMetric};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     buffer::Buffer,
@@ -478,6 +479,7 @@ pub fn render_ui_with_dpad(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn render_ui_with_pads(
     f: &mut Frame,
@@ -497,6 +499,49 @@ pub fn render_ui_with_pads(
     mod_dragging: bool,
     dpad_pos: Option<(u16, u16)>,
     dpad_dragging: bool,
+) -> UiGeometry {
+    render_ui_with_pads_and_quota(
+        f,
+        world,
+        screen,
+        sidebar_open,
+        sidebar_width,
+        touch_mode,
+        prefix_active,
+        ctrl_active,
+        alt_active,
+        scrollback_offset,
+        selection,
+        copied_flash,
+        modal,
+        mod_pos,
+        mod_dragging,
+        dpad_pos,
+        dpad_dragging,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_ui_with_pads_and_quota(
+    f: &mut Frame,
+    world: &World,
+    screen: Option<&vt100::Screen>,
+    sidebar_open: bool,
+    sidebar_width: u16,
+    touch_mode: bool,
+    prefix_active: bool,
+    ctrl_active: bool,
+    alt_active: bool,
+    scrollback_offset: usize,
+    selection: Option<&TerminalSelection>,
+    copied_flash: bool,
+    modal: &Modal,
+    mod_pos: Option<(u16, u16)>,
+    mod_dragging: bool,
+    dpad_pos: Option<(u16, u16)>,
+    dpad_dragging: bool,
+    focused_quota: Option<&AgentQuota>,
 ) -> UiGeometry {
     let area = f.area();
     let mut hits = Vec::new();
@@ -548,7 +593,7 @@ pub fn render_ui_with_pads(
     render_bottom_status_bar(
         f,
         bottom_rect,
-        world,
+        focused_quota,
         scrollback_offset,
         copied_flash,
         &mut hits,
@@ -928,10 +973,55 @@ fn render_top_tabbar(
     }
 }
 
+fn quota_remaining_color(remaining_percent: f64) -> Color {
+    if remaining_percent <= 15.0 {
+        Color::Rgb(247, 118, 142)
+    } else if remaining_percent <= 40.0 {
+        Color::Rgb(224, 175, 104)
+    } else {
+        Color::Rgb(115, 218, 146)
+    }
+}
+
+fn agent_badge_colors(agent: AgentKind) -> (Color, Color) {
+    match agent {
+        AgentKind::Codex => (Color::Rgb(24, 52, 74), Color::Rgb(125, 207, 255)),
+        AgentKind::Claude => (Color::Rgb(62, 38, 28), Color::Rgb(245, 169, 127)),
+        AgentKind::OpenCode => (Color::Rgb(28, 54, 44), Color::Rgb(158, 206, 106)),
+        AgentKind::Antigravity => (Color::Rgb(48, 36, 74), Color::Rgb(187, 154, 247)),
+        AgentKind::Freebuff => (Color::Rgb(56, 48, 26), Color::Rgb(224, 175, 104)),
+    }
+}
+
+fn metric_display_width(m: &QuotaMetric, bar_w: usize, show_detail: bool) -> usize {
+    let pct = m.remaining_percent.clamp(0.0, 100.0).round() as u64;
+    let pct_str = format!("{pct}%");
+    let bar_part = if bar_w > 0 { bar_w + 1 } else { 0 };
+    let detail_part = if show_detail {
+        m.detail.as_ref().map_or(0, |d| 3 + d.width())
+    } else {
+        0
+    };
+    m.window_label.width() + 1 + bar_part + pct_str.width() + detail_part
+}
+
+fn push_clamped_str(buf: &mut Buffer, x: &mut u16, y: u16, avail_end: u16, s: &str, style: Style) {
+    if *x >= avail_end || s.is_empty() {
+        return;
+    }
+    let rem = (avail_end - *x) as usize;
+    let clipped = truncate_to_width(s, rem);
+    let w = clipped.width() as u16;
+    if w > 0 {
+        buf.set_string(*x, y, &clipped, style);
+        *x = (*x).saturating_add(w);
+    }
+}
+
 fn render_bottom_status_bar(
     f: &mut Frame,
     rect: Rect,
-    world: &World,
+    focused_quota: Option<&AgentQuota>,
     scrollback_offset: usize,
     copied_flash: bool,
     hits: &mut Vec<HitRegion>,
@@ -946,54 +1036,6 @@ fn render_bottom_status_bar(
     let buf = f.buffer_mut();
     let max_x = rect.x + rect.width;
     let mut x = rect.x;
-
-    let active_state = world
-        .active_space()
-        .and_then(|s| s.tabs.get(world.active_tab_index()))
-        .map(|t| world.tab_state(t))
-        .unwrap_or(AgentState::None);
-
-    let (badge_lbl, badge_bg, badge_fg) = match active_state {
-        AgentState::Blocked => (
-            " ◉ BLOCKED ",
-            Color::Rgb(92, 28, 42),
-            Color::Rgb(247, 118, 142),
-        ),
-        AgentState::Working => (
-            " ● WORKING ",
-            Color::Rgb(24, 52, 74),
-            Color::Rgb(125, 207, 255),
-        ),
-        AgentState::Done => (
-            " ✓ DONE ",
-            Color::Rgb(26, 56, 38),
-            Color::Rgb(158, 206, 106),
-        ),
-        AgentState::Idle => (
-            " ○ IDLE ",
-            Color::Rgb(42, 38, 26),
-            Color::Rgb(224, 175, 104),
-        ),
-        AgentState::None => (
-            " ○ SHELL ",
-            Color::Rgb(26, 30, 46),
-            Color::Rgb(140, 150, 185),
-        ),
-    };
-
-    let bw = badge_lbl.width() as u16;
-    if x + bw <= max_x {
-        buf.set_string(
-            x,
-            rect.y,
-            badge_lbl,
-            Style::default()
-                .bg(badge_bg)
-                .fg(badge_fg)
-                .add_modifier(Modifier::BOLD),
-        );
-        x += bw;
-    }
 
     // Reserve right-side space for optional `✓ Copied` and `▼ BOT (+N)` indicators
     let copied_lbl = if copied_flash {
@@ -1019,63 +1061,115 @@ fn render_bottom_status_bar(
     let right_reserved = copied_w + scroll_w;
     let avail_end = max_x.saturating_sub(right_reserved);
 
-    // Count workspace agent states & turns for the read-only Agent Status Bar
-    let mut working_cnt = 0usize;
-    let mut blocked_cnt = 0usize;
-    let mut done_cnt = 0usize;
-    let mut total_turns = 0u64;
-    for info in world.terminals.values() {
-        total_turns += info.turn;
-        match info.agent_state() {
-            AgentState::Working => working_cnt += 1,
-            AgentState::Blocked => blocked_cnt += 1,
-            AgentState::Done => done_cnt += 1,
-            _ => {}
-        }
-    }
-
-    let detail = world
-        .active_terminal_address()
-        .and_then(|addr| {
-            world.terminals.get(&addr).map(|info| {
-                let cwd = shorten_home_path(info.effective_cwd());
-                let title = if info.title.is_empty() {
-                    addr.as_str()
-                } else {
-                    info.title.as_str()
-                };
-                if info.turn > 0 {
-                    format!(" {title} · {cwd} · turn #{}", info.turn)
-                } else {
-                    format!(" {title} · {cwd}")
-                }
-            })
-        })
-        .unwrap_or_else(|| " shell".to_string());
-
-    let usage_summary = format!(
-        " ◉{blocked_cnt} ●{working_cnt} ✓{done_cnt} · turns:{total_turns} "
-    );
-    let usage_w = usage_summary.width() as u16;
-    let detail_end = if avail_end.saturating_sub(x) > usage_w + 12 {
-        avail_end.saturating_sub(usage_w)
-    } else {
-        avail_end
-    };
-
-    if x < detail_end {
-        let d_trunc = truncate_to_width(&detail, (detail_end - x) as usize);
-        buf.set_string(x, rect.y, &d_trunc, base_style);
-    }
-    if detail_end < avail_end {
-        buf.set_string(
-            detail_end,
+    // Strictly render ONLY the currently focused agent's quota usage on this single row.
+    // When no agent is focused (e.g. a plain shell tab), keep the left side clean without
+    // repeating status/cwd/turn info that the terminal already displays.
+    if let Some(quota) = focused_quota {
+        let (badge_bg, badge_fg) = agent_badge_colors(quota.agent);
+        let badge_lbl = if avail_end.saturating_sub(x) < 22 {
+            match quota.agent {
+                AgentKind::Codex => " Cdx ".to_string(),
+                AgentKind::Claude => " Clau ".to_string(),
+                AgentKind::OpenCode => " OC ".to_string(),
+                AgentKind::Antigravity => " Agy ".to_string(),
+                AgentKind::Freebuff => " Fb ".to_string(),
+            }
+        } else {
+            format!(" {} ", quota.agent.display_name())
+        };
+        push_clamped_str(
+            buf,
+            &mut x,
             rect.y,
-            &usage_summary,
+            avail_end,
+            &badge_lbl,
             Style::default()
-                .bg(Color::Rgb(20, 24, 36))
-                .fg(Color::Rgb(138, 162, 218)),
+                .bg(badge_bg)
+                .fg(badge_fg)
+                .add_modifier(Modifier::BOLD),
         );
+
+        if x < avail_end {
+            push_clamped_str(buf, &mut x, rect.y, avail_end, " ", base_style);
+        }
+
+        if quota.metrics.is_empty() {
+            push_clamped_str(
+                buf,
+                &mut x,
+                rect.y,
+                avail_end,
+                "剩余 --",
+                Style::default().bg(bar_bg).fg(Color::Rgb(126, 136, 168)),
+            );
+        } else if x < avail_end {
+            let avail_w = (avail_end - x) as usize;
+            const TIERS: [(usize, bool, &str); 5] = [
+                (8, true, "  ·  "),
+                (6, true, " · "),
+                (8, false, "  ·  "),
+                (5, false, " · "),
+                (0, false, " · "),
+            ];
+            let (bar_w, show_detail, sep) = TIERS
+                .into_iter()
+                .find(|(bw, sd, sp)| {
+                    let sep_total = sp.width() * quota.metrics.len().saturating_sub(1);
+                    let metrics_total: usize = quota
+                        .metrics
+                        .iter()
+                        .map(|m| metric_display_width(m, *bw, *sd))
+                        .sum();
+                    metrics_total + sep_total <= avail_w
+                })
+                .unwrap_or((0, false, " · "));
+
+            let lbl_style = Style::default()
+                .bg(bar_bg)
+                .fg(Color::Rgb(192, 202, 245))
+                .add_modifier(Modifier::BOLD);
+            let track_style = Style::default().bg(bar_bg).fg(Color::Rgb(56, 64, 94));
+            let detail_style = Style::default().bg(bar_bg).fg(Color::Rgb(132, 142, 178));
+            let sep_style = Style::default().bg(bar_bg).fg(Color::Rgb(86, 94, 126));
+
+            for (idx, m) in quota.metrics.iter().enumerate() {
+                if x >= avail_end {
+                    break;
+                }
+                if idx > 0 {
+                    push_clamped_str(buf, &mut x, rect.y, avail_end, sep, sep_style);
+                }
+                push_clamped_str(buf, &mut x, rect.y, avail_end, &m.window_label, lbl_style);
+                push_clamped_str(buf, &mut x, rect.y, avail_end, " ", base_style);
+
+                let u_col = quota_remaining_color(m.remaining_percent);
+                let fill_style = Style::default().bg(bar_bg).fg(u_col);
+                let pct_style = Style::default()
+                    .bg(bar_bg)
+                    .fg(u_col)
+                    .add_modifier(Modifier::BOLD);
+
+                if bar_w > 0 {
+                    let bar = render_progress_bar(m.remaining_percent, bar_w);
+                    let filled_part: String = bar.chars().take_while(|&c| c != '░').collect();
+                    let empty_part: String = bar.chars().skip_while(|&c| c != '░').collect();
+                    push_clamped_str(buf, &mut x, rect.y, avail_end, &filled_part, fill_style);
+                    push_clamped_str(buf, &mut x, rect.y, avail_end, &empty_part, track_style);
+                    push_clamped_str(buf, &mut x, rect.y, avail_end, " ", base_style);
+                }
+
+                let pct = m.remaining_percent.clamp(0.0, 100.0).round() as u64;
+                let pct_str = format!("{pct}%");
+                push_clamped_str(buf, &mut x, rect.y, avail_end, &pct_str, pct_style);
+
+                if show_detail {
+                    if let Some(ref d) = m.detail {
+                        let d_str = format!(" ({d})");
+                        push_clamped_str(buf, &mut x, rect.y, avail_end, &d_str, detail_style);
+                    }
+                }
+            }
+        }
     }
 
     let mut rx = avail_end;
@@ -2858,5 +2952,131 @@ mod tests {
             wrap_sel.extract_text(wrap_parser.screen()),
             "abcdefghijklmno"
         );
+    }
+
+    #[test]
+    fn bottom_bar_renders_focused_agent_quota_on_single_row_and_omits_redundant_shell_info() {
+        let world = sample_world();
+        let quota = AgentQuota {
+            agent: AgentKind::Codex,
+            metrics: vec![
+                QuotaMetric {
+                    window_label: "5h".to_string(),
+                    remaining_percent: 49.0,
+                    detail: Some("2h14m".to_string()),
+                },
+                QuotaMetric {
+                    window_label: "7d".to_string(),
+                    remaining_percent: 8.0,
+                    detail: Some("4d12h".to_string()),
+                },
+            ],
+        };
+
+        // 1. Desktop width (`100x24`): shows full progress bars, percentages, and reset details on row 23
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut hits = Vec::new();
+        terminal
+            .draw(|f| {
+                let geom = render_ui_with_pads_and_quota(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    false,
+                    false,
+                    2,
+                    None,
+                    true,
+                    &Modal::None,
+                    None,
+                    false,
+                    None,
+                    false,
+                    Some(&quota),
+                );
+                hits = geom.hits;
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let bot_line: String = (0..100).map(|x| buf[(x, 23)].symbol()).collect();
+        assert!(bot_line.contains("Codex"));
+        assert!(bot_line.contains("5h ███▉░░░░ 49% (2h14m)"));
+        assert!(bot_line.contains("7d ▋░░░░░░░ 8% (4d12h)"));
+        assert!(bot_line.contains("✓ Copied"));
+        assert!(bot_line.contains("▼ BOT (+2)"));
+        assert!(!bot_line.contains("WORKING"));
+        assert!(!bot_line.contains("turns:"));
+        assert!(hits
+            .iter()
+            .any(|h| h.target == HitTarget::ExitScrollback && h.rect.y == 23 && h.rect.height == 1));
+
+        // 2. Narrow width (`42x12`): drops optional detail so both 5h and 7d percentages fit on 1 row
+        let narrow_backend = TestBackend::new(42, 12);
+        let mut narrow_term = Terminal::new(narrow_backend).unwrap();
+        narrow_term
+            .draw(|f| {
+                render_ui_with_pads_and_quota(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::None,
+                    None,
+                    false,
+                    None,
+                    false,
+                    Some(&quota),
+                );
+            })
+            .unwrap();
+        let nbuf = narrow_term.backend().buffer();
+        let nline: String = (0..42).map(|x| nbuf[(x, 11)].symbol()).collect();
+        assert!(nline.contains("49%"));
+        assert!(nline.contains("8%"));
+
+        // 3. Plain shell (`focused_quota = None`): left side is clean with no redundant SHELL/cwd text
+        let shell_backend = TestBackend::new(80, 12);
+        let mut shell_term = Terminal::new(shell_backend).unwrap();
+        shell_term
+            .draw(|f| {
+                render_ui_with_pads_and_quota(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::None,
+                    None,
+                    false,
+                    None,
+                    false,
+                    None,
+                );
+            })
+            .unwrap();
+        let sbuf = shell_term.backend().buffer();
+        let sline: String = (0..80).map(|x| sbuf[(x, 11)].symbol()).collect();
+        assert_eq!(sline.trim(), "");
     }
 }
