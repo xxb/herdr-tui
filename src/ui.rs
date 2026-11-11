@@ -683,14 +683,23 @@ fn draw_touchbar_pill(
         buf.set_string(x, rect.y + 1, label, style);
         buf.set_string(x, rect.y + 2, &bot_line, style.fg(bot_fg));
     } else if rect.height == 2 && lw > 0 {
-        let top_fg = if emphasized {
+        // 2-row keycap pill:
+        // - Row 0 (`rect.y`): vertically centered glyph inside the colored pill (`style`)
+        // - Row 1 (`rect.y + 1`): crisp bottom gloss highlight (`▔`) hugging the lower edge
+        //   of Row 0 against the dark bar background so text never appears pushed down.
+        let bot_gloss_fg = if emphasized {
             Color::Rgb(245, 194, 118)
         } else {
             Color::Rgb(118, 162, 247)
         };
-        let top_line = "▔".repeat(lw as usize);
-        buf.set_string(x, rect.y, &top_line, style.fg(top_fg));
-        buf.set_string(x, rect.y + 1, label, style);
+        let bot_line = "▔".repeat(lw as usize);
+        buf.set_string(x, rect.y, label, style);
+        buf.set_string(
+            x,
+            rect.y + 1,
+            &bot_line,
+            Style::default().bg(Color::Rgb(12, 14, 22)).fg(bot_gloss_fg),
+        );
     } else {
         buf.set_string(x, rect.y, label, style);
     }
@@ -716,7 +725,7 @@ fn render_top_tabbar(
     let max_x = rect.x + rect.width;
     let buf = f.buffer_mut();
 
-    if rect.height >= 2 {
+    if rect.height >= 3 {
         let full_line = "▔".repeat(rect.width as usize);
         buf.set_string(
             rect.x,
@@ -725,6 +734,16 @@ fn render_top_tabbar(
             Style::default()
                 .bg(Color::Rgb(12, 14, 22))
                 .fg(Color::Rgb(82, 114, 184)),
+        );
+    } else if rect.height == 2 {
+        let full_line = "▔".repeat(rect.width as usize);
+        buf.set_string(
+            rect.x,
+            rect.y + 1,
+            &full_line,
+            Style::default()
+                .bg(Color::Rgb(12, 14, 22))
+                .fg(Color::Rgb(54, 68, 108)),
         );
     }
 
@@ -815,7 +834,7 @@ fn render_top_tabbar(
 
     // Subtle slash divider between Space button and Tab pills
     if x + 1 < avail_end {
-        let div_y = if rect.height >= 2 { rect.y + 1 } else { rect.y };
+        let div_y = if rect.height >= 3 { rect.y + 1 } else { rect.y };
         buf.set_string(
             x,
             div_y,
@@ -2552,6 +2571,20 @@ mod tests {
         assert!(hits
             .iter()
             .any(|h| h.target == HitTarget::ToggleHelp && h.rect.height == 2 && h.rect.y == 0));
+
+        // On a 2-row Top Tab Bar, Row 0 holds pill labels + slash divider while Row 1 holds
+        // the bottom gloss highlight line (`▔`) underneath the pills.
+        let buf = terminal.backend().buffer();
+        let row0: String = (0..100).map(|x| buf[(x, 0)].symbol()).collect();
+        let row1: String = (0..100).map(|x| buf[(x, 1)].symbol()).collect();
+        assert!(row0.contains('⏏'));
+        assert!(row0.contains("main"));
+        assert!(row0.contains('╱'));
+        assert!(row0.contains("1:agent"));
+        assert!(row0.contains('+'));
+        assert!(row0.contains('?'));
+        assert!(!row0.contains('▔'));
+        assert!(row1.chars().all(|c| c == '▔'));
 
         // Bottom 1-row read-only Agent Status Bar exposes ExitScrollback on row 23
         assert!(hits.iter().any(|h| h.target == HitTarget::ExitScrollback
