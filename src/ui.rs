@@ -973,10 +973,10 @@ fn render_top_tabbar(
     }
 }
 
-fn quota_usage_color(used_percent: f64) -> Color {
-    if used_percent >= 85.0 {
+fn quota_remaining_color(remaining_percent: f64) -> Color {
+    if remaining_percent <= 15.0 {
         Color::Rgb(247, 118, 142)
-    } else if used_percent >= 60.0 {
+    } else if remaining_percent <= 40.0 {
         Color::Rgb(224, 175, 104)
     } else {
         Color::Rgb(115, 218, 146)
@@ -994,7 +994,7 @@ fn agent_badge_colors(agent: AgentKind) -> (Color, Color) {
 }
 
 fn metric_display_width(m: &QuotaMetric, bar_w: usize, show_detail: bool) -> usize {
-    let pct = m.used_percent.clamp(0.0, 100.0).round() as u64;
+    let pct = m.remaining_percent.clamp(0.0, 100.0).round() as u64;
     let pct_str = format!("{pct}%");
     let bar_part = if bar_w > 0 { bar_w + 1 } else { 0 };
     let detail_part = if show_detail {
@@ -1099,7 +1099,7 @@ fn render_bottom_status_bar(
                 &mut x,
                 rect.y,
                 avail_end,
-                "已用 --",
+                "剩余 --",
                 Style::default().bg(bar_bg).fg(Color::Rgb(126, 136, 168)),
             );
         } else if x < avail_end {
@@ -1142,7 +1142,7 @@ fn render_bottom_status_bar(
                 push_clamped_str(buf, &mut x, rect.y, avail_end, &m.window_label, lbl_style);
                 push_clamped_str(buf, &mut x, rect.y, avail_end, " ", base_style);
 
-                let u_col = quota_usage_color(m.used_percent);
+                let u_col = quota_remaining_color(m.remaining_percent);
                 let fill_style = Style::default().bg(bar_bg).fg(u_col);
                 let pct_style = Style::default()
                     .bg(bar_bg)
@@ -1150,7 +1150,7 @@ fn render_bottom_status_bar(
                     .add_modifier(Modifier::BOLD);
 
                 if bar_w > 0 {
-                    let bar = render_progress_bar(m.used_percent, bar_w);
+                    let bar = render_progress_bar(m.remaining_percent, bar_w);
                     let filled_part: String = bar.chars().take_while(|&c| c != '░').collect();
                     let empty_part: String = bar.chars().skip_while(|&c| c != '░').collect();
                     push_clamped_str(buf, &mut x, rect.y, avail_end, &filled_part, fill_style);
@@ -1158,7 +1158,7 @@ fn render_bottom_status_bar(
                     push_clamped_str(buf, &mut x, rect.y, avail_end, " ", base_style);
                 }
 
-                let pct = m.used_percent.clamp(0.0, 100.0).round() as u64;
+                let pct = m.remaining_percent.clamp(0.0, 100.0).round() as u64;
                 let pct_str = format!("{pct}%");
                 push_clamped_str(buf, &mut x, rect.y, avail_end, &pct_str, pct_style);
 
@@ -2962,12 +2962,12 @@ mod tests {
             metrics: vec![
                 QuotaMetric {
                     window_label: "5h".to_string(),
-                    used_percent: 49.0,
+                    remaining_percent: 49.0,
                     detail: Some("2h14m".to_string()),
                 },
                 QuotaMetric {
                     window_label: "7d".to_string(),
-                    used_percent: 8.0,
+                    remaining_percent: 8.0,
                     detail: Some("4d12h".to_string()),
                 },
             ],

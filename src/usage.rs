@@ -15,6 +15,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CACHE_TTL: Duration = Duration::from_secs(10);
+const AGY_CACHE_TTL: Duration = Duration::from_secs(30);
+
+fn cache_ttl_for_agent(kind: AgentKind) -> Duration {
+    match kind {
+        AgentKind::Antigravity => AGY_CACHE_TTL,
+        _ => CACHE_TTL,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AgentKind {
@@ -40,8 +48,8 @@ impl AgentKind {
 #[derive(Clone, Debug, PartialEq)]
 pub struct QuotaMetric {
     pub window_label: String,
-    /// Used percentage (`0.0..=100.0`).
-    pub used_percent: f64,
+    /// Remaining percentage (`0.0..=100.0`).
+    pub remaining_percent: f64,
     /// Optional compact suffix such as reset countdown (`"2h14m"`) or count (`"28/200 · 142k"`).
     pub detail: Option<String>,
 }
@@ -69,11 +77,12 @@ impl UsageTracker {
 
         std::thread::spawn(move || {
             while let Ok(kind) = req_rx.recv() {
+                let ttl = cache_ttl_for_agent(kind);
                 let should_collect = {
                     let guard = cache_bg.lock().unwrap();
                     guard
                         .get(&kind)
-                        .is_none_or(|(ts, _)| ts.elapsed() >= CACHE_TTL)
+                        .is_none_or(|(ts, _)| ts.elapsed() >= ttl)
                 };
                 if !should_collect {
                     continue;
@@ -100,11 +109,12 @@ impl UsageTracker {
 
     pub fn focused_quota(&self, world: &World) -> Option<AgentQuota> {
         let kind = detect_focused_agent(world)?;
+        let ttl = cache_ttl_for_agent(kind);
         let mut need_refresh = false;
         let cached = {
             let guard = self.cache.lock().unwrap();
             if let Some((ts, q)) = guard.get(&kind) {
-                if ts.elapsed() >= CACHE_TTL {
+                if ts.elapsed() >= ttl {
                     need_refresh = true;
                 }
                 Some(q.clone())
@@ -190,11 +200,11 @@ pub fn detect_agent_from_str(s: &str) -> Option<AgentKind> {
     }
 }
 
-pub fn render_progress_bar(used_percent: f64, width: usize) -> String {
+pub fn render_progress_bar(percent: f64, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
-    let clamped = used_percent.clamp(0.0, 100.0);
+    let clamped = percent.clamp(0.0, 100.0);
     let total_eighths = ((clamped / 100.0) * (width as f64) * 8.0).round() as usize;
     let full_cells = (total_eighths / 8).min(width);
     let rem_eighth = total_eighths % 8;
@@ -256,6 +266,37 @@ fn now_unix_secs() -> u64 {
 
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+pub fn parse_utc_iso8601_secs(s: &str) -> Option<u64> {
+    let s = s.trim().strip_suffix('Z')?;
+    let (date_part, time_part) = s.split_once('T')?;
+    let mut d_it = date_part.split('-');
+    let year: i64 = d_it.next()?.parse().ok()?;
+    let month: i64 = d_it.next()?.parse().ok()?;
+    let day: i64 = d_it.next()?.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let mut t_it = time_part.split(':');
+    let hour: u64 = t_it.next()?.parse().ok()?;
+    let min: u64 = t_it.next()?.parse().ok()?;
+    let sec_str = t_it.next()?;
+    let sec_int_str = sec_str.split('.').next().unwrap_or(sec_str);
+    let sec: u64 = sec_int_str.parse().ok()?;
+
+    // Howard Hinnant's days_from_civil algorithm
+    let y = year - if month <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let m = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * m + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    if days < 0 {
+        return None;
+    }
+    Some((days as u64) * 86_400 + hour * 3_600 + min * 60 + sec)
 }
 
 fn collect_quota_for_agent(kind: AgentKind, cfg: &QuotaFileConfig) -> AgentQuota {
@@ -336,24 +377,25 @@ pub fn parse_codex_rate_limits_from_jsonl(text: &str, now_secs: u64) -> Option<V
                     m if m > 0 && m % 60 == 0 => format!("{}h", m / 60),
                     _ => default_lbl.to_string(),
                 };
-                let raw_pct = win
+                let raw_used_pct = win
                     .get("used_percent")
                     .and_then(Value::as_f64)
                     .unwrap_or(0.0);
+                let raw_rem_pct = (100.0 - raw_used_pct).clamp(0.0, 100.0);
                 let resets_at = win.get("resets_at").and_then(Value::as_u64).unwrap_or(0);
-                let (used_pct, detail) = if resets_at > 0 && now_secs >= resets_at {
-                    (0.0, None)
+                let (rem_pct, detail) = if resets_at > 0 && now_secs >= resets_at {
+                    (100.0, None)
                 } else if resets_at > now_secs {
                     (
-                        raw_pct.clamp(0.0, 100.0),
+                        raw_rem_pct,
                         Some(format_duration_short(resets_at - now_secs)),
                     )
                 } else {
-                    (raw_pct.clamp(0.0, 100.0), None)
+                    (raw_rem_pct, None)
                 };
                 metrics.push(QuotaMetric {
                     window_label: lbl,
-                    used_percent: used_pct,
+                    remaining_percent: rem_pct,
                     detail,
                 });
             }
@@ -450,18 +492,18 @@ print(json.dumps({"day_reqs": day_reqs, "day_toks": day_toks, "five_reqs": five_
     let five_reqs = val.get("five_reqs").and_then(Value::as_u64).unwrap_or(0);
     let five_toks = val.get("five_toks").and_then(Value::as_u64).unwrap_or(0);
 
-    let day_pct = ((day_reqs as f64 / daily_limit as f64) * 100.0).clamp(0.0, 100.0);
-    let five_pct = ((five_reqs as f64 / limit_5h as f64) * 100.0).clamp(0.0, 100.0);
+    let day_used_pct = ((day_reqs as f64 / daily_limit as f64) * 100.0).clamp(0.0, 100.0);
+    let five_used_pct = ((five_reqs as f64 / limit_5h as f64) * 100.0).clamp(0.0, 100.0);
 
     vec![
         QuotaMetric {
             window_label: "今日".to_string(),
-            used_percent: day_pct,
+            remaining_percent: (100.0 - day_used_pct).clamp(0.0, 100.0),
             detail: Some(format!("{day_reqs}/{daily_limit} · {}", format_tokens(day_toks))),
         },
         QuotaMetric {
             window_label: "5h".to_string(),
-            used_percent: five_pct,
+            remaining_percent: (100.0 - five_used_pct).clamp(0.0, 100.0),
             detail: Some(format!("{five_reqs}/{limit_5h} · {}", format_tokens(five_toks))),
         },
     ]
@@ -557,11 +599,11 @@ print(json.dumps({"tok_5h": tok_5h, "msg_5h": msg_5h, "tok_7d": tok_7d, "msg_7d"
     let msg_7d = val.get("msg_7d").and_then(Value::as_u64).unwrap_or(0);
     let reset_5h = val.get("reset_5h").and_then(Value::as_u64).unwrap_or(0);
 
-    let pct_5h = ((tok_5h as f64 / limit_5h_toks as f64)
+    let used_5h = ((tok_5h as f64 / limit_5h_toks as f64)
         .max(msg_5h as f64 / limit_5h_msgs as f64)
         * 100.0)
         .clamp(0.0, 100.0);
-    let pct_7d = ((tok_7d as f64 / limit_7d_toks as f64)
+    let used_7d = ((tok_7d as f64 / limit_7d_toks as f64)
         .max(msg_7d as f64 / limit_7d_msgs as f64)
         * 100.0)
         .clamp(0.0, 100.0);
@@ -575,18 +617,261 @@ print(json.dumps({"tok_5h": tok_5h, "msg_5h": msg_5h, "tok_7d": tok_7d, "msg_7d"
     vec![
         QuotaMetric {
             window_label: "5h".to_string(),
-            used_percent: pct_5h,
+            remaining_percent: (100.0 - used_5h).clamp(0.0, 100.0),
             detail: Some(detail_5h),
         },
         QuotaMetric {
             window_label: "7d".to_string(),
-            used_percent: pct_7d,
+            remaining_percent: (100.0 - used_7d).clamp(0.0, 100.0),
             detail: Some(format_tokens(tok_7d)),
         },
     ]
 }
 
+pub fn parse_antigravity_quota_summary(text: &str, now_secs: u64) -> Option<Vec<QuotaMetric>> {
+    let val: Value = serde_json::from_str(text.trim()).ok()?;
+    let groups = val.get("groups")?.as_array()?;
+    if groups.is_empty() {
+        return None;
+    }
+
+    // Prefer the "Gemini Models" group (`displayName` or `bucketId` contains "gemini"),
+    // falling back to the first group returned by `retrieveUserQuotaSummary`.
+    let chosen_group = groups
+        .iter()
+        .find(|g| {
+            let dname = g
+                .get("displayName")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if dname.contains("gemini") {
+                return true;
+            }
+            g.get("buckets")
+                .and_then(Value::as_array)
+                .is_some_and(|bs| {
+                    bs.iter().any(|b| {
+                        b.get("bucketId")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_ascii_lowercase()
+                            .contains("gemini")
+                    })
+                })
+        })
+        .unwrap_or(&groups[0]);
+
+    let buckets = chosen_group.get("buckets")?.as_array()?;
+    let mut metric_5h: Option<QuotaMetric> = None;
+    let mut metric_7d: Option<QuotaMetric> = None;
+    let mut others: Vec<QuotaMetric> = Vec::new();
+
+    for b in buckets {
+        let win_str = b
+            .get("window")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let bid_str = b
+            .get("bucketId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let is_5h = win_str == "5h" || bid_str.ends_with("-5h");
+        let is_7d = win_str == "weekly" || win_str == "7d" || bid_str.ends_with("-weekly");
+        let lbl = if is_5h {
+            "5h".to_string()
+        } else if is_7d {
+            "7d".to_string()
+        } else if !win_str.is_empty() {
+            win_str
+        } else {
+            continue;
+        };
+
+        let raw_rem = (b
+            .get("remainingFraction")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0)
+            * 100.0)
+            .clamp(0.0, 100.0);
+        let resets_at = b
+            .get("resetTime")
+            .and_then(Value::as_str)
+            .and_then(parse_utc_iso8601_secs)
+            .unwrap_or(0);
+        let (rem_pct, detail) = if resets_at > 0 && now_secs >= resets_at {
+            (100.0, None)
+        } else if resets_at > now_secs {
+            (raw_rem, Some(format_duration_short(resets_at - now_secs)))
+        } else {
+            (raw_rem, None)
+        };
+        let metric = QuotaMetric {
+            window_label: lbl,
+            remaining_percent: rem_pct,
+            detail,
+        };
+        if is_5h && metric_5h.is_none() {
+            metric_5h = Some(metric);
+        } else if is_7d && metric_7d.is_none() {
+            metric_7d = Some(metric);
+        } else {
+            others.push(metric);
+        }
+    }
+
+    let mut out = Vec::new();
+    if let Some(m) = metric_5h {
+        out.push(m);
+    }
+    if let Some(m) = metric_7d {
+        out.push(m);
+    }
+    out.extend(others);
+
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn fetch_antigravity_api_quota(now_secs: u64) -> Option<Vec<QuotaMetric>> {
+    let script = r#"
+import ctypes, datetime, json, os, re, shutil, sys, time, urllib.parse, urllib.request
+
+def load_agy_token():
+    lib = None
+    for cand in ("libsecret-1.so.0", "/usr/lib/libsecret-1.so.0", "/usr/lib/x86_64-linux-gnu/libsecret-1.so.0"):
+        try:
+            lib = ctypes.CDLL(cand)
+            break
+        except Exception:
+            pass
+    if lib is None and os.path.isdir("/nix/store"):
+        with os.scandir("/nix/store") as it:
+            for e in it:
+                if "libsecret-" in e.name and not e.name.endswith(".drv"):
+                    p = os.path.join(e.path, "lib/libsecret-1.so.0")
+                    if os.path.exists(p):
+                        try:
+                            lib = ctypes.CDLL(p)
+                            break
+                        except Exception:
+                            pass
+    if lib is not None:
+        try:
+            class SecretSchemaAttribute(ctypes.Structure):
+                _fields_ = [("name", ctypes.c_char_p), ("type", ctypes.c_int)]
+            class SecretSchema(ctypes.Structure):
+                _fields_ = [("name", ctypes.c_char_p), ("flags", ctypes.c_int), ("attributes", SecretSchemaAttribute * 32)]
+            attrs = (SecretSchemaAttribute * 32)()
+            attrs[0] = SecretSchemaAttribute(b"service", 0)
+            attrs[1] = SecretSchemaAttribute(b"username", 0)
+            attrs[2] = SecretSchemaAttribute(None, 0)
+            schema = SecretSchema(b"org.freedesktop.Secret.Generic", 2, attrs)
+            lib.secret_password_lookup_sync.restype = ctypes.c_char_p
+            raw = lib.secret_password_lookup_sync(
+                ctypes.byref(schema), None, None, b"service", b"gemini", b"username", b"antigravity", None
+            )
+            if raw:
+                return json.loads(raw.decode("utf-8", errors="ignore"))
+        except Exception:
+            pass
+    home = os.environ.get("HOME", "")
+    tok_file = os.path.join(home, ".gemini/antigravity-cli/antigravity-oauth-token")
+    if os.path.isfile(tok_file):
+        with open(tok_file, "r", encoding="utf-8", errors="ignore") as f:
+            return json.load(f)
+    return None
+
+def refresh_oauth_token(refresh_token):
+    agy_bin = shutil.which("agy") or "/run/current-system/sw/bin/agy"
+    with open(agy_bin, "rb") as f:
+        blob = f.read()
+    cid_m = re.search(rb"[0-9]{10,}-[a-z0-9]+\.apps\.googleusercontent\.com", blob)
+    csec_m = re.search(rb"GOCSPX-[A-Za-z0-9_-]{24,36}", blob)
+    if not cid_m or not csec_m:
+        return None
+    data = urllib.parse.urlencode({
+        "client_id": cid_m.group(0).decode("ascii"),
+        "client_secret": csec_m.group(0).decode("ascii"),
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
+    }).encode()
+    req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data)
+    return json.loads(urllib.request.urlopen(req, timeout=4).read().decode())["access_token"]
+
+def query_quota(access_token, auth_method):
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "User-Agent": f"antigravity/cli/1.5.3 (aidev_client; os_type=linux; arch=amd64; auth_method={auth_method})",
+        "X-Goog-Api-Client": "gl-go/1.24.0",
+    }
+    req = urllib.request.Request(
+        "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+        data=json.dumps({"project": "aicode-consumers"}).encode(),
+        headers=headers,
+    )
+    return urllib.request.urlopen(req, timeout=4).read().decode("utf-8", errors="ignore")
+
+obj = load_agy_token()
+if not obj:
+    sys.exit(1)
+auth_method = (obj.get("auth_method") or "consumer").strip() or "consumer"
+tok_info = obj.get("token") or {}
+access_token = tok_info.get("access_token")
+refresh_token = tok_info.get("refresh_token")
+expiry_str = tok_info.get("expiry") or ""
+need_refresh = True
+if access_token and expiry_str:
+    try:
+        exp_ts = datetime.datetime.fromisoformat(expiry_str.replace("Z", "+00:00")).timestamp()
+        if exp_ts > time.time() + 60:
+            need_refresh = False
+    except Exception:
+        pass
+
+if need_refresh and refresh_token:
+    access_token = refresh_oauth_token(refresh_token)
+
+if not access_token:
+    sys.exit(1)
+
+try:
+    out = query_quota(access_token, auth_method)
+except Exception:
+    if not need_refresh and refresh_token:
+        access_token = refresh_oauth_token(refresh_token)
+        out = query_quota(access_token, auth_method)
+    else:
+        raise
+
+print(out)
+"#;
+
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_antigravity_quota_summary(&text, now_secs)
+}
+
 fn collect_antigravity_metrics(now_secs: u64, cfg: &QuotaFileConfig) -> Vec<QuotaMetric> {
+    if let Some(api_metrics) = fetch_antigravity_api_quota(now_secs) {
+        return api_metrics;
+    }
+
     let Some(home) = home_dir() else {
         return Vec::new();
     };
@@ -628,18 +913,18 @@ fn collect_antigravity_metrics(now_secs: u64, cfg: &QuotaFileConfig) -> Vec<Quot
         }
     }
 
-    let pct_5h = ((steps_5h as f64 / limit_5h as f64) * 100.0).clamp(0.0, 100.0);
-    let pct_day = ((steps_day as f64 / limit_day as f64) * 100.0).clamp(0.0, 100.0);
+    let used_5h = ((steps_5h as f64 / limit_5h as f64) * 100.0).clamp(0.0, 100.0);
+    let used_day = ((steps_day as f64 / limit_day as f64) * 100.0).clamp(0.0, 100.0);
 
     vec![
         QuotaMetric {
             window_label: "5h".to_string(),
-            used_percent: pct_5h,
+            remaining_percent: (100.0 - used_5h).clamp(0.0, 100.0),
             detail: Some(format!("{steps_5h}/{limit_5h} steps")),
         },
         QuotaMetric {
             window_label: "今日".to_string(),
-            used_percent: pct_day,
+            remaining_percent: (100.0 - used_day).clamp(0.0, 100.0),
             detail: Some(format!("{steps_day}/{limit_day} steps")),
         },
     ]
@@ -662,10 +947,10 @@ fn collect_freebuff_metrics(_now_secs: u64) -> Vec<QuotaMetric> {
             }
         }
     }
-    let pct = ((today_briefs as f64 / 100.0) * 100.0).clamp(0.0, 100.0);
+    let used_pct = ((today_briefs as f64 / 100.0) * 100.0).clamp(0.0, 100.0);
     vec![QuotaMetric {
         window_label: "今日".to_string(),
-        used_percent: pct,
+        remaining_percent: (100.0 - used_pct).clamp(0.0, 100.0),
         detail: Some(format!("{today_briefs} briefs")),
     }]
 }
@@ -713,22 +998,71 @@ mod tests {
     }
 
     #[test]
-    fn parses_codex_rate_limits_and_resets_expired_windows() {
-        let sample = r#"{"timestamp":"2026-11-11T04:00:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","primary":{"used_percent":49.0,"window_minutes":300,"resets_at":2000},"secondary":{"used_percent":12.0,"window_minutes":10080,"resets_at":500000}}}}"#;
+    fn parses_codex_rate_limits_as_remaining_percentage_and_resets_expired_windows() {
+        let sample = r#"{"timestamp":"2026-11-11T04:00:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","primary":{"used_percent":17.0,"window_minutes":300,"resets_at":2000},"secondary":{"used_percent":84.0,"window_minutes":10080,"resets_at":500000}}}}"#;
 
-        // Before `resets_at`: both 5h (49%) and 7d (12%) are active
+        // Before `resets_at`: 5h has 83% remaining (100 - 17), 7d has 16% remaining (100 - 84)
         let metrics = parse_codex_rate_limits_from_jsonl(sample, 1000).unwrap();
         assert_eq!(metrics.len(), 2);
         assert_eq!(metrics[0].window_label, "5h");
-        assert_eq!(metrics[0].used_percent, 49.0);
+        assert_eq!(metrics[0].remaining_percent, 83.0);
         assert_eq!(metrics[0].detail.as_deref(), Some("16m"));
         assert_eq!(metrics[1].window_label, "7d");
-        assert_eq!(metrics[1].used_percent, 12.0);
+        assert_eq!(metrics[1].remaining_percent, 16.0);
 
-        // After primary `resets_at` (2500 >= 2000): 5h window resets to 0%
+        // After primary `resets_at` (2500 >= 2000): 5h window restores to 100% remaining
         let expired = parse_codex_rate_limits_from_jsonl(sample, 2500).unwrap();
-        assert_eq!(expired[0].used_percent, 0.0);
+        assert_eq!(expired[0].remaining_percent, 100.0);
         assert_eq!(expired[0].detail, None);
-        assert_eq!(expired[1].used_percent, 12.0);
+        assert_eq!(expired[1].remaining_percent, 16.0);
+    }
+
+    #[test]
+    fn parses_antigravity_quota_summary_gemini_models_remaining_percentages() {
+        let sample = r#"{
+          "groups": [
+            {
+              "displayName": "Gemini Models",
+              "description": "Models within this group: Gemini Flash, Gemini Pro",
+              "buckets": [
+                {
+                  "bucketId": "gemini-weekly",
+                  "displayName": "Weekly Limit Remaining",
+                  "window": "weekly",
+                  "resetTime": "2026-11-14T00:28:34Z",
+                  "remainingFraction": 0.4396
+                },
+                {
+                  "bucketId": "gemini-5h",
+                  "displayName": "Five Hour Limit Remaining",
+                  "window": "5h",
+                  "resetTime": "2026-11-11T10:41:18Z",
+                  "remainingFraction": 0.9545
+                }
+              ]
+            },
+            {
+              "displayName": "Claude and GPT models",
+              "buckets": [
+                {
+                  "bucketId": "3p-weekly",
+                  "window": "weekly",
+                  "resetTime": "2026-11-12T07:31:10Z",
+                  "remainingFraction": 0.0084
+                }
+              ]
+            }
+          ]
+        }"#;
+
+        let now_secs = parse_utc_iso8601_secs("2026-11-11T06:50:00Z").unwrap();
+        let metrics = parse_antigravity_quota_summary(sample, now_secs).unwrap();
+        assert_eq!(metrics.len(), 2);
+        assert_eq!(metrics[0].window_label, "5h");
+        assert!((metrics[0].remaining_percent - 95.45).abs() < 1e-4);
+        assert_eq!(metrics[0].detail.as_deref(), Some("3h51m"));
+        assert_eq!(metrics[1].window_label, "7d");
+        assert!((metrics[1].remaining_percent - 43.96).abs() < 1e-4);
+        assert_eq!(metrics[1].detail.as_deref(), Some("2d17h"));
     }
 }
