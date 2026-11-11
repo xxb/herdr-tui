@@ -1097,15 +1097,21 @@ def load_agy_token():
 
 def refresh_oauth_token(refresh_token):
     agy_bin = shutil.which("agy") or "/run/current-system/sw/bin/agy"
+    cid_bytes = None
+    csec_bytes = None
     with open(agy_bin, "rb") as f:
-        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-            cid_m = re.search(rb"[0-9]{10,}-[a-z0-9]+\.apps\.googleusercontent\.com", mm)
-            csec_m = re.search(rb"GOCSPX-[A-Za-z0-9_-]{24,36}", mm)
-    if not cid_m or not csec_m:
+        if os.fstat(f.fileno()).st_size > 0:
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                cid_m = re.search(rb"[0-9]{10,}-[a-z0-9]+\.apps\.googleusercontent\.com", mm)
+                csec_m = re.search(rb"GOCSPX-[A-Za-z0-9_-]{24,36}", mm)
+                if cid_m and csec_m:
+                    cid_bytes = cid_m.group(0)
+                    csec_bytes = csec_m.group(0)
+    if not cid_bytes or not csec_bytes:
         return None
     data = urllib.parse.urlencode({
-        "client_id": cid_m.group(0).decode("ascii"),
-        "client_secret": csec_m.group(0).decode("ascii"),
+        "client_id": cid_bytes.decode("ascii"),
+        "client_secret": csec_bytes.decode("ascii"),
         "refresh_token": refresh_token,
         "grant_type": "refresh_token",
     }).encode()

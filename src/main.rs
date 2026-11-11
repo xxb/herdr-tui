@@ -46,6 +46,7 @@ const ATTACH_HISTORY_LINES: usize = SCROLLBACK_LINES;
 const MAX_EVENTS_PER_TICK: usize = 512;
 const CREDIT_FLUSH_THRESHOLD_BYTES: usize = 16 * 1024;
 const SIBLING_RESIZE_DEBOUNCE: Duration = Duration::from_millis(80);
+const ATTACH_RETRY_DELAY: Duration = Duration::from_millis(250);
 const CLIPBOARD_READ_TIMEOUT: Duration = Duration::from_millis(200);
 
 enum AppEvent {
@@ -669,8 +670,27 @@ fn main() -> Result<()> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct SyncOutcome {
     newly_attached_active: bool,
+    active_attach_failed: bool,
     has_unwarmed_siblings: bool,
     has_unresized_siblings: bool,
+}
+
+fn active_needs_sync(
+    want_addr: Option<&str>,
+    active_addr: Option<&str>,
+    attached_has_active: bool,
+    pending_attach_retry: Option<&(String, Instant)>,
+) -> bool {
+    let cur_attached = active_addr.filter(|_| attached_has_active);
+    if want_addr == cur_attached {
+        return false;
+    }
+    if let Some((retry_addr, _)) = pending_attach_retry {
+        if want_addr == Some(retry_addr.as_str()) {
+            return false;
+        }
+    }
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -706,6 +726,7 @@ fn sync_attached_terminals(
         *scrollback_offset = 0;
     }
 
+    let mut resolved_active: Option<String> = None;
     if let Some(ref addr) = want_addr {
         if let Some(cur) = attached_map.get_mut(addr) {
             if cur.cols != cols || cur.rows != rows {
@@ -718,14 +739,18 @@ fn sync_attached_terminals(
                 core.set_focus(cur.channel, true);
                 world.mark_active_seen(core);
             }
+            resolved_active = Some(addr.clone());
         } else if let Ok(ch) = core.attach_terminal(addr, cols, rows, ATTACH_HISTORY_LINES) {
             core.set_focus(ch, true);
             attached_map.insert(addr.clone(), AttachedTerminal::new(ch, cols, rows));
             world.mark_active_seen(core);
             outcome.newly_attached_active = true;
+            resolved_active = Some(addr.clone());
+        } else {
+            outcome.active_attach_failed = true;
         }
     }
-    *active_addr = want_addr;
+    *active_addr = resolved_active;
 
     // Progressively pre-attach sibling terminals in the active space (at most 1 per pass)
     // and debounce background sibling SIGWINCH resizes so active interaction stays 0ms-responsive.
@@ -734,8 +759,7 @@ fn sync_attached_terminals(
         if let Some(space) = world.active_space() {
             for tab in &space.tabs {
                 for addr in world.tab_terminals(tab) {
-                    if Some(addr.as_str()) != active_addr.as_deref()
-                        && !sibling_addrs.contains(&addr)
+                    if Some(addr.as_str()) != want_addr.as_deref() && !sibling_addrs.contains(&addr)
                     {
                         sibling_addrs.push(addr);
                     }
@@ -995,6 +1019,7 @@ fn run_app(
     let mut clipboard_buffer = String::new();
     let mut copied_until: Option<Instant> = None;
     let mut pending_sibling_resize_at: Option<Instant> = None;
+    let mut pending_attach_retry: Option<(String, Instant)> = None;
     let mut last_usage_rev: u64 = 0;
     let mut has_focused_agent = false;
     let mut dirty = true;
@@ -1018,6 +1043,12 @@ fn run_app(
             pending_sibling_resize_at = None;
             need_sync_terminals = true;
         }
+        if pending_attach_retry.as_ref().is_some_and(|(addr, t)| {
+            now >= *t || world.active_terminal_address_ref() != Some(addr.as_str())
+        }) {
+            pending_attach_retry = None;
+            need_sync_terminals = true;
+        }
 
         let area_size = cur_size;
         let area = Rect::new(0, 0, area_size.0, area_size.1);
@@ -1028,10 +1059,18 @@ fn run_app(
             dirty = true;
         }
 
+        let attached_has_active = active_addr
+            .as_ref()
+            .is_some_and(|a| attached_map.contains_key(a));
         let mut newly_attached_active = false;
         if need_sync_terminals
             || world.doc_version != last_synced_doc_version
-            || world.active_terminal_address_ref() != active_addr.as_deref()
+            || active_needs_sync(
+                world.active_terminal_address_ref(),
+                active_addr.as_deref(),
+                attached_has_active,
+                pending_attach_retry.as_ref(),
+            )
         {
             let prev_addr = active_addr.clone();
             let allow_sibling_resize = pending_sibling_resize_at.is_none();
@@ -1048,6 +1087,13 @@ fn run_app(
             last_synced_doc_version = world.doc_version;
             newly_attached_active = sync_out.newly_attached_active;
             need_sync_terminals = sync_out.has_unwarmed_siblings;
+            if sync_out.active_attach_failed {
+                pending_attach_retry = world
+                    .active_terminal_address()
+                    .map(|want| (want, Instant::now() + ATTACH_RETRY_DELAY));
+            } else {
+                pending_attach_retry = None;
+            }
             if sync_out.has_unresized_siblings && pending_sibling_resize_at.is_none() {
                 pending_sibling_resize_at = Some(Instant::now() + SIBLING_RESIZE_DEBOUNCE);
             }
@@ -1073,7 +1119,8 @@ fn run_app(
             } else {
                 None
             };
-            for deadline in [copied_until, pending_sibling_resize_at]
+            let retry_deadline = pending_attach_retry.as_ref().map(|(_, t)| *t);
+            for deadline in [copied_until, pending_sibling_resize_at, retry_deadline]
                 .into_iter()
                 .flatten()
             {
@@ -1094,6 +1141,14 @@ fn run_app(
                         }
                         if pending_sibling_resize_at.is_some_and(|t| after >= t) {
                             pending_sibling_resize_at = None;
+                            need_sync_terminals = true;
+                            continue;
+                        }
+                        if pending_attach_retry
+                            .as_ref()
+                            .is_some_and(|(_, t)| after >= *t)
+                        {
+                            pending_attach_retry = None;
                             need_sync_terminals = true;
                             continue;
                         }
@@ -1884,7 +1939,16 @@ fn run_app(
 
                     // Break batch early if the active terminal switched so `sync_attached_terminals`
                     // updates `active_addr` before any subsequent input events in the queue.
-                    if world.active_terminal_address_ref() != active_addr.as_deref() {
+                    let has_active_att = active_addr
+                        .as_ref()
+                        .is_some_and(|a| attached_map.contains_key(a));
+                    if active_needs_sync(
+                        world.active_terminal_address_ref(),
+                        active_addr.as_deref(),
+                        has_active_att,
+                        pending_attach_retry.as_ref(),
+                    ) {
+                        pending_attach_retry = None;
                         need_sync_terminals = true;
                         more_events = true;
                         break;
@@ -1925,10 +1989,19 @@ fn run_app(
 
         // If the active terminal or viewport dimensions changed while draining events,
         // resync immediately before drawing so the tab header and terminal screen never mismatch.
+        let has_active_att = active_addr
+            .as_ref()
+            .is_some_and(|a| attached_map.contains_key(a));
         if !resynced_this_frame
             && (cur_size != area_size
-                || world.active_terminal_address_ref() != active_addr.as_deref())
+                || active_needs_sync(
+                    world.active_terminal_address_ref(),
+                    active_addr.as_deref(),
+                    has_active_att,
+                    pending_attach_retry.as_ref(),
+                ))
         {
+            pending_attach_retry = None;
             resynced_this_frame = true;
             need_sync_terminals = true;
             continue;
@@ -2447,5 +2520,20 @@ mod tests {
         let timed_out = run_clipboard_read_cmd("sh", &["-c", "sleep 5"], Duration::from_millis(40));
         assert!(timed_out.is_none());
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn active_needs_sync_tracks_missing_attachments_and_respects_retry_backoff() {
+        let retry_t1 = ("t1".to_string(), Instant::now() + ATTACH_RETRY_DELAY);
+
+        // Healthy attached active terminal needs no sync
+        assert!(!active_needs_sync(Some("t1"), Some("t1"), true, None));
+        // Missing channel for active address triggers sync when not in backoff
+        assert!(active_needs_sync(Some("t1"), None, false, None));
+        assert!(active_needs_sync(Some("t1"), Some("t1"), false, None));
+        // Active backoff suppresses immediate tight-loop retries for the same terminal
+        assert!(!active_needs_sync(Some("t1"), None, false, Some(&retry_t1)));
+        // Switching to a different terminal bypasses the previous terminal's retry backoff immediately
+        assert!(active_needs_sync(Some("t2"), None, false, Some(&retry_t1)));
     }
 }
