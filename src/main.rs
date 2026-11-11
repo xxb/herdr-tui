@@ -2,6 +2,7 @@ mod core;
 mod keys;
 mod model;
 mod ui;
+mod usage;
 mod wire;
 
 use crate::core::{CoreClient, CoreMessage};
@@ -12,9 +13,10 @@ use crate::keys::{
 use crate::model::World;
 use crate::ui::{
     collect_fuzzy_items, compute_terminal_rect, find_hit_target, is_on_dpad_disc,
-    render_ui_with_pads, resolve_dpad_disc_rect, resolve_fuzzy_selection, resolve_mod_cross_rect,
-    HitRegion, HitTarget, Modal, PromptKind, TerminalSelection,
+    render_ui_with_pads_and_quota, resolve_dpad_disc_rect, resolve_fuzzy_selection,
+    resolve_mod_cross_rect, HitRegion, HitTarget, Modal, PromptKind, TerminalSelection,
 };
+use crate::usage::UsageTracker;
 use anyhow::Result;
 use clap::Parser;
 use crossterm::{
@@ -439,11 +441,14 @@ fn main() -> Result<()> {
         initial_area.width >= mobile_threshold
     };
 
+    let usage_tracker = UsageTracker::new(file_cfg.quota.clone());
+
     let res = run_app(
         &mut terminal,
         &core,
         &core_rx,
         &mut world,
+        &usage_tracker,
         &prefix_spec,
         &mut sidebar_open,
         sidebar_width,
@@ -688,6 +693,7 @@ fn run_app(
     core: &CoreClient,
     core_rx: &std::sync::mpsc::Receiver<CoreMessage>,
     world: &mut World,
+    usage_tracker: &UsageTracker,
     prefix_spec: &str,
     sidebar_open: &mut bool,
     sidebar_width: u16,
@@ -712,6 +718,7 @@ fn run_app(
     let mut selection_screen: Option<vt100::Screen> = None;
     let mut clipboard_buffer = String::new();
     let mut copied_until: Option<Instant> = None;
+    let mut last_usage_rev: u64 = 0;
     let mut dirty = true;
     let mut prev_width = terminal.size()?.width;
 
@@ -865,6 +872,13 @@ fn run_app(
             scrollback_offset = att.parser.screen().scrollback();
         }
 
+        let focused_quota = usage_tracker.focused_quota(world);
+        let cur_usage_rev = usage_tracker.revision();
+        if cur_usage_rev != last_usage_rev {
+            last_usage_rev = cur_usage_rev;
+            dirty = true;
+        }
+
         if dirty {
             let active_att = active_addr.as_ref().and_then(|a| attached_map.get(a));
             let scr_ref = if selection.as_ref().is_some_and(|s| s.active) {
@@ -878,7 +892,7 @@ fn run_app(
             let mod_dragging = dpad_drag.as_ref().is_some_and(|d| d.is_mod && d.moved);
             let dpad_dragging = dpad_drag.as_ref().is_some_and(|d| !d.is_mod && d.moved);
             terminal.draw(|f| {
-                let geom = render_ui_with_pads(
+                let geom = render_ui_with_pads_and_quota(
                     f,
                     world,
                     scr_ref,
@@ -896,6 +910,7 @@ fn run_app(
                     mod_dragging,
                     dpad_pos,
                     dpad_dragging,
+                    focused_quota.as_ref(),
                 );
                 last_hits = geom.hits;
                 last_mod_rect = geom.mod_rect;
