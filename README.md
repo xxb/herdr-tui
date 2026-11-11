@@ -14,7 +14,7 @@ A fast, lightweight **multi-tab TUI client** for [`herdr-core` (`hc`)](https://g
 - **Bidirectional Official Client Sync (与官方客户端双向实时同步)**
   Reads and writes `herdr-core`'s `doc("herdr-app")` layout document directly. Spaces and Tabs created, renamed, or closed in `hct` immediately appear in the official Herdr Android / Desktop client, and vice versa.
 - **Top `Space / Tab1 / Tab2 / [+]` Bar + Secondary Space Popover (顶部 Space/Tab 状态栏 + 二级浮层菜单)**
-  - **Top Tab Bar**: Displays `[ ▾ Space ] ╱ [ ● 1:tab1 ] [ ○ 2:tab2 ] [ + ] ... [ ? ]` along the top edge.
+  - **Top Tab Bar**: Displays `[ ⏏ ] [ ▾ Space ] ╱ [ ● 1:tab1 ] [ ○ 2:tab2 ] [ + ] ... [ ? ]` along the top edge, with `[ ⏏ ]` on the far left for one-tap detach (`^b q`).
   - **Secondary Space Popover (`^b b` or Tap `[ ▾ Space ]`)**: Tapping the Space button opens a floating popover menu listing all Spaces with live Agent status and a `[ + New Space ]` button—eliminating the need for a permanent Left Sidebar so the terminal viewport always enjoys 100% horizontal width.
   - **Direct Tab Switching & `[ + ]` New Tab**: Tap any Tab pill on the top bar to switch directly to that Tab, or tap `[ + ]` on the right of the tabs to add a new Tab.
 - **Dual Floating Draggable Semi-Transparent `+` Cross Pads (`hct --touch` 开启双悬浮可拖动半透明十字按钮盘)**
@@ -26,7 +26,7 @@ A fast, lightweight **multi-tab TUI client** for [`herdr-core` (`hc`)](https://g
   - Displays **only** the currently focused Agent's quota remaining percentage (`剩余百分比`) with an 8-step Unicode fractional block progress bar (e.g. `Codex  5h ██████▋░ 83% (3h12m)  ·  7d █▎░░░░░░ 16% (5d04h)`, `Antigravity  5h ███████▋ 95% (3h51m)  ·  7d ███▌░░░░ 44% (2d17h)`, `OpenCode  今日 ██████▉░ 86% (28/200 · 142k)`), never exceeding 1 line, without repeating status/CWD/turn info that the agent TUI already shows, plus `[ ✓ Copied ]` and clickable `[ ▼ BOT (+N) ]` when viewing scrollback.
 - **Touch & Mouse Friendly for iPad / Mobile SSH (触控与鼠标丝滑切换)**
   - **Touch Drag Text Selection + Auto Copy over SSH (手指拖动选字自动复制)**: Drag across terminal text with your finger (or mouse) to highlight text in real time; releasing automatically copies the selected text to the remote SSH client's system clipboard via OSC 52 (and local clipboard when available) and flashes `[✓ Copied]`.
-  - **3-Row Large Touch Top Bar**: Uses a 3-row beveled top bar for comfortable finger hit targets.
+  - **2-Row Compact Touch Top Bar**: Uses a 2-row beveled top bar for comfortable finger hit targets without wasting vertical screen space.
   - **Touch-Interactive Modals**: Directly tap items in the Space Popover (`^b b`) or Fuzzy Switcher (`^b w`), tap Confirm/Cancel buttons in dialogs, or tap any of the 12 quick-action buttons in the `[ ? ]` panel.
 - **Classic `herdr` Keybindings (兼容旧版 `herdr` 快捷键)**
   Compatible with `~/.config/herdr/config.toml` and `~/.config/herdr-tui/config.toml`.
@@ -53,7 +53,7 @@ A fast, lightweight **multi-tab TUI client** for [`herdr-core` (`hc`)](https://g
 | **Cycle Pane in Split Tab** (多窗格轮换) | `^b o` | — |
 | **Scrollback Mode** (历史回滚查看) | `^b [` | Mouse Wheel Up / Down |
 | **Help Overlay** (快捷键帮助) | `^b ?` | Tap `[ ? ]` on top tab bar |
-| **Detach `hct`** (脱离并保持后台运行) | `^b q` (or `^b d`) | `Ctrl+\` |
+| **Detach `hct`** (脱离并保持后台运行) | `^b q` (or `^b d`) | `Ctrl+\` or Tap `[ ⏏ ]` on top tab bar |
 
 ---
 

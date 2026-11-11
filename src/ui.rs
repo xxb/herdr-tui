@@ -355,8 +355,6 @@ impl TerminalSelection {
 pub fn top_bar_height(area: Rect, _touch_mode: bool) -> u16 {
     if area.height <= 1 {
         0
-    } else if area.height >= 10 {
-        3
     } else if area.height >= 6 {
         2
     } else {
@@ -730,13 +728,37 @@ fn render_top_tabbar(
         );
     }
 
+    let detach_lbl = if rect.width < 48 { " ⏏ " } else { "  ⏏  " };
+    let detach_w = detach_lbl.width() as u16;
     let help_lbl = if rect.width < 48 { " ? " } else { "  ?  " };
     let help_w = help_lbl.width() as u16;
     let plus_lbl = if rect.width < 48 { " + " } else { "  +  " };
     let plus_w = plus_lbl.width() as u16;
     let avail_end = max_x.saturating_sub(help_w.min(rect.width.saturating_sub(4)));
 
-    // 1. Far Left: Space selector button (`[ ▾ SpaceName ]`) — opens secondary Space popover menu
+    // 0. Far Left: Detach button (`[ ⏏ ]`) — equivalent to `^b q` (`Action::Detach`)
+    if detach_w > 0 && x + detach_w <= max_x {
+        let dstyle = Style::default()
+            .bg(Color::Rgb(48, 28, 38))
+            .fg(Color::Rgb(247, 118, 142))
+            .add_modifier(Modifier::BOLD);
+        draw_touchbar_pill(buf, x, rect, detach_lbl, dstyle, false);
+        hits.push(HitRegion {
+            rect: Rect {
+                x,
+                y: rect.y,
+                width: detach_w,
+                height: rect.height,
+            },
+            target: HitTarget::TriggerAction(Action::Detach),
+        });
+        x += detach_w;
+        if rect.width >= 48 && x + 1 < avail_end {
+            x += 1;
+        }
+    }
+
+    // 1. Space selector button (`[ ▾ SpaceName ]`) — opens secondary Space popover menu
     let (sname, sstate) = world
         .active_space()
         .map(|s| (world.space_display_name(s), world.space_state(s)))
@@ -758,11 +780,15 @@ fn render_top_tabbar(
             truncate_to_width(&sname, max_space_w.saturating_sub(6))
         )
     };
+    let space_fit = avail_end.saturating_sub(x) as usize;
     let space_budget = avail_end.saturating_sub(x).saturating_sub(plus_w + 2);
     let space_lbl = if (raw_space_lbl.width() as u16) <= space_budget {
         raw_space_lbl
     } else {
-        truncate_to_width(&raw_space_lbl, space_budget.max(4) as usize)
+        truncate_to_width(
+            &raw_space_lbl,
+            (space_budget as usize).max(4).min(space_fit),
+        )
     };
     let space_w = space_lbl.width() as u16;
     if space_w > 0 && x + space_w <= max_x {
@@ -2106,6 +2132,7 @@ fn render_help_modal(f: &mut Frame, area: Rect, hits: &mut Vec<HitRegion>) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )),
+        Line::from("  Top Bar [ ⏏ ]            Detach hct while keeping sessions running (^b q)"),
         Line::from("  Top Bar [ ▾ Space ]      Open secondary Space popover menu / + New Space"),
         Line::from("  Top Bar [ Tab ] / [ + ]  Switch directly to Tab or add a new Tab"),
         Line::from("  Left Floating Cross (+)  Tap Esc / Ctl / ^B / Alt / Tab (drag to move)"),
@@ -2121,7 +2148,7 @@ fn render_help_modal(f: &mut Frame, area: Rect, hits: &mut Vec<HitRegion>) {
         Line::from("  Quick Fuzzy Switcher     ^b w          or  ^b f"),
         Line::from("  Jump Next Alert Agent    ^b a          (◉ blocked / ✓ done)"),
         Line::from("  Scrollback / History     ^b [          or  Tap [▼ BOT] on status bar"),
-        Line::from("  Detach (keep running)    ^b q / ^b d   or  Ctrl+\\"),
+        Line::from("  Detach (keep running)    ^b q / ^b d   or  Ctrl+\\ / Tap [ ⏏ ]"),
         Line::from(""),
         Line::from(Span::styled(
             "  Tap outside, [ ✕ ], Esc, Enter, or ? to close",
@@ -2476,7 +2503,7 @@ mod tests {
                     None,
                     false,
                     24,
-                    true, // touch_mode = true (3-row top tabbar + 1-row bottom status bar)
+                    true, // touch_mode = true (2-row top tabbar + 1-row bottom status bar)
                     false,
                     false,
                     false,
@@ -2490,31 +2517,41 @@ mod tests {
                 dpad_rect_out = geom.dpad_rect;
                 assert_eq!(geom.term_rect.x, 0);
                 assert_eq!(geom.term_rect.width, 100);
-                assert_eq!(geom.term_rect.y, 3);
-                assert_eq!(geom.term_rect.height, 20);
+                assert_eq!(geom.term_rect.y, 2);
+                assert_eq!(geom.term_rect.height, 21);
             })
             .unwrap();
 
-        // Top Bar Space selector on rows 0..2 should hit ToggleSpaceMenu
+        // Far-left button (`[ ⏏ ]`) on rows 0..1 triggers Detach (`^b q`)
         assert_eq!(
             find_hit_target(&hits, 1, 0),
+            Some(HitTarget::TriggerAction(Action::Detach))
+        );
+        assert_eq!(
+            find_hit_target(&hits, 1, 1),
+            Some(HitTarget::TriggerAction(Action::Detach))
+        );
+
+        // Top Bar Space selector right after `[ ⏏ ]` on rows 0..1 should hit ToggleSpaceMenu
+        assert_eq!(
+            find_hit_target(&hits, 7, 0),
             Some(HitTarget::ToggleSpaceMenu)
         );
         assert_eq!(
-            find_hit_target(&hits, 1, 2),
+            find_hit_target(&hits, 7, 1),
             Some(HitTarget::ToggleSpaceMenu)
         );
 
-        // Top Bar exposes Tab pill, [ + ] (NewTab), and [ ? ] (ToggleHelp)
+        // Top Bar exposes 2-row Tab pill, [ + ] (NewTab), and [ ? ] (ToggleHelp)
         assert!(hits
             .iter()
-            .any(|h| matches!(h.target, HitTarget::SelectTab { .. }) && h.rect.height == 3));
+            .any(|h| matches!(h.target, HitTarget::SelectTab { .. }) && h.rect.height == 2));
         assert!(hits
             .iter()
-            .any(|h| h.target == HitTarget::NewTab && h.rect.height == 3 && h.rect.y == 0));
+            .any(|h| h.target == HitTarget::NewTab && h.rect.height == 2 && h.rect.y == 0));
         assert!(hits
             .iter()
-            .any(|h| h.target == HitTarget::ToggleHelp && h.rect.height == 3 && h.rect.y == 0));
+            .any(|h| h.target == HitTarget::ToggleHelp && h.rect.height == 2 && h.rect.y == 0));
 
         // Bottom 1-row read-only Agent Status Bar exposes ExitScrollback on row 23
         assert!(hits.iter().any(|h| h.target == HitTarget::ExitScrollback
@@ -2685,6 +2722,10 @@ mod tests {
         assert!(g_no.dpad_rect.is_none());
         assert_eq!(
             find_hit_target(&hits_no_touch, 1, 0),
+            Some(HitTarget::TriggerAction(Action::Detach))
+        );
+        assert_eq!(
+            find_hit_target(&hits_no_touch, 4, 0),
             Some(HitTarget::ToggleSpaceMenu)
         );
         assert!(hits_no_touch.iter().any(|h| h.target == HitTarget::NewTab));
@@ -2857,9 +2898,9 @@ mod tests {
             assert!(is_on_dpad_disc(Some(disc), disc.x + 7, disc.y + 3));
         }
 
-        // Constrained viewports (e.g. 80x9 with 3-row touchbar -> 6-row viewport, or 30x8 with open sidebar)
+        // Constrained viewports (e.g. 80x8 with 2-row top tabbar -> 5-row viewport, or 30x8)
         // scale down the + cross so all 4 directions and centered Paste remain accessible.
-        for (w, h, sidebar_open) in [(80u16, 9u16, false), (30u16, 8u16, true)] {
+        for (w, h, sidebar_open) in [(80u16, 8u16, false), (30u16, 8u16, true)] {
             let backend = TestBackend::new(w, h);
             let mut terminal = Terminal::new(backend).unwrap();
             let world = World::default();
