@@ -19,7 +19,7 @@ const AGY_CACHE_TTL: Duration = Duration::from_secs(30);
 
 fn cache_ttl_for_agent(kind: AgentKind) -> Duration {
     match kind {
-        AgentKind::Antigravity => AGY_CACHE_TTL,
+        AgentKind::Codex | AgentKind::Antigravity => AGY_CACHE_TTL,
         _ => CACHE_TTL,
     }
 }
@@ -407,10 +407,113 @@ pub fn parse_codex_rate_limits_from_jsonl(text: &str, now_secs: u64) -> Option<V
     None
 }
 
+pub fn parse_codex_wham_usage_json(text: &str, now_secs: u64) -> Option<Vec<QuotaMetric>> {
+    let val: Value = serde_json::from_str(text.trim()).ok()?;
+    let rl = val.get("rate_limit")?;
+    if rl.is_null() {
+        return None;
+    }
+    let mut metrics = Vec::new();
+    for (key, default_lbl) in [("primary_window", "5h"), ("secondary_window", "7d")] {
+        let Some(win) = rl.get(key) else {
+            continue;
+        };
+        if win.is_null() {
+            continue;
+        }
+        let win_secs = win
+            .get("limit_window_seconds")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let lbl = match win_secs {
+            18_000 => "5h".to_string(),
+            604_800 => "7d".to_string(),
+            86_400 => "1d".to_string(),
+            s if s > 0 && s % 3_600 == 0 => format!("{}h", s / 3_600),
+            _ => default_lbl.to_string(),
+        };
+        let raw_used_pct = win
+            .get("used_percent")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let raw_rem_pct = (100.0 - raw_used_pct).clamp(0.0, 100.0);
+        let reset_at = win.get("reset_at").and_then(Value::as_u64).unwrap_or(0);
+        let reset_after = win
+            .get("reset_after_seconds")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let (rem_pct, detail) = if reset_at > 0 && now_secs >= reset_at {
+            (100.0, None)
+        } else if reset_at > now_secs {
+            (
+                raw_rem_pct,
+                Some(format_duration_short(reset_at - now_secs)),
+            )
+        } else if reset_after > 0 {
+            (raw_rem_pct, Some(format_duration_short(reset_after)))
+        } else {
+            (raw_rem_pct, None)
+        };
+        metrics.push(QuotaMetric {
+            window_label: lbl,
+            remaining_percent: rem_pct,
+            detail,
+        });
+    }
+    if metrics.is_empty() {
+        None
+    } else {
+        Some(metrics)
+    }
+}
+
+fn fetch_codex_wham_usage(home: &Path, now_secs: u64) -> Option<Vec<QuotaMetric>> {
+    let auth_path = home.join(".codex/auth.json");
+    if !auth_path.is_file() {
+        return None;
+    }
+    let script = r#"
+import json, sys, urllib.request
+auth_path = sys.argv[1]
+with open(auth_path, "r", encoding="utf-8", errors="ignore") as f:
+    auth = json.load(f)
+tokens = auth.get("tokens") or {}
+access_token = tokens.get("access_token")
+if not access_token:
+    sys.exit(1)
+headers = {
+    "Authorization": f"Bearer {access_token}",
+    "User-Agent": "codex-cli",
+}
+account_id = tokens.get("account_id")
+if account_id:
+    headers["ChatGPT-Account-Id"] = account_id
+req = urllib.request.Request("https://chatgpt.com/backend-api/wham/usage", headers=headers)
+out = urllib.request.urlopen(req, timeout=4).read().decode("utf-8", errors="ignore")
+print(out)
+"#;
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(&auth_path)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_codex_wham_usage_json(&text, now_secs)
+}
+
 fn collect_codex_metrics(now_secs: u64) -> Vec<QuotaMetric> {
     let Some(home) = home_dir() else {
         return Vec::new();
     };
+    if let Some(wham_metrics) = fetch_codex_wham_usage(&home, now_secs) {
+        return wham_metrics;
+    }
     let sessions_dir = home.join(".codex/sessions");
     let mut files = Vec::new();
     let min_mtime = SystemTime::now().checked_sub(Duration::from_secs(7 * 86_400));
@@ -1015,6 +1118,17 @@ mod tests {
         assert_eq!(expired[0].remaining_percent, 100.0);
         assert_eq!(expired[0].detail, None);
         assert_eq!(expired[1].remaining_percent, 16.0);
+
+        // Also verify live `/backend-api/wham/usage` JSON parsing
+        let wham_sample = r#"{"rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":17,"limit_window_seconds":18000,"reset_after_seconds":10860,"reset_at":11860},"secondary_window":{"used_percent":84,"limit_window_seconds":604800,"reset_after_seconds":446400,"reset_at":447400}}}"#;
+        let wham_metrics = parse_codex_wham_usage_json(wham_sample, 1000).unwrap();
+        assert_eq!(wham_metrics.len(), 2);
+        assert_eq!(wham_metrics[0].window_label, "5h");
+        assert_eq!(wham_metrics[0].remaining_percent, 83.0);
+        assert_eq!(wham_metrics[0].detail.as_deref(), Some("3h01m"));
+        assert_eq!(wham_metrics[1].window_label, "7d");
+        assert_eq!(wham_metrics[1].remaining_percent, 16.0);
+        assert_eq!(wham_metrics[1].detail.as_deref(), Some("5d04h"));
     }
 
     #[test]
