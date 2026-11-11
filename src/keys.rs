@@ -64,9 +64,10 @@ pub struct KeysFileConfig {
 impl FileConfig {
     pub fn load() -> Self {
         let mut paths = Vec::new();
-        if let Some(cfg_dir) = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| {
-            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config"))
-        }) {
+        if let Some(cfg_dir) = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        {
             paths.push(cfg_dir.join("herdr-tui/config.toml"));
             paths.push(cfg_dir.join("herdr/config.toml"));
         }
@@ -302,17 +303,13 @@ mod tests {
 
     #[test]
     fn encode_key_event_preserves_combined_modifiers() {
-        let ctrl_shift_left = KeyEvent::new(
-            KeyCode::Left,
-            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-        );
+        let ctrl_shift_left =
+            KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
         assert_eq!(encode_key_event(&ctrl_shift_left, false), b"\x1b[1;6D");
         assert_eq!(encode_key_event(&ctrl_shift_left, true), b"\x1b[1;6D");
 
-        let alt_shift_right = KeyEvent::new(
-            KeyCode::Right,
-            KeyModifiers::ALT | KeyModifiers::SHIFT,
-        );
+        let alt_shift_right =
+            KeyEvent::new(KeyCode::Right, KeyModifiers::ALT | KeyModifiers::SHIFT);
         assert_eq!(encode_key_event(&alt_shift_right, false), b"\x1b[1;4C");
 
         let plain_up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);

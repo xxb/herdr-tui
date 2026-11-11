@@ -10,7 +10,7 @@ use crate::keys::{
     encode_key_event, is_prefix_key, match_direct_action, match_prefix_action, prefix_bytes,
     Action, FileConfig,
 };
-use crate::model::World;
+use crate::model::{EventDisposition, World};
 use crate::ui::{
     collect_fuzzy_items, compute_terminal_rect, find_hit_target, is_on_dpad_disc,
     render_ui_with_pads_and_quota, resolve_dpad_disc_rect, resolve_fuzzy_selection,
@@ -25,20 +25,44 @@ use crossterm::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
         Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    execute, queue,
+    terminal::{
+        disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
+        EnterAlternateScreen, LeaveAlternateScreen,
+    },
 };
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthChar;
 
 const SCROLLBACK_LINES: usize = 2000;
 const ATTACH_HISTORY_LINES: usize = SCROLLBACK_LINES;
-const MAX_MSGS_PER_TICK: usize = 256;
+const MAX_EVENTS_PER_TICK: usize = 512;
+const CREDIT_FLUSH_THRESHOLD_BYTES: usize = 16 * 1024;
+const SIBLING_RESIZE_DEBOUNCE: Duration = Duration::from_millis(80);
+const ATTACH_RETRY_DELAY: Duration = Duration::from_millis(250);
+const CLIPBOARD_READ_TIMEOUT: Duration = Duration::from_millis(200);
+
+enum AppEvent {
+    Core(CoreMessage),
+    Input(Event),
+    QuotaUpdated,
+}
+
+fn should_forward_input_event(ev: &Event) -> bool {
+    match ev {
+        Event::Mouse(mev) => !matches!(mev.kind, MouseEventKind::Moved),
+        Event::Key(kev) => kev.kind == KeyEventKind::Press,
+        Event::FocusGained | Event::FocusLost => false,
+        Event::Resize(_, _) | Event::Paste(_) => true,
+    }
+}
 
 struct TerminalCleanupGuard;
 
@@ -48,6 +72,7 @@ impl Drop for TerminalCleanupGuard {
         let mut stdout = io::stdout();
         let _ = execute!(
             stdout,
+            EndSynchronizedUpdate,
             DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen,
@@ -91,6 +116,7 @@ struct AttachedTerminal {
     rows: u16,
     utf8_tail: Vec<u8>,
     prev_width1_symbol: bool,
+    vt_seq: u64,
 }
 
 impl AttachedTerminal {
@@ -102,17 +128,15 @@ impl AttachedTerminal {
             rows,
             utf8_tail: Vec::new(),
             prev_width1_symbol: false,
+            vt_seq: 0,
         }
     }
 
     fn process_vt_bytes(&mut self, payload: &[u8]) {
-        let clean = sanitize_vt_stream(
-            payload,
-            &mut self.utf8_tail,
-            &mut self.prev_width1_symbol,
-        );
+        let clean = sanitize_vt_stream(payload, &mut self.utf8_tail, &mut self.prev_width1_symbol);
         if !clean.is_empty() {
             self.parser.process(&clean);
+            self.vt_seq = self.vt_seq.wrapping_add(1);
         }
     }
 }
@@ -422,6 +446,53 @@ fn copy_to_clipboard(text: &str) {
     });
 }
 
+fn run_clipboard_read_cmd(prog: &str, args: &[&str], timeout: Duration) -> Option<String> {
+    let mut child = Command::new(prog)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let res = io::Read::read_to_end(&mut stdout, &mut buf).map(|_| buf);
+        let _ = tx.send(res);
+    });
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let rem = deadline.saturating_duration_since(Instant::now());
+                let buf = rx
+                    .recv_timeout(rem.max(Duration::from_millis(10)))
+                    .ok()?
+                    .ok()?;
+                let s = String::from_utf8_lossy(&buf).into_owned();
+                return (!s.is_empty()).then_some(s);
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 fn read_clipboard_text(fallback: &str) -> String {
     if std::env::var_os("SSH_CONNECTION").is_none() && std::env::var_os("SSH_TTY").is_none() {
         let local_cmds: &[(&str, &[&str])] = &[
@@ -436,18 +507,8 @@ fn read_clipboard_text(fallback: &str) -> String {
             if *prog == "xclip" && std::env::var_os("DISPLAY").is_none() {
                 continue;
             }
-            if let Ok(output) = Command::new(prog)
-                .args(*args)
-                .stdin(Stdio::null())
-                .stderr(Stdio::null())
-                .output()
-            {
-                if output.status.success() {
-                    let s = String::from_utf8_lossy(&output.stdout).into_owned();
-                    if !s.is_empty() {
-                        return s;
-                    }
-                }
+            if let Some(s) = run_clipboard_read_cmd(prog, args, CLIPBOARD_READ_TIMEOUT) {
+                return s;
             }
         }
     }
@@ -510,7 +571,9 @@ fn main() -> Result<()> {
         file_cfg.ui.touch_mode.unwrap_or(false)
     };
 
-    let (core, core_rx) = CoreClient::connect(cli.session.as_deref())?;
+    let (app_tx, app_rx) = mpsc::channel::<AppEvent>();
+    let core =
+        CoreClient::connect_with_sender(cli.session.as_deref(), app_tx.clone(), AppEvent::Core)?;
     let snapshot = core.subscribe_events()?;
 
     let mut world = World::default();
@@ -520,7 +583,7 @@ fn main() -> Result<()> {
     // restores raw mode, alternate screen, mouse capture, and cursor visibility.
     enable_raw_mode()?;
     let _cleanup_guard = TerminalCleanupGuard;
-    let mut stdout = io::stdout();
+    let mut stdout = BufWriter::with_capacity(64 * 1024, io::stdout());
     execute!(
         stdout,
         EnterAlternateScreen,
@@ -542,12 +605,37 @@ fn main() -> Result<()> {
         initial_area.width >= mobile_threshold
     };
 
-    let usage_tracker = UsageTracker::new(file_cfg.quota.clone());
+    let quota_tx = app_tx.clone();
+    let usage_tracker = UsageTracker::new_with_waker(file_cfg.quota.clone(), move || {
+        let _ = quota_tx.send(AppEvent::QuotaUpdated);
+    });
+
+    let input_running = Arc::new(AtomicBool::new(true));
+    let input_flag = Arc::clone(&input_running);
+    let input_tx = app_tx;
+    let input_thread = std::thread::spawn(move || {
+        while input_flag.load(Ordering::Relaxed) {
+            match event::poll(Duration::from_millis(25)) {
+                Ok(true) => match event::read() {
+                    Ok(ev) => {
+                        if should_forward_input_event(&ev)
+                            && input_tx.send(AppEvent::Input(ev)).is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                },
+                Ok(false) => {}
+                Err(_) => break,
+            }
+        }
+    });
 
     let res = run_app(
         &mut terminal,
         &core,
-        &core_rx,
+        &app_rx,
         &mut world,
         &usage_tracker,
         &prefix_spec,
@@ -557,19 +645,55 @@ fn main() -> Result<()> {
         touch_mode,
     );
 
+    input_running.store(false, Ordering::Relaxed);
+    drop(app_rx);
+    let _ = input_thread.join();
+
     // Restore terminal cleanly
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        DisableBracketedPaste,
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    )?;
-    terminal.show_cursor()?;
+    if disable_raw_mode().is_ok()
+        && execute!(
+            terminal.backend_mut(),
+            EndSynchronizedUpdate,
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        )
+        .is_ok()
+        && terminal.show_cursor().is_ok()
+    {
+        std::mem::forget(_cleanup_guard);
+    }
 
     res
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SyncOutcome {
+    newly_attached_active: bool,
+    active_attach_failed: bool,
+    has_unwarmed_siblings: bool,
+    has_unresized_siblings: bool,
+}
+
+fn active_needs_sync(
+    want_addr: Option<&str>,
+    active_addr: Option<&str>,
+    attached_has_active: bool,
+    pending_attach_retry: Option<&(String, Instant)>,
+) -> bool {
+    let cur_attached = active_addr.filter(|_| attached_has_active);
+    if want_addr == cur_attached {
+        return false;
+    }
+    if let Some((retry_addr, _)) = pending_attach_retry {
+        if want_addr == Some(retry_addr.as_str()) {
+            return false;
+        }
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
 fn sync_attached_terminals(
     core: &CoreClient,
     world: &mut World,
@@ -577,8 +701,10 @@ fn sync_attached_terminals(
     active_addr: &mut Option<String>,
     term_rect: Rect,
     scrollback_offset: &mut usize,
-    preattach_siblings: bool,
-) -> bool {
+    warm_siblings: bool,
+    resize_siblings: bool,
+) -> SyncOutcome {
+    let mut outcome = SyncOutcome::default();
     let cols = term_rect.width.max(1);
     let rows = term_rect.height.max(1);
 
@@ -600,7 +726,7 @@ fn sync_attached_terminals(
         *scrollback_offset = 0;
     }
 
-    let mut newly_attached_active = false;
+    let mut resolved_active: Option<String> = None;
     if let Some(ref addr) = want_addr {
         if let Some(cur) = attached_map.get_mut(addr) {
             if cur.cols != cols || cur.rows != rows {
@@ -613,58 +739,68 @@ fn sync_attached_terminals(
                 core.set_focus(cur.channel, true);
                 world.mark_active_seen(core);
             }
+            resolved_active = Some(addr.clone());
         } else if let Ok(ch) = core.attach_terminal(addr, cols, rows, ATTACH_HISTORY_LINES) {
             core.set_focus(ch, true);
             attached_map.insert(addr.clone(), AttachedTerminal::new(ch, cols, rows));
             world.mark_active_seen(core);
-            newly_attached_active = true;
+            outcome.newly_attached_active = true;
+            resolved_active = Some(addr.clone());
+        } else {
+            outcome.active_attach_failed = true;
         }
     }
-    *active_addr = want_addr;
+    *active_addr = resolved_active;
 
-    // Pre-attach and keep sibling terminals in the active space warm at `(cols, rows)`
-    // so switching tabs is instantaneous (0ms) and background tabs never revert to
-    // 200x120 headless size or trigger slow SIGWINCH reflows on tab switch.
-    if preattach_siblings {
+    // Progressively pre-attach sibling terminals in the active space (at most 1 per pass)
+    // and debounce background sibling SIGWINCH resizes so active interaction stays 0ms-responsive.
+    if warm_siblings {
         let mut sibling_addrs = Vec::new();
         if let Some(space) = world.active_space() {
             for tab in &space.tabs {
                 for addr in world.tab_terminals(tab) {
-                    if !sibling_addrs.contains(&addr) {
+                    if Some(addr.as_str()) != want_addr.as_deref() && !sibling_addrs.contains(&addr)
+                    {
                         sibling_addrs.push(addr);
                     }
                 }
             }
         }
-        let mut attached_any_sibling = false;
+        let mut warmed_one = false;
         for sib_addr in sibling_addrs {
-            if Some(&sib_addr) == active_addr.as_ref() {
-                continue;
-            }
             if let Some(sib) = attached_map.get_mut(&sib_addr) {
                 if sib.cols != cols || sib.rows != rows {
-                    sib.cols = cols;
-                    sib.rows = rows;
-                    sib.parser.set_size(rows, cols);
-                    core.resize_channel(sib.channel, cols, rows);
+                    if resize_siblings {
+                        sib.cols = cols;
+                        sib.rows = rows;
+                        sib.parser.set_size(rows, cols);
+                        core.resize_channel(sib.channel, cols, rows);
+                    } else {
+                        outcome.has_unresized_siblings = true;
+                    }
                 }
             } else if world.terminals.contains_key(&sib_addr) {
-                if let Ok(ch) = core.attach_terminal(&sib_addr, cols, rows, ATTACH_HISTORY_LINES) {
-                    core.set_focus(ch, false);
-                    attached_map.insert(sib_addr, AttachedTerminal::new(ch, cols, rows));
-                    attached_any_sibling = true;
+                if !warmed_one {
+                    if let Ok(ch) =
+                        core.attach_terminal(&sib_addr, cols, rows, ATTACH_HISTORY_LINES)
+                    {
+                        core.set_focus(ch, false);
+                        attached_map.insert(sib_addr, AttachedTerminal::new(ch, cols, rows));
+                        warmed_one = true;
+                    }
+                } else {
+                    outcome.has_unwarmed_siblings = true;
                 }
             }
         }
-        if attached_any_sibling {
+        if warmed_one {
             if let Some(act) = active_addr.as_ref().and_then(|a| attached_map.get(a)) {
                 core.set_focus(act.channel, true);
             }
-            newly_attached_active = true;
         }
     }
 
-    newly_attached_active
+    outcome
 }
 
 fn encode_wheel_for_terminal(
@@ -701,6 +837,7 @@ fn encode_wheel_for_terminal(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_action(
     action: Action,
     core: &CoreClient,
@@ -823,11 +960,37 @@ struct FloatingDPadDrag {
     tap_target: Option<HitTarget>,
 }
 
+fn record_credit(pending: &mut Vec<(u32, u32)>, channel: u32, bytes: u32) {
+    if bytes == 0 {
+        return;
+    }
+    if let Some(entry) = pending.iter_mut().find(|(ch, _)| *ch == channel) {
+        entry.1 = entry.1.saturating_add(bytes);
+    } else {
+        pending.push((channel, bytes));
+    }
+}
+
+fn flush_credits(core: &CoreClient, pending: &mut Vec<(u32, u32)>, accum_bytes: &mut usize) {
+    if !pending.is_empty() {
+        core.ack_credits(pending);
+        pending.clear();
+        *accum_bytes = 0;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyOutcome {
+    ForwardedToPty,
+    UiChanged,
+    Quit,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_app(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut Terminal<CrosstermBackend<BufWriter<io::Stdout>>>,
     core: &CoreClient,
-    core_rx: &std::sync::mpsc::Receiver<CoreMessage>,
+    app_rx: &mpsc::Receiver<AppEvent>,
     world: &mut World,
     usage_tracker: &UsageTracker,
     prefix_spec: &str,
@@ -852,143 +1015,998 @@ fn run_app(
     let mut dpad_drag: Option<FloatingDPadDrag> = None;
     let mut selection: Option<TerminalSelection> = None;
     let mut selection_screen: Option<vt100::Screen> = None;
+    let mut selection_vt_seq: Option<u64> = None;
     let mut clipboard_buffer = String::new();
     let mut copied_until: Option<Instant> = None;
+    let mut pending_sibling_resize_at: Option<Instant> = None;
+    let mut pending_attach_retry: Option<(String, Instant)> = None;
     let mut last_usage_rev: u64 = 0;
+    let mut has_focused_agent = false;
     let mut dirty = true;
-    let mut prev_width = terminal.size()?.width;
+    let mut need_sync_terminals = true;
+    let mut more_events = false;
+    let mut resynced_this_frame = false;
+    let mut last_synced_doc_version: u64 = 0;
+    let init_size = terminal.size()?;
+    let mut cur_size = (init_size.width, init_size.height);
+    let mut prev_term_rect = Rect::default();
+    let mut pending_credits: Vec<(u32, u32)> = Vec::with_capacity(8);
+    let mut pending_credit_bytes: usize = 0;
 
     loop {
-        if copied_until.is_some_and(|t| Instant::now() >= t) {
+        let now = Instant::now();
+        if copied_until.is_some_and(|t| now >= t) {
             copied_until = None;
             dirty = true;
         }
-        let size = terminal.size()?;
-        if size.width != prev_width {
-            if size.width < mobile_threshold {
-                *sidebar_open = false;
-            }
-            prev_width = size.width;
-            dirty = true;
+        if pending_sibling_resize_at.is_some_and(|t| now >= t) {
+            pending_sibling_resize_at = None;
+            need_sync_terminals = true;
         }
-        let area = Rect::new(0, 0, size.width, size.height);
+        if pending_attach_retry.as_ref().is_some_and(|(addr, t)| {
+            now >= *t || world.active_terminal_address_ref() != Some(addr.as_str())
+        }) {
+            pending_attach_retry = None;
+            need_sync_terminals = true;
+        }
+
+        let area_size = cur_size;
+        let area = Rect::new(0, 0, area_size.0, area_size.1);
         let term_rect = compute_terminal_rect(area, *sidebar_open, sidebar_width, touch_mode);
-
-        let prev_addr = active_addr.clone();
-        let newly_attached = sync_attached_terminals(
-            core,
-            world,
-            &mut attached_map,
-            &mut active_addr,
-            term_rect,
-            &mut scrollback_offset,
-            first_frame_drawn,
-        );
-        if active_addr != prev_addr {
-            selection = None;
-            selection_screen = None;
+        if term_rect != prev_term_rect {
+            prev_term_rect = term_rect;
+            need_sync_terminals = true;
             dirty = true;
         }
 
-        let active_channel = active_addr
+        let attached_has_active = active_addr
+            .as_ref()
+            .is_some_and(|a| attached_map.contains_key(a));
+        let mut newly_attached_active = false;
+        if need_sync_terminals
+            || world.doc_version != last_synced_doc_version
+            || active_needs_sync(
+                world.active_terminal_address_ref(),
+                active_addr.as_deref(),
+                attached_has_active,
+                pending_attach_retry.as_ref(),
+            )
+        {
+            let prev_addr = active_addr.clone();
+            let allow_sibling_resize = pending_sibling_resize_at.is_none();
+            let sync_out = sync_attached_terminals(
+                core,
+                world,
+                &mut attached_map,
+                &mut active_addr,
+                term_rect,
+                &mut scrollback_offset,
+                first_frame_drawn,
+                allow_sibling_resize,
+            );
+            last_synced_doc_version = world.doc_version;
+            newly_attached_active = sync_out.newly_attached_active;
+            need_sync_terminals = sync_out.has_unwarmed_siblings;
+            if sync_out.active_attach_failed {
+                pending_attach_retry = world
+                    .active_terminal_address()
+                    .map(|want| (want, Instant::now() + ATTACH_RETRY_DELAY));
+            } else {
+                pending_attach_retry = None;
+            }
+            if sync_out.has_unresized_siblings && pending_sibling_resize_at.is_none() {
+                pending_sibling_resize_at = Some(Instant::now() + SIBLING_RESIZE_DEBOUNCE);
+            }
+            if active_addr != prev_addr {
+                selection = None;
+                selection_screen = None;
+                selection_vt_seq = None;
+                dirty = true;
+            }
+        }
+
+        let mut active_channel = active_addr
             .as_ref()
             .and_then(|a| attached_map.get(a))
             .map(|att| att.channel);
 
-        // Drain pending messages from `herdr-core` BEFORE rendering so that initial attach
-        // history replays and multi-frame output bursts are coalesced into a single screen draw
-        // without flashing a blank screen or intermediate scrollback frames.
-        let drain_start = Instant::now();
-        let mut drained = 0usize;
-        let mut more_messages = false;
-        let mut coalesce_burst = newly_attached;
-        let drain_budget = if newly_attached {
-            Duration::from_millis(80)
-        } else {
-            Duration::from_millis(16)
-        };
-        loop {
-            let next_msg = if drained == 0 && newly_attached {
-                core_rx.recv_timeout(Duration::from_millis(30)).ok()
-            } else if let Ok(msg) = core_rx.try_recv() {
-                Some(msg)
-            } else if coalesce_burst && drain_start.elapsed() < drain_budget {
-                let wait_ms = if newly_attached { 4 } else { 2 };
-                core_rx.recv_timeout(Duration::from_millis(wait_ms)).ok()
+        // When completely idle, block on the unified `AppEvent` channel with zero polling.
+        let mut first_event: Option<AppEvent> = None;
+        if !dirty && !more_events && !need_sync_terminals && !newly_attached_active {
+            let now = Instant::now();
+            let mut wait_timeout: Option<Duration> = if has_focused_agent {
+                Some(Duration::from_secs(30))
             } else {
                 None
             };
-            let Some(msg) = next_msg else {
+            let retry_deadline = pending_attach_retry.as_ref().map(|(_, t)| *t);
+            for deadline in [copied_until, pending_sibling_resize_at, retry_deadline]
+                .into_iter()
+                .flatten()
+            {
+                let rem = deadline.saturating_duration_since(now);
+                wait_timeout = Some(match wait_timeout {
+                    Some(cur) => cur.min(rem),
+                    None => rem,
+                });
+            }
+            first_event = match wait_timeout {
+                Some(dur) => match app_rx.recv_timeout(dur) {
+                    Ok(ev) => Some(ev),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        let after = Instant::now();
+                        if copied_until.is_some_and(|t| after >= t) {
+                            copied_until = None;
+                            dirty = true;
+                        }
+                        if pending_sibling_resize_at.is_some_and(|t| after >= t) {
+                            pending_sibling_resize_at = None;
+                            need_sync_terminals = true;
+                            continue;
+                        }
+                        if pending_attach_retry
+                            .as_ref()
+                            .is_some_and(|(_, t)| after >= *t)
+                        {
+                            pending_attach_retry = None;
+                            need_sync_terminals = true;
+                            continue;
+                        }
+                        None
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                },
+                None => match app_rx.recv() {
+                    Ok(ev) => Some(ev),
+                    Err(_) => return Ok(()),
+                },
+            };
+        }
+
+        // Drain queued `AppEvent`s BEFORE rendering so initial attach history replays,
+        // rapid PTY output bursts, core events, and mouse drag streams coalesce into a single draw.
+        let drain_start = Instant::now();
+        let mut drained = 0usize;
+        more_events = false;
+        let drain_budget = if newly_attached_active {
+            Duration::from_millis(80)
+        } else {
+            Duration::from_millis(12)
+        };
+        let mut pending_doc_sync = false;
+        let mut pending_lifecycle_sync = false;
+        let mut pending_term_refresh = false;
+        let mut check_active_seen = false;
+
+        loop {
+            let next_ev = if let Some(ev) = first_event.take() {
+                Some(ev)
+            } else if drained == 0 && newly_attached_active {
+                flush_credits(core, &mut pending_credits, &mut pending_credit_bytes);
+                app_rx.recv_timeout(Duration::from_millis(30)).ok()
+            } else if let Ok(ev) = app_rx.try_recv() {
+                Some(ev)
+            } else if newly_attached_active && drain_start.elapsed() < drain_budget {
+                flush_credits(core, &mut pending_credits, &mut pending_credit_bytes);
+                app_rx.recv_timeout(Duration::from_millis(4)).ok()
+            } else {
+                None
+            };
+            let Some(app_ev) = next_ev else {
                 break;
             };
             drained += 1;
-            match msg {
-                CoreMessage::TerminalData { channel, data } => {
-                    core.ack_credit(channel, data.len() as u32);
-                    let is_active = active_channel == Some(channel);
-                    if is_active {
+
+            match app_ev {
+                AppEvent::Core(msg) => match msg {
+                    CoreMessage::TerminalData { channel, data } => {
+                        record_credit(&mut pending_credits, channel, data.len() as u32);
+                        pending_credit_bytes += data.len();
+                        if pending_credit_bytes >= CREDIT_FLUSH_THRESHOLD_BYTES {
+                            flush_credits(core, &mut pending_credits, &mut pending_credit_bytes);
+                        }
+                        let is_active = active_channel == Some(channel);
+                        if is_active {
+                            dirty = true;
+                        }
+                        if let Some(att) = attached_map.values_mut().find(|a| a.channel == channel)
+                        {
+                            att.process_vt_bytes(&data);
+                            if is_active && selection.as_ref().is_some_and(|s| !s.active) {
+                                selection = None;
+                                selection_screen = None;
+                                selection_vt_seq = None;
+                            }
+                        }
+                    }
+                    CoreMessage::TerminalClosed { channel, .. } => {
                         dirty = true;
-                        if data.len() >= 4096 {
-                            coalesce_burst = true;
+                        need_sync_terminals = true;
+                        attached_map.retain(|_, a| a.channel != channel);
+                        if active_channel == Some(channel) {
+                            active_addr = None;
+                            active_channel = None;
                         }
+                        pending_lifecycle_sync = true;
                     }
-                    if let Some(att) = attached_map.values_mut().find(|a| a.channel == channel) {
-                        att.process_vt_bytes(&data);
-                        if is_active && selection.as_ref().is_some_and(|s| !s.active) {
-                            selection = None;
-                            selection_screen = None;
+                    CoreMessage::Event(ev) => match world.apply_core_event(&ev) {
+                        EventDisposition::Unchanged => {}
+                        EventDisposition::AppliedInPlace => {
+                            dirty = true;
+                            check_active_seen = true;
                         }
+                        EventDisposition::NeedsTerminalRefresh => {
+                            pending_term_refresh = true;
+                        }
+                        EventDisposition::NeedsLifecycleSync => {
+                            pending_lifecycle_sync = true;
+                        }
+                        EventDisposition::NeedsDocSync => {
+                            pending_doc_sync = true;
+                        }
+                    },
+                    CoreMessage::Disconnected => {
+                        flush_credits(core, &mut pending_credits, &mut pending_credit_bytes);
+                        return Ok(());
                     }
-                }
-                CoreMessage::TerminalClosed { channel, .. } => {
+                },
+                AppEvent::QuotaUpdated => {
                     dirty = true;
-                    attached_map.retain(|_, a| a.channel != channel);
-                    if active_channel == Some(channel) {
-                        active_addr = None;
-                    }
-                    if world.refresh_terminals(core).is_ok() {
-                        let _ = world.reconcile_and_sync(core);
-                    }
                 }
-                CoreMessage::Event(ev) => {
-                    dirty = true;
-                    let method = ev
-                        .get("method")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("");
-                    let ev_type = ev
-                        .get("params")
-                        .and_then(|p| p.get("type"))
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("");
-                    if method == "missed" || ev_type == "doc" || ev_type == "missed" {
-                        if world.fetch_doc(core).is_ok() && world.refresh_terminals(core).is_ok() {
-                            let _ = world.reconcile_and_sync(core);
+                AppEvent::Input(ev) => {
+                    let active_att = active_addr.as_ref().and_then(|a| attached_map.get(a));
+                    match ev {
+                        Event::Resize(w, h) => {
+                            if w < mobile_threshold {
+                                *sidebar_open = false;
+                            }
+                            cur_size = (w, h);
+                            pending_sibling_resize_at =
+                                Some(Instant::now() + SIBLING_RESIZE_DEBOUNCE);
+                            need_sync_terminals = true;
+                            dirty = true;
                         }
-                    } else {
-                        match ev_type {
-                            "created" | "started" | "finished" => {
-                                if world.refresh_terminals(core).is_ok() {
-                                    let _ = world.reconcile_and_sync(core);
+                        Event::Paste(text) => {
+                            if !text.is_empty() {
+                                clipboard_buffer = text.clone();
+                            }
+                            let was_modal = !matches!(modal, Modal::None);
+                            let prev_scroll = scrollback_offset;
+                            paste_text_into_app(
+                                &text,
+                                core,
+                                world,
+                                active_att,
+                                &mut scrollback_offset,
+                                &mut modal,
+                            );
+                            if was_modal || scrollback_offset != prev_scroll {
+                                dirty = true;
+                            }
+                        }
+                        Event::Mouse(mev) => match mev.kind {
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                let mx = mev.column;
+                                let my = mev.row;
+                                let had_vis_sel = selection
+                                    .as_ref()
+                                    .is_some_and(TerminalSelection::is_non_empty);
+                                if is_on_dpad_disc(last_dpad_rect, mx, my) {
+                                    selection = None;
+                                    selection_screen = None;
+                                    selection_vt_seq = None;
+                                    if had_vis_sel {
+                                        dirty = true;
+                                    }
+                                    if let Some(disc) = last_dpad_rect {
+                                        dpad_drag = Some(FloatingDPadDrag {
+                                            is_mod: false,
+                                            start_mouse: (mx, my),
+                                            start_pos: (disc.x, disc.y),
+                                            moved: false,
+                                            tap_target: find_hit_target(&last_hits, mx, my),
+                                        });
+                                    }
+                                } else if is_on_dpad_disc(last_mod_rect, mx, my) {
+                                    selection = None;
+                                    selection_screen = None;
+                                    selection_vt_seq = None;
+                                    if had_vis_sel {
+                                        dirty = true;
+                                    }
+                                    if let Some(disc) = last_mod_rect {
+                                        dpad_drag = Some(FloatingDPadDrag {
+                                            is_mod: true,
+                                            start_mouse: (mx, my),
+                                            start_pos: (disc.x, disc.y),
+                                            moved: false,
+                                            tap_target: find_hit_target(&last_hits, mx, my),
+                                        });
+                                    }
+                                } else if let Some(target) = find_hit_target(&last_hits, mx, my) {
+                                    dpad_drag = None;
+                                    selection = None;
+                                    selection_screen = None;
+                                    selection_vt_seq = None;
+                                    if had_vis_sel {
+                                        dirty = true;
+                                    }
+                                    match target {
+                                        HitTarget::ModalNoop => {}
+                                        HitTarget::CancelModal => {
+                                            modal = Modal::None;
+                                            prefix_active = false;
+                                            ctrl_active = false;
+                                            alt_active = false;
+                                            dirty = true;
+                                        }
+                                        HitTarget::ConfirmCloseYes { tab_id } => {
+                                            modal = Modal::None;
+                                            prefix_active = false;
+                                            ctrl_active = false;
+                                            alt_active = false;
+                                            let _ = world.close_tab_by_id(core, &tab_id);
+                                            need_sync_terminals = true;
+                                            dirty = true;
+                                        }
+                                        HitTarget::SubmitPrompt => {
+                                            prefix_active = false;
+                                            ctrl_active = false;
+                                            alt_active = false;
+                                            if let Modal::Prompt { kind, input } =
+                                                std::mem::replace(&mut modal, Modal::None)
+                                            {
+                                                match kind {
+                                                    PromptKind::RenameTab { tab_id } => {
+                                                        let _ = world.rename_tab_by_id(
+                                                            core, &tab_id, &input,
+                                                        );
+                                                    }
+                                                    PromptKind::RenameSpace { space_id } => {
+                                                        let _ = world.rename_space_by_id(
+                                                            core, &space_id, &input,
+                                                        );
+                                                    }
+                                                    PromptKind::NewSpace => {
+                                                        let _ =
+                                                            world.create_new_space(core, &input);
+                                                        need_sync_terminals = true;
+                                                    }
+                                                }
+                                            }
+                                            dirty = true;
+                                        }
+                                        HitTarget::TriggerAction(act) => {
+                                            modal = Modal::None;
+                                            prefix_active = false;
+                                            ctrl_active = false;
+                                            alt_active = false;
+                                            if execute_action(
+                                                act,
+                                                core,
+                                                world,
+                                                active_att,
+                                                prefix_spec,
+                                                sidebar_open,
+                                                &mut scrollback_offset,
+                                                &mut modal,
+                                            )? {
+                                                flush_credits(
+                                                    core,
+                                                    &mut pending_credits,
+                                                    &mut pending_credit_bytes,
+                                                );
+                                                return Ok(());
+                                            }
+                                            dirty = true;
+                                        }
+                                        HitTarget::TogglePrefix => {
+                                            modal = Modal::None;
+                                            ctrl_active = false;
+                                            alt_active = false;
+                                            if prefix_active {
+                                                prefix_active = false;
+                                                if let Some(att) = active_att {
+                                                    let bytes = prefix_bytes(prefix_spec);
+                                                    core.send_input(att.channel, &bytes);
+                                                }
+                                            } else {
+                                                prefix_active = true;
+                                            }
+                                            dirty = true;
+                                        }
+                                        HitTarget::ToggleCtrl => {
+                                            modal = Modal::None;
+                                            prefix_active = false;
+                                            ctrl_active = !ctrl_active;
+                                            dirty = true;
+                                        }
+                                        HitTarget::ToggleAlt => {
+                                            modal = Modal::None;
+                                            prefix_active = false;
+                                            alt_active = !alt_active;
+                                            dirty = true;
+                                        }
+                                        HitTarget::PasteClipboard => {
+                                            let had_sticky =
+                                                prefix_active || ctrl_active || alt_active;
+                                            prefix_active = false;
+                                            ctrl_active = false;
+                                            alt_active = false;
+                                            let was_modal = !matches!(modal, Modal::None);
+                                            let prev_scroll = scrollback_offset;
+                                            let text = read_clipboard_text(&clipboard_buffer);
+                                            if !text.is_empty() {
+                                                paste_text_into_app(
+                                                    &text,
+                                                    core,
+                                                    world,
+                                                    active_att,
+                                                    &mut scrollback_offset,
+                                                    &mut modal,
+                                                );
+                                            }
+                                            if had_sticky
+                                                || was_modal
+                                                || scrollback_offset != prev_scroll
+                                            {
+                                                dirty = true;
+                                            }
+                                        }
+                                        HitTarget::ExitScrollback => {
+                                            modal = Modal::None;
+                                            prefix_active = false;
+                                            ctrl_active = false;
+                                            alt_active = false;
+                                            scrollback_offset = 0;
+                                            dirty = true;
+                                        }
+                                        HitTarget::ToggleSidebar | HitTarget::ToggleSpaceMenu => {
+                                            prefix_active = false;
+                                            ctrl_active = false;
+                                            alt_active = false;
+                                            modal = if matches!(modal, Modal::SpaceMenu) {
+                                                Modal::None
+                                            } else {
+                                                Modal::SpaceMenu
+                                            };
+                                            dirty = true;
+                                        }
+                                        HitTarget::ToggleSpaceCollapse(space_id) => {
+                                            modal = Modal::None;
+                                            prefix_active = false;
+                                            ctrl_active = false;
+                                            alt_active = false;
+                                            world.toggle_space_collapsed(&space_id);
+                                            dirty = true;
+                                        }
+                                        HitTarget::SelectSpace(space_id) => {
+                                            modal = Modal::None;
+                                            prefix_active = false;
+                                            ctrl_active = false;
+                                            alt_active = false;
+                                            if world.select_space_by_id(&space_id) {
+                                                world.mark_active_seen(core);
+                                            }
+                                            dirty = true;
+                                        }
+                                        HitTarget::SelectTab { space_id, tab_id } => {
+                                            modal = Modal::None;
+                                            prefix_active = false;
+                                            ctrl_active = false;
+                                            alt_active = false;
+                                            if world.select_tab_by_id(&space_id, &tab_id) {
+                                                world.mark_active_seen(core);
+                                            }
+                                            dirty = true;
+                                        }
+                                        HitTarget::NewTab => {
+                                            modal = Modal::None;
+                                            prefix_active = false;
+                                            ctrl_active = false;
+                                            alt_active = false;
+                                            let _ = world.create_new_tab(core);
+                                            need_sync_terminals = true;
+                                            dirty = true;
+                                        }
+                                        HitTarget::NewSpacePrompt => {
+                                            prefix_active = false;
+                                            ctrl_active = false;
+                                            alt_active = false;
+                                            modal = Modal::Prompt {
+                                                kind: PromptKind::NewSpace,
+                                                input: String::new(),
+                                            };
+                                            dirty = true;
+                                        }
+                                        HitTarget::ToggleHelp => {
+                                            prefix_active = false;
+                                            ctrl_active = false;
+                                            alt_active = false;
+                                            modal = if matches!(modal, Modal::Help) {
+                                                Modal::None
+                                            } else {
+                                                Modal::Help
+                                            };
+                                            dirty = true;
+                                        }
+                                        HitTarget::SendKey(kev) => match handle_key_event(
+                                            kev,
+                                            core,
+                                            world,
+                                            active_att,
+                                            prefix_spec,
+                                            sidebar_open,
+                                            &mut prefix_active,
+                                            &mut ctrl_active,
+                                            &mut alt_active,
+                                            &mut scrollback_offset,
+                                            &mut modal,
+                                            term_rect,
+                                        )? {
+                                            KeyOutcome::Quit => {
+                                                flush_credits(
+                                                    core,
+                                                    &mut pending_credits,
+                                                    &mut pending_credit_bytes,
+                                                );
+                                                return Ok(());
+                                            }
+                                            KeyOutcome::UiChanged => dirty = true,
+                                            KeyOutcome::ForwardedToPty => {}
+                                        },
+                                    }
+                                } else if !matches!(modal, Modal::None) {
+                                    dpad_drag = None;
+                                    modal = Modal::None;
+                                    prefix_active = false;
+                                    ctrl_active = false;
+                                    alt_active = false;
+                                    dirty = true;
+                                } else if mx >= term_rect.x
+                                    && mx < term_rect.x.saturating_add(term_rect.width)
+                                    && my >= term_rect.y
+                                    && my < term_rect.y.saturating_add(term_rect.height)
+                                {
+                                    dpad_drag = None;
+                                    let rel_col = mx.saturating_sub(term_rect.x);
+                                    let rel_row = my.saturating_sub(term_rect.y);
+                                    selection = Some(TerminalSelection::new(rel_row, rel_col));
+                                    selection_screen = None;
+                                    selection_vt_seq = None;
+                                    if had_vis_sel {
+                                        dirty = true;
+                                    }
+                                } else {
+                                    dpad_drag = None;
+                                    selection = None;
+                                    selection_screen = None;
+                                    selection_vt_seq = None;
+                                    if had_vis_sel {
+                                        dirty = true;
+                                    }
                                 }
                             }
-                            "status" | "turn" | "title" | "labels" | "foreground" | "renamed" => {
-                                let _ = world.refresh_terminals(core);
-                                world.mark_active_seen(core);
+                            MouseEventKind::Drag(MouseButton::Left) => {
+                                if let Some(ref mut drag) = dpad_drag {
+                                    let dx = mev.column as i32 - drag.start_mouse.0 as i32;
+                                    let dy = mev.row as i32 - drag.start_mouse.1 as i32;
+                                    if drag.moved || dx.abs() >= 2 || dy.abs() >= 1 {
+                                        let was_moved = drag.moved;
+                                        drag.moved = true;
+                                        let nx = (drag.start_pos.0 as i32 + dx).max(0) as u16;
+                                        let ny = (drag.start_pos.1 as i32 + dy).max(0) as u16;
+                                        if drag.is_mod {
+                                            if let Some(clamped) =
+                                                resolve_mod_cross_rect(term_rect, Some((nx, ny)))
+                                            {
+                                                let next_pos = Some((clamped.x, clamped.y));
+                                                if !was_moved || mod_pos != next_pos {
+                                                    mod_pos = next_pos;
+                                                    dirty = true;
+                                                }
+                                            }
+                                        } else if let Some(clamped) =
+                                            resolve_dpad_disc_rect(term_rect, Some((nx, ny)))
+                                        {
+                                            let next_pos = Some((clamped.x, clamped.y));
+                                            if !was_moved || dpad_pos != next_pos {
+                                                dpad_pos = next_pos;
+                                                dirty = true;
+                                            }
+                                        }
+                                    }
+                                } else if let Some(ref mut sel) = selection {
+                                    if sel.active && term_rect.width > 0 && term_rect.height > 0 {
+                                        let rel_col = mev
+                                            .column
+                                            .saturating_sub(term_rect.x)
+                                            .min(term_rect.width.saturating_sub(1));
+                                        let rel_row = mev
+                                            .row
+                                            .saturating_sub(term_rect.y)
+                                            .min(term_rect.height.saturating_sub(1));
+                                        let new_head = (rel_row, rel_col);
+                                        if sel.head != new_head {
+                                            sel.head = new_head;
+                                            if sel.is_non_empty() && selection_screen.is_none() {
+                                                selection_screen =
+                                                    active_att.map(|a| a.parser.screen().clone());
+                                                selection_vt_seq = active_att.map(|a| a.vt_seq);
+                                            }
+                                            dirty = true;
+                                        }
+                                    }
+                                }
+                            }
+                            MouseEventKind::Up(MouseButton::Left) => {
+                                if let Some(drag) = dpad_drag.take() {
+                                    if drag.moved {
+                                        dirty = true;
+                                    } else if matches!(modal, Modal::None) {
+                                        match drag.tap_target {
+                                            Some(HitTarget::TogglePrefix) => {
+                                                modal = Modal::None;
+                                                ctrl_active = false;
+                                                alt_active = false;
+                                                if prefix_active {
+                                                    prefix_active = false;
+                                                    if let Some(att) = active_att {
+                                                        let bytes = prefix_bytes(prefix_spec);
+                                                        core.send_input(att.channel, &bytes);
+                                                    }
+                                                } else {
+                                                    prefix_active = true;
+                                                }
+                                                dirty = true;
+                                            }
+                                            Some(HitTarget::ToggleCtrl) => {
+                                                modal = Modal::None;
+                                                prefix_active = false;
+                                                ctrl_active = !ctrl_active;
+                                                dirty = true;
+                                            }
+                                            Some(HitTarget::ToggleAlt) => {
+                                                modal = Modal::None;
+                                                prefix_active = false;
+                                                alt_active = !alt_active;
+                                                dirty = true;
+                                            }
+                                            Some(HitTarget::PasteClipboard) => {
+                                                let had_sticky =
+                                                    prefix_active || ctrl_active || alt_active;
+                                                prefix_active = false;
+                                                ctrl_active = false;
+                                                alt_active = false;
+                                                let was_modal = !matches!(modal, Modal::None);
+                                                let prev_scroll = scrollback_offset;
+                                                let text = read_clipboard_text(&clipboard_buffer);
+                                                if !text.is_empty() {
+                                                    paste_text_into_app(
+                                                        &text,
+                                                        core,
+                                                        world,
+                                                        active_att,
+                                                        &mut scrollback_offset,
+                                                        &mut modal,
+                                                    );
+                                                }
+                                                if had_sticky
+                                                    || was_modal
+                                                    || scrollback_offset != prev_scroll
+                                                {
+                                                    dirty = true;
+                                                }
+                                            }
+                                            Some(HitTarget::SendKey(kev)) => {
+                                                match handle_key_event(
+                                                    kev,
+                                                    core,
+                                                    world,
+                                                    active_att,
+                                                    prefix_spec,
+                                                    sidebar_open,
+                                                    &mut prefix_active,
+                                                    &mut ctrl_active,
+                                                    &mut alt_active,
+                                                    &mut scrollback_offset,
+                                                    &mut modal,
+                                                    term_rect,
+                                                )? {
+                                                    KeyOutcome::Quit => {
+                                                        flush_credits(
+                                                            core,
+                                                            &mut pending_credits,
+                                                            &mut pending_credit_bytes,
+                                                        );
+                                                        return Ok(());
+                                                    }
+                                                    KeyOutcome::UiChanged => dirty = true,
+                                                    KeyOutcome::ForwardedToPty => {}
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                } else if let Some(ref mut sel) = selection {
+                                    if sel.active {
+                                        if term_rect.width > 0 && term_rect.height > 0 {
+                                            let rel_col = mev
+                                                .column
+                                                .saturating_sub(term_rect.x)
+                                                .min(term_rect.width.saturating_sub(1));
+                                            let rel_row = mev
+                                                .row
+                                                .saturating_sub(term_rect.y)
+                                                .min(term_rect.height.saturating_sub(1));
+                                            sel.head = (rel_row, rel_col);
+                                        }
+                                        sel.active = false;
+                                        let snap = selection_screen.take();
+                                        let snap_seq = selection_vt_seq.take();
+                                        if sel.is_non_empty() {
+                                            let scr = snap
+                                                .as_ref()
+                                                .or_else(|| active_att.map(|a| a.parser.screen()));
+                                            if let Some(screen) = scr {
+                                                let text = sel.extract_text(screen);
+                                                if !text.is_empty() {
+                                                    clipboard_buffer = text.clone();
+                                                    copy_to_clipboard(&text);
+                                                    copied_until = Some(
+                                                        Instant::now() + Duration::from_secs(2),
+                                                    );
+                                                }
+                                            }
+                                            if snap.is_some()
+                                                && snap_seq != active_att.map(|a| a.vt_seq)
+                                            {
+                                                selection = None;
+                                            }
+                                            dirty = true;
+                                        } else {
+                                            selection = None;
+                                        }
+                                    }
+                                }
+                            }
+                            MouseEventKind::ScrollUp => {
+                                if matches!(modal, Modal::SpaceMenu) {
+                                    world.prev_space();
+                                    world.mark_active_seen(core);
+                                    dirty = true;
+                                } else if let Modal::Fuzzy {
+                                    ref query,
+                                    ref mut selected,
+                                    ref mut selected_tab_id,
+                                } = modal
+                                {
+                                    let items = collect_fuzzy_items(world, query);
+                                    let cur_sel = resolve_fuzzy_selection(
+                                        &items,
+                                        *selected,
+                                        selected_tab_id.as_deref(),
+                                    )
+                                    .unwrap_or(0);
+                                    *selected = cur_sel.saturating_sub(1);
+                                    *selected_tab_id =
+                                        items.get(*selected).map(|it| it.tab_id.clone());
+                                    dirty = true;
+                                } else if matches!(modal, Modal::None)
+                                    && mev.row >= term_rect.y
+                                    && mev.row < term_rect.y.saturating_add(term_rect.height)
+                                    && !is_on_dpad_disc(last_dpad_rect, mev.column, mev.row)
+                                    && !is_on_dpad_disc(last_mod_rect, mev.column, mev.row)
+                                {
+                                    if selection
+                                        .as_ref()
+                                        .is_some_and(TerminalSelection::is_non_empty)
+                                    {
+                                        dirty = true;
+                                    }
+                                    selection = None;
+                                    selection_screen = None;
+                                    selection_vt_seq = None;
+                                    let rel_col =
+                                        mev.column.saturating_sub(term_rect.x).saturating_add(1);
+                                    let rel_row =
+                                        mev.row.saturating_sub(term_rect.y).saturating_add(1);
+                                    if let Some((ch, bytes)) = active_att.and_then(|att| {
+                                        encode_wheel_for_terminal(
+                                            att.parser.screen(),
+                                            true,
+                                            rel_col,
+                                            rel_row,
+                                        )
+                                        .map(|b| (att.channel, b))
+                                    }) {
+                                        core.send_input(ch, &bytes);
+                                    } else {
+                                        let prev_scroll = scrollback_offset;
+                                        scrollback_offset = scrollback_offset.saturating_add(3);
+                                        if scrollback_offset != prev_scroll {
+                                            dirty = true;
+                                        }
+                                    }
+                                }
+                            }
+                            MouseEventKind::ScrollDown => {
+                                if matches!(modal, Modal::SpaceMenu) {
+                                    world.next_space();
+                                    world.mark_active_seen(core);
+                                    dirty = true;
+                                } else if let Modal::Fuzzy {
+                                    ref query,
+                                    ref mut selected,
+                                    ref mut selected_tab_id,
+                                } = modal
+                                {
+                                    let items = collect_fuzzy_items(world, query);
+                                    if !items.is_empty() {
+                                        let cur_sel = resolve_fuzzy_selection(
+                                            &items,
+                                            *selected,
+                                            selected_tab_id.as_deref(),
+                                        )
+                                        .unwrap_or(0);
+                                        *selected = (cur_sel + 1).min(items.len() - 1);
+                                        *selected_tab_id =
+                                            items.get(*selected).map(|it| it.tab_id.clone());
+                                        dirty = true;
+                                    }
+                                } else if matches!(modal, Modal::None)
+                                    && mev.row >= term_rect.y
+                                    && mev.row < term_rect.y.saturating_add(term_rect.height)
+                                    && !is_on_dpad_disc(last_dpad_rect, mev.column, mev.row)
+                                    && !is_on_dpad_disc(last_mod_rect, mev.column, mev.row)
+                                {
+                                    if selection
+                                        .as_ref()
+                                        .is_some_and(TerminalSelection::is_non_empty)
+                                    {
+                                        dirty = true;
+                                    }
+                                    selection = None;
+                                    selection_screen = None;
+                                    selection_vt_seq = None;
+                                    let rel_col =
+                                        mev.column.saturating_sub(term_rect.x).saturating_add(1);
+                                    let rel_row =
+                                        mev.row.saturating_sub(term_rect.y).saturating_add(1);
+                                    if let Some((ch, bytes)) = active_att.and_then(|att| {
+                                        encode_wheel_for_terminal(
+                                            att.parser.screen(),
+                                            false,
+                                            rel_col,
+                                            rel_row,
+                                        )
+                                        .map(|b| (att.channel, b))
+                                    }) {
+                                        core.send_input(ch, &bytes);
+                                    } else {
+                                        let prev_scroll = scrollback_offset;
+                                        scrollback_offset = scrollback_offset.saturating_sub(3);
+                                        if scrollback_offset != prev_scroll {
+                                            dirty = true;
+                                        }
+                                    }
+                                }
                             }
                             _ => {}
+                        },
+                        Event::Key(kev) if kev.kind == KeyEventKind::Press => {
+                            let had_drag_or_sel = dpad_drag.as_ref().is_some_and(|d| d.moved)
+                                || selection
+                                    .as_ref()
+                                    .is_some_and(TerminalSelection::is_non_empty);
+                            dpad_drag = None;
+                            selection = None;
+                            selection_screen = None;
+                            selection_vt_seq = None;
+                            if had_drag_or_sel {
+                                dirty = true;
+                            }
+                            match handle_key_event(
+                                kev,
+                                core,
+                                world,
+                                active_att,
+                                prefix_spec,
+                                sidebar_open,
+                                &mut prefix_active,
+                                &mut ctrl_active,
+                                &mut alt_active,
+                                &mut scrollback_offset,
+                                &mut modal,
+                                term_rect,
+                            )? {
+                                KeyOutcome::Quit => {
+                                    flush_credits(
+                                        core,
+                                        &mut pending_credits,
+                                        &mut pending_credit_bytes,
+                                    );
+                                    return Ok(());
+                                }
+                                KeyOutcome::UiChanged => {
+                                    dirty = true;
+                                }
+                                KeyOutcome::ForwardedToPty => {}
+                            }
                         }
+                        _ => {}
+                    }
+
+                    // Break batch early if the active terminal switched so `sync_attached_terminals`
+                    // updates `active_addr` before any subsequent input events in the queue.
+                    let has_active_att = active_addr
+                        .as_ref()
+                        .is_some_and(|a| attached_map.contains_key(a));
+                    if active_needs_sync(
+                        world.active_terminal_address_ref(),
+                        active_addr.as_deref(),
+                        has_active_att,
+                        pending_attach_retry.as_ref(),
+                    ) {
+                        pending_attach_retry = None;
+                        need_sync_terminals = true;
+                        more_events = true;
+                        break;
                     }
                 }
-                CoreMessage::Disconnected => return Ok(()),
             }
-            if drained >= MAX_MSGS_PER_TICK
-                || drain_start.elapsed() >= drain_budget
-            {
-                more_messages = true;
+
+            if drained >= MAX_EVENTS_PER_TICK || drain_start.elapsed() >= drain_budget {
+                more_events = true;
                 break;
             }
         }
+
+        flush_credits(core, &mut pending_credits, &mut pending_credit_bytes);
+
+        // Execute at most ONE coalesced RPC sync for the entire drained event batch.
+        if pending_doc_sync {
+            if world.fetch_doc(core).is_ok() && world.refresh_terminals(core).is_ok() {
+                let _ = world.reconcile_and_sync(core);
+            }
+            world.mark_active_seen(core);
+            need_sync_terminals = true;
+            dirty = true;
+        } else if pending_lifecycle_sync {
+            if world.refresh_terminals(core).is_ok() {
+                let _ = world.reconcile_and_sync(core);
+            }
+            world.mark_active_seen(core);
+            need_sync_terminals = true;
+            dirty = true;
+        } else if pending_term_refresh {
+            let _ = world.refresh_terminals(core);
+            world.mark_active_seen(core);
+            dirty = true;
+        } else if check_active_seen {
+            world.mark_active_seen(core);
+        }
+
+        // If the active terminal or viewport dimensions changed while draining events,
+        // resync immediately before drawing so the tab header and terminal screen never mismatch.
+        let has_active_att = active_addr
+            .as_ref()
+            .is_some_and(|a| attached_map.contains_key(a));
+        if !resynced_this_frame
+            && (cur_size != area_size
+                || active_needs_sync(
+                    world.active_terminal_address_ref(),
+                    active_addr.as_deref(),
+                    has_active_att,
+                    pending_attach_retry.as_ref(),
+                ))
+        {
+            pending_attach_retry = None;
+            resynced_this_frame = true;
+            need_sync_terminals = true;
+            continue;
+        }
+        resynced_this_frame = false;
 
         if let Modal::ConfirmCloseTab { ref tab_id, .. } = modal {
             if !world.has_tab(tab_id) {
@@ -1015,6 +2033,7 @@ fn run_app(
         }
 
         let focused_quota = usage_tracker.focused_quota(world);
+        has_focused_agent = focused_quota.is_some();
         let cur_usage_rev = usage_tracker.revision();
         if cur_usage_rev != last_usage_rev {
             last_usage_rev = cur_usage_rev;
@@ -1033,6 +2052,7 @@ fn run_app(
             let copied_flash = copied_until.is_some();
             let mod_dragging = dpad_drag.as_ref().is_some_and(|d| d.is_mod && d.moved);
             let dpad_dragging = dpad_drag.as_ref().is_some_and(|d| !d.is_mod && d.moved);
+            queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
             terminal.draw(|f| {
                 let geom = render_ui_with_pads_and_quota(
                     f,
@@ -1058,542 +2078,12 @@ fn run_app(
                 last_mod_rect = geom.mod_rect;
                 last_dpad_rect = geom.dpad_rect;
             })?;
+            execute!(terminal.backend_mut(), EndSynchronizedUpdate)?;
             dirty = false;
             if !first_frame_drawn {
                 first_frame_drawn = true;
-                continue;
+                need_sync_terminals = true;
             }
-        }
-
-        let poll_timeout = if more_messages {
-            Duration::ZERO
-        } else {
-            Duration::from_millis(4)
-        };
-        if !event::poll(poll_timeout)? {
-            continue;
-        }
-
-        let ev = event::read()?;
-        dirty = true;
-        let active_att = active_addr.as_ref().and_then(|a| attached_map.get(a));
-
-        match ev {
-            Event::Resize(w, _) => {
-                if w < mobile_threshold {
-                    *sidebar_open = false;
-                }
-                prev_width = w;
-            }
-            Event::Paste(text) => {
-                if !text.is_empty() {
-                    clipboard_buffer = text.clone();
-                }
-                paste_text_into_app(
-                    &text,
-                    core,
-                    world,
-                    active_att,
-                    &mut scrollback_offset,
-                    &mut modal,
-                );
-            }
-            Event::Mouse(mev) => {
-                match mev.kind {
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        let mx = mev.column;
-                        let my = mev.row;
-                        if is_on_dpad_disc(last_dpad_rect, mx, my) {
-                            selection = None;
-                            selection_screen = None;
-                            if let Some(disc) = last_dpad_rect {
-                                dpad_drag = Some(FloatingDPadDrag {
-                                    is_mod: false,
-                                    start_mouse: (mx, my),
-                                    start_pos: (disc.x, disc.y),
-                                    moved: false,
-                                    tap_target: find_hit_target(&last_hits, mx, my),
-                                });
-                            }
-                        } else if is_on_dpad_disc(last_mod_rect, mx, my) {
-                            selection = None;
-                            selection_screen = None;
-                            if let Some(disc) = last_mod_rect {
-                                dpad_drag = Some(FloatingDPadDrag {
-                                    is_mod: true,
-                                    start_mouse: (mx, my),
-                                    start_pos: (disc.x, disc.y),
-                                    moved: false,
-                                    tap_target: find_hit_target(&last_hits, mx, my),
-                                });
-                            }
-                        } else if let Some(target) = find_hit_target(&last_hits, mx, my) {
-                            dpad_drag = None;
-                            selection = None;
-                            selection_screen = None;
-                            match target {
-                                HitTarget::ModalNoop => {}
-                                HitTarget::CancelModal => {
-                                    modal = Modal::None;
-                                    prefix_active = false;
-                                    ctrl_active = false;
-                                    alt_active = false;
-                                }
-                                HitTarget::ConfirmCloseYes { tab_id } => {
-                                    modal = Modal::None;
-                                    prefix_active = false;
-                                    ctrl_active = false;
-                                    alt_active = false;
-                                    let _ = world.close_tab_by_id(core, &tab_id);
-                                }
-                                HitTarget::SubmitPrompt => {
-                                    prefix_active = false;
-                                    ctrl_active = false;
-                                    alt_active = false;
-                                    if let Modal::Prompt { kind, input } =
-                                        std::mem::replace(&mut modal, Modal::None)
-                                    {
-                                        match kind {
-                                            PromptKind::RenameTab { tab_id } => {
-                                                let _ = world.rename_tab_by_id(core, &tab_id, &input);
-                                            }
-                                            PromptKind::RenameSpace { space_id } => {
-                                                let _ =
-                                                    world.rename_space_by_id(core, &space_id, &input);
-                                            }
-                                            PromptKind::NewSpace => {
-                                                let _ = world.create_new_space(core, &input);
-                                            }
-                                        }
-                                    }
-                                }
-                                HitTarget::TriggerAction(act) => {
-                                    modal = Modal::None;
-                                    prefix_active = false;
-                                    ctrl_active = false;
-                                    alt_active = false;
-                                    if execute_action(
-                                        act,
-                                        core,
-                                        world,
-                                        active_att,
-                                        prefix_spec,
-                                        sidebar_open,
-                                        &mut scrollback_offset,
-                                        &mut modal,
-                                    )? {
-                                        return Ok(());
-                                    }
-                                }
-                                HitTarget::TogglePrefix => {
-                                    modal = Modal::None;
-                                    ctrl_active = false;
-                                    alt_active = false;
-                                    if prefix_active {
-                                        prefix_active = false;
-                                        if let Some(att) = active_att {
-                                            let bytes = prefix_bytes(prefix_spec);
-                                            core.send_input(att.channel, &bytes);
-                                        }
-                                    } else {
-                                        prefix_active = true;
-                                    }
-                                }
-                                HitTarget::ToggleCtrl => {
-                                    modal = Modal::None;
-                                    prefix_active = false;
-                                    ctrl_active = !ctrl_active;
-                                }
-                                HitTarget::ToggleAlt => {
-                                    modal = Modal::None;
-                                    prefix_active = false;
-                                    alt_active = !alt_active;
-                                }
-                                HitTarget::PasteClipboard => {
-                                    prefix_active = false;
-                                    ctrl_active = false;
-                                    alt_active = false;
-                                    let text = read_clipboard_text(&clipboard_buffer);
-                                    if !text.is_empty() {
-                                        paste_text_into_app(
-                                            &text,
-                                            core,
-                                            world,
-                                            active_att,
-                                            &mut scrollback_offset,
-                                            &mut modal,
-                                        );
-                                    }
-                                }
-                                HitTarget::ExitScrollback => {
-                                    modal = Modal::None;
-                                    prefix_active = false;
-                                    ctrl_active = false;
-                                    alt_active = false;
-                                    scrollback_offset = 0;
-                                }
-                                HitTarget::ToggleSidebar | HitTarget::ToggleSpaceMenu => {
-                                    prefix_active = false;
-                                    ctrl_active = false;
-                                    alt_active = false;
-                                    modal = if matches!(modal, Modal::SpaceMenu) {
-                                        Modal::None
-                                    } else {
-                                        Modal::SpaceMenu
-                                    };
-                                }
-                                HitTarget::ToggleSpaceCollapse(space_id) => {
-                                    modal = Modal::None;
-                                    prefix_active = false;
-                                    ctrl_active = false;
-                                    alt_active = false;
-                                    world.toggle_space_collapsed(&space_id);
-                                }
-                                HitTarget::SelectSpace(space_id) => {
-                                    modal = Modal::None;
-                                    prefix_active = false;
-                                    ctrl_active = false;
-                                    alt_active = false;
-                                    if world.select_space_by_id(&space_id) {
-                                        world.mark_active_seen(core);
-                                    }
-                                }
-                                HitTarget::SelectTab { space_id, tab_id } => {
-                                    modal = Modal::None;
-                                    prefix_active = false;
-                                    ctrl_active = false;
-                                    alt_active = false;
-                                    if world.select_tab_by_id(&space_id, &tab_id) {
-                                        world.mark_active_seen(core);
-                                    }
-                                }
-                                HitTarget::NewTab => {
-                                    modal = Modal::None;
-                                    prefix_active = false;
-                                    ctrl_active = false;
-                                    alt_active = false;
-                                    let _ = world.create_new_tab(core);
-                                }
-                                HitTarget::NewSpacePrompt => {
-                                    prefix_active = false;
-                                    ctrl_active = false;
-                                    alt_active = false;
-                                    modal = Modal::Prompt {
-                                        kind: PromptKind::NewSpace,
-                                        input: String::new(),
-                                    };
-                                }
-                                HitTarget::ToggleHelp => {
-                                    prefix_active = false;
-                                    ctrl_active = false;
-                                    alt_active = false;
-                                    modal = if matches!(modal, Modal::Help) {
-                                        Modal::None
-                                    } else {
-                                        Modal::Help
-                                    };
-                                }
-                                HitTarget::SendKey(kev) => {
-                                    if handle_key_event(
-                                        kev,
-                                        core,
-                                        world,
-                                        active_att,
-                                        prefix_spec,
-                                        sidebar_open,
-                                        &mut prefix_active,
-                                        &mut ctrl_active,
-                                        &mut alt_active,
-                                        &mut scrollback_offset,
-                                        &mut modal,
-                                        term_rect,
-                                    )? {
-                                        return Ok(());
-                                    }
-                                }
-                            }
-                        } else if !matches!(modal, Modal::None) {
-                            dpad_drag = None;
-                            modal = Modal::None;
-                            prefix_active = false;
-                            ctrl_active = false;
-                            alt_active = false;
-                        } else if mx >= term_rect.x
-                            && mx < term_rect.x.saturating_add(term_rect.width)
-                            && my >= term_rect.y
-                            && my < term_rect.y.saturating_add(term_rect.height)
-                        {
-                            dpad_drag = None;
-                            let rel_col = mx.saturating_sub(term_rect.x);
-                            let rel_row = my.saturating_sub(term_rect.y);
-                            selection = Some(TerminalSelection::new(rel_row, rel_col));
-                            selection_screen = None;
-                        } else {
-                            dpad_drag = None;
-                            selection = None;
-                            selection_screen = None;
-                        }
-                    }
-                    MouseEventKind::Drag(MouseButton::Left) => {
-                        if let Some(ref mut drag) = dpad_drag {
-                            let dx = mev.column as i32 - drag.start_mouse.0 as i32;
-                            let dy = mev.row as i32 - drag.start_mouse.1 as i32;
-                            if drag.moved || dx.abs() >= 2 || dy.abs() >= 1 {
-                                drag.moved = true;
-                                let nx = (drag.start_pos.0 as i32 + dx).max(0) as u16;
-                                let ny = (drag.start_pos.1 as i32 + dy).max(0) as u16;
-                                if drag.is_mod {
-                                    if let Some(clamped) =
-                                        resolve_mod_cross_rect(term_rect, Some((nx, ny)))
-                                    {
-                                        mod_pos = Some((clamped.x, clamped.y));
-                                    }
-                                } else if let Some(clamped) =
-                                    resolve_dpad_disc_rect(term_rect, Some((nx, ny)))
-                                {
-                                    dpad_pos = Some((clamped.x, clamped.y));
-                                }
-                            }
-                        } else if let Some(ref mut sel) = selection {
-                            if sel.active && term_rect.width > 0 && term_rect.height > 0 {
-                                let rel_col = mev
-                                    .column
-                                    .saturating_sub(term_rect.x)
-                                    .min(term_rect.width.saturating_sub(1));
-                                let rel_row = mev
-                                    .row
-                                    .saturating_sub(term_rect.y)
-                                    .min(term_rect.height.saturating_sub(1));
-                                sel.head = (rel_row, rel_col);
-                                if sel.is_non_empty() && selection_screen.is_none() {
-                                    selection_screen =
-                                        active_att.map(|a| a.parser.screen().clone());
-                                }
-                            }
-                        }
-                    }
-                    MouseEventKind::Up(MouseButton::Left) => {
-                        if let Some(drag) = dpad_drag.take() {
-                            if !drag.moved && matches!(modal, Modal::None) {
-                                match drag.tap_target {
-                                    Some(HitTarget::TogglePrefix) => {
-                                        modal = Modal::None;
-                                        ctrl_active = false;
-                                        alt_active = false;
-                                        if prefix_active {
-                                            prefix_active = false;
-                                            if let Some(att) = active_att {
-                                                let bytes = prefix_bytes(prefix_spec);
-                                                core.send_input(att.channel, &bytes);
-                                            }
-                                        } else {
-                                            prefix_active = true;
-                                        }
-                                    }
-                                    Some(HitTarget::ToggleCtrl) => {
-                                        modal = Modal::None;
-                                        prefix_active = false;
-                                        ctrl_active = !ctrl_active;
-                                    }
-                                    Some(HitTarget::ToggleAlt) => {
-                                        modal = Modal::None;
-                                        prefix_active = false;
-                                        alt_active = !alt_active;
-                                    }
-                                    Some(HitTarget::PasteClipboard) => {
-                                        prefix_active = false;
-                                        ctrl_active = false;
-                                        alt_active = false;
-                                        let text = read_clipboard_text(&clipboard_buffer);
-                                        if !text.is_empty() {
-                                            paste_text_into_app(
-                                                &text,
-                                                core,
-                                                world,
-                                                active_att,
-                                                &mut scrollback_offset,
-                                                &mut modal,
-                                            );
-                                        }
-                                    }
-                                    Some(HitTarget::SendKey(kev)) => {
-                                        if handle_key_event(
-                                            kev,
-                                            core,
-                                            world,
-                                            active_att,
-                                            prefix_spec,
-                                            sidebar_open,
-                                            &mut prefix_active,
-                                            &mut ctrl_active,
-                                            &mut alt_active,
-                                            &mut scrollback_offset,
-                                            &mut modal,
-                                            term_rect,
-                                        )? {
-                                            return Ok(());
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        } else if let Some(ref mut sel) = selection {
-                            if sel.active {
-                                if term_rect.width > 0 && term_rect.height > 0 {
-                                    let rel_col = mev
-                                        .column
-                                        .saturating_sub(term_rect.x)
-                                        .min(term_rect.width.saturating_sub(1));
-                                    let rel_row = mev
-                                        .row
-                                        .saturating_sub(term_rect.y)
-                                        .min(term_rect.height.saturating_sub(1));
-                                    sel.head = (rel_row, rel_col);
-                                }
-                                sel.active = false;
-                                let snap = selection_screen.take();
-                                if sel.is_non_empty() {
-                                    let scr = snap
-                                        .as_ref()
-                                        .or_else(|| active_att.map(|a| a.parser.screen()));
-                                    if let Some(screen) = scr {
-                                        let text = sel.extract_text(screen);
-                                        if !text.is_empty() {
-                                            clipboard_buffer = text.clone();
-                                            copy_to_clipboard(&text);
-                                            copied_until =
-                                                Some(Instant::now() + Duration::from_secs(2));
-                                        }
-                                    }
-                                    if snap.as_ref().is_some_and(|s| {
-                                        active_att.is_some_and(|a| {
-                                            s.contents() != a.parser.screen().contents()
-                                        })
-                                    }) {
-                                        selection = None;
-                                    }
-                                } else {
-                                    selection = None;
-                                }
-                            }
-                        }
-                    }
-                    MouseEventKind::ScrollUp => {
-                        if matches!(modal, Modal::SpaceMenu) {
-                            world.prev_space();
-                            world.mark_active_seen(core);
-                        } else if let Modal::Fuzzy {
-                            ref query,
-                            ref mut selected,
-                            ref mut selected_tab_id,
-                        } = modal
-                        {
-                            let items = collect_fuzzy_items(world, query);
-                            let cur_sel = resolve_fuzzy_selection(
-                                &items,
-                                *selected,
-                                selected_tab_id.as_deref(),
-                            )
-                            .unwrap_or(0);
-                            *selected = cur_sel.saturating_sub(1);
-                            *selected_tab_id = items.get(*selected).map(|it| it.tab_id.clone());
-                        } else if matches!(modal, Modal::None)
-                            && mev.row >= term_rect.y
-                            && mev.row < term_rect.y.saturating_add(term_rect.height)
-                            && !is_on_dpad_disc(last_dpad_rect, mev.column, mev.row)
-                            && !is_on_dpad_disc(last_mod_rect, mev.column, mev.row)
-                        {
-                            selection = None;
-                            selection_screen = None;
-                            let rel_col = mev.column.saturating_sub(term_rect.x).saturating_add(1);
-                            let rel_row = mev.row.saturating_sub(term_rect.y).saturating_add(1);
-                            if let Some((ch, bytes)) = active_att.and_then(|att| {
-                                encode_wheel_for_terminal(
-                                    att.parser.screen(),
-                                    true,
-                                    rel_col,
-                                    rel_row,
-                                )
-                                .map(|b| (att.channel, b))
-                            }) {
-                                core.send_input(ch, &bytes);
-                            } else {
-                                scrollback_offset = scrollback_offset.saturating_add(3);
-                            }
-                        }
-                    }
-                    MouseEventKind::ScrollDown => {
-                        if matches!(modal, Modal::SpaceMenu) {
-                            world.next_space();
-                            world.mark_active_seen(core);
-                        } else if let Modal::Fuzzy {
-                            ref query,
-                            ref mut selected,
-                            ref mut selected_tab_id,
-                        } = modal
-                        {
-                            let items = collect_fuzzy_items(world, query);
-                            if !items.is_empty() {
-                                let cur_sel = resolve_fuzzy_selection(
-                                    &items,
-                                    *selected,
-                                    selected_tab_id.as_deref(),
-                                )
-                                .unwrap_or(0);
-                                *selected = (cur_sel + 1).min(items.len() - 1);
-                                *selected_tab_id =
-                                    items.get(*selected).map(|it| it.tab_id.clone());
-                            }
-                        } else if matches!(modal, Modal::None)
-                            && mev.row >= term_rect.y
-                            && mev.row < term_rect.y.saturating_add(term_rect.height)
-                            && !is_on_dpad_disc(last_dpad_rect, mev.column, mev.row)
-                            && !is_on_dpad_disc(last_mod_rect, mev.column, mev.row)
-                        {
-                            selection = None;
-                            selection_screen = None;
-                            let rel_col = mev.column.saturating_sub(term_rect.x).saturating_add(1);
-                            let rel_row = mev.row.saturating_sub(term_rect.y).saturating_add(1);
-                            if let Some((ch, bytes)) = active_att.and_then(|att| {
-                                encode_wheel_for_terminal(
-                                    att.parser.screen(),
-                                    false,
-                                    rel_col,
-                                    rel_row,
-                                )
-                                .map(|b| (att.channel, b))
-                            }) {
-                                core.send_input(ch, &bytes);
-                            } else {
-                                scrollback_offset = scrollback_offset.saturating_sub(3);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Event::Key(kev) if kev.kind == KeyEventKind::Press => {
-                dpad_drag = None;
-                selection = None;
-                selection_screen = None;
-                if handle_key_event(
-                    kev,
-                    core,
-                    world,
-                    active_att,
-                    prefix_spec,
-                    sidebar_open,
-                    &mut prefix_active,
-                    &mut ctrl_active,
-                    &mut alt_active,
-                    &mut scrollback_offset,
-                    &mut modal,
-                    term_rect,
-                )? {
-                    return Ok(());
-                }
-            }
-            _ => {}
         }
     }
 }
@@ -1612,14 +2102,17 @@ fn handle_key_event(
     scrollback_offset: &mut usize,
     modal: &mut Modal,
     term_rect: Rect,
-) -> Result<bool> {
+) -> Result<KeyOutcome> {
+    let mut ui_changed = false;
     if *ctrl_active {
         kev.modifiers.insert(KeyModifiers::CONTROL);
         *ctrl_active = false;
+        ui_changed = true;
     }
     if *alt_active {
         kev.modifiers.insert(KeyModifiers::ALT);
         *alt_active = false;
+        ui_changed = true;
     }
     // 1. Handle active Modal first
     match modal {
@@ -1644,11 +2137,11 @@ fn handle_key_event(
                 }
                 _ => {}
             }
-            return Ok(false);
+            return Ok(KeyOutcome::UiChanged);
         }
         Modal::Help => {
             *modal = Modal::None;
-            return Ok(false);
+            return Ok(KeyOutcome::UiChanged);
         }
         Modal::ConfirmCloseTab { tab_id, .. } => {
             let target_id = tab_id.clone();
@@ -1662,7 +2155,7 @@ fn handle_key_event(
                 }
                 _ => {}
             }
-            return Ok(false);
+            return Ok(KeyOutcome::UiChanged);
         }
         Modal::Prompt { kind, input } => {
             let k = kind.clone();
@@ -1697,7 +2190,7 @@ fn handle_key_event(
                 }
                 _ => {}
             }
-            return Ok(false);
+            return Ok(KeyOutcome::UiChanged);
         }
         Modal::Fuzzy {
             query,
@@ -1705,8 +2198,8 @@ fn handle_key_event(
             selected_tab_id,
         } => {
             let items = collect_fuzzy_items(world, query);
-            let cur_sel = resolve_fuzzy_selection(&items, *selected, selected_tab_id.as_deref())
-                .unwrap_or(0);
+            let cur_sel =
+                resolve_fuzzy_selection(&items, *selected, selected_tab_id.as_deref()).unwrap_or(0);
             match kev.code {
                 KeyCode::Esc => {
                     *modal = Modal::None;
@@ -1759,7 +2252,7 @@ fn handle_key_event(
                 }
                 _ => {}
             }
-            return Ok(false);
+            return Ok(KeyOutcome::UiChanged);
         }
         Modal::None => {}
     }
@@ -1768,7 +2261,7 @@ fn handle_key_event(
     if *prefix_active {
         *prefix_active = false;
         if let Some(action) = match_prefix_action(&kev, prefix_spec) {
-            return execute_action(
+            if execute_action(
                 action,
                 core,
                 world,
@@ -1777,20 +2270,22 @@ fn handle_key_event(
                 sidebar_open,
                 scrollback_offset,
                 modal,
-            );
+            )? {
+                return Ok(KeyOutcome::Quit);
+            }
         }
-        return Ok(false);
+        return Ok(KeyOutcome::UiChanged);
     }
 
     // 3. Check if prefix key was pressed
     if is_prefix_key(&kev, prefix_spec) {
         *prefix_active = true;
-        return Ok(false);
+        return Ok(KeyOutcome::UiChanged);
     }
 
     // 4. Direct global shortcuts (`Alt+Left/Right/Up/Down/1..9`, `Ctrl+\`)
     if let Some(action) = match_direct_action(&kev) {
-        return execute_action(
+        if execute_action(
             action,
             core,
             world,
@@ -1799,7 +2294,10 @@ fn handle_key_event(
             sidebar_open,
             scrollback_offset,
             modal,
-        );
+        )? {
+            return Ok(KeyOutcome::Quit);
+        }
+        return Ok(KeyOutcome::UiChanged);
     }
 
     // 5. Scrollback mode navigation (or Shift+PageUp to enter scrollback from main screen)
@@ -1809,7 +2307,7 @@ fn handle_key_event(
         && attached.is_none_or(|a| !a.parser.screen().alternate_screen())
     {
         *scrollback_offset = (term_rect.height as usize / 2).max(1);
-        return Ok(false);
+        return Ok(KeyOutcome::UiChanged);
     }
     if *scrollback_offset > 0 {
         match kev.code {
@@ -1838,7 +2336,7 @@ fn handle_key_event(
             }
             _ => {}
         }
-        return Ok(false);
+        return Ok(KeyOutcome::UiChanged);
     }
 
     // 6. Forward regular keyboard input to the active terminal
@@ -1849,7 +2347,11 @@ fn handle_key_event(
             core.send_input(att.channel, &bytes);
         }
     }
-    Ok(false)
+    Ok(if ui_changed {
+        KeyOutcome::UiChanged
+    } else {
+        KeyOutcome::ForwardedToPty
+    })
 }
 
 #[cfg(test)]
@@ -1949,5 +2451,89 @@ mod tests {
         assert_eq!(scr_split.contents_between(0, 0, 0, 8), "╭──────╮");
         assert_eq!(scr_split.contents_between(1, 0, 1, 8), "│ CPU! │");
         assert_eq!(scr_split.contents_between(2, 0, 2, 8), "╰──────X");
+    }
+
+    #[test]
+    fn input_filter_drops_mouse_moved_and_key_release_events() {
+        use crossterm::event::MouseEvent;
+
+        let moved = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 4,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!should_forward_input_event(&moved));
+
+        let drag = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 4,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(should_forward_input_event(&drag));
+
+        let release = Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ));
+        assert!(!should_forward_input_event(&release));
+
+        let press = Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        ));
+        assert!(should_forward_input_event(&press));
+        assert!(!should_forward_input_event(&Event::FocusGained));
+        assert!(should_forward_input_event(&Event::Resize(120, 40)));
+    }
+
+    #[test]
+    fn vt_seq_and_credit_coalescing_track_mutations_accurately() {
+        let mut att = AttachedTerminal::new(7, 20, 4);
+        assert_eq!(att.vt_seq, 0);
+        // Incomplete UTF-8 prefix produces no VT write yet
+        att.process_vt_bytes(&[0xe2, 0x9a]);
+        assert_eq!(att.vt_seq, 0);
+        att.process_vt_bytes(&[0x99]);
+        assert_eq!(att.vt_seq, 1);
+
+        let mut credits = Vec::new();
+        record_credit(&mut credits, 3, 1024);
+        record_credit(&mut credits, 5, 512);
+        record_credit(&mut credits, 3, 2048);
+        assert_eq!(credits, vec![(3, 3072), (5, 512)]);
+    }
+
+    #[test]
+    fn clipboard_helper_captures_stdout_and_times_out_hung_process() {
+        let ok = run_clipboard_read_cmd(
+            "sh",
+            &["-c", "printf 'copied-text'"],
+            Duration::from_millis(200),
+        );
+        assert_eq!(ok.as_deref(), Some("copied-text"));
+
+        let start = Instant::now();
+        let timed_out = run_clipboard_read_cmd("sh", &["-c", "sleep 5"], Duration::from_millis(40));
+        assert!(timed_out.is_none());
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn active_needs_sync_tracks_missing_attachments_and_respects_retry_backoff() {
+        let retry_t1 = ("t1".to_string(), Instant::now() + ATTACH_RETRY_DELAY);
+
+        // Healthy attached active terminal needs no sync
+        assert!(!active_needs_sync(Some("t1"), Some("t1"), true, None));
+        // Missing channel for active address triggers sync when not in backoff
+        assert!(active_needs_sync(Some("t1"), None, false, None));
+        assert!(active_needs_sync(Some("t1"), Some("t1"), false, None));
+        // Active backoff suppresses immediate tight-loop retries for the same terminal
+        assert!(!active_needs_sync(Some("t1"), None, false, Some(&retry_t1)));
+        // Switching to a different terminal bypasses the previous terminal's retry backoff immediately
+        assert!(active_needs_sync(Some("t2"), None, false, Some(&retry_t1)));
     }
 }

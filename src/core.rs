@@ -4,7 +4,7 @@ use crate::wire;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,11 +28,13 @@ pub enum CoreMessage {
     Disconnected,
 }
 
+type PendingRpcMap = HashMap<u64, (String, Sender<Value>)>;
+
 pub struct CoreClient {
     _child: Child,
-    writer: Arc<Mutex<ChildStdin>>,
+    writer: Arc<Mutex<BufWriter<ChildStdin>>>,
     next_id: AtomicU64,
-    pending: Arc<Mutex<HashMap<u64, (String, Sender<Value>)>>>,
+    pending: Arc<Mutex<PendingRpcMap>>,
     events_channel: Arc<Mutex<Option<u32>>>,
 }
 
@@ -60,7 +62,22 @@ fn find_core_binary() -> PathBuf {
 }
 
 impl CoreClient {
+    #[allow(dead_code)]
     pub fn connect(session: Option<&str>) -> Result<(Self, Receiver<CoreMessage>)> {
+        let (msg_tx, msg_rx) = mpsc::channel();
+        let client = Self::connect_with_sender(session, msg_tx, |msg| msg)?;
+        Ok((client, msg_rx))
+    }
+
+    pub fn connect_with_sender<T, F>(
+        session: Option<&str>,
+        msg_tx: Sender<T>,
+        wrap: F,
+    ) -> Result<Self>
+    where
+        T: Send + 'static,
+        F: Fn(CoreMessage) -> T + Send + 'static,
+    {
         let bin = find_core_binary();
         let mut cmd = Command::new(&bin);
         cmd.arg("connect");
@@ -94,12 +111,9 @@ impl CoreClient {
             bail!("herdr-core closed connection during hello handshake");
         }
 
-        let writer = Arc::new(Mutex::new(stdin));
-        let pending: Arc<Mutex<HashMap<u64, (String, Sender<Value>)>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let writer = Arc::new(Mutex::new(BufWriter::with_capacity(16 * 1024, stdin)));
+        let pending: Arc<Mutex<PendingRpcMap>> = Arc::new(Mutex::new(HashMap::new()));
         let events_channel: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
-
-        let (msg_tx, msg_rx) = mpsc::channel();
 
         {
             let writer_clone = writer.clone();
@@ -135,29 +149,30 @@ impl CoreClient {
                                     let _ = tx.send(val);
                                 }
                             } else if val.get("method").is_some() {
-                                let _ = msg_tx.send(CoreMessage::Event(val));
+                                let _ = msg_tx.send(wrap(CoreMessage::Event(val)));
                             }
                         }
                         continue;
                     }
 
-                    let is_events_ch = *events_ch_clone.lock().unwrap_or_else(|e| e.into_inner())
-                        == Some(ch);
+                    let is_events_ch =
+                        *events_ch_clone.lock().unwrap_or_else(|e| e.into_inner()) == Some(ch);
 
                     if is_events_ch {
                         if kind == wire::DATA {
                             // Acknowledge flow-control credit immediately for low-volume JSON event lines
-                            let credit = wire::encode(ch, wire::CREDIT, &(payload.len() as u32).to_le_bytes());
-                            let _ = writer_clone
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .write_all(&credit);
+                            let hdr = wire::encode_header(ch, wire::CREDIT, 4);
+                            let mut w = writer_clone.lock().unwrap_or_else(|e| e.into_inner());
+                            let _ = w.write_all(&hdr);
+                            let _ = w.write_all(&(payload.len() as u32).to_le_bytes());
+                            let _ = w.flush();
+                            drop(w);
 
                             event_buf.extend_from_slice(&payload);
                             while let Some(pos) = event_buf.iter().position(|&b| b == b'\n') {
                                 let line: Vec<u8> = event_buf.drain(..=pos).collect();
                                 if let Ok(val) = serde_json::from_slice::<Value>(&line) {
-                                    let _ = msg_tx.send(CoreMessage::Event(val));
+                                    let _ = msg_tx.send(wrap(CoreMessage::Event(val)));
                                 }
                             }
                         }
@@ -166,42 +181,57 @@ impl CoreClient {
 
                     match kind {
                         wire::DATA => {
-                            let _ = msg_tx.send(CoreMessage::TerminalData {
+                            let _ = msg_tx.send(wrap(CoreMessage::TerminalData {
                                 channel: ch,
                                 data: payload,
-                            });
+                            }));
                         }
                         wire::CLOSE => {
                             let reason = serde_json::from_slice(&payload).unwrap_or(Value::Null);
-                            let _ = msg_tx.send(CoreMessage::TerminalClosed {
+                            let _ = msg_tx.send(wrap(CoreMessage::TerminalClosed {
                                 channel: ch,
                                 reason,
-                            });
+                            }));
                         }
                         _ => {}
                     }
                 }
-                let _ = msg_tx.send(CoreMessage::Disconnected);
+                let _ = msg_tx.send(wrap(CoreMessage::Disconnected));
             });
         }
 
-        let client = Self {
+        Ok(Self {
             _child: child,
             writer,
             next_id: AtomicU64::new(1),
             pending,
             events_channel,
-        };
-
-        Ok((client, msg_rx))
+        })
     }
 
     pub fn send_frame(&self, channel: u32, kind: u8, payload: &[u8]) -> Result<()> {
-        let frame = wire::encode(channel, kind, payload);
+        let hdr = wire::encode_header(channel, kind, payload.len());
         let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-        w.write_all(&frame)?;
+        w.write_all(&hdr)?;
+        w.write_all(payload)?;
         w.flush()?;
         Ok(())
+    }
+
+    /// Fire-and-forget JSON-RPC call on channel 0 without blocking the caller for a reply.
+    /// Allocates a normal request `id` so `herdr-core` processes standard RPC methods,
+    /// while the reader thread silently drops the unawaited response.
+    pub fn call_async(&self, method: &str, params: Value) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        if let Ok(bytes) = serde_json::to_vec(&req) {
+            let _ = self.send_frame(0, wire::DATA, &bytes);
+        }
     }
 
     pub fn call(&self, method: &str, params: Value) -> Result<Value> {
@@ -222,7 +252,8 @@ impl CoreClient {
             "method": method,
             "params": params,
         });
-        if let Err(e) = self.send_frame(0, wire::DATA, req.to_string().as_bytes()) {
+        let req_bytes = serde_json::to_vec(&req)?;
+        if let Err(e) = self.send_frame(0, wire::DATA, &req_bytes) {
             self.pending
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -258,13 +289,22 @@ impl CoreClient {
     pub fn subscribe_events(&self) -> Result<Value> {
         let result = self.call("events.subscribe", json!({}))?;
         if let Some(ch) = result.get("channel").and_then(Value::as_u64) {
-            *self.events_channel.lock().unwrap_or_else(|e| e.into_inner()) = Some(ch as u32);
+            *self
+                .events_channel
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(ch as u32);
         }
         Ok(result)
     }
 
     /// Attach to a terminal and return its stream channel ID.
-    pub fn attach_terminal(&self, terminal: &str, cols: u16, rows: u16, history: usize) -> Result<u32> {
+    pub fn attach_terminal(
+        &self,
+        terminal: &str,
+        cols: u16,
+        rows: u16,
+        history: usize,
+    ) -> Result<u32> {
         let params = json!({
             "terminal": terminal,
             "observe": false,
@@ -292,10 +332,27 @@ impl CoreClient {
     }
 
     /// Return flow-control credit for a terminal channel after the UI thread drains data.
+    #[allow(dead_code)]
     pub fn ack_credit(&self, channel: u32, bytes: u32) {
         if bytes > 0 {
             let _ = self.send_frame(channel, wire::CREDIT, &bytes.to_le_bytes());
         }
+    }
+
+    /// Return coalesced flow-control credits for multiple channels in a single lock & flush.
+    pub fn ack_credits(&self, credits: &[(u32, u32)]) {
+        if !credits.iter().any(|&(_, bytes)| bytes > 0) {
+            return;
+        }
+        let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        for &(channel, bytes) in credits {
+            if bytes > 0 {
+                let hdr = wire::encode_header(channel, wire::CREDIT, 4);
+                let _ = w.write_all(&hdr);
+                let _ = w.write_all(&bytes.to_le_bytes());
+            }
+        }
+        let _ = w.flush();
     }
 
     /// Send input bytes to an attached terminal channel.
