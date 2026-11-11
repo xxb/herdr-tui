@@ -128,7 +128,23 @@ fn last_utf8_char(buf: &[u8]) -> Option<char> {
     std::str::from_utf8(&buf[start..]).ok()?.chars().next_back()
 }
 
-fn trailing_incomplete_utf8_len(buf: &[u8]) -> usize {
+fn trailing_incomplete_vt_or_utf8_len(buf: &[u8]) -> usize {
+    if buf.is_empty() {
+        return 0;
+    }
+    if buf[buf.len() - 1] == 0x1b {
+        return 1;
+    }
+    let max_csi_back = buf.len().min(32);
+    for back in 2..=max_csi_back {
+        let idx = buf.len() - back;
+        if buf[idx] == 0x1b && buf[idx + 1] == b'[' {
+            if buf[idx + 2..].iter().all(|&b| (0x20..=0x3F).contains(&b)) {
+                return back;
+            }
+            break;
+        }
+    }
     let max_back = buf.len().min(3);
     for back in 1..=max_back {
         let idx = buf.len() - back;
@@ -182,7 +198,7 @@ fn sanitize_vt_stream<'a>(
         Cow::Owned(buf)
     };
 
-    let trailing = trailing_incomplete_utf8_len(&combined);
+    let trailing = trailing_incomplete_vt_or_utf8_len(&combined);
     let valid_len = combined.len() - trailing;
     if trailing > 0 {
         utf8_tail.extend_from_slice(&combined[valid_len..]);
@@ -192,10 +208,10 @@ fn sanitize_vt_stream<'a>(
         return Cow::Borrowed(&[]);
     }
 
-    let has_9001 = slice.windows(7).any(|w| w == b"\x1b[?9001");
+    let has_esc = slice.contains(&0x1b);
     let has_fe0f = slice.windows(3).any(|w| w == b"\xef\xb8\x8f");
 
-    if !has_9001 && !has_fe0f {
+    if !has_esc && !has_fe0f {
         *prev_width1_symbol = last_utf8_char(slice).is_some_and(is_width1_non_ascii);
         return match combined {
             Cow::Borrowed(b) => Cow::Borrowed(&b[..valid_len]),
@@ -209,13 +225,98 @@ fn sanitize_vt_stream<'a>(
     let mut out = Vec::with_capacity(slice.len());
     let mut i = 0;
     while i < slice.len() {
-        if has_9001
-            && i + 8 <= slice.len()
-            && (&slice[i..i + 8] == b"\x1b[?9001h" || &slice[i..i + 8] == b"\x1b[?9001l")
-        {
-            *prev_width1_symbol = false;
-            i += 8;
-            continue;
+        if has_esc && slice[i] == 0x1b && i + 1 < slice.len() && slice[i + 1] == b'[' {
+            let param_start = i + 2;
+            let mut p = param_start;
+            while p < slice.len() && (0x30..=0x3F).contains(&slice[p]) {
+                p += 1;
+            }
+            let param_end = p;
+            while p < slice.len() && (0x20..=0x2F).contains(&slice[p]) {
+                p += 1;
+            }
+            let inter_end = p;
+            if p < slice.len() && (0x40..=0x7E).contains(&slice[p]) {
+                let params = &slice[param_start..param_end];
+                let intermediates = &slice[param_end..inter_end];
+                let final_byte = slice[p];
+                *prev_width1_symbol = false;
+                if intermediates.is_empty() {
+                    if params == b"?9001" && (final_byte == b'h' || final_byte == b'l') {
+                        i = p + 1;
+                        continue;
+                    }
+                    if params.iter().all(|&b| b.is_ascii_digit() || b == b';') {
+                        match final_byte {
+                            // ECMA-48 HVP (`CSI row ; col f`), used heavily by `btop` (`Mv::to`),
+                            // is identical to CUP (`CSI row ; col H`), which `vt100` supports.
+                            b'f' => {
+                                out.extend_from_slice(b"\x1b[");
+                                out.extend_from_slice(params);
+                                out.push(b'H');
+                                i = p + 1;
+                                continue;
+                            }
+                            // HPA (`CSI col \``) -> CHA (`CSI col G`)
+                            b'`' => {
+                                out.extend_from_slice(b"\x1b[");
+                                out.extend_from_slice(params);
+                                out.push(b'G');
+                                i = p + 1;
+                                continue;
+                            }
+                            // HPR (`CSI n a`) -> CUF (`CSI n C`)
+                            b'a' => {
+                                out.extend_from_slice(b"\x1b[");
+                                out.extend_from_slice(params);
+                                out.push(b'C');
+                                i = p + 1;
+                                continue;
+                            }
+                            // VPR (`CSI n e`) -> CUD (`CSI n B`)
+                            b'e' => {
+                                out.extend_from_slice(b"\x1b[");
+                                out.extend_from_slice(params);
+                                out.push(b'B');
+                                i = p + 1;
+                                continue;
+                            }
+                            // CNL (`CSI n E`) -> CUD (`CSI n B`) + CR (`\r`)
+                            b'E' => {
+                                out.extend_from_slice(b"\x1b[");
+                                out.extend_from_slice(params);
+                                out.extend_from_slice(b"B\r");
+                                i = p + 1;
+                                continue;
+                            }
+                            // CPL (`CSI n F`) -> CUU (`CSI n A`) + CR (`\r`)
+                            b'F' => {
+                                out.extend_from_slice(b"\x1b[");
+                                out.extend_from_slice(params);
+                                out.extend_from_slice(b"A\r");
+                                i = p + 1;
+                                continue;
+                            }
+                            // SCOSC (`CSI s`) -> DECSC (`ESC 7`)
+                            b's' if params.is_empty() => {
+                                out.extend_from_slice(b"\x1b7");
+                                i = p + 1;
+                                continue;
+                            }
+                            // SCORC (`CSI u`) -> DECRC (`ESC 8`)
+                            b'u' if params.is_empty() => {
+                                out.extend_from_slice(b"\x1b8");
+                                i = p + 1;
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                out.extend_from_slice(&slice[i..=p]);
+                i = p + 1;
+                continue;
+            }
         }
         if has_fe0f && i + 3 <= slice.len() && &slice[i..i + 3] == b"\xef\xb8\x8f" {
             // U+FE0F (Variation Selector-16) requests 2-column emoji presentation for preceding
@@ -1825,5 +1926,28 @@ mod tests {
             encode_wheel_for_terminal(att.parser.screen(), false, 10, 3).as_deref(),
             Some(&b"\x1b[<65;10;3M"[..])
         );
+    }
+
+    #[test]
+    fn sanitize_vt_stream_translates_btop_hvp_and_ecma48_cursor_sequences_across_frames() {
+        // btop uses `\x1b[<row>;<col>f` (HVP) instead of `\x1b[<row>;<col>H` (CUP)
+        let stream = "\x1b[2J\x1b[1;1f╭──────╮\x1b[2;1f│      │\x1b[3;1f╰──────╯\x1b[2;3fCPU\x1b[s\x1b[3;8fX\x1b[u!".as_bytes();
+
+        let mut att_whole = AttachedTerminal::new(1, 20, 5);
+        att_whole.process_vt_bytes(stream);
+        let scr = att_whole.parser.screen();
+        assert_eq!(scr.contents_between(0, 0, 0, 8), "╭──────╮");
+        assert_eq!(scr.contents_between(1, 0, 1, 8), "│ CPU! │");
+        assert_eq!(scr.contents_between(2, 0, 2, 8), "╰──────X");
+
+        // Also verify 1-byte-at-a-time streaming across split CSI sequences
+        let mut att_split = AttachedTerminal::new(2, 20, 5);
+        for b in stream {
+            att_split.process_vt_bytes(std::slice::from_ref(b));
+        }
+        let scr_split = att_split.parser.screen();
+        assert_eq!(scr_split.contents_between(0, 0, 0, 8), "╭──────╮");
+        assert_eq!(scr_split.contents_between(1, 0, 1, 8), "│ CPU! │");
+        assert_eq!(scr_split.contents_between(2, 0, 2, 8), "╰──────X");
     }
 }
