@@ -73,11 +73,11 @@ struct Cli {
     #[arg(long, conflicts_with = "sidebar")]
     no_sidebar: bool,
 
-    /// Enable 2-row large touch top bar mode for iPad / tablet SSH clients
+    /// Show the dual floating touch `+` cross pads (`Esc/Ctl/^B/Alt/Tab` and `↑/←/⎘/→/↓`)
     #[arg(long)]
     touch: bool,
 
-    /// Disable 2-row large touch top bar mode
+    /// Hide the dual floating touch `+` cross pads
     #[arg(long, conflicts_with = "touch")]
     no_touch: bool,
 }
@@ -404,7 +404,7 @@ fn main() -> Result<()> {
     } else if cli.no_touch {
         false
     } else {
-        file_cfg.ui.touch_mode.unwrap_or(true)
+        file_cfg.ui.touch_mode.unwrap_or(false)
     };
 
     let (core, core_rx) = CoreClient::connect(cli.session.as_deref())?;

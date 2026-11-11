@@ -351,12 +351,12 @@ impl TerminalSelection {
     }
 }
 
-pub fn top_bar_height(area: Rect, touch_mode: bool) -> u16 {
+pub fn top_bar_height(area: Rect, _touch_mode: bool) -> u16 {
     if area.height <= 1 {
         0
-    } else if touch_mode && area.height >= 10 {
+    } else if area.height >= 10 {
         3
-    } else if touch_mode && area.height >= 6 {
+    } else if area.height >= 6 {
         2
     } else {
         1
@@ -556,17 +556,19 @@ pub fn render_ui_with_pads(
 
     match modal {
         Modal::None => {
-            mod_rect = render_floating_mod_cross(
-                f,
-                term_rect,
-                mod_pos,
-                mod_dragging,
-                prefix_active,
-                ctrl_active,
-                alt_active,
-                &mut hits,
-            );
-            dpad_rect = render_floating_dpad(f, term_rect, dpad_pos, dpad_dragging, &mut hits);
+            if touch_mode {
+                mod_rect = render_floating_mod_cross(
+                    f,
+                    term_rect,
+                    mod_pos,
+                    mod_dragging,
+                    prefix_active,
+                    ctrl_active,
+                    alt_active,
+                    &mut hits,
+                );
+                dpad_rect = render_floating_dpad(f, term_rect, dpad_pos, dpad_dragging, &mut hits);
+            }
         }
         Modal::SpaceMenu => {
             render_space_menu_modal(f, area, top_h, world, &mut hits);
@@ -799,14 +801,39 @@ fn render_top_tabbar(
             tab_pills.push((ti, tab.id.clone(), lbl, st, is_active));
         }
 
-        // Ensure `active_ti` is within the visible horizontal slice
+        // Ensure `active_ti` (and `active_ti + 1` whenever both fit) is within the visible slice
+        // so selecting the rightmost visible tab reveals the next hidden tab on the right.
         let avail_tabs_w = tabs_limit_x.saturating_sub(x);
+        let total_tabs_w: u16 = tab_pills
+            .iter()
+            .enumerate()
+            .map(|(i, (_, _, lbl, _, _))| lbl.width() as u16 + u16::from(i + 1 < total_tabs))
+            .sum();
+        let tabs_overflow = total_tabs_w > avail_tabs_w;
         let mut start_idx = 0usize;
         if avail_tabs_w > 0 && !tab_pills.is_empty() {
-            while start_idx < active_ti {
-                let needed: u16 = tab_pills[start_idx..=active_ti]
+            let lookahead_ti = if active_ti + 1 < total_tabs {
+                let pair_w: u16 = tab_pills[active_ti..=active_ti + 1]
                     .iter()
-                    .map(|(_, _, lbl, _, _)| lbl.width() as u16 + 1)
+                    .enumerate()
+                    .map(|(i, (_, _, lbl, _, _))| lbl.width() as u16 + u16::from(i == 0))
+                    .sum();
+                if pair_w <= avail_tabs_w {
+                    active_ti + 1
+                } else {
+                    active_ti
+                }
+            } else {
+                active_ti
+            };
+            while start_idx < active_ti {
+                let slice = &tab_pills[start_idx..=lookahead_ti];
+                let needed: u16 = slice
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, _, lbl, _, _))| {
+                        lbl.width() as u16 + u16::from(i + 1 < slice.len())
+                    })
                     .sum();
                 if needed <= avail_tabs_w {
                     break;
@@ -847,9 +874,13 @@ fn render_top_tabbar(
                     width: pw,
                     height: rect.height,
                 },
-                target: HitTarget::SelectTab {
-                    space_id: space_id.clone(),
-                    tab_id,
+                target: if is_active && tabs_overflow && total_tabs > 1 {
+                    HitTarget::TriggerAction(Action::NextTab)
+                } else {
+                    HitTarget::SelectTab {
+                        space_id: space_id.clone(),
+                        tab_id,
+                    }
                 },
             });
             x += pw;
@@ -2501,12 +2532,102 @@ mod tests {
     }
 
     #[test]
-    fn narrow_terminal_retains_compact_top_space_and_plus_buttons() {
+    fn narrow_terminal_retains_compact_top_space_and_plus_buttons_and_respects_touch_flag() {
         let backend = TestBackend::new(30, 12);
         let mut terminal = Terminal::new(backend).unwrap();
         let world = World::default();
-        let mut hits = Vec::new();
+        let mut hits_no_touch = Vec::new();
+        let mut geom_no_touch = None;
 
+        // Without `--touch` (`touch_mode = false`), the two floating `+` crosses are hidden
+        terminal
+            .draw(|f| {
+                let geom = render_ui(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::None,
+                );
+                hits_no_touch = geom.hits.clone();
+                geom_no_touch = Some(geom);
+            })
+            .unwrap();
+
+        let g_no = geom_no_touch.unwrap();
+        assert!(g_no.mod_rect.is_none());
+        assert!(g_no.dpad_rect.is_none());
+        assert_eq!(
+            find_hit_target(&hits_no_touch, 1, 0),
+            Some(HitTarget::ToggleSpaceMenu)
+        );
+        assert!(hits_no_touch.iter().any(|h| h.target == HitTarget::NewTab));
+        assert!(!hits_no_touch
+            .iter()
+            .any(|h| h.target == HitTarget::PasteClipboard));
+
+        // With `--touch` (`touch_mode = true`), both floating `+` crosses are rendered
+        let mut geom_touch = None;
+        terminal
+            .draw(|f| {
+                geom_touch = Some(render_ui(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    true,
+                    false,
+                    false,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::None,
+                ));
+            })
+            .unwrap();
+        let g_yes = geom_touch.unwrap();
+        assert!(g_yes.mod_rect.is_some());
+        assert!(g_yes.dpad_rect.is_some());
+        assert!(g_yes
+            .hits
+            .iter()
+            .any(|h| h.target == HitTarget::PasteClipboard));
+        assert!(g_yes
+            .hits
+            .iter()
+            .any(|h| h.target == HitTarget::TogglePrefix));
+    }
+
+    #[test]
+    fn overflowing_top_tabs_reveal_next_tab_and_allow_cycling_forward() {
+        let backend = TestBackend::new(42, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut world = World::default();
+        world.doc.spaces.push(SharedSpace {
+            id: "space-1".to_string(),
+            name: "main".to_string(),
+            tabs: (1..=6)
+                .map(|i| SharedTab {
+                    id: format!("tab-{i}"),
+                    name: format!("agent-{i}"),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        });
+        world.select_tab_index(1); // active = tab-2
+
+        let mut hits = Vec::new();
         terminal
             .draw(|f| {
                 let geom = render_ui(
@@ -2528,17 +2649,17 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(
-            find_hit_target(&hits, 1, 0),
-            Some(HitTarget::ToggleSpaceMenu)
-        );
-        assert!(hits.iter().any(|h| h.target == HitTarget::NewTab));
+        // Tapping the active tab when tabs overflow cycles to NextTab, and the next tab (`tab-3`) is exposed
         assert!(hits
             .iter()
-            .any(|h| h.target == HitTarget::PasteClipboard));
-        assert!(hits
-            .iter()
-            .any(|h| h.target == HitTarget::TogglePrefix));
+            .any(|h| h.target == HitTarget::TriggerAction(Action::NextTab)));
+        assert!(hits.iter().any(|h| {
+            h.target
+                == HitTarget::SelectTab {
+                    space_id: "space-1".to_string(),
+                    tab_id: "tab-3".to_string(),
+                }
+        }));
     }
 
     #[test]

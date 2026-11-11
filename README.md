@@ -17,7 +17,8 @@ A fast, lightweight **multi-tab TUI client** for [`herdr-core` (`hc`)](https://g
   - **Top Tab Bar**: Displays `[ ▾ Space ] ╱ [ ● 1:tab1 ] [ ○ 2:tab2 ] [ + ] ... [ ? ]` along the top edge.
   - **Secondary Space Popover (`^b b` or Tap `[ ▾ Space ]`)**: Tapping the Space button opens a floating popover menu listing all Spaces with live Agent status and a `[ + New Space ]` button—eliminating the need for a permanent Left Sidebar so the terminal viewport always enjoys 100% horizontal width.
   - **Direct Tab Switching & `[ + ]` New Tab**: Tap any Tab pill on the top bar to switch directly to that Tab, or tap `[ + ]` on the right of the tabs to add a new Tab.
-- **Dual Floating Draggable Semi-Transparent `+` Cross Pads (双悬浮可拖动半透明十字按钮盘)**
+- **Dual Floating Draggable Semi-Transparent `+` Cross Pads (`hct --touch` 开启双悬浮可拖动半透明十字按钮盘)**
+  - Enabled with `hct --touch` (hidden by default when running `hct` on desktop without `--touch`).
   - **Left Modifier Cross (`Esc` / `Ctl` / `^B` / `Alt` / `Tab`)**: `15 × 7` hollow-corner `+` cross with `Esc` (top), sticky `Ctl` (left), sticky `^B` prefix (center), sticky `Alt` (right), and `Tab` (bottom).
   - **Right Directional & Paste Cross (`↑` / `←` / `⎘` / `→` / `↓`)**: `15 × 7` hollow-corner `+` cross with 4 directional keys (`↑`, `↓`, `←`, `→`) and centered Paste (`⎘`).
   - Both `+` crosses can be tapped or dragged independently anywhere over the terminal viewport, with 4 completely hollow corners so underlying terminal text remains visible and clickable.
@@ -25,7 +26,7 @@ A fast, lightweight **multi-tab TUI client** for [`herdr-core` (`hc`)](https://g
   - Displays the active Tab's Agent state badge (`◉ BLOCKED`, `● WORKING`, `✓ DONE`, `○ IDLE`, `○ SHELL`), active terminal title/CWD/turn count, workspace agent summary counts, `[ ✓ Copied ]`, and clickable `[ ▼ BOT (+N) ]` when viewing scrollback.
 - **Touch & Mouse Friendly for iPad / Mobile SSH (触控与鼠标丝滑切换)**
   - **Touch Drag Text Selection + Auto Copy over SSH (手指拖动选字自动复制)**: Drag across terminal text with your finger (or mouse) to highlight text in real time; releasing automatically copies the selected text to the remote SSH client's system clipboard via OSC 52 (and local clipboard when available) and flashes `[✓ Copied]`.
-  - **3-Row Large Touch Top Bar (Default, `--no-touch` for 1-row)**: Uses a 3-row beveled top bar by default for comfortable finger hit targets.
+  - **3-Row Large Touch Top Bar**: Uses a 3-row beveled top bar for comfortable finger hit targets.
   - **Touch-Interactive Modals**: Directly tap items in the Space Popover (`^b b`) or Fuzzy Switcher (`^b w`), tap Confirm/Cancel buttons in dialogs, or tap any of the 12 quick-action buttons in the `[ ? ]` panel.
 - **Classic `herdr` Keybindings (兼容旧版 `herdr` 快捷键)**
   Compatible with `~/.config/herdr/config.toml` and `~/.config/herdr-tui/config.toml`.
