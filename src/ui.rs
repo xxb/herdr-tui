@@ -1653,13 +1653,20 @@ fn render_space_menu_modal(
     let list_end_y = max_y.saturating_sub(footer_h);
     let w = inner.width as usize;
 
+    let total_spaces = world.doc.spaces.len();
     let use_two_row = list_end_y.saturating_sub(inner.y) >= 2;
     let row_step: usize = if use_two_row { 2 } else { 1 };
     let visible_spaces = (list_end_y.saturating_sub(inner.y) as usize / row_step).max(1);
-    let start_si = if world.active_space_idx < visible_spaces {
+    let spaces_overflow = total_spaces > visible_spaces;
+    let lookahead_si = if visible_spaces >= 2 {
+        (world.active_space_idx + 1).min(total_spaces.saturating_sub(1))
+    } else {
+        world.active_space_idx
+    };
+    let start_si = if lookahead_si < visible_spaces {
         0
     } else {
-        world.active_space_idx + 1 - visible_spaces
+        lookahead_si + 1 - visible_spaces
     };
 
     let mut y = inner.y;
@@ -1720,6 +1727,11 @@ fn render_space_menu_modal(
             );
         }
 
+        let target_space_id = if is_active && spaces_overflow && total_spaces > 1 {
+            world.doc.spaces[(si + 1) % total_spaces].id.clone()
+        } else {
+            space.id.clone()
+        };
         hits.push(HitRegion {
             rect: Rect {
                 x: inner.x,
@@ -1727,7 +1739,7 @@ fn render_space_menu_modal(
                 width: inner.width,
                 height: row_step as u16,
             },
-            target: HitTarget::SelectSpace(space.id.clone()),
+            target: HitTarget::SelectSpace(target_space_id),
         });
         y += row_step as u16;
     }

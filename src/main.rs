@@ -1322,7 +1322,10 @@ fn run_app(
                         }
                     }
                     MouseEventKind::ScrollUp => {
-                        if let Modal::Fuzzy {
+                        if matches!(modal, Modal::SpaceMenu) {
+                            world.prev_space();
+                            world.mark_active_seen(core);
+                        } else if let Modal::Fuzzy {
                             ref query,
                             ref mut selected,
                             ref mut selected_tab_id,
@@ -1349,7 +1352,10 @@ fn run_app(
                         }
                     }
                     MouseEventKind::ScrollDown => {
-                        if let Modal::Fuzzy {
+                        if matches!(modal, Modal::SpaceMenu) {
+                            world.next_space();
+                            world.mark_active_seen(core);
+                        } else if let Modal::Fuzzy {
                             ref query,
                             ref mut selected,
                             ref mut selected_tab_id,
