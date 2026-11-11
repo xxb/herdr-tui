@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CACHE_TTL: Duration = Duration::from_secs(10);
@@ -136,26 +136,9 @@ impl UsageTracker {
 }
 
 pub fn detect_focused_agent(world: &World) -> Option<AgentKind> {
-    if let Some(addr) = world.active_terminal_address() {
-        if let Some(info) = world.terminals.get(&addr) {
-            if let Some(kind) = detect_agent_from_terminal(info) {
-                return Some(kind);
-            }
-        }
-    }
-    if let Some(tab) = world.active_tab() {
-        for addr in world.tab_terminals(tab) {
-            if let Some(info) = world.terminals.get(&addr) {
-                if let Some(kind) = detect_agent_from_terminal(info) {
-                    return Some(kind);
-                }
-            }
-        }
-        if let Some(kind) = detect_agent_from_str(&tab.name) {
-            return Some(kind);
-        }
-    }
-    None
+    let addr = world.active_terminal_address()?;
+    let info = world.terminals.get(&addr)?;
+    detect_agent_from_terminal(info)
 }
 
 pub fn detect_agent_from_terminal(info: &TerminalInfo) -> Option<AgentKind> {
@@ -269,8 +252,30 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 pub fn parse_utc_iso8601_secs(s: &str) -> Option<u64> {
-    let s = s.trim().strip_suffix('Z')?;
-    let (date_part, time_part) = s.split_once('T')?;
+    let s = s.trim();
+    let (date_part, rest) = s.split_once('T').or_else(|| s.split_once(' '))?;
+    let (time_part, offset_secs): (&str, i64) =
+        if let Some(t) = rest.strip_suffix('Z').or_else(|| rest.strip_suffix('z')) {
+            (t, 0)
+        } else if let Some(idx) = rest.rfind(['+', '-']) {
+            let (t, off_str) = rest.split_at(idx);
+            let sign: i64 = if off_str.starts_with('-') { -1 } else { 1 };
+            let off_body = &off_str[1..];
+            let (oh, om) = if let Some((h, m)) = off_body.split_once(':') {
+                (h.parse::<i64>().ok()?, m.parse::<i64>().ok()?)
+            } else if off_body.len() == 4 {
+                (
+                    off_body[..2].parse::<i64>().ok()?,
+                    off_body[2..].parse::<i64>().ok()?,
+                )
+            } else {
+                return None;
+            };
+            (t, sign * (oh * 3_600 + om * 60))
+        } else {
+            return None;
+        };
+
     let mut d_it = date_part.split('-');
     let year: i64 = d_it.next()?.parse().ok()?;
     let month: i64 = d_it.next()?.parse().ok()?;
@@ -279,11 +284,11 @@ pub fn parse_utc_iso8601_secs(s: &str) -> Option<u64> {
         return None;
     }
     let mut t_it = time_part.split(':');
-    let hour: u64 = t_it.next()?.parse().ok()?;
-    let min: u64 = t_it.next()?.parse().ok()?;
+    let hour: i64 = t_it.next()?.parse().ok()?;
+    let min: i64 = t_it.next()?.parse().ok()?;
     let sec_str = t_it.next()?;
     let sec_int_str = sec_str.split('.').next().unwrap_or(sec_str);
-    let sec: u64 = sec_int_str.parse().ok()?;
+    let sec: i64 = sec_int_str.parse().ok()?;
 
     // Howard Hinnant's days_from_civil algorithm
     let y = year - if month <= 2 { 1 } else { 0 };
@@ -293,10 +298,41 @@ pub fn parse_utc_iso8601_secs(s: &str) -> Option<u64> {
     let doy = (153 * m + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146097 + doe - 719468;
-    if days < 0 {
-        return None;
-    }
-    Some((days as u64) * 86_400 + hour * 3_600 + min * 60 + sec)
+    let utc_secs = days * 86_400 + hour * 3_600 + min * 60 + sec - offset_secs;
+    u64::try_from(utc_secs).ok()
+}
+
+fn local_utc_offset_secs() -> i64 {
+    static OFFSET: OnceLock<i64> = OnceLock::new();
+    *OFFSET.get_or_init(|| {
+        let Ok(out) = Command::new("date")
+            .arg("+%z")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        else {
+            return 0;
+        };
+        if !out.status.success() {
+            return 0;
+        }
+        let s = String::from_utf8_lossy(&out.stdout);
+        let trimmed = s.trim();
+        if trimmed.len() >= 5 {
+            let sign: i64 = if trimmed.starts_with('-') { -1 } else { 1 };
+            let hh = trimmed[1..3].parse::<i64>().unwrap_or(0);
+            let mm = trimmed[3..5].parse::<i64>().unwrap_or(0);
+            sign * (hh * 3_600 + mm * 60)
+        } else {
+            0
+        }
+    })
+}
+
+pub fn today_midnight_unix_secs(now_secs: u64, utc_offset_secs: i64) -> u64 {
+    let local_secs = (now_secs as i64).saturating_add(utc_offset_secs);
+    let local_midnight = local_secs - local_secs.rem_euclid(86_400);
+    local_midnight.saturating_sub(utc_offset_secs).max(0) as u64
 }
 
 fn collect_quota_for_agent(kind: AgentKind, cfg: &QuotaFileConfig) -> AgentQuota {
@@ -345,8 +381,12 @@ fn read_tail_string(path: &Path, max_bytes: u64) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
-pub fn parse_codex_rate_limits_from_jsonl(text: &str, now_secs: u64) -> Option<Vec<QuotaMetric>> {
-    for line in text.lines().rev() {
+pub fn parse_codex_rate_limits_snapshot_from_jsonl(
+    text: &str,
+    now_secs: u64,
+) -> Option<(Option<u64>, Vec<QuotaMetric>)> {
+    let mut best: Option<(Option<u64>, usize, Vec<QuotaMetric>)> = None;
+    for (idx, line) in text.lines().enumerate() {
         if !line.contains("\"rate_limits\"") {
             continue;
         }
@@ -363,6 +403,11 @@ pub fn parse_codex_rate_limits_from_jsonl(text: &str, now_secs: u64) -> Option<V
         if rl.is_null() {
             continue;
         }
+        let event_ts = val
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_utc_iso8601_secs)
+            .or_else(|| val.get("timestamp").and_then(Value::as_u64));
         let mut metrics = Vec::new();
         for (key, default_lbl) in [("primary", "5h"), ("secondary", "7d")] {
             if let Some(win) = rl.get(key) {
@@ -401,10 +446,21 @@ pub fn parse_codex_rate_limits_from_jsonl(text: &str, now_secs: u64) -> Option<V
             }
         }
         if !metrics.is_empty() {
-            return Some(metrics);
+            let replace = match &best {
+                None => true,
+                Some((prev_ts, prev_idx, _)) => (event_ts.unwrap_or(0), idx) >= (prev_ts.unwrap_or(0), *prev_idx),
+            };
+            if replace {
+                best = Some((event_ts, idx, metrics));
+            }
         }
     }
-    None
+    best.map(|(ts, _, m)| (ts, m))
+}
+
+#[cfg(test)]
+pub fn parse_codex_rate_limits_from_jsonl(text: &str, now_secs: u64) -> Option<Vec<QuotaMetric>> {
+    parse_codex_rate_limits_snapshot_from_jsonl(text, now_secs).map(|(_, m)| m)
 }
 
 pub fn parse_codex_wham_usage_json(text: &str, now_secs: u64) -> Option<Vec<QuotaMetric>> {
@@ -507,6 +563,31 @@ print(out)
     parse_codex_wham_usage_json(&text, now_secs)
 }
 
+pub fn collect_codex_metrics_from_sessions_dir(
+    sessions_dir: &Path,
+    now_secs: u64,
+) -> Vec<QuotaMetric> {
+    let mut files = Vec::new();
+    let min_mtime = UNIX_EPOCH + Duration::from_secs(now_secs.saturating_sub(7 * 86_400));
+    collect_recursive_files(sessions_dir, "jsonl", Some(min_mtime), &mut files);
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let mut best: Option<((u64, SystemTime), Vec<QuotaMetric>)> = None;
+    for (mtime, path) in files.into_iter().take(12) {
+        if let Some(tail) = read_tail_string(&path, 256 * 1024) {
+            if let Some((event_ts, metrics)) =
+                parse_codex_rate_limits_snapshot_from_jsonl(&tail, now_secs)
+            {
+                let rank = (event_ts.unwrap_or(0), mtime);
+                if best.as_ref().is_none_or(|(prev_rank, _)| rank > *prev_rank) {
+                    best = Some((rank, metrics));
+                }
+            }
+        }
+    }
+    best.map(|(_, m)| m).unwrap_or_default()
+}
+
 fn collect_codex_metrics(now_secs: u64) -> Vec<QuotaMetric> {
     let Some(home) = home_dir() else {
         return Vec::new();
@@ -515,19 +596,7 @@ fn collect_codex_metrics(now_secs: u64) -> Vec<QuotaMetric> {
         return wham_metrics;
     }
     let sessions_dir = home.join(".codex/sessions");
-    let mut files = Vec::new();
-    let min_mtime = SystemTime::now().checked_sub(Duration::from_secs(7 * 86_400));
-    collect_recursive_files(&sessions_dir, "jsonl", min_mtime, &mut files);
-    files.sort_by(|a, b| b.0.cmp(&a.0));
-
-    for (_, path) in files.into_iter().take(6) {
-        if let Some(tail) = read_tail_string(&path, 256 * 1024) {
-            if let Some(metrics) = parse_codex_rate_limits_from_jsonl(&tail, now_secs) {
-                return metrics;
-            }
-        }
-    }
-    Vec::new()
+    collect_codex_metrics_from_sessions_dir(&sessions_dir, now_secs)
 }
 
 fn collect_opencode_metrics(_now_secs: u64, cfg: &QuotaFileConfig) -> Vec<QuotaMetric> {
@@ -612,11 +681,11 @@ print(json.dumps({"day_reqs": day_reqs, "day_toks": day_toks, "five_reqs": five_
     ]
 }
 
-fn collect_claude_metrics(_now_secs: u64, cfg: &QuotaFileConfig) -> Vec<QuotaMetric> {
-    let Some(home) = home_dir() else {
-        return Vec::new();
-    };
-    let projects_dir = home.join(".claude/projects");
+pub fn collect_claude_metrics_from_dir(
+    projects_dir: &Path,
+    now_secs: u64,
+    cfg: &QuotaFileConfig,
+) -> Vec<QuotaMetric> {
     if !projects_dir.is_dir() {
         return Vec::new();
     }
@@ -625,82 +694,111 @@ fn collect_claude_metrics(_now_secs: u64, cfg: &QuotaFileConfig) -> Vec<QuotaMet
     let limit_7d_toks = cfg.claude_7d_tokens.unwrap_or(25_000_000).max(1);
     let limit_7d_msgs = cfg.claude_7d_messages.unwrap_or(450).max(1);
 
-    let script = r#"
-import glob, os, json, sys, time, datetime
-projects_dir = sys.argv[1]
-now = time.time()
-cut_7d = now - 7 * 86400
-cut_5h = now - 5 * 3600
-tok_5h = 0
-msg_5h = 0
-tok_7d = 0
-msg_7d = 0
-oldest_5h = None
-for root, _, files in os.walk(projects_dir):
-    for fn in files:
-        if not fn.endswith(".jsonl"):
-            continue
-        p = os.path.join(root, fn)
-        try:
-            st = os.stat(p)
-        except Exception:
-            continue
-        if st.st_mtime < cut_7d:
-            continue
-        try:
-            with open(p, "r", errors="ignore") as f:
-                for line in f:
-                    if '"usage"' not in line:
-                        continue
-                    obj = json.loads(line)
-                    msg = obj.get("message") or {}
-                    u = msg.get("usage") or obj.get("usage")
-                    if not isinstance(u, dict):
-                        continue
-                    ts_str = obj.get("timestamp")
-                    ts = st.st_mtime
-                    if isinstance(ts_str, str) and ts_str:
-                        try:
-                            ts = datetime.datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
-                        except Exception:
-                            pass
-                    if ts < cut_7d:
-                        continue
-                    t = int(u.get("input_tokens") or 0) + int(u.get("output_tokens") or 0) + int(u.get("cache_creation_input_tokens") or 0)
-                    tok_7d += t
-                    msg_7d += 1
-                    if ts >= cut_5h:
-                        tok_5h += t
-                        msg_5h += 1
-                        if oldest_5h is None or ts < oldest_5h:
-                            oldest_5h = ts
-        except Exception:
-            continue
-reset_5h = int((oldest_5h + 5 * 3600) - now) if oldest_5h is not None else 0
-print(json.dumps({"tok_5h": tok_5h, "msg_5h": msg_5h, "tok_7d": tok_7d, "msg_7d": msg_7d, "reset_5h": max(0, reset_5h)}))
-"#;
+    let cut_7d = now_secs.saturating_sub(7 * 86_400);
+    let cut_5h = now_secs.saturating_sub(5 * 3_600);
+    let min_mtime = UNIX_EPOCH + Duration::from_secs(cut_7d);
 
-    let Ok(output) = Command::new("python3")
-        .arg("-c")
-        .arg(script)
-        .arg(&projects_dir)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-    else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new();
+    let mut files = Vec::new();
+    collect_recursive_files(projects_dir, "jsonl", Some(min_mtime), &mut files);
+
+    // Map response identity (`message.id` / `requestId`) -> (earliest_ts, cumulative_tokens)
+    let mut responses: HashMap<String, (u64, u64)> = HashMap::new();
+    for (file_idx, (mtime, path)) in files.into_iter().enumerate() {
+        let mtime_secs = mtime
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(now_secs);
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        let content = String::from_utf8_lossy(&bytes);
+        for (line_idx, line) in content.lines().enumerate() {
+            if !line.contains("\"usage\"") {
+                continue;
+            }
+            let Ok(obj) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let msg = obj.get("message");
+            let Some(u) = msg
+                .and_then(|m| m.get("usage"))
+                .or_else(|| obj.get("usage"))
+            else {
+                continue;
+            };
+            if !u.is_object() {
+                continue;
+            }
+            let ts = obj
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(parse_utc_iso8601_secs)
+                .or_else(|| obj.get("timestamp").and_then(Value::as_u64))
+                .unwrap_or(mtime_secs);
+            if ts < cut_7d {
+                continue;
+            }
+            let t = u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0)
+                + u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0)
+                + u.get("cache_creation_input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+
+            let msg_id = msg
+                .and_then(|m| m.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            let req_id = obj
+                .get("requestId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            let resp_key = if !msg_id.is_empty() || !req_id.is_empty() {
+                format!("resp:{msg_id}:{req_id}")
+            } else if let Some(uuid) = obj
+                .get("uuid")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                format!("uuid:{uuid}")
+            } else {
+                format!("anon:{file_idx}:{line_idx}")
+            };
+
+            responses
+                .entry(resp_key)
+                .and_modify(|(prev_ts, prev_toks)| {
+                    *prev_ts = (*prev_ts).min(ts);
+                    *prev_toks = (*prev_toks).max(t);
+                })
+                .or_insert((ts, t));
+        }
     }
-    let Ok(val) = serde_json::from_slice::<Value>(&output.stdout) else {
-        return Vec::new();
-    };
-    let tok_5h = val.get("tok_5h").and_then(Value::as_u64).unwrap_or(0);
-    let msg_5h = val.get("msg_5h").and_then(Value::as_u64).unwrap_or(0);
-    let tok_7d = val.get("tok_7d").and_then(Value::as_u64).unwrap_or(0);
-    let msg_7d = val.get("msg_7d").and_then(Value::as_u64).unwrap_or(0);
-    let reset_5h = val.get("reset_5h").and_then(Value::as_u64).unwrap_or(0);
+
+    let mut tok_7d = 0u64;
+    let mut msg_7d = 0u64;
+    let mut tok_5h = 0u64;
+    let mut msg_5h = 0u64;
+    let mut oldest_5h: Option<u64> = None;
+
+    for &(ts, t) in responses.values() {
+        if ts < cut_7d {
+            continue;
+        }
+        tok_7d += t;
+        msg_7d += 1;
+        if ts >= cut_5h {
+            tok_5h += t;
+            msg_5h += 1;
+            oldest_5h = Some(oldest_5h.map_or(ts, |old| old.min(ts)));
+        }
+    }
+
+    let reset_5h = oldest_5h
+        .map(|oldest| (oldest + 5 * 3_600).saturating_sub(now_secs))
+        .unwrap_or(0);
 
     let used_5h = ((tok_5h as f64 / limit_5h_toks as f64)
         .max(msg_5h as f64 / limit_5h_msgs as f64)
@@ -729,6 +827,14 @@ print(json.dumps({"tok_5h": tok_5h, "msg_5h": msg_5h, "tok_7d": tok_7d, "msg_7d"
             detail: Some(format_tokens(tok_7d)),
         },
     ]
+}
+
+fn collect_claude_metrics(now_secs: u64, cfg: &QuotaFileConfig) -> Vec<QuotaMetric> {
+    let Some(home) = home_dir() else {
+        return Vec::new();
+    };
+    let projects_dir = home.join(".claude/projects");
+    collect_claude_metrics_from_dir(&projects_dir, now_secs, cfg)
 }
 
 pub fn parse_antigravity_quota_summary(text: &str, now_secs: u64) -> Option<Vec<QuotaMetric>> {
@@ -970,6 +1076,44 @@ print(out)
     parse_antigravity_quota_summary(&text, now_secs)
 }
 
+pub fn count_antigravity_transcript_steps_in_str(
+    text: &str,
+    cutoff_5h: u64,
+    midnight_secs: u64,
+) -> (u64, u64) {
+    let mut steps_5h = 0u64;
+    let mut steps_day = 0u64;
+    for line in text.lines() {
+        if !line.contains("\"PLANNER_RESPONSE\"") {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if val.get("type").and_then(Value::as_str) != Some("PLANNER_RESPONSE") {
+            continue;
+        }
+        let Some(ts) = val
+            .get("created_at")
+            .or_else(|| val.get("timestamp"))
+            .and_then(|v| {
+                v.as_str()
+                    .and_then(parse_utc_iso8601_secs)
+                    .or_else(|| v.as_u64())
+            })
+        else {
+            continue;
+        };
+        if ts >= midnight_secs {
+            steps_day += 1;
+        }
+        if ts >= cutoff_5h {
+            steps_5h += 1;
+        }
+    }
+    (steps_5h, steps_day)
+}
+
 fn collect_antigravity_metrics(now_secs: u64, cfg: &QuotaFileConfig) -> Vec<QuotaMetric> {
     if let Some(api_metrics) = fetch_antigravity_api_quota(now_secs) {
         return api_metrics;
@@ -982,9 +1126,13 @@ fn collect_antigravity_metrics(now_secs: u64, cfg: &QuotaFileConfig) -> Vec<Quot
     let limit_5h = cfg.agy_5h_steps.unwrap_or(300).max(1);
     let limit_day = cfg.agy_daily_steps.unwrap_or(1000).max(1);
 
+    let cutoff_5h = now_secs.saturating_sub(5 * 3_600);
+    let midnight_secs = today_midnight_unix_secs(now_secs, local_utc_offset_secs());
+    let min_cutoff_secs = cutoff_5h.min(midnight_secs);
+    let min_mtime = UNIX_EPOCH.checked_add(Duration::from_secs(min_cutoff_secs));
+
     let mut steps_5h = 0u64;
     let mut steps_day = 0u64;
-    let min_mtime = SystemTime::now().checked_sub(Duration::from_secs(86_400));
     if let Ok(entries) = fs::read_dir(&brain_dir) {
         for entry in entries.flatten() {
             let log_path = entry
@@ -996,23 +1144,14 @@ fn collect_antigravity_metrics(now_secs: u64, cfg: &QuotaFileConfig) -> Vec<Quot
             let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
             if min_mtime.is_some_and(|m| mtime < m) {
                 continue;
-            };
-            let Some(tail) = read_tail_string(&log_path, 256 * 1024) else {
+            }
+            let Some(tail) = read_tail_string(&log_path, 512 * 1024) else {
                 continue;
             };
-            let mtime_secs = mtime
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(now_secs);
-            for line in tail.lines() {
-                if !line.contains("\"PLANNER_RESPONSE\"") {
-                    continue;
-                }
-                steps_day += 1;
-                if now_secs.saturating_sub(mtime_secs) <= 5 * 3_600 {
-                    steps_5h += 1;
-                }
-            }
+            let (s5, sd) =
+                count_antigravity_transcript_steps_in_str(&tail, cutoff_5h, midnight_secs);
+            steps_5h += s5;
+            steps_day += sd;
         }
     }
 
@@ -1033,29 +1172,84 @@ fn collect_antigravity_metrics(now_secs: u64, cfg: &QuotaFileConfig) -> Vec<Quot
     ]
 }
 
-fn collect_freebuff_metrics(_now_secs: u64) -> Vec<QuotaMetric> {
+pub fn parse_freebuff_session_quota_json(text: &str, now_secs: u64) -> Option<Vec<QuotaMetric>> {
+    let val: Value = serde_json::from_str(text.trim()).ok()?;
+    if let Some(exp) = val
+        .get("expires_at")
+        .or_else(|| val.get("resets_at"))
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(parse_utc_iso8601_secs))
+        })
+    {
+        if exp > 0 && now_secs >= exp {
+            return None;
+        }
+    }
+    let rem_pct = if let Some(rem) = val.get("remaining_percent").and_then(Value::as_f64) {
+        rem.clamp(0.0, 100.0)
+    } else if let Some(used_pct) = val.get("used_percent").and_then(Value::as_f64) {
+        (100.0 - used_pct).clamp(0.0, 100.0)
+    } else {
+        let used = val
+            .get("used")
+            .or_else(|| val.get("requests_used"))
+            .and_then(Value::as_u64)?;
+        let limit = val
+            .get("limit")
+            .or_else(|| val.get("requests_limit"))
+            .and_then(Value::as_u64)
+            .filter(|&l| l > 0)?;
+        let used_pct = ((used as f64 / limit as f64) * 100.0).clamp(0.0, 100.0);
+        (100.0 - used_pct).clamp(0.0, 100.0)
+    };
+    let label = val
+        .get("window_label")
+        .or_else(|| val.get("window"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("会话")
+        .to_string();
+    let detail = val
+        .get("detail")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            let used = val
+                .get("used")
+                .or_else(|| val.get("requests_used"))
+                .and_then(Value::as_u64)?;
+            let limit = val
+                .get("limit")
+                .or_else(|| val.get("requests_limit"))
+                .and_then(Value::as_u64)?;
+            Some(format!("{used}/{limit}"))
+        });
+    Some(vec![QuotaMetric {
+        window_label: label,
+        remaining_percent: rem_pct,
+        detail,
+    }])
+}
+
+fn collect_freebuff_metrics(now_secs: u64) -> Vec<QuotaMetric> {
     let Some(home) = home_dir() else {
         return Vec::new();
     };
-    let cache_dir = home.join(".cache/herdr-freebuff");
-    let min_mtime = SystemTime::now().checked_sub(Duration::from_secs(86_400));
-    let mut today_briefs = 0u64;
-    if let Ok(entries) = fs::read_dir(&cache_dir) {
-        for entry in entries.flatten() {
-            if let Ok(meta) = entry.metadata() {
-                let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
-                if min_mtime.is_none_or(|m| mtime >= m) {
-                    today_briefs += 1;
-                }
-            }
+    for rel in [
+        ".cache/herdr-freebuff/session_quota.json",
+        ".config/freebuff/session_quota.json",
+    ] {
+        let path = home.join(rel);
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Some(metrics) = parse_freebuff_session_quota_json(&text, now_secs) {
+            return metrics;
         }
     }
-    let used_pct = ((today_briefs as f64 / 100.0) * 100.0).clamp(0.0, 100.0);
-    vec![QuotaMetric {
-        window_label: "今日".to_string(),
-        remaining_percent: (100.0 - used_pct).clamp(0.0, 100.0),
-        detail: Some(format!("{today_briefs} briefs")),
-    }]
+    Vec::new()
 }
 
 #[cfg(test)]
@@ -1178,5 +1372,170 @@ mod tests {
         assert_eq!(metrics[1].window_label, "7d");
         assert!((metrics[1].remaining_percent - 43.96).abs() < 1e-4);
         assert_eq!(metrics[1].detail.as_deref(), Some("2d17h"));
+    }
+
+    #[test]
+    fn detect_focused_agent_stops_at_selected_pane_without_falling_back_to_tab_or_sibling_pane() {
+        use crate::model::{SharedSpace, SharedTab};
+
+        let mut world = World::default();
+        world.terminals.insert(
+            "t_codex".to_string(),
+            TerminalInfo {
+                address: "t_codex".to_string(),
+                title: "codex".to_string(),
+                fg_name: Some("codex".to_string()),
+                ..Default::default()
+            },
+        );
+        world.terminals.insert(
+            "t_shell".to_string(),
+            TerminalInfo {
+                address: "t_shell".to_string(),
+                title: "zsh".to_string(),
+                fg_name: Some("zsh".to_string()),
+                ..Default::default()
+            },
+        );
+        world.doc.spaces.push(SharedSpace {
+            id: "s1".to_string(),
+            name: "Main".to_string(),
+            folder: String::new(),
+            tabs: vec![SharedTab {
+                id: "tab1".to_string(),
+                name: "codex".to_string(),
+                root: serde_json::json!({
+                    "type": "row",
+                    "children": [
+                        { "type": "block", "content": { "terminal": "t_codex" } },
+                        { "type": "block", "content": { "terminal": "t_shell" } }
+                    ]
+                }),
+                rest: Default::default(),
+            }],
+            rest: Default::default(),
+        });
+        world.active_space_idx = 0;
+        world
+            .active_tab_by_space
+            .insert("s1".to_string(), "tab1".to_string());
+        world
+            .active_term_by_tab
+            .insert("tab1".to_string(), "t_shell".to_string());
+
+        assert_eq!(detect_focused_agent(&world), None);
+
+        world
+            .active_term_by_tab
+            .insert("tab1".to_string(), "t_codex".to_string());
+        assert_eq!(detect_focused_agent(&world), Some(AgentKind::Codex));
+    }
+
+    #[test]
+    fn filters_antigravity_transcript_steps_by_individual_event_timestamps() {
+        let transcript = concat!(
+            r#"{"type":"PLANNER_RESPONSE","created_at":"2026-11-09T10:00:00Z"}"#,
+            "\n",
+            r#"{"type":"PLANNER_RESPONSE","created_at":"2026-11-11T01:00:00Z"}"#,
+            "\n",
+            r#"{"type":"PLANNER_RESPONSE","created_at":"2026-11-11T08:00:00Z"}"#,
+            "\n",
+        );
+        let now_secs = parse_utc_iso8601_secs("2026-11-11T10:00:00Z").unwrap();
+        let cutoff_5h = now_secs - 5 * 3_600; // 05:00:00Z
+        let midnight_secs = today_midnight_unix_secs(now_secs, 0); // 00:00:00Z
+
+        let (steps_5h, steps_day) =
+            count_antigravity_transcript_steps_in_str(transcript, cutoff_5h, midnight_secs);
+        assert_eq!(steps_5h, 1);
+        assert_eq!(steps_day, 2);
+    }
+
+    #[test]
+    fn selects_newest_codex_rate_limit_snapshot_across_session_files() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "hct_test_codex_sessions_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        let older_snapshot_newer_file = tmp_dir.join("session_a.jsonl");
+        let newer_snapshot_older_file = tmp_dir.join("session_b.jsonl");
+
+        let line_newer = r#"{"timestamp":"2026-11-11T10:00:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":40.0,"window_minutes":300,"resets_at":2000000000}}}}"#;
+        let line_older = r#"{"timestamp":"2026-11-11T08:00:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":10.0,"window_minutes":300,"resets_at":2000000000}}}}"#;
+
+        fs::write(&newer_snapshot_older_file, format!("{line_newer}\n")).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(
+            &older_snapshot_newer_file,
+            format!("{line_older}\n{{\"timestamp\":\"2026-11-11T10:05:00Z\",\"type\":\"other\"}}\n"),
+        )
+        .unwrap();
+
+        let now_secs = parse_utc_iso8601_secs("2026-11-11T10:06:00Z").unwrap();
+        let metrics = collect_codex_metrics_from_sessions_dir(&tmp_dir, now_secs);
+        let _ = fs::remove_dir_all(&tmp_dir);
+
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].remaining_percent, 60.0);
+    }
+
+    #[test]
+    fn claude_collector_deduplicates_multi_block_responses_and_skips_malformed_lines() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "hct_test_claude_projects_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        let now_secs = parse_utc_iso8601_secs("2026-11-11T10:00:00Z").unwrap();
+        let transcript = concat!(
+            r#"{"timestamp":"2026-11-11T09:00:00Z","requestId":"req_1","message":{"id":"msg_1","usage":{"input_tokens":100,"output_tokens":50}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-11-11T09:00:01Z","requestId":"req_1","message":{"id":"msg_1","usage":{"input_tokens":100,"output_tokens":50}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-11-11T09:00:02Z","requestId":"req_1","message":{"id":"msg_1","usage":{"input_tokens":100,"output_tokens":50}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-11-11T09:05:00Z","message":{"usage":{"input_tokens":999"#,
+            "\n",
+            r#"{"timestamp":"2026-11-11T09:10:00Z","requestId":"req_2","message":{"id":"msg_2","usage":{"input_tokens":120,"output_tokens":30}}}"#,
+            "\n",
+        );
+        fs::write(tmp_dir.join("conv.jsonl"), transcript).unwrap();
+
+        let cfg = QuotaFileConfig {
+            claude_5h_tokens: Some(1_000),
+            claude_5h_messages: Some(10),
+            claude_7d_tokens: Some(10_000),
+            claude_7d_messages: Some(100),
+            ..Default::default()
+        };
+        let metrics = collect_claude_metrics_from_dir(&tmp_dir, now_secs, &cfg);
+        let _ = fs::remove_dir_all(&tmp_dir);
+
+        assert_eq!(metrics.len(), 2);
+        // 2 unique responses (300 tokens total, 2 messages):
+        // 5h used = max(300/1000, 2/10) = 30% -> 70% remaining
+        assert!((metrics[0].remaining_percent - 70.0).abs() < 1e-4);
+        assert!(metrics[0].detail.as_deref().unwrap().starts_with("300 · "));
+        // 7d used = max(300/10000, 2/100) = 3% -> 97% remaining
+        assert!((metrics[1].remaining_percent - 97.0).abs() < 1e-4);
+        assert_eq!(metrics[1].detail.as_deref(), Some("300"));
+    }
+
+    #[test]
+    fn parses_freebuff_session_quota_and_rejects_expired_or_missing() {
+        let sample = r#"{"window_label":"会话","used":12,"limit":60,"expires_at":2000}"#;
+        let metrics = parse_freebuff_session_quota_json(sample, 1000).unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].window_label, "会话");
+        assert!((metrics[0].remaining_percent - 80.0).abs() < 1e-4);
+        assert_eq!(metrics[0].detail.as_deref(), Some("12/60"));
+
+        assert!(parse_freebuff_session_quota_json(sample, 2500).is_none());
+        assert!(parse_freebuff_session_quota_json("{}", 1000).is_none());
     }
 }
