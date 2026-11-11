@@ -1,5 +1,6 @@
-//! TUI rendering (`ratatui` + `vt100`) with Collapsible 2-Row Left Sidebar,
-//! Herdr-style Bottom Touchbar, touch/mouse hit-testing regions, and modal overlays.
+//! TUI rendering (`ratatui` + `vt100`) with Top `Space / Tab1 / Tab2 / [+]` Bar,
+//! Secondary Space Switcher Popover, Dual Floating Draggable `+` Cross Pads,
+//! Read-Only Bottom Agent Status Bar, and modal overlays.
 
 use crate::keys::Action;
 use crate::model::{AgentState, World};
@@ -14,8 +15,10 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HitTarget {
+    ToggleSpaceMenu,
     ToggleSidebar,
     ToggleSpaceCollapse(String),
     SelectSpace(String),
@@ -57,6 +60,7 @@ pub fn find_hit_target(hits: &[HitRegion], col: u16, row: u16) -> Option<HitTarg
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Modal {
     None,
+    SpaceMenu,
     Help,
     ConfirmCloseTab {
         tab_id: String,
@@ -209,16 +213,17 @@ fn dpad_cross_metrics(r: Rect) -> (u16, u16, u16) {
 pub struct UiGeometry {
     pub term_rect: Rect,
     pub hits: Vec<HitRegion>,
+    pub mod_rect: Option<Rect>,
     pub dpad_rect: Option<Rect>,
 }
 
-pub fn resolve_dpad_disc_rect(term_rect: Rect, custom_pos: Option<(u16, u16)>) -> Option<Rect> {
-    if term_rect.width < 3 || term_rect.height < 3 {
+fn cross_pad_dimensions(term_rect: Rect) -> Option<(u16, u16)> {
+    if term_rect.width < 6 || term_rect.height < 3 {
         return None;
     }
-    let pad_w = if term_rect.width >= DPAD_DISC_WIDTH {
+    let pad_w = if term_rect.width >= DPAD_DISC_WIDTH * 2 {
         DPAD_DISC_WIDTH
-    } else if term_rect.width >= 9 {
+    } else if term_rect.width >= 18 {
         9
     } else {
         3
@@ -230,9 +235,37 @@ pub fn resolve_dpad_disc_rect(term_rect: Rect, custom_pos: Option<(u16, u16)>) -
     } else {
         3
     };
+    Some((pad_w, pad_h))
+}
+
+pub fn resolve_mod_cross_rect(term_rect: Rect, custom_pos: Option<(u16, u16)>) -> Option<Rect> {
+    let (pad_w, pad_h) = cross_pad_dimensions(term_rect)?;
     let max_x = term_rect.x + term_rect.width.saturating_sub(pad_w);
     let max_y = term_rect.y + term_rect.height.saturating_sub(pad_h);
-    let default_x = max_x.saturating_sub(1).max(term_rect.x);
+    let default_x = if term_rect.width > pad_w * 2 + 1 {
+        term_rect.x + 1
+    } else {
+        term_rect.x
+    };
+    let default_y = max_y.saturating_sub(1).max(term_rect.y);
+    let (px, py) = custom_pos.unwrap_or((default_x, default_y));
+    Some(Rect {
+        x: px.clamp(term_rect.x, max_x),
+        y: py.clamp(term_rect.y, max_y),
+        width: pad_w,
+        height: pad_h,
+    })
+}
+
+pub fn resolve_dpad_disc_rect(term_rect: Rect, custom_pos: Option<(u16, u16)>) -> Option<Rect> {
+    let (pad_w, pad_h) = cross_pad_dimensions(term_rect)?;
+    let max_x = term_rect.x + term_rect.width.saturating_sub(pad_w);
+    let max_y = term_rect.y + term_rect.height.saturating_sub(pad_h);
+    let default_x = if term_rect.width > pad_w * 2 + 1 {
+        max_x.saturating_sub(1).max(term_rect.x)
+    } else {
+        max_x
+    };
     let default_y = max_y.saturating_sub(1).max(term_rect.y);
     let (px, py) = custom_pos.unwrap_or((default_x, default_y));
     Some(Rect {
@@ -318,10 +351,10 @@ impl TerminalSelection {
     }
 }
 
-pub fn bottom_bar_height(area: Rect, touch_mode: bool) -> u16 {
+pub fn top_bar_height(area: Rect, touch_mode: bool) -> u16 {
     if area.height <= 1 {
         0
-    } else if touch_mode && area.height >= 8 {
+    } else if touch_mode && area.height >= 10 {
         3
     } else if touch_mode && area.height >= 6 {
         2
@@ -330,23 +363,27 @@ pub fn bottom_bar_height(area: Rect, touch_mode: bool) -> u16 {
     }
 }
 
-pub fn compute_terminal_rect(
-    area: Rect,
-    sidebar_open: bool,
-    sidebar_width: u16,
-    touch_mode: bool,
-) -> Rect {
-    let bb_h = bottom_bar_height(area, touch_mode);
-    let body_height = area.height.saturating_sub(bb_h).max(1);
-    let sw = if sidebar_open && area.width > 12 {
-        sidebar_width.min(area.width.saturating_sub(12))
+pub fn bottom_bar_height(area: Rect, _touch_mode: bool) -> u16 {
+    if area.height >= 3 {
+        1
     } else {
         0
-    };
+    }
+}
+
+pub fn compute_terminal_rect(
+    area: Rect,
+    _sidebar_open: bool,
+    _sidebar_width: u16,
+    touch_mode: bool,
+) -> Rect {
+    let top_h = top_bar_height(area, touch_mode);
+    let bot_h = bottom_bar_height(area, touch_mode);
+    let body_height = area.height.saturating_sub(top_h + bot_h).max(1);
     Rect {
-        x: area.x + sw,
-        y: area.y,
-        width: area.width.saturating_sub(sw).max(1),
+        x: area.x,
+        y: area.y + top_h,
+        width: area.width.max(1),
         height: body_height,
     }
 }
@@ -380,7 +417,7 @@ pub fn render_ui(
     copied_flash: bool,
     modal: &Modal,
 ) -> UiGeometry {
-    render_ui_with_dpad(
+    render_ui_with_pads(
         f,
         world,
         screen,
@@ -396,9 +433,12 @@ pub fn render_ui(
         modal,
         None,
         false,
+        None,
+        false,
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn render_ui_with_dpad(
     f: &mut Frame,
@@ -417,22 +457,65 @@ pub fn render_ui_with_dpad(
     dpad_pos: Option<(u16, u16)>,
     dpad_dragging: bool,
 ) -> UiGeometry {
+    render_ui_with_pads(
+        f,
+        world,
+        screen,
+        sidebar_open,
+        sidebar_width,
+        touch_mode,
+        prefix_active,
+        ctrl_active,
+        alt_active,
+        scrollback_offset,
+        selection,
+        copied_flash,
+        modal,
+        None,
+        false,
+        dpad_pos,
+        dpad_dragging,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_ui_with_pads(
+    f: &mut Frame,
+    world: &World,
+    screen: Option<&vt100::Screen>,
+    sidebar_open: bool,
+    sidebar_width: u16,
+    touch_mode: bool,
+    prefix_active: bool,
+    ctrl_active: bool,
+    alt_active: bool,
+    scrollback_offset: usize,
+    selection: Option<&TerminalSelection>,
+    copied_flash: bool,
+    modal: &Modal,
+    mod_pos: Option<(u16, u16)>,
+    mod_dragging: bool,
+    dpad_pos: Option<(u16, u16)>,
+    dpad_dragging: bool,
+) -> UiGeometry {
     let area = f.area();
     let mut hits = Vec::new();
-    let bb_h = bottom_bar_height(area, touch_mode);
-
+    let top_h = top_bar_height(area, touch_mode);
+    let bot_h = bottom_bar_height(area, touch_mode);
     let term_rect = compute_terminal_rect(area, sidebar_open, sidebar_width, touch_mode);
-    let actual_sidebar_w = term_rect.x.saturating_sub(area.x);
 
-    if actual_sidebar_w > 0 && term_rect.height > 0 {
-        let side_rect = Rect {
-            x: area.x,
-            y: area.y,
-            width: actual_sidebar_w,
-            height: term_rect.height,
-        };
-        render_sidebar(f, side_rect, world, &mut hits);
-    }
+    let top_rect = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: top_h,
+    };
+    let bottom_rect = Rect {
+        x: area.x,
+        y: term_rect.y + term_rect.height,
+        width: area.width,
+        height: bot_h,
+    };
 
     if let Some(scr) = screen {
         f.render_widget(
@@ -457,83 +540,47 @@ pub fn render_ui_with_dpad(
         f.render_widget(placeholder, term_rect);
     }
 
-    let bottom_rect = Rect {
-        x: area.x,
-        y: area.y + term_rect.height,
-        width: area.width,
-        height: bb_h,
-    };
-
+    let mut mod_rect = None;
     let mut dpad_rect = None;
+    let space_menu_open = matches!(modal, Modal::SpaceMenu);
 
-    // Render bottom touchbar and floating semi-transparent 4-way D-Pad disc when no modal is open,
-    // or render bottom touchbar then modal overlay when a modal is active.
+    render_top_tabbar(f, top_rect, world, space_menu_open, &mut hits);
+    render_bottom_status_bar(
+        f,
+        bottom_rect,
+        world,
+        scrollback_offset,
+        copied_flash,
+        &mut hits,
+    );
+
     match modal {
         Modal::None => {
-            dpad_rect = render_floating_dpad(f, term_rect, dpad_pos, dpad_dragging, &mut hits);
-            render_bottom_touchbar(
+            mod_rect = render_floating_mod_cross(
                 f,
-                bottom_rect,
-                world,
-                sidebar_open,
+                term_rect,
+                mod_pos,
+                mod_dragging,
                 prefix_active,
                 ctrl_active,
                 alt_active,
-                scrollback_offset,
-                copied_flash,
-                dpad_rect.is_none(),
                 &mut hits,
             );
+            dpad_rect = render_floating_dpad(f, term_rect, dpad_pos, dpad_dragging, &mut hits);
+        }
+        Modal::SpaceMenu => {
+            render_space_menu_modal(f, area, top_h, world, &mut hits);
         }
         Modal::Help => {
-            render_bottom_touchbar(
-                f,
-                bottom_rect,
-                world,
-                sidebar_open,
-                prefix_active,
-                ctrl_active,
-                alt_active,
-                scrollback_offset,
-                copied_flash,
-                false,
-                &mut hits,
-            );
             render_help_modal(f, area, &mut hits);
         }
         Modal::ConfirmCloseTab {
             tab_id,
             tab_title,
         } => {
-            render_bottom_touchbar(
-                f,
-                bottom_rect,
-                world,
-                sidebar_open,
-                prefix_active,
-                ctrl_active,
-                alt_active,
-                scrollback_offset,
-                copied_flash,
-                false,
-                &mut hits,
-            );
             render_confirm_close_modal(f, area, tab_id, tab_title, &mut hits);
         }
         Modal::Prompt { kind, input } => {
-            render_bottom_touchbar(
-                f,
-                bottom_rect,
-                world,
-                sidebar_open,
-                prefix_active,
-                ctrl_active,
-                alt_active,
-                scrollback_offset,
-                copied_flash,
-                false,
-                &mut hits,
-            );
             render_prompt_modal(f, area, kind, input, &mut hits);
         }
         Modal::Fuzzy {
@@ -541,19 +588,6 @@ pub fn render_ui_with_dpad(
             selected,
             selected_tab_id,
         } => {
-            render_bottom_touchbar(
-                f,
-                bottom_rect,
-                world,
-                sidebar_open,
-                prefix_active,
-                ctrl_active,
-                alt_active,
-                scrollback_offset,
-                copied_flash,
-                false,
-                &mut hits,
-            );
             render_fuzzy_modal(
                 f,
                 area,
@@ -569,6 +603,7 @@ pub fn render_ui_with_dpad(
     UiGeometry {
         term_rect,
         hits,
+        mod_rect,
         dpad_rect,
     }
 }
@@ -620,17 +655,11 @@ fn draw_touchbar_pill(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_bottom_touchbar(
+fn render_top_tabbar(
     f: &mut Frame,
     rect: Rect,
     world: &World,
-    sidebar_open: bool,
-    prefix_active: bool,
-    ctrl_active: bool,
-    alt_active: bool,
-    scrollback_offset: usize,
-    copied_flash: bool,
-    include_dpad_fallback: bool,
+    space_menu_open: bool,
     hits: &mut Vec<HitRegion>,
 ) {
     if rect.width == 0 || rect.height == 0 {
@@ -645,8 +674,6 @@ fn render_bottom_touchbar(
     let max_x = rect.x + rect.width;
     let buf = f.buffer_mut();
 
-    // Draw continuous highlighted top divider line (`▔`) across the entire MacBook Touch Bar (`rect.y`)
-    // when in 2-row mode; in 3-row mode (`▄` + label + `▀`), draw `▔` across non-keycap bezel areas.
     if rect.height >= 2 {
         let full_line = "▔".repeat(rect.width as usize);
         buf.set_string(
@@ -659,449 +686,200 @@ fn render_bottom_touchbar(
         );
     }
 
-    // Reserve right-side space for optional `✓ Copied`, `▼ BOT`, and `?` keycaps.
-    // Because the 4 directional arrows (`←`, `↓`, `↑`, `→`) and Paste (`⎘`) are hosted in the
-    // floating semi-transparent 4-way circular disc over the terminal viewport, the bottom Touch Bar
-    // only needs to fit the 5 modifier keycaps (`^B`, `Esc`, `Ctrl`, `Alt`, `Tab`).
-    let narrow_bar = rect.width < 42;
-    let compact_badges = rect.width < 88;
-    let copied_lbl = if copied_flash {
-        Some(if compact_badges { " ✓ " } else { " ✓ Copied " })
-    } else {
-        None
-    };
-    let scroll_lbl = if scrollback_offset > 0 {
-        Some(if compact_badges { " ▼ " } else { " ▼ BOT " })
-    } else {
-        None
-    };
-    let help_lbl = if rect.width < 60 { " ? " } else { "  ?  " };
-    let copied_w = copied_lbl.map_or(0, |s| s.width() as u16 + 1);
-    let scroll_w = scroll_lbl.map_or(0, |s| s.width() as u16 + 1);
+    let help_lbl = if rect.width < 48 { " ? " } else { "  ?  " };
     let help_w = help_lbl.width() as u16;
-    let right_reserved = (copied_w + scroll_w + help_w).min(rect.width.saturating_sub(4));
-    let avail_end = max_x.saturating_sub(right_reserved);
+    let plus_lbl = if rect.width < 48 { " + " } else { "  +  " };
+    let plus_w = plus_lbl.width() as u16;
+    let avail_end = max_x.saturating_sub(help_w.min(rect.width.saturating_sub(4)));
 
-    // 1. Far Left: compact icon-only Sidebar Toggle (` ◄≡ ` / ` ≡► `)
-    let icon_lbl = if sidebar_open { " ◄≡ " } else { " ≡► " };
-    let max_sb_budget = avail_end.saturating_sub(x);
-    let sb_label = if (icon_lbl.width() as u16) <= max_sb_budget {
-        icon_lbl.to_string()
+    // 1. Far Left: Space selector button (`[ ▾ SpaceName ]`) — opens secondary Space popover menu
+    let (sname, sstate) = world
+        .active_space()
+        .map(|s| (world.space_display_name(s), world.space_state(s)))
+        .unwrap_or_else(|| ("space".to_string(), AgentState::None));
+    let arrow = if space_menu_open { "▴" } else { "▾" };
+    let max_space_w = if rect.width < 36 {
+        10usize
+    } else if rect.width < 60 {
+        14usize
     } else {
-        truncate_to_width(icon_lbl, max_sb_budget as usize)
+        20usize
     };
-    let sb_w = sb_label.width() as u16;
-    if sb_w > 0 && x + sb_w <= max_x {
+    let raw_space_lbl = if rect.width < 36 {
+        format!(" {arrow} {} ", truncate_to_width(&sname, 5))
+    } else {
+        format!(
+            " {arrow} {} {} ",
+            sstate.symbol(),
+            truncate_to_width(&sname, max_space_w.saturating_sub(6))
+        )
+    };
+    let space_budget = avail_end.saturating_sub(x).saturating_sub(plus_w + 2);
+    let space_lbl = if (raw_space_lbl.width() as u16) <= space_budget {
+        raw_space_lbl
+    } else {
+        truncate_to_width(&raw_space_lbl, space_budget.max(4) as usize)
+    };
+    let space_w = space_lbl.width() as u16;
+    if space_w > 0 && x + space_w <= max_x {
         let style = Style::default()
-            .bg(if sidebar_open {
-                Color::Rgb(51, 59, 94)
+            .bg(if space_menu_open {
+                Color::Rgb(56, 68, 110)
             } else {
-                Color::Rgb(31, 35, 53)
+                Color::Rgb(32, 38, 60)
             })
-            .fg(Color::Rgb(192, 202, 245))
+            .fg(Color::Rgb(125, 207, 255))
             .add_modifier(Modifier::BOLD);
-        draw_touchbar_pill(buf, x, rect, &sb_label, style, sidebar_open);
+        draw_touchbar_pill(buf, x, rect, &space_lbl, style, space_menu_open);
         hits.push(HitRegion {
             rect: Rect {
                 x,
                 y: rect.y,
-                width: sb_w,
+                width: space_w,
                 height: rect.height,
             },
-            target: HitTarget::ToggleSidebar,
+            target: HitTarget::ToggleSpaceMenu,
         });
-        x += sb_w;
+        x += space_w;
     }
 
-    if x < avail_end {
-        x += 1;
-    }
-
-    // 2. Left Space Name + Hollow/Solid Tab Circles (`●` = active tab, `○` = inactive tab):
-    let dots_start_x = x;
-    let base_end = max_x.saturating_sub(help_w.min(rect.width.saturating_sub(4)));
-    let min_key_reserve: u16 = 29;
-    let max_dots_w: u16 = if rect.width >= 90 {
-        11
-    } else if rect.width >= 72 {
-        9
-    } else if rect.width >= 56 {
-        8
-    } else {
-        0
-    };
-    let dots_budget = base_end
-        .saturating_sub(dots_start_x)
-        .saturating_sub(min_key_reserve)
-        .min(max_dots_w);
-    let dots_limit_x = (dots_start_x + dots_budget).min(max_x);
-
-    if dots_budget >= 2 {
-        if let Some(space) = world.active_space() {
-            let sname = world.space_display_name(space);
-            let active_ti = world.active_tab_index();
-            let space_id = space.id.clone();
-            let total_tabs = space.tabs.len();
-            let zone_color = Color::Rgb(24, 27, 42);
-            let zone_bg = Style::default()
-                .bg(zone_color)
-                .fg(Color::Rgb(125, 207, 255))
-                .add_modifier(Modifier::BOLD);
-
-            if rect.height >= 2 {
-                let (name_row, dots_row) = if rect.height >= 3 {
-                    buf.set_string(
-                        dots_start_x,
-                        rect.y,
-                        &"▔".repeat(dots_budget as usize),
-                        Style::default()
-                            .bg(zone_color)
-                            .fg(Color::Rgb(118, 162, 247)),
-                    );
-                    (rect.y + 1, rect.y + 2)
-                } else {
-                    (rect.y, rect.y + 1)
-                };
-                // Space name row
-                let sname_padded = pad_to_width(&format!(" {sname}"), dots_budget as usize);
-                buf.set_string(dots_start_x, name_row, &sname_padded, zone_bg);
-                // Dots row background fill
-                buf.set_string(
-                    dots_start_x,
-                    dots_row,
-                    &" ".repeat(dots_budget as usize),
-                    Style::default().bg(zone_color),
-                );
-                // Default hit target across the Space+Dots widget cycles to the next tab
-                hits.push(HitRegion {
-                    rect: Rect {
-                        x: dots_start_x,
-                        y: rect.y,
-                        width: dots_budget,
-                        height: rect.height,
-                    },
-                    target: HitTarget::TriggerAction(Action::NextTab),
-                });
-
-                // Solid `●` for current tab, hollow `○` for other tabs in this Space
-                let compact_dots = total_tabs > 5 || (dots_budget as usize) < total_tabs * 2;
-                let dot_step: usize = if compact_dots { 1 } else { 2 };
-                let max_visible_dots = (dots_budget.saturating_sub(1) as usize / dot_step).max(1);
-                let start_ti = if total_tabs <= max_visible_dots || active_ti < max_visible_dots {
-                    0
-                } else {
-                    (active_ti + 1 - max_visible_dots)
-                        .min(total_tabs.saturating_sub(max_visible_dots))
-                };
-
-                let mut dx = dots_start_x + 1;
-                for (ti, tab) in space
-                    .tabs
-                    .iter()
-                    .enumerate()
-                    .skip(start_ti)
-                    .take(max_visible_dots)
-                {
-                    let is_active = ti == active_ti;
-                    let circle = if is_active { "●" } else { "○" };
-                    let pill = if compact_dots {
-                        circle.to_string()
-                    } else {
-                        format!("{circle} ")
-                    };
-                    let pw = pill.width() as u16;
-                    if dx + pw > dots_limit_x {
-                        break;
-                    }
-                    let st = world.tab_state(tab);
-                    let fg_col = if is_active {
-                        Color::Rgb(125, 207, 255)
-                    } else if matches!(st, AgentState::Blocked | AgentState::Done) {
-                        state_color(st)
-                    } else {
-                        Color::Rgb(105, 115, 152)
-                    };
-                    let dstyle = Style::default()
-                        .bg(zone_color)
-                        .fg(fg_col)
-                        .add_modifier(if is_active {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        });
-                    buf.set_string(dx, dots_row, &pill, dstyle);
-                    hits.push(HitRegion {
-                        rect: Rect {
-                            x: dx,
-                            y: rect.y,
-                            width: pw,
-                            height: rect.height,
-                        },
-                        target: if is_active && total_tabs > 1 {
-                            HitTarget::TriggerAction(Action::NextTab)
-                        } else {
-                            HitTarget::SelectTab {
-                                space_id: space_id.clone(),
-                                tab_id: tab.id.clone(),
-                            }
-                        },
-                    });
-                    dx += pw;
-                }
-                x = dots_limit_x;
-            } else {
-                // 1-row fallback (`--no-touch`): compact `●`/`○` circles
-                let compact_dots = total_tabs > 3 || (dots_budget as usize) < total_tabs * 3;
-                let dot_step: usize = if compact_dots { 2 } else { 3 };
-                let max_visible_dots = (dots_budget as usize / dot_step).max(1);
-                let start_ti = if total_tabs <= max_visible_dots || active_ti < max_visible_dots {
-                    0
-                } else {
-                    (active_ti + 1 - max_visible_dots)
-                        .min(total_tabs.saturating_sub(max_visible_dots))
-                };
-
-                for (ti, tab) in space
-                    .tabs
-                    .iter()
-                    .enumerate()
-                    .skip(start_ti)
-                    .take(max_visible_dots)
-                {
-                    let is_active = ti == active_ti;
-                    let circle = if is_active { "●" } else { "○" };
-                    let pill = if compact_dots {
-                        format!("{circle} ")
-                    } else {
-                        format!(" {circle} ")
-                    };
-                    let pw = pill.width() as u16;
-                    if x + pw > dots_limit_x {
-                        break;
-                    }
-                    let pstyle = Style::default()
-                        .bg(if is_active {
-                            Color::Rgb(51, 59, 94)
-                        } else {
-                            zone_color
-                        })
-                        .fg(if is_active {
-                            Color::Rgb(125, 207, 255)
-                        } else {
-                            Color::Rgb(105, 115, 152)
-                        })
-                        .add_modifier(Modifier::BOLD);
-                    draw_touchbar_pill(buf, x, rect, &pill, pstyle, is_active);
-                    hits.push(HitRegion {
-                        rect: Rect {
-                            x,
-                            y: rect.y,
-                            width: pw,
-                            height: rect.height,
-                        },
-                        target: HitTarget::SelectTab {
-                            space_id: space_id.clone(),
-                            tab_id: tab.id.clone(),
-                        },
-                    });
-                    x += pw;
-                }
-            }
-        }
-    }
-    if dots_budget >= 2 && x < dots_limit_x {
-        x = dots_limit_x;
-    }
-    if x > dots_start_x && x < avail_end {
-        x += 1;
-    }
-
-    // 3. Modern Modifier Keycap Pills (`^B`, `Esc`, `Ctrl`, `Alt`, `Tab`)
-    // Directional arrows (`↑`, `↓`, `←`, `→`) and Paste (`⎘`) are rendered in the floating
-    // draggable semi-transparent 4-way circular disc over the terminal viewport.
-    let keycap_style = |active_highlight: bool, kind: u8| -> Style {
-        if active_highlight {
-            Style::default()
-                .bg(Color::Rgb(224, 175, 104))
-                .fg(Color::Rgb(20, 22, 32))
-                .add_modifier(Modifier::BOLD)
+    // Subtle slash divider between Space button and Tab pills
+    if x + 1 < avail_end {
+        let div_y = if rect.height >= 2 {
+            rect.y + 1
         } else {
-            match kind {
-                1 => Style::default()
-                    .bg(Color::Rgb(38, 42, 64))
-                    .fg(Color::Rgb(187, 154, 247))
-                    .add_modifier(Modifier::BOLD),
-                2 => Style::default()
-                    .bg(Color::Rgb(29, 33, 50))
-                    .fg(Color::Rgb(192, 202, 245))
-                    .add_modifier(Modifier::BOLD),
-                _ => Style::default()
-                    .bg(Color::Rgb(34, 38, 57))
-                    .fg(Color::Rgb(192, 202, 245))
-                    .add_modifier(Modifier::BOLD),
-            }
-        }
-    };
-
-    let full_mods = rect.width >= 48;
-    let wide_mods = rect.width >= 72;
-    let mut key_buttons: Vec<(&str, HitTarget, bool, u8)> = vec![
-        (
-            if narrow_bar {
-                "^B"
-            } else if wide_mods {
-                "  ^B  "
-            } else {
-                " ^B "
-            },
-            HitTarget::TogglePrefix,
-            prefix_active,
-            1,
-        ),
-        (
-            if narrow_bar {
-                "Es"
-            } else if full_mods {
-                " Esc "
-            } else {
-                "Esc"
-            },
-            HitTarget::SendKey(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-            false,
-            0,
-        ),
-        (
-            if narrow_bar {
-                "Ct"
-            } else if wide_mods {
-                " Ctrl "
-            } else if full_mods {
-                " Ctl "
-            } else {
-                "Ctl"
-            },
-            HitTarget::ToggleCtrl,
-            ctrl_active,
-            1,
-        ),
-        (
-            if narrow_bar {
-                "Al"
-            } else if full_mods {
-                " Alt "
-            } else {
-                "Alt"
-            },
-            HitTarget::ToggleAlt,
-            alt_active,
-            1,
-        ),
-        (
-            if narrow_bar {
-                "Tb"
-            } else if full_mods {
-                " Tab "
-            } else {
-                "Tab"
-            },
-            HitTarget::SendKey(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
-            false,
-            0,
-        ),
-    ];
-
-    if include_dpad_fallback {
-        key_buttons.extend([
-            (
-                "←",
-                HitTarget::SendKey(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
-                false,
-                2,
-            ),
-            (
-                "↓",
-                HitTarget::SendKey(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-                false,
-                0,
-            ),
-            (
-                "↑",
-                HitTarget::SendKey(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
-                false,
-                2,
-            ),
-            (
-                "→",
-                HitTarget::SendKey(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
-                false,
-                0,
-            ),
-            ("⎘", HitTarget::PasteClipboard, false, 3),
-        ]);
-    }
-
-    for (i, (lbl, target, active_highlight, kind)) in key_buttons.into_iter().enumerate() {
-        let kw = lbl.width() as u16;
-        if x + kw > avail_end {
-            break;
-        }
-        let kstyle = if narrow_bar && !active_highlight && i % 2 == 1 {
-            keycap_style(false, 2)
-        } else {
-            keycap_style(active_highlight, kind)
+            rect.y
         };
-        draw_touchbar_pill(buf, x, rect, lbl, kstyle, active_highlight);
-        hits.push(HitRegion {
-            rect: Rect {
-                x,
-                y: rect.y,
-                width: kw,
-                height: rect.height,
-            },
-            target,
-        });
-        x += kw;
-
-        if !narrow_bar && x < avail_end {
-            x += 1;
-        }
+        buf.set_string(
+            x,
+            div_y,
+            "╱",
+            Style::default()
+                .bg(Color::Rgb(12, 14, 22))
+                .fg(Color::Rgb(72, 82, 118)),
+        );
+        x += 1;
     }
 
-    // 4. Right: optional `✓ Copied`, `▼ BOT`, and `?` keycaps
-    let mut rx = avail_end;
-    if let Some(clbl) = copied_lbl {
-        let cw = clbl.width() as u16;
-        if rx + cw <= max_x {
-            let cstyle = Style::default()
-                .bg(Color::Rgb(158, 206, 106))
-                .fg(Color::Rgb(20, 22, 32))
-                .add_modifier(Modifier::BOLD);
-            draw_touchbar_pill(buf, rx, rect, clbl, cstyle, true);
-            rx = (rx + cw + 1).min(max_x);
+    // 2. Horizontal Tab pills (`space / tab1 / tab2 ...`) + trailing `[ + ]` button
+    let tabs_limit_x = avail_end.saturating_sub(plus_w + 1);
+    if let Some(space) = world.active_space() {
+        let active_ti = world.active_tab_index();
+        let space_id = space.id.clone();
+        let total_tabs = space.tabs.len();
+        let compact_tabs = rect.width < 64 || total_tabs > 4;
+        let max_tab_name_w = if rect.width < 44 {
+            4usize
+        } else if compact_tabs {
+            8usize
+        } else {
+            14usize
+        };
+
+        // Build formatted labels for all tabs so we can window around `active_ti` if needed
+        let mut tab_pills: Vec<(usize, String, String, AgentState, bool)> =
+            Vec::with_capacity(total_tabs);
+        for (ti, tab) in space.tabs.iter().enumerate() {
+            let is_active = ti == active_ti;
+            let st = world.tab_state(tab);
+            let tname = truncate_to_width(&world.tab_display_name(space, ti), max_tab_name_w);
+            let icon = if matches!(st, AgentState::Blocked | AgentState::Working | AgentState::Done)
+            {
+                st.symbol()
+            } else if is_active {
+                "●"
+            } else {
+                "○"
+            };
+            let lbl = if rect.width < 40 {
+                format!(" {icon}{} ", ti + 1)
+            } else {
+                format!(" {icon} {}:{} ", ti + 1, tname)
+            };
+            tab_pills.push((ti, tab.id.clone(), lbl, st, is_active));
         }
-    }
-    if let Some(slbl) = scroll_lbl {
-        let sw = slbl.width() as u16;
-        if rx + sw <= max_x {
-            let sstyle = Style::default()
-                .bg(Color::Rgb(125, 207, 255))
-                .fg(Color::Rgb(20, 22, 32))
-                .add_modifier(Modifier::BOLD);
-            draw_touchbar_pill(buf, rx, rect, slbl, sstyle, true);
+
+        // Ensure `active_ti` is within the visible horizontal slice
+        let avail_tabs_w = tabs_limit_x.saturating_sub(x);
+        let mut start_idx = 0usize;
+        if avail_tabs_w > 0 && !tab_pills.is_empty() {
+            while start_idx < active_ti {
+                let needed: u16 = tab_pills[start_idx..=active_ti]
+                    .iter()
+                    .map(|(_, _, lbl, _, _)| lbl.width() as u16 + 1)
+                    .sum();
+                if needed <= avail_tabs_w {
+                    break;
+                }
+                start_idx += 1;
+            }
+        }
+
+        for (_ti, tab_id, lbl, st, is_active) in tab_pills.into_iter().skip(start_idx) {
+            let pw = lbl.width() as u16;
+            if x + pw > tabs_limit_x {
+                break;
+            }
+            let fg_col = if is_active {
+                Color::White
+            } else if matches!(st, AgentState::Blocked | AgentState::Done) {
+                state_color(st)
+            } else {
+                Color::Rgb(160, 170, 205)
+            };
+            let bg_col = if is_active {
+                Color::Rgb(58, 70, 114)
+            } else {
+                Color::Rgb(24, 28, 44)
+            };
+            let tstyle = Style::default().bg(bg_col).fg(fg_col).add_modifier(
+                if is_active {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                },
+            );
+            draw_touchbar_pill(buf, x, rect, &lbl, tstyle, is_active);
             hits.push(HitRegion {
                 rect: Rect {
-                    x: rx,
+                    x,
                     y: rect.y,
-                    width: sw,
+                    width: pw,
                     height: rect.height,
                 },
-                target: HitTarget::ExitScrollback,
+                target: HitTarget::SelectTab {
+                    space_id: space_id.clone(),
+                    tab_id,
+                },
             });
-            rx = (rx + sw + 1).min(max_x);
+            x += pw;
+            if x < tabs_limit_x {
+                x += 1;
+            }
         }
     }
 
-    if rx + help_w <= max_x {
+    // 3. `[ + ]` button immediately after the tabs to add a new Tab
+    if x + plus_w <= avail_end {
+        let pstyle = Style::default()
+            .bg(Color::Rgb(28, 52, 44))
+            .fg(Color::Rgb(158, 206, 106))
+            .add_modifier(Modifier::BOLD);
+        draw_touchbar_pill(buf, x, rect, plus_lbl, pstyle, false);
+        hits.push(HitRegion {
+            rect: Rect {
+                x,
+                y: rect.y,
+                width: plus_w,
+                height: rect.height,
+            },
+            target: HitTarget::NewTab,
+        });
+    }
+
+    // 4. Far Right: `[ ? ]` Quick Actions & Help button
+    let rx = max_x.saturating_sub(help_w);
+    if rx >= x && rx + help_w <= max_x {
         let hstyle = Style::default()
             .bg(Color::Rgb(34, 40, 62))
             .fg(Color::Rgb(125, 207, 255))
@@ -1117,6 +895,427 @@ fn render_bottom_touchbar(
             target: HitTarget::ToggleHelp,
         });
     }
+}
+
+fn render_bottom_status_bar(
+    f: &mut Frame,
+    rect: Rect,
+    world: &World,
+    scrollback_offset: usize,
+    copied_flash: bool,
+    hits: &mut Vec<HitRegion>,
+) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+    let bar_bg = Color::Rgb(14, 16, 24);
+    let base_style = Style::default().bg(bar_bg).fg(Color::Rgb(160, 168, 200));
+    f.render_widget(Block::default().style(base_style), rect);
+
+    let buf = f.buffer_mut();
+    let max_x = rect.x + rect.width;
+    let mut x = rect.x;
+
+    let active_state = world
+        .active_space()
+        .and_then(|s| s.tabs.get(world.active_tab_index()))
+        .map(|t| world.tab_state(t))
+        .unwrap_or(AgentState::None);
+
+    let (badge_lbl, badge_bg, badge_fg) = match active_state {
+        AgentState::Blocked => (
+            " ◉ BLOCKED ",
+            Color::Rgb(92, 28, 42),
+            Color::Rgb(247, 118, 142),
+        ),
+        AgentState::Working => (
+            " ● WORKING ",
+            Color::Rgb(24, 52, 74),
+            Color::Rgb(125, 207, 255),
+        ),
+        AgentState::Done => (
+            " ✓ DONE ",
+            Color::Rgb(26, 56, 38),
+            Color::Rgb(158, 206, 106),
+        ),
+        AgentState::Idle => (
+            " ○ IDLE ",
+            Color::Rgb(42, 38, 26),
+            Color::Rgb(224, 175, 104),
+        ),
+        AgentState::None => (
+            " ○ SHELL ",
+            Color::Rgb(26, 30, 46),
+            Color::Rgb(140, 150, 185),
+        ),
+    };
+
+    let bw = badge_lbl.width() as u16;
+    if x + bw <= max_x {
+        buf.set_string(
+            x,
+            rect.y,
+            badge_lbl,
+            Style::default()
+                .bg(badge_bg)
+                .fg(badge_fg)
+                .add_modifier(Modifier::BOLD),
+        );
+        x += bw;
+    }
+
+    // Reserve right-side space for optional `✓ Copied` and `▼ BOT (+N)` indicators
+    let copied_lbl = if copied_flash {
+        Some(if rect.width < 60 {
+            " ✓ "
+        } else {
+            " ✓ Copied "
+        })
+    } else {
+        None
+    };
+    let scroll_lbl = if scrollback_offset > 0 {
+        Some(if rect.width < 60 {
+            " ▼ BOT ".to_string()
+        } else {
+            format!(" ▼ BOT (+{scrollback_offset}) ")
+        })
+    } else {
+        None
+    };
+    let copied_w = copied_lbl.map_or(0, |s| s.width() as u16);
+    let scroll_w = scroll_lbl.as_ref().map_or(0, |s| s.width() as u16);
+    let right_reserved = copied_w + scroll_w;
+    let avail_end = max_x.saturating_sub(right_reserved);
+
+    // Count workspace agent states & turns for the read-only Agent Status Bar
+    let mut working_cnt = 0usize;
+    let mut blocked_cnt = 0usize;
+    let mut done_cnt = 0usize;
+    let mut total_turns = 0u64;
+    for info in world.terminals.values() {
+        total_turns += info.turn;
+        match info.agent_state() {
+            AgentState::Working => working_cnt += 1,
+            AgentState::Blocked => blocked_cnt += 1,
+            AgentState::Done => done_cnt += 1,
+            _ => {}
+        }
+    }
+
+    let detail = world
+        .active_terminal_address()
+        .and_then(|addr| {
+            world.terminals.get(&addr).map(|info| {
+                let cwd = shorten_home_path(info.effective_cwd());
+                let title = if info.title.is_empty() {
+                    addr.as_str()
+                } else {
+                    info.title.as_str()
+                };
+                if info.turn > 0 {
+                    format!(" {title} · {cwd} · turn #{}", info.turn)
+                } else {
+                    format!(" {title} · {cwd}")
+                }
+            })
+        })
+        .unwrap_or_else(|| " shell".to_string());
+
+    let usage_summary = format!(
+        " ◉{blocked_cnt} ●{working_cnt} ✓{done_cnt} · turns:{total_turns} "
+    );
+    let usage_w = usage_summary.width() as u16;
+    let detail_end = if avail_end.saturating_sub(x) > usage_w + 12 {
+        avail_end.saturating_sub(usage_w)
+    } else {
+        avail_end
+    };
+
+    if x < detail_end {
+        let d_trunc = truncate_to_width(&detail, (detail_end - x) as usize);
+        buf.set_string(x, rect.y, &d_trunc, base_style);
+    }
+    if detail_end < avail_end {
+        buf.set_string(
+            detail_end,
+            rect.y,
+            &usage_summary,
+            Style::default()
+                .bg(Color::Rgb(20, 24, 36))
+                .fg(Color::Rgb(138, 162, 218)),
+        );
+    }
+
+    let mut rx = avail_end;
+    if let Some(clbl) = copied_lbl {
+        let cw = clbl.width() as u16;
+        if rx + cw <= max_x {
+            buf.set_string(
+                rx,
+                rect.y,
+                clbl,
+                Style::default()
+                    .bg(Color::Rgb(158, 206, 106))
+                    .fg(Color::Rgb(20, 22, 32))
+                    .add_modifier(Modifier::BOLD),
+            );
+            rx += cw;
+        }
+    }
+    if let Some(slbl) = scroll_lbl {
+        let sw = slbl.width() as u16;
+        if rx + sw <= max_x {
+            buf.set_string(
+                rx,
+                rect.y,
+                &slbl,
+                Style::default()
+                    .bg(Color::Rgb(125, 207, 255))
+                    .fg(Color::Rgb(20, 22, 32))
+                    .add_modifier(Modifier::BOLD),
+            );
+            hits.push(HitRegion {
+                rect: Rect {
+                    x: rx,
+                    y: rect.y,
+                    width: sw,
+                    height: rect.height,
+                },
+                target: HitTarget::ExitScrollback,
+            });
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_floating_mod_cross(
+    f: &mut Frame,
+    term_rect: Rect,
+    mod_pos: Option<(u16, u16)>,
+    dragging: bool,
+    prefix_active: bool,
+    ctrl_active: bool,
+    alt_active: bool,
+    hits: &mut Vec<HitRegion>,
+) -> Option<Rect> {
+    let disc = resolve_mod_cross_rect(term_rect, mod_pos)?;
+    let buf = f.buffer_mut();
+
+    let base_tint = if dragging {
+        (64, 58, 114)
+    } else {
+        (46, 42, 86)
+    };
+    let base_alpha = if dragging { 82 } else { 72 };
+    let center_tint = if dragging {
+        (78, 62, 128)
+    } else {
+        (58, 46, 98)
+    };
+    let center_alpha = if dragging { 86 } else { 78 };
+    let active_tint = (214, 162, 84);
+    let active_alpha = 88;
+
+    let border_fg = if dragging {
+        Color::Rgb(187, 154, 247)
+    } else {
+        Color::Rgb(124, 112, 178)
+    };
+    let key_fg = Color::Rgb(230, 238, 255);
+    let mod_fg = Color::Rgb(210, 190, 255);
+    let active_fg = Color::Rgb(255, 248, 220);
+
+    // 15x7 Compact Cross (+) for Modifier Keys with 4 hollow corners:
+    // col: 012345678901234
+    // r0:       ╭───╮     
+    // r1:       │Esc│     
+    // r2:  ╭───╮├───┤╭───╮
+    // r3:  │Ctl││^B ││Alt│
+    // r4:  ╰───╯├───┤╰───╯
+    // r5:       │Tab│     
+    // r6:       ╰───╯     
+    let (arm_w, arm_h, mid_h) = dpad_cross_metrics(disc);
+    let mid_col_end = arm_w * 2;
+    let mid_row_end = arm_h + mid_h;
+    let up_label_y = arm_h.saturating_sub(1);
+    let mid_label_y = arm_h + mid_h / 2;
+    let down_label_y = mid_row_end;
+    let left_label_x = arm_w / 2;
+    let center_label_x = arm_w + arm_w / 2;
+    let right_label_x = mid_col_end + arm_w / 2;
+    let full_15x7 = disc.width == DPAD_DISC_WIDTH && disc.height == DPAD_DISC_HEIGHT;
+
+    for dy in 0..disc.height {
+        for dx in 0..disc.width {
+            let in_cross = (arm_w..mid_col_end).contains(&dx) || (arm_h..mid_row_end).contains(&dy);
+            if !in_cross {
+                continue;
+            }
+            let x = disc.x + dx;
+            let y = disc.y + dy;
+            if x >= buf.area.width || y >= buf.area.height {
+                continue;
+            }
+            let is_center =
+                (arm_w..mid_col_end).contains(&dx) && (arm_h..mid_row_end).contains(&dy);
+            let is_left = dx < arm_w && (arm_h..mid_row_end).contains(&dy);
+            let is_right = dx >= mid_col_end && (arm_h..mid_row_end).contains(&dy);
+
+            let sector_active = (is_center && prefix_active)
+                || (is_left && ctrl_active)
+                || (is_right && alt_active);
+
+            let cell = &mut buf[(x, y)];
+            let base_bg = color_to_rgb(cell.bg, (18, 20, 30));
+            let base_fg = color_to_rgb(cell.fg, (169, 177, 214));
+            let (tint, alpha) = if sector_active {
+                (active_tint, active_alpha)
+            } else if is_center {
+                (center_tint, center_alpha)
+            } else {
+                (base_tint, base_alpha)
+            };
+            let blended_bg = blend_rgb(base_bg, tint, alpha);
+
+            let ctl_col = if ctrl_active { active_fg } else { mod_fg };
+            let pfx_col = if prefix_active { active_fg } else { mod_fg };
+            let alt_col = if alt_active { active_fg } else { mod_fg };
+
+            let glyph: Option<(&str, Color, bool)> = if full_15x7 {
+                match (dy, dx) {
+                    // Row 0: top of Esc box
+                    (0, 5) => Some(("╭", border_fg, false)),
+                    (0, 6..=8) => Some(("─", border_fg, false)),
+                    (0, 9) => Some(("╮", border_fg, false)),
+                    // Row 1: Esc label
+                    (1, 5) | (1, 9) => Some(("│", border_fg, false)),
+                    (1, 6) => Some(("E", key_fg, true)),
+                    (1, 7) => Some(("s", key_fg, true)),
+                    (1, 8) => Some(("c", key_fg, true)),
+                    // Row 2: top of Left / Center / Right
+                    (2, 0) | (2, 10) => Some(("╭", border_fg, false)),
+                    (2, 4) | (2, 14) => Some(("╮", border_fg, false)),
+                    (2, 5) => Some(("├", border_fg, false)),
+                    (2, 9) => Some(("┤", border_fg, false)),
+                    (2, 1..=3) | (2, 6..=8) | (2, 11..=13) => Some(("─", border_fg, false)),
+                    // Row 3: Ctl / ^B / Alt labels
+                    (3, 0) | (3, 4) | (3, 5) | (3, 9) | (3, 10) | (3, 14) => {
+                        Some(("│", border_fg, false))
+                    }
+                    (3, 1) => Some(("C", ctl_col, true)),
+                    (3, 2) => Some(("t", ctl_col, true)),
+                    (3, 3) => Some(("l", ctl_col, true)),
+                    (3, 6) => Some(("^", pfx_col, true)),
+                    (3, 7) => Some(("B", pfx_col, true)),
+                    (3, 8) => Some((" ", pfx_col, false)),
+                    (3, 11) => Some(("A", alt_col, true)),
+                    (3, 12) => Some(("l", alt_col, true)),
+                    (3, 13) => Some(("t", alt_col, true)),
+                    // Row 4: bottom of Left / Center / Right
+                    (4, 0) | (4, 10) => Some(("╰", border_fg, false)),
+                    (4, 4) | (4, 14) => Some(("╯", border_fg, false)),
+                    (4, 5) => Some(("├", border_fg, false)),
+                    (4, 9) => Some(("┤", border_fg, false)),
+                    (4, 1..=3) | (4, 6..=8) | (4, 11..=13) => Some(("─", border_fg, false)),
+                    // Row 5: Tab label
+                    (5, 5) | (5, 9) => Some(("│", border_fg, false)),
+                    (5, 6) => Some(("T", key_fg, true)),
+                    (5, 7) => Some(("a", key_fg, true)),
+                    (5, 8) => Some(("b", key_fg, true)),
+                    // Row 6: bottom of Tab box
+                    (6, 5) => Some(("╰", border_fg, false)),
+                    (6, 6..=8) => Some(("─", border_fg, false)),
+                    (6, 9) => Some(("╯", border_fg, false)),
+                    _ => None,
+                }
+            } else if dy == up_label_y && dx == center_label_x {
+                Some(("E", key_fg, true))
+            } else if dy == down_label_y && dx == center_label_x {
+                Some(("T", key_fg, true))
+            } else if dy == mid_label_y && dx == left_label_x {
+                Some(("C", ctl_col, true))
+            } else if dy == mid_label_y && dx == center_label_x {
+                Some(("B", pfx_col, true))
+            } else if dy == mid_label_y && dx == right_label_x {
+                Some(("A", alt_col, true))
+            } else {
+                None
+            };
+
+            cell.set_bg(blended_bg);
+            if let Some((sym, fg, bold)) = glyph {
+                cell.set_symbol(sym);
+                cell.set_fg(fg);
+                if bold {
+                    cell.modifier.insert(Modifier::BOLD);
+                } else {
+                    cell.modifier.remove(Modifier::BOLD);
+                }
+            } else {
+                if cell.symbol().width() != 1 {
+                    cell.set_symbol(" ");
+                }
+                let ghost_fg = blend_rgb(base_fg, tint, 55);
+                cell.set_fg(ghost_fg);
+                cell.modifier.remove(Modifier::BOLD);
+            }
+        }
+    }
+
+    // Register 5 hit regions covering 100% of the Left Modifier Cross (+):
+    // Top arm (Esc)
+    hits.push(HitRegion {
+        rect: Rect {
+            x: disc.x + arm_w,
+            y: disc.y,
+            width: arm_w,
+            height: arm_h,
+        },
+        target: HitTarget::SendKey(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+    });
+    // Bottom arm (Tab)
+    hits.push(HitRegion {
+        rect: Rect {
+            x: disc.x + arm_w,
+            y: disc.y + mid_row_end,
+            width: arm_w,
+            height: arm_h,
+        },
+        target: HitTarget::SendKey(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+    });
+    // Left arm (Ctrl)
+    hits.push(HitRegion {
+        rect: Rect {
+            x: disc.x,
+            y: disc.y + arm_h,
+            width: arm_w,
+            height: mid_h,
+        },
+        target: HitTarget::ToggleCtrl,
+    });
+    // Right arm (Alt)
+    hits.push(HitRegion {
+        rect: Rect {
+            x: disc.x + mid_col_end,
+            y: disc.y + arm_h,
+            width: arm_w,
+            height: mid_h,
+        },
+        target: HitTarget::ToggleAlt,
+    });
+    // Center square (^B Prefix)
+    hits.push(HitRegion {
+        rect: Rect {
+            x: disc.x + arm_w,
+            y: disc.y + arm_h,
+            width: arm_w,
+            height: mid_h,
+        },
+        target: HitTarget::TogglePrefix,
+    });
+
+    Some(disc)
 }
 
 fn color_to_rgb(c: Color, default_rgb: (u8, u8, u8)) -> (u8, u8, u8) {
@@ -1353,16 +1552,6 @@ fn render_floating_dpad(
     Some(disc)
 }
 
-struct SidebarCard {
-    row1: String,
-    row2: String,
-    dot_col: Option<(u16, AgentState)>,
-    is_active: bool,
-    is_space: bool,
-    collapse_space_id: Option<String>,
-    target: HitTarget,
-}
-
 fn shorten_home_path(path: &str) -> String {
     if path.is_empty() {
         return "~".to_string();
@@ -1380,211 +1569,124 @@ fn shorten_home_path(path: &str) -> String {
     path.to_string()
 }
 
-fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRegion>) {
-    let bg = Style::default()
-        .bg(Color::Rgb(18, 20, 30))
-        .fg(Color::Rgb(200, 205, 220));
+fn render_space_menu_modal(
+    f: &mut Frame,
+    area: Rect,
+    top_h: u16,
+    world: &World,
+    hits: &mut Vec<HitRegion>,
+) {
+    hits.clear();
+    let space_cnt = world.doc.spaces.len().max(1) as u16;
+    let desired_h = (space_cnt * 2 + 5).max(7);
+    let pop_y = (area.y + top_h).min(area.y + area.height.saturating_sub(3));
+    let avail_h = (area.y + area.height).saturating_sub(pop_y);
+    let pop_h = desired_h.min(avail_h).max(3.min(avail_h));
+    let pop_w = 40u16.min(area.width.saturating_sub(2)).max(12.min(area.width));
+    let pop_x = (area.x + 1).min(area.x + area.width.saturating_sub(pop_w));
+    let popup = Rect {
+        x: pop_x,
+        y: pop_y,
+        width: pop_w,
+        height: pop_h,
+    };
+
+    f.render_widget(Clear, popup);
+    hits.push(HitRegion {
+        rect: popup,
+        target: HitTarget::ModalNoop,
+    });
+
     let block = Block::default()
-        .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(Color::Rgb(55, 60, 85)))
-        .style(bg);
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
+        .title(" ❖ Spaces ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Rgb(125, 207, 255)))
+        .style(
+            Style::default()
+                .bg(Color::Rgb(18, 20, 32))
+                .fg(Color::Rgb(200, 205, 220)),
+        );
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let buf = f.buffer_mut();
+    draw_modal_close_button(buf, popup, hits);
 
     if inner.width == 0 || inner.height == 0 {
         return;
     }
 
-    let buf = f.buffer_mut();
-    let mut y = inner.y;
     let max_y = inner.y + inner.height;
+    let footer_h: u16 = if inner.height >= 4 { 2 } else { 1 };
+    let list_end_y = max_y.saturating_sub(footer_h);
     let w = inner.width as usize;
 
-    // Header (1 row)
-    if y < max_y {
-        let hdr = pad_to_width(" ❖ WORKSPACES", w);
-        buf.set_string(
-            inner.x,
-            y,
-            &hdr,
-            Style::default()
-                .bg(Color::Rgb(22, 24, 37))
-                .fg(Color::Rgb(122, 162, 247))
-                .add_modifier(Modifier::BOLD),
-        );
-        y += 1;
-    }
-
-    // Reserve footer space for 2-row visually centered (`▄` + text + `▀`) `[+ New Tab]` and `[+ New Space]`
-    // buttons with tight margin between them and above the bottom touchbar.
-    let footer_rows = if max_y.saturating_sub(y) >= 9 {
-        6
-    } else if max_y.saturating_sub(y) >= 4 {
-        2
-    } else {
+    let use_two_row = list_end_y.saturating_sub(inner.y) >= 2;
+    let row_step: usize = if use_two_row { 2 } else { 1 };
+    let visible_spaces = (list_end_y.saturating_sub(inner.y) as usize / row_step).max(1);
+    let start_si = if world.active_space_idx < visible_spaces {
         0
+    } else {
+        world.active_space_idx + 1 - visible_spaces
     };
-    let list_end_y = max_y.saturating_sub(footer_rows);
 
-    // Build 2-row cards for all Spaces and (when not collapsed) their child Tabs
-    let mut cards: Vec<SidebarCard> = Vec::new();
-    let mut active_card_idx: usize = 0;
-
-    for (si, space) in world.doc.spaces.iter().enumerate() {
-        let is_active_space = si == world.active_space_idx;
-        let is_collapsed = world.is_space_collapsed(&space.id);
-        if is_active_space {
-            active_card_idx = cards.len();
+    let mut y = inner.y;
+    for (si, space) in world.doc.spaces.iter().enumerate().skip(start_si) {
+        if y + (row_step as u16) > list_end_y {
+            break;
         }
+        let is_active = si == world.active_space_idx;
         let sname = world.space_display_name(space);
         let sstate = world.space_state(space);
-        let arrow = if is_collapsed { "▸" } else { "▾" };
-        let prefix = format!(" {arrow} ");
+        let tab_cnt = space.tabs.len();
+        let marker = if is_active { "▸" } else { " " };
+        let prefix = format!(" {marker} ");
         let dot_x = prefix.width() as u16;
-        let collapsed_suffix = if is_collapsed {
-            format!(" ({})", space.tabs.len())
-        } else {
-            String::new()
-        };
-        let row1 = format!("{prefix}{} {sname}{collapsed_suffix}", sstate.symbol());
+        let row1 = format!("{prefix}{} {sname} ({tab_cnt})", sstate.symbol());
         let folder = shorten_home_path(&space.folder);
         let row2 = format!("     {folder}");
 
-        cards.push(SidebarCard {
-            row1,
-            row2,
-            dot_col: Some((dot_x, sstate)),
-            is_active: is_active_space,
-            is_space: true,
-            collapse_space_id: Some(space.id.clone()),
-            target: HitTarget::SelectSpace(space.id.clone()),
-        });
-
-        if is_collapsed {
-            continue;
-        }
-
-        let active_ti = if is_active_space {
-            Some(world.active_tab_index())
-        } else {
-            None
-        };
-
-        for (ti, tab) in space.tabs.iter().enumerate() {
-            let is_active_tab = active_ti == Some(ti);
-            if is_active_tab {
-                active_card_idx = cards.len();
-            }
-            let tname = world.tab_display_name(space, ti);
-            let st = world.tab_state(tab);
-            let panes = world.tab_terminals(tab).len();
-            let pane_suffix = if panes > 1 {
-                format!(" ({panes})")
-            } else {
-                String::new()
-            };
-            let prefix = format!("   {}:", ti + 1);
-            let dot_x = prefix.width() as u16;
-            let row1 = format!("{prefix}{} {tname}{pane_suffix}", st.symbol());
-
-            let subtitle = world
-                .active_terminal_for_tab(tab)
-                .and_then(|addr| {
-                    world.terminals.get(&addr).map(|info| {
-                        let cwd = shorten_home_path(info.effective_cwd());
-                        format!("      {addr} · {cwd}")
-                    })
-                })
-                .unwrap_or_else(|| "      shell".to_string());
-
-            cards.push(SidebarCard {
-                row1,
-                row2: subtitle,
-                dot_col: Some((dot_x, st)),
-                is_active: is_active_tab,
-                is_space: false,
-                collapse_space_id: None,
-                target: HitTarget::SelectTab {
-                    space_id: space.id.clone(),
-                    tab_id: tab.id.clone(),
-                },
-            });
-        }
-    }
-
-    // Calculate visible 2-row card window so `active_card_idx` stays in view
-    let avail_rows = list_end_y.saturating_sub(y) as usize;
-    let visible_cards = avail_rows / 2;
-    let start_card = if visible_cards == 0 || active_card_idx < visible_cards {
-        0
-    } else {
-        active_card_idx + 1 - visible_cards
-    };
-
-    for card in cards.into_iter().skip(start_card) {
-        if y + 2 > list_end_y {
-            break;
-        }
-        let (r1_style, r2_style) = match (card.is_space, card.is_active) {
-            (true, true) => (
+        let (r1_style, r2_style) = if is_active {
+            (
                 Style::default()
-                    .bg(Color::Rgb(42, 48, 76))
+                    .bg(Color::Rgb(46, 56, 92))
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
                 Style::default()
-                    .bg(Color::Rgb(42, 48, 76))
-                    .fg(Color::Rgb(150, 165, 200)),
-            ),
-            (true, false) => (
+                    .bg(Color::Rgb(46, 56, 92))
+                    .fg(Color::Rgb(165, 180, 220)),
+            )
+        } else {
+            (
                 Style::default()
-                    .bg(Color::Rgb(26, 30, 46))
+                    .bg(Color::Rgb(24, 28, 44))
                     .fg(Color::Rgb(190, 198, 220))
                     .add_modifier(Modifier::BOLD),
                 Style::default()
-                    .bg(Color::Rgb(26, 30, 46))
-                    .fg(Color::Rgb(120, 130, 155)),
-            ),
-            (false, true) => (
-                Style::default()
-                    .bg(Color::Rgb(68, 78, 128))
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-                Style::default()
-                    .bg(Color::Rgb(68, 78, 128))
-                    .fg(Color::Rgb(200, 210, 240)),
-            ),
-            (false, false) => (
-                Style::default()
-                    .bg(Color::Rgb(20, 22, 34))
-                    .fg(Color::Rgb(170, 178, 200)),
-                Style::default()
-                    .bg(Color::Rgb(20, 22, 34))
-                    .fg(Color::Rgb(110, 118, 142)),
-            ),
+                    .bg(Color::Rgb(24, 28, 44))
+                    .fg(Color::Rgb(115, 125, 155)),
+            )
         };
 
-        buf.set_string(inner.x, y, &pad_to_width(&card.row1, w), r1_style);
-        buf.set_string(inner.x, y + 1, &pad_to_width(&card.row2, w), r2_style);
-
-        if card.is_active {
-            let accent = if card.is_space {
-                Color::Rgb(125, 207, 255)
-            } else {
-                Color::Rgb(122, 162, 247)
-            };
-            buf.set_string(inner.x, y, "▍", r1_style.fg(accent));
-            buf.set_string(inner.x, y + 1, "▍", r2_style.fg(accent));
+        buf.set_string(inner.x, y, &pad_to_width(&row1, w), r1_style);
+        if use_two_row {
+            buf.set_string(inner.x, y + 1, &pad_to_width(&row2, w), r2_style);
         }
-
-        if let Some((dot_off, st)) = card.dot_col {
-            if inner.x + dot_off < inner.x + inner.width {
-                buf.set_string(
-                    inner.x + dot_off,
-                    y,
-                    st.symbol(),
-                    r1_style.fg(state_color(st)).add_modifier(Modifier::BOLD),
-                );
+        if is_active {
+            let accent = Color::Rgb(125, 207, 255);
+            buf.set_string(inner.x, y, "▍", r1_style.fg(accent));
+            if use_two_row {
+                buf.set_string(inner.x, y + 1, "▍", r2_style.fg(accent));
             }
+        }
+        if inner.x + dot_x < inner.x + inner.width {
+            buf.set_string(
+                inner.x + dot_x,
+                y,
+                sstate.symbol(),
+                r1_style.fg(state_color(sstate)).add_modifier(Modifier::BOLD),
+            );
         }
 
         hits.push(HitRegion {
@@ -1592,142 +1694,34 @@ fn render_sidebar(f: &mut Frame, rect: Rect, world: &World, hits: &mut Vec<HitRe
                 x: inner.x,
                 y,
                 width: inner.width,
-                height: 2,
+                height: row_step as u16,
             },
-            target: card.target,
+            target: HitTarget::SelectSpace(space.id.clone()),
         });
-        if let Some(space_id) = card.collapse_space_id {
-            hits.push(HitRegion {
-                rect: Rect {
-                    x: inner.x,
-                    y,
-                    width: 4.min(inner.width),
-                    height: 2,
-                },
-                target: HitTarget::ToggleSpaceCollapse(space_id),
-            });
-        }
-        y += 2;
+        y += row_step as u16;
     }
 
-    // Render 2-row tall, vertically centered Footer Buttons (`+ New Tab` and `+ New Space`)
-    // using half-block top (`▄`) and bottom (`▀`) caps so the text row sits dead-center vertically.
-    let pad_x: u16 = if inner.width > 6 { 1 } else { 0 };
-    let btn_x = inner.x + pad_x;
-    let btn_w = inner.width.saturating_sub(pad_x * 2);
-    let btn_w_usize = btn_w as usize;
-    let sb_bg = Color::Rgb(18, 20, 30);
-
-    if footer_rows == 6 && btn_w > 0 {
-        let half_top = "▄".repeat(btn_w_usize);
-        let half_bot = "▀".repeat(btn_w_usize);
-
-        let tab_y = max_y - 6;
-        let tab_bg = Color::Rgb(28, 48, 42);
-        let tab_fg = Color::Rgb(158, 206, 106);
-        buf.set_string(
-            btn_x,
-            tab_y,
-            &half_top,
-            Style::default().fg(tab_bg).bg(sb_bg),
-        );
-        buf.set_string(
-            btn_x,
-            tab_y + 1,
-            &pad_to_width(" ▎ + New Tab    ^b c ", btn_w_usize),
-            Style::default()
-                .bg(tab_bg)
-                .fg(tab_fg)
-                .add_modifier(Modifier::BOLD),
-        );
-        buf.set_string(
-            btn_x,
-            tab_y + 2,
-            &half_bot,
-            Style::default().fg(tab_bg).bg(sb_bg),
-        );
-        hits.push(HitRegion {
-            rect: Rect {
-                x: btn_x,
-                y: tab_y,
-                width: btn_w,
-                height: 3,
-            },
-            target: HitTarget::NewTab,
-        });
-
-        let sp_y = max_y - 3;
-        let sp_bg = Color::Rgb(26, 38, 56);
-        let sp_fg = Color::Rgb(125, 207, 255);
-        buf.set_string(
-            btn_x,
-            sp_y,
-            &half_top,
-            Style::default().fg(sp_bg).bg(sb_bg),
-        );
-        buf.set_string(
-            btn_x,
-            sp_y + 1,
-            &pad_to_width(" ▎ + New Space  ^b C ", btn_w_usize),
-            Style::default()
-                .bg(sp_bg)
-                .fg(sp_fg)
-                .add_modifier(Modifier::BOLD),
-        );
-        buf.set_string(
-            btn_x,
-            sp_y + 2,
-            &half_bot,
-            Style::default().fg(sp_bg).bg(sb_bg),
-        );
-        hits.push(HitRegion {
-            rect: Rect {
-                x: btn_x,
-                y: sp_y,
-                width: btn_w,
-                height: 3,
-            },
-            target: HitTarget::NewSpacePrompt,
-        });
-    } else if footer_rows == 2 && btn_w > 0 {
-        let tab_y = max_y - 2;
-        buf.set_string(
-            btn_x,
-            tab_y,
-            &pad_to_width(" ▎ + New Tab    ^b c ", btn_w_usize),
-            Style::default()
-                .bg(Color::Rgb(28, 48, 42))
-                .fg(Color::Rgb(158, 206, 106))
-                .add_modifier(Modifier::BOLD),
-        );
-        hits.push(HitRegion {
-            rect: Rect {
-                x: btn_x,
-                y: tab_y,
-                width: btn_w,
-                height: 1,
-            },
-            target: HitTarget::NewTab,
-        });
-        buf.set_string(
-            btn_x,
-            tab_y + 1,
-            &pad_to_width(" ▎ + New Space  ^b C ", btn_w_usize),
-            Style::default()
-                .bg(Color::Rgb(26, 38, 56))
-                .fg(Color::Rgb(125, 207, 255))
-                .add_modifier(Modifier::BOLD),
-        );
-        hits.push(HitRegion {
-            rect: Rect {
-                x: btn_x,
-                y: tab_y + 1,
-                width: btn_w,
-                height: 1,
-            },
-            target: HitTarget::NewSpacePrompt,
-        });
-    }
+    // Bottom `[ + New Space  ^b C ]` action button inside the Space popover
+    let btn_y = max_y.saturating_sub(1);
+    let btn_lbl = pad_to_width(" ▎ + New Space          ^b C ", w);
+    buf.set_string(
+        inner.x,
+        btn_y,
+        &btn_lbl,
+        Style::default()
+            .bg(Color::Rgb(26, 44, 64))
+            .fg(Color::Rgb(125, 207, 255))
+            .add_modifier(Modifier::BOLD),
+    );
+    hits.push(HitRegion {
+        rect: Rect {
+            x: inner.x,
+            y: btn_y,
+            width: inner.width,
+            height: 1,
+        },
+        target: HitTarget::NewSpacePrompt,
+    });
 }
 
 struct VtScreenWidget<'a> {
@@ -1964,20 +1958,21 @@ fn render_help_modal(f: &mut Frame, area: Rect, hits: &mut Vec<HitRegion>) {
             "  Keyboard & Touch Shortcuts:",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )),
-        Line::from("  Tap ● ○ ✓ on Touchbar    Switch directly to Tab (no body swipe conflict)"),
-        Line::from("  Tap ▾ / ▸ on Space       Collapse / expand Space's child Tabs in sidebar"),
-        Line::from("  Prefix / Modifiers       Tap [^B], [Ctrl], or [Alt] on bottom touchbar"),
+        Line::from("  Top Bar [ ▾ Space ]      Open secondary Space popover menu / + New Space"),
+        Line::from("  Top Bar [ Tab ] / [ + ]  Switch directly to Tab or add a new Tab"),
+        Line::from("  Left Floating Cross (+)  Tap Esc / Ctl / ^B / Alt / Tab (drag to move)"),
+        Line::from("  Right Floating Cross (+) Tap ↑ / ← / ⎘ (Paste) / → / ↓ (drag to move)"),
         Line::from("  Clipboard Copy / Paste   Drag text to copy (OSC 52); Tap ⎘ to paste"),
         Line::from("  Next / Prev Tab          ^b n / ^b p   or  Alt+Right / Alt+Left"),
         Line::from("  Switch Tab 1..9          ^b 1..9       or  Alt+1..9"),
-        Line::from("  New Tab in Space         ^b c          or  Tap [+ New Tab] in sidebar"),
+        Line::from("  New Tab in Space         ^b c          or  Tap [ + ] on top tab bar"),
         Line::from("  Rename / Close Tab       ^b , (rename) /   ^b x (close)"),
         Line::from("  Next / Prev Space        ^b Down / Up  or  Alt+Down / Alt+Up"),
         Line::from("  New / Rename Space       ^b C (new)    /   ^b $ (rename)"),
-        Line::from("  Toggle Left Sidebar      ^b b          or  Tap ◄≡ / ≡► on touchbar"),
+        Line::from("  Toggle Space Menu        ^b b          or  Tap [ ▾ Space ] on top bar"),
         Line::from("  Quick Fuzzy Switcher     ^b w          or  ^b f"),
         Line::from("  Jump Next Alert Agent    ^b a          (◉ blocked / ✓ done)"),
-        Line::from("  Scrollback / History     ^b [          or  Tap [▼ BOT] to exit"),
+        Line::from("  Scrollback / History     ^b [          or  Tap [▼ BOT] on status bar"),
         Line::from("  Detach (keep running)    ^b q / ^b d   or  Ctrl+\\"),
         Line::from(""),
         Line::from(Span::styled(
@@ -2284,15 +2279,41 @@ fn render_fuzzy_modal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{SharedSpace, SharedTab};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
+    fn sample_world() -> World {
+        let mut world = World::default();
+        world.doc.spaces.push(SharedSpace {
+            id: "space-1".to_string(),
+            name: "main".to_string(),
+            folder: "/tmp/work".to_string(),
+            tabs: vec![
+                SharedTab {
+                    id: "tab-1".to_string(),
+                    name: "agent".to_string(),
+                    ..Default::default()
+                },
+                SharedTab {
+                    id: "tab-2".to_string(),
+                    name: "shell".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        world
+    }
+
     #[test]
-    fn bottom_touchbar_and_2row_sidebar_expose_touch_hits() {
+    fn top_tabbar_bottom_status_bar_and_dual_floating_crosses_expose_touch_hits() {
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        let world = World::default();
+        let world = sample_world();
         let mut hits = Vec::new();
+        let mut mod_rect_out = None;
+        let mut dpad_rect_out = None;
 
         terminal
             .draw(|f| {
@@ -2300,9 +2321,9 @@ mod tests {
                     f,
                     &world,
                     None,
-                    true, // sidebar_open = true
+                    false,
                     24,
-                    true, // touch_mode = true (2-row bottom touchbar)
+                    true, // touch_mode = true (3-row top tabbar + 1-row bottom status bar)
                     false,
                     false,
                     false,
@@ -2312,38 +2333,81 @@ mod tests {
                     &Modal::None,
                 );
                 hits = geom.hits;
-                assert_eq!(geom.term_rect.y, 0);
-                assert_eq!(geom.term_rect.height, 21);
+                mod_rect_out = geom.mod_rect;
+                dpad_rect_out = geom.dpad_rect;
+                assert_eq!(geom.term_rect.x, 0);
+                assert_eq!(geom.term_rect.width, 100);
+                assert_eq!(geom.term_rect.y, 3);
+                assert_eq!(geom.term_rect.height, 20);
             })
             .unwrap();
 
-        // Sidebar toggle on the bottom touchbar (rows 21..23) should hit ToggleSidebar
+        // Top Bar Space selector on rows 0..2 should hit ToggleSpaceMenu
         assert_eq!(
-            find_hit_target(&hits, 1, 21),
-            Some(HitTarget::ToggleSidebar)
+            find_hit_target(&hits, 1, 0),
+            Some(HitTarget::ToggleSpaceMenu)
         );
         assert_eq!(
-            find_hit_target(&hits, 1, 23),
-            Some(HitTarget::ToggleSidebar)
+            find_hit_target(&hits, 1, 2),
+            Some(HitTarget::ToggleSpaceMenu)
         );
 
-        // Scrollback badge, Prefix/Ctrl/Alt/Esc/Tab buttons, and Help button are on the bottom touchbar;
-        // 4-way arrows + centered Paste (⎘) are on the floating circular disc.
+        // Top Bar exposes Tab pill, [ + ] (NewTab), and [ ? ] (ToggleHelp)
         assert!(hits
             .iter()
-            .any(|h| h.target == HitTarget::ExitScrollback && h.rect.height == 3));
+            .any(|h| matches!(h.target, HitTarget::SelectTab { .. }) && h.rect.height == 3));
         assert!(hits
             .iter()
-            .any(|h| h.target == HitTarget::TogglePrefix && h.rect.height == 3));
+            .any(|h| h.target == HitTarget::NewTab && h.rect.height == 3 && h.rect.y == 0));
         assert!(hits
             .iter()
-            .any(|h| h.target == HitTarget::ToggleCtrl && h.rect.height == 3));
+            .any(|h| h.target == HitTarget::ToggleHelp && h.rect.height == 3 && h.rect.y == 0));
+
+        // Bottom 1-row read-only Agent Status Bar exposes ExitScrollback on row 23
         assert!(hits
             .iter()
-            .any(|h| h.target == HitTarget::ToggleAlt && h.rect.height == 3));
-        assert!(hits
-            .iter()
-            .any(|h| h.target == HitTarget::PasteClipboard && h.rect.width == 5 && h.rect.height == 3));
+            .any(|h| h.target == HitTarget::ExitScrollback && h.rect.y == 23 && h.rect.height == 1));
+
+        // Left floating Modifier Cross (+) exposes Esc, Ctl, ^B, Alt, Tab
+        let mrect = mod_rect_out.expect("expected left modifier cross rect");
+        assert_eq!(mrect.width, DPAD_DISC_WIDTH);
+        assert_eq!(mrect.height, DPAD_DISC_HEIGHT);
+        assert_eq!(
+            find_hit_target(&hits, mrect.x + 7, mrect.y + 1),
+            Some(HitTarget::SendKey(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE
+            )))
+        );
+        assert_eq!(
+            find_hit_target(&hits, mrect.x + 2, mrect.y + 3),
+            Some(HitTarget::ToggleCtrl)
+        );
+        assert_eq!(
+            find_hit_target(&hits, mrect.x + 7, mrect.y + 3),
+            Some(HitTarget::TogglePrefix)
+        );
+        assert_eq!(
+            find_hit_target(&hits, mrect.x + 12, mrect.y + 3),
+            Some(HitTarget::ToggleAlt)
+        );
+        assert_eq!(
+            find_hit_target(&hits, mrect.x + 7, mrect.y + 5),
+            Some(HitTarget::SendKey(KeyEvent::new(
+                KeyCode::Tab,
+                KeyModifiers::NONE
+            )))
+        );
+
+        // Right floating D-pad Cross (+) exposes Up, Left, Paste, Right, Down
+        let drect = dpad_rect_out.expect("expected right dpad cross rect");
+        assert_eq!(drect.width, DPAD_DISC_WIDTH);
+        assert_eq!(drect.height, DPAD_DISC_HEIGHT);
+        assert!(mrect.x + mrect.width <= drect.x);
+        assert_eq!(
+            find_hit_target(&hits, drect.x + 7, drect.y + 3),
+            Some(HitTarget::PasteClipboard)
+        );
         for arrow in [KeyCode::Left, KeyCode::Down, KeyCode::Up, KeyCode::Right] {
             assert!(hits.iter().any(|h| {
                 h.target == HitTarget::SendKey(KeyEvent::new(arrow, KeyModifiers::NONE))
@@ -2351,48 +2415,22 @@ mod tests {
                     && h.rect.height >= 2
             }));
         }
-        assert!(!hits.iter().any(|h| {
-            h.target == HitTarget::SendKey(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
-        }));
-        assert!(hits.iter().any(|h| {
-            h.target == HitTarget::SendKey(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-        }));
-        assert!(hits
-            .iter()
-            .any(|h| h.target == HitTarget::ToggleHelp && h.rect.height == 3));
-
-        // Sidebar footer has vertically centered [+ New Tab] and [+ New Space] buttons
-        let new_tab_hit = hits
-            .iter()
-            .find(|h| h.target == HitTarget::NewTab && h.rect.height >= 2)
-            .expect("expected multi-row NewTab hit in sidebar");
-        let new_space_hit = hits
-            .iter()
-            .find(|h| h.target == HitTarget::NewSpacePrompt && h.rect.height >= 2)
-            .expect("expected multi-row NewSpacePrompt hit in sidebar");
-        assert!(new_tab_hit.rect.x >= 1);
-        assert_eq!(
-            new_space_hit.rect.y,
-            new_tab_hit.rect.y + new_tab_hit.rect.height
-        );
-        assert!(21 >= new_space_hit.rect.y + new_space_hit.rect.height);
     }
 
     #[test]
-    fn touchbar_keys_do_not_jitter_across_state_toggles() {
+    fn space_menu_popover_exposes_spaces_and_new_space_prompt() {
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        let world = World::default();
+        let world = sample_world();
+        let mut hits = Vec::new();
 
-        let mut prefix_x_1 = 0;
-        let mut prefix_x_2 = 0;
         terminal
             .draw(|f| {
                 let geom = render_ui(
                     f,
                     &world,
                     None,
-                    true,
+                    false,
                     24,
                     true,
                     false,
@@ -2401,44 +2439,23 @@ mod tests {
                     0,
                     None,
                     false,
-                    &Modal::None,
+                    &Modal::SpaceMenu,
                 );
-                prefix_x_1 = geom
-                    .hits
-                    .iter()
-                    .find(|h| h.target == HitTarget::TogglePrefix)
-                    .unwrap()
-                    .rect
-                    .x;
+                hits = geom.hits;
+                assert!(geom.mod_rect.is_none());
+                assert!(geom.dpad_rect.is_none());
             })
             .unwrap();
-        terminal
-            .draw(|f| {
-                let geom = render_ui(
-                    f,
-                    &world,
-                    None,
-                    false,
-                    24,
-                    true,
-                    true,
-                    true,
-                    true,
-                    15,
-                    None,
-                    true,
-                    &Modal::None,
-                );
-                prefix_x_2 = geom
-                    .hits
-                    .iter()
-                    .find(|h| h.target == HitTarget::TogglePrefix)
-                    .unwrap()
-                    .rect
-                    .x;
-            })
-            .unwrap();
-        assert_eq!(prefix_x_1, prefix_x_2);
+
+        assert!(hits
+            .iter()
+            .any(|h| matches!(h.target, HitTarget::SelectSpace(_))));
+        assert!(hits
+            .iter()
+            .any(|h| h.target == HitTarget::NewSpacePrompt));
+        assert!(hits
+            .iter()
+            .any(|h| h.target == HitTarget::CancelModal));
     }
 
     #[test]
@@ -2484,7 +2501,7 @@ mod tests {
     }
 
     #[test]
-    fn narrow_terminal_retains_compact_sidebar_toggle() {
+    fn narrow_terminal_retains_compact_top_space_and_plus_buttons() {
         let backend = TestBackend::new(30, 12);
         let mut terminal = Terminal::new(backend).unwrap();
         let world = World::default();
@@ -2512,12 +2529,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            find_hit_target(&hits, 1, 11),
-            Some(HitTarget::ToggleSidebar)
+            find_hit_target(&hits, 1, 0),
+            Some(HitTarget::ToggleSpaceMenu)
         );
+        assert!(hits.iter().any(|h| h.target == HitTarget::NewTab));
         assert!(hits
             .iter()
             .any(|h| h.target == HitTarget::PasteClipboard));
+        assert!(hits
+            .iter()
+            .any(|h| h.target == HitTarget::TogglePrefix));
     }
 
     #[test]

@@ -12,8 +12,8 @@ use crate::keys::{
 use crate::model::World;
 use crate::ui::{
     collect_fuzzy_items, compute_terminal_rect, find_hit_target, is_on_dpad_disc,
-    render_ui_with_dpad, resolve_dpad_disc_rect, resolve_fuzzy_selection, HitRegion, HitTarget,
-    Modal, PromptKind, TerminalSelection,
+    render_ui_with_pads, resolve_dpad_disc_rect, resolve_fuzzy_selection, resolve_mod_cross_rect,
+    HitRegion, HitTarget, Modal, PromptKind, TerminalSelection,
 };
 use anyhow::Result;
 use clap::Parser;
@@ -566,7 +566,7 @@ fn execute_action(
     world: &mut World,
     attached: Option<&AttachedTerminal>,
     prefix_spec: &str,
-    sidebar_open: &mut bool,
+    _sidebar_open: &mut bool,
     scrollback_offset: &mut usize,
     modal: &mut Modal,
 ) -> Result<bool> {
@@ -635,7 +635,11 @@ fn execute_action(
             }
         }
         Action::ToggleSidebar => {
-            *sidebar_open = !*sidebar_open;
+            *modal = if matches!(modal, Modal::SpaceMenu) {
+                Modal::None
+            } else {
+                Modal::SpaceMenu
+            };
         }
         Action::FuzzyFinder => {
             let items = collect_fuzzy_items(world, "");
@@ -671,6 +675,7 @@ fn execute_action(
 
 #[derive(Debug, Clone)]
 struct FloatingDPadDrag {
+    is_mod: bool,
     start_mouse: (u16, u16),
     start_pos: (u16, u16),
     moved: bool,
@@ -698,6 +703,8 @@ fn run_app(
     let mut scrollback_offset: usize = 0;
     let mut modal = Modal::None;
     let mut last_hits: Vec<HitRegion> = Vec::new();
+    let mut mod_pos: Option<(u16, u16)> = None;
+    let mut last_mod_rect: Option<Rect> = None;
     let mut dpad_pos: Option<(u16, u16)> = None;
     let mut last_dpad_rect: Option<Rect> = None;
     let mut dpad_drag: Option<FloatingDPadDrag> = None;
@@ -868,9 +875,10 @@ fn run_app(
                 active_att.map(|a| a.parser.screen())
             };
             let copied_flash = copied_until.is_some();
-            let dpad_dragging = dpad_drag.as_ref().is_some_and(|d| d.moved);
+            let mod_dragging = dpad_drag.as_ref().is_some_and(|d| d.is_mod && d.moved);
+            let dpad_dragging = dpad_drag.as_ref().is_some_and(|d| !d.is_mod && d.moved);
             terminal.draw(|f| {
-                let geom = render_ui_with_dpad(
+                let geom = render_ui_with_pads(
                     f,
                     world,
                     scr_ref,
@@ -884,10 +892,13 @@ fn run_app(
                     selection.as_ref(),
                     copied_flash,
                     &modal,
+                    mod_pos,
+                    mod_dragging,
                     dpad_pos,
                     dpad_dragging,
                 );
                 last_hits = geom.hits;
+                last_mod_rect = geom.mod_rect;
                 last_dpad_rect = geom.dpad_rect;
             })?;
             dirty = false;
@@ -940,6 +951,19 @@ fn run_app(
                             selection_screen = None;
                             if let Some(disc) = last_dpad_rect {
                                 dpad_drag = Some(FloatingDPadDrag {
+                                    is_mod: false,
+                                    start_mouse: (mx, my),
+                                    start_pos: (disc.x, disc.y),
+                                    moved: false,
+                                    tap_target: find_hit_target(&last_hits, mx, my),
+                                });
+                            }
+                        } else if is_on_dpad_disc(last_mod_rect, mx, my) {
+                            selection = None;
+                            selection_screen = None;
+                            if let Some(disc) = last_mod_rect {
+                                dpad_drag = Some(FloatingDPadDrag {
+                                    is_mod: true,
                                     start_mouse: (mx, my),
                                     start_pos: (disc.x, disc.y),
                                     moved: false,
@@ -1051,12 +1075,15 @@ fn run_app(
                                     alt_active = false;
                                     scrollback_offset = 0;
                                 }
-                                HitTarget::ToggleSidebar => {
-                                    modal = Modal::None;
+                                HitTarget::ToggleSidebar | HitTarget::ToggleSpaceMenu => {
                                     prefix_active = false;
                                     ctrl_active = false;
                                     alt_active = false;
-                                    *sidebar_open = !*sidebar_open;
+                                    modal = if matches!(modal, Modal::SpaceMenu) {
+                                        Modal::None
+                                    } else {
+                                        Modal::SpaceMenu
+                                    };
                                 }
                                 HitTarget::ToggleSpaceCollapse(space_id) => {
                                     modal = Modal::None;
@@ -1158,7 +1185,13 @@ fn run_app(
                                 drag.moved = true;
                                 let nx = (drag.start_pos.0 as i32 + dx).max(0) as u16;
                                 let ny = (drag.start_pos.1 as i32 + dy).max(0) as u16;
-                                if let Some(clamped) =
+                                if drag.is_mod {
+                                    if let Some(clamped) =
+                                        resolve_mod_cross_rect(term_rect, Some((nx, ny)))
+                                    {
+                                        mod_pos = Some((clamped.x, clamped.y));
+                                    }
+                                } else if let Some(clamped) =
                                     resolve_dpad_disc_rect(term_rect, Some((nx, ny)))
                                 {
                                     dpad_pos = Some((clamped.x, clamped.y));
@@ -1186,6 +1219,30 @@ fn run_app(
                         if let Some(drag) = dpad_drag.take() {
                             if !drag.moved && matches!(modal, Modal::None) {
                                 match drag.tap_target {
+                                    Some(HitTarget::TogglePrefix) => {
+                                        modal = Modal::None;
+                                        ctrl_active = false;
+                                        alt_active = false;
+                                        if prefix_active {
+                                            prefix_active = false;
+                                            if let Some(att) = active_att {
+                                                let bytes = prefix_bytes(prefix_spec);
+                                                core.send_input(att.channel, &bytes);
+                                            }
+                                        } else {
+                                            prefix_active = true;
+                                        }
+                                    }
+                                    Some(HitTarget::ToggleCtrl) => {
+                                        modal = Modal::None;
+                                        prefix_active = false;
+                                        ctrl_active = !ctrl_active;
+                                    }
+                                    Some(HitTarget::ToggleAlt) => {
+                                        modal = Modal::None;
+                                        prefix_active = false;
+                                        alt_active = !alt_active;
+                                    }
                                     Some(HitTarget::PasteClipboard) => {
                                         prefix_active = false;
                                         ctrl_active = false;
@@ -1281,8 +1338,10 @@ fn run_app(
                             *selected = cur_sel.saturating_sub(1);
                             *selected_tab_id = items.get(*selected).map(|it| it.tab_id.clone());
                         } else if matches!(modal, Modal::None)
+                            && mev.row >= term_rect.y
                             && mev.row < term_rect.y.saturating_add(term_rect.height)
                             && !is_on_dpad_disc(last_dpad_rect, mev.column, mev.row)
+                            && !is_on_dpad_disc(last_mod_rect, mev.column, mev.row)
                         {
                             selection = None;
                             selection_screen = None;
@@ -1309,8 +1368,10 @@ fn run_app(
                                     items.get(*selected).map(|it| it.tab_id.clone());
                             }
                         } else if matches!(modal, Modal::None)
+                            && mev.row >= term_rect.y
                             && mev.row < term_rect.y.saturating_add(term_rect.height)
                             && !is_on_dpad_disc(last_dpad_rect, mev.column, mev.row)
+                            && !is_on_dpad_disc(last_mod_rect, mev.column, mev.row)
                         {
                             selection = None;
                             selection_screen = None;
@@ -1371,6 +1432,29 @@ fn handle_key_event(
     }
     // 1. Handle active Modal first
     match modal {
+        Modal::SpaceMenu => {
+            match kev.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+                    *modal = Modal::None;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    world.prev_space();
+                    world.mark_active_seen(core);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    world.next_space();
+                    world.mark_active_seen(core);
+                }
+                KeyCode::Char('c' | 'C' | '+') => {
+                    *modal = Modal::Prompt {
+                        kind: PromptKind::NewSpace,
+                        input: String::new(),
+                    };
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
         Modal::Help => {
             *modal = Modal::None;
             return Ok(false);
