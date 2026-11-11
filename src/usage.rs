@@ -1128,7 +1128,7 @@ mod tests {
         assert_eq!(wham_metrics[0].detail.as_deref(), Some("3h01m"));
         assert_eq!(wham_metrics[1].window_label, "7d");
         assert_eq!(wham_metrics[1].remaining_percent, 16.0);
-        assert_eq!(wham_metrics[1].detail.as_deref(), Some("5d04h"));
+        assert_eq!(wham_metrics[1].detail.as_deref(), Some("5d4h"));
     }
 
     #[test]
