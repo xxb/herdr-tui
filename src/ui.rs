@@ -355,8 +355,6 @@ impl TerminalSelection {
 pub fn top_bar_height(area: Rect, _touch_mode: bool) -> u16 {
     if area.height <= 1 {
         0
-    } else if area.height >= 6 {
-        2
     } else {
         1
     }
@@ -701,7 +699,14 @@ fn draw_touchbar_pill(
             Style::default().bg(Color::Rgb(12, 14, 22)).fg(bot_gloss_fg),
         );
     } else {
-        buf.set_string(x, rect.y, label, style);
+        let pill_style = if emphasized {
+            style
+                .add_modifier(Modifier::UNDERLINED)
+                .underline_color(Color::Rgb(245, 194, 118))
+        } else {
+            style
+        };
+        buf.set_string(x, rect.y, label, pill_style);
     }
 }
 
@@ -2522,7 +2527,7 @@ mod tests {
                     None,
                     false,
                     24,
-                    true, // touch_mode = true (2-row top tabbar + 1-row bottom status bar)
+                    true, // touch_mode = true (1-row top tabbar + 1-row bottom status bar)
                     false,
                     false,
                     false,
@@ -2536,55 +2541,59 @@ mod tests {
                 dpad_rect_out = geom.dpad_rect;
                 assert_eq!(geom.term_rect.x, 0);
                 assert_eq!(geom.term_rect.width, 100);
-                assert_eq!(geom.term_rect.y, 2);
-                assert_eq!(geom.term_rect.height, 21);
+                assert_eq!(geom.term_rect.y, 1);
+                assert_eq!(geom.term_rect.height, 22);
             })
             .unwrap();
 
-        // Far-left button (`[ ⏏ ]`) on rows 0..1 triggers Detach (`^b q`)
+        // Far-left button (`[ ⏏ ]`) on row 0 triggers Detach (`^b q`)
         assert_eq!(
             find_hit_target(&hits, 1, 0),
             Some(HitTarget::TriggerAction(Action::Detach))
         );
-        assert_eq!(
-            find_hit_target(&hits, 1, 1),
-            Some(HitTarget::TriggerAction(Action::Detach))
-        );
 
-        // Top Bar Space selector right after `[ ⏏ ]` on rows 0..1 should hit ToggleSpaceMenu
+        // Top Bar Space selector right after `[ ⏏ ]` on row 0 should hit ToggleSpaceMenu
         assert_eq!(
             find_hit_target(&hits, 7, 0),
             Some(HitTarget::ToggleSpaceMenu)
         );
-        assert_eq!(
-            find_hit_target(&hits, 7, 1),
-            Some(HitTarget::ToggleSpaceMenu)
-        );
 
-        // Top Bar exposes 2-row Tab pill, [ + ] (NewTab), and [ ? ] (ToggleHelp)
+        // Top Bar exposes compact 1-row Tab pill, [ + ] (NewTab), and [ ? ] (ToggleHelp)
         assert!(hits
             .iter()
-            .any(|h| matches!(h.target, HitTarget::SelectTab { .. }) && h.rect.height == 2));
+            .any(|h| matches!(h.target, HitTarget::SelectTab { .. }) && h.rect.height == 1));
         assert!(hits
             .iter()
-            .any(|h| h.target == HitTarget::NewTab && h.rect.height == 2 && h.rect.y == 0));
+            .any(|h| h.target == HitTarget::NewTab && h.rect.height == 1 && h.rect.y == 0));
         assert!(hits
             .iter()
-            .any(|h| h.target == HitTarget::ToggleHelp && h.rect.height == 2 && h.rect.y == 0));
+            .any(|h| h.target == HitTarget::ToggleHelp && h.rect.height == 1 && h.rect.y == 0));
 
-        // On a 2-row Top Tab Bar, Row 0 holds pill labels + slash divider while Row 1 holds
-        // the bottom gloss highlight line (`▔`) underneath the pills.
+        // On the compact 1-row Top Tab Bar, Row 0 holds pill labels + slash divider with
+        // emphasized bottom underline on the active tab, and Row 1 belongs immediately to
+        // the terminal viewport (no blank gap row).
         let buf = terminal.backend().buffer();
         let row0: String = (0..100).map(|x| buf[(x, 0)].symbol()).collect();
-        let row1: String = (0..100).map(|x| buf[(x, 1)].symbol()).collect();
         assert!(row0.contains('⏏'));
         assert!(row0.contains("main"));
         assert!(row0.contains('╱'));
         assert!(row0.contains("1:agent"));
         assert!(row0.contains('+'));
         assert!(row0.contains('?'));
-        assert!(!row0.contains('▔'));
-        assert!(row1.chars().all(|c| c == '▔'));
+        let active_byte = row0
+            .find("1:agent")
+            .expect("expected active tab label on row 0");
+        let active_x = row0[..active_byte].chars().count() as u16;
+        assert!(buf[(active_x, 0)].modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(
+            buf[(active_x, 0)].underline_color,
+            Color::Rgb(245, 194, 118)
+        );
+        let inactive_byte = row0
+            .find("2:shell")
+            .expect("expected inactive tab label on row 0");
+        let inactive_x = row0[..inactive_byte].chars().count() as u16;
+        assert!(!buf[(inactive_x, 0)].modifier.contains(Modifier::UNDERLINED));
 
         // Bottom 1-row read-only Agent Status Bar exposes ExitScrollback on row 23
         assert!(hits.iter().any(|h| h.target == HitTarget::ExitScrollback
