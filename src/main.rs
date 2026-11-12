@@ -1024,10 +1024,15 @@ fn execute_action(
         }
         Action::FuzzyFinder => {
             let items = collect_fuzzy_items(world, "");
-            let selected_tab_id = items.first().map(|it| it.tab_id.clone());
+            let active_tid = world.active_tab().map(|t| t.id.clone());
+            let selected = active_tid
+                .as_deref()
+                .and_then(|tid| items.iter().position(|it| it.tab_id == tid))
+                .unwrap_or(0);
+            let selected_tab_id = items.get(selected).map(|it| it.tab_id.clone());
             *modal = Modal::Fuzzy {
                 query: String::new(),
-                selected: 0,
+                selected,
                 selected_tab_id,
             };
         }
@@ -1895,6 +1900,10 @@ fn run_app(
                                     *selected_tab_id =
                                         items.get(*selected).map(|it| it.tab_id.clone());
                                     dirty = true;
+                                } else if matches!(modal, Modal::None) && mev.row < term_rect.y {
+                                    world.prev_tab();
+                                    world.mark_active_seen(core);
+                                    dirty = true;
                                 } else if matches!(modal, Modal::None)
                                     && mev.row >= term_rect.y
                                     && mev.row < term_rect.y.saturating_add(term_rect.height)
@@ -1957,6 +1966,10 @@ fn run_app(
                                             items.get(*selected).map(|it| it.tab_id.clone());
                                         dirty = true;
                                     }
+                                } else if matches!(modal, Modal::None) && mev.row < term_rect.y {
+                                    world.next_tab();
+                                    world.mark_active_seen(core);
+                                    dirty = true;
                                 } else if matches!(modal, Modal::None)
                                     && mev.row >= term_rect.y
                                     && mev.row < term_rect.y.saturating_add(term_rect.height)

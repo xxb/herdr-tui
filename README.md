@@ -14,9 +14,10 @@ A fast, lightweight **multi-tab TUI client** for [`herdr-core` (`hc`)](https://g
 - **Bidirectional Official Client Sync (与官方客户端双向实时同步)**
   Reads and writes `herdr-core`'s `doc("herdr-app")` layout document directly. Spaces and Tabs created, renamed, or closed in `hct` immediately appear in the official Herdr Android / Desktop client, and vice versa.
 - **Top `Space / Tab1 / Tab2 / [+]` Bar + Secondary Space Popover (顶部 Space/Tab 状态栏 + 二级浮层菜单)**
-  - **Top Tab Bar**: Displays `[ ⏏ ] [ ▾ Space ] ╱ [ ● 1:tab1 ] [ ○ 2:tab2 ] [ + ] ... [ ? ]` along the top edge, with `[ ⏏ ]` on the far left for one-tap detach (`^b q`).
+  - **Top Tab Bar**: Displays `[ ⏏ ] [ ▾ Space ] ╱ [ 1:tab1 ] [ 2:tab2 ] [ + ] ... [ ? ]` along the top edge, with `[ ⏏ ]` on the far left for one-tap detach (`^b q`), active tab underline highlighting, and zero-width color-coded Agent states (`Blocked` / `Done` / `Working`).
+  - **Accordion Folding & Overflow Count Badges**: When many tabs are open, inactive tabs automatically fold into compact `[ 1 ] [ 2 ] [ 3:active ] [ 4 ]` pills so all tabs stay visible in fixed order without disorienting horizontal scrolling; on extreme tab counts, clickable `[ ‹N ]` / `[ N› ]` badges open the Quick Fuzzy Switcher directly.
   - **Secondary Space Popover (`^b b` or Tap `[ ▾ Space ]`)**: Tapping the Space button opens a floating popover menu listing all Spaces with live Agent status and a `[ + New Space ]` button—eliminating the need for a permanent Left Sidebar so the terminal viewport always enjoys 100% horizontal width.
-  - **Direct Tab Switching & `[ + ]` New Tab**: Tap any Tab pill on the top bar to switch directly to that Tab, or tap `[ + ]` on the right of the tabs to add a new Tab.
+  - **Direct Tab Switching & `[ + ]` New Tab**: Tap any Tab pill on the top bar (or scroll the mouse wheel over the top bar) to switch tabs, or tap `[ + ]` on the right of the tabs to add a new Tab.
 - **Dual Floating Draggable Semi-Transparent `+` Cross Pads (`hct --touch` 开启双悬浮可拖动半透明十字按钮盘)**
   - Enabled with `hct --touch` (hidden by default when running `hct` on desktop without `--touch`).
   - **Left Modifier Cross (`Esc` / `Ctl` / `^B` / `Alt` / `Tab`)**: `15 × 7` hollow-corner `+` cross with `Esc` (top), sticky `Ctl` (left), sticky `^B` prefix (center), sticky `Alt` (right), and `Tab` (bottom).
