@@ -190,11 +190,11 @@ fn fuzzy_subsequence(hay: &str, needle: &str) -> bool {
 
 pub fn state_color(state: AgentState) -> Color {
     match state {
-        AgentState::Blocked => Color::LightRed,
-        AgentState::Working => Color::LightYellow,
-        AgentState::Done => Color::LightGreen,
-        AgentState::Idle => Color::Cyan,
-        AgentState::None => Color::DarkGray,
+        AgentState::Blocked => HERDR_RED,
+        AgentState::Working => HERDR_YELLOW,
+        AgentState::Done => HERDR_TEAL,
+        AgentState::Idle => HERDR_GREEN,
+        AgentState::None => HERDR_OVERLAY1,
     }
 }
 
@@ -651,8 +651,24 @@ pub fn render_ui_with_pads_and_quota(
     }
 }
 
-const TOPBAR_UNDERLINE_DIM: Color = Color::Rgb(58, 74, 118);
-const TOPBAR_UNDERLINE_ACTIVE: Color = Color::Rgb(245, 194, 118);
+// Classic `herdr` Catppuccin Mocha palette tokens (`Palette::catppuccin()`)
+const HERDR_ACCENT: Color = Color::Rgb(137, 180, 250); // #89b4fa (Blue — focused tab bg)
+const HERDR_PANEL_BG: Color = Color::Rgb(24, 24, 37); // #181825 (Mantle — bar bg & focused tab fg)
+const HERDR_SURFACE_DIM: Color = Color::Rgb(30, 30, 46); // #1e1e2e (Base)
+const HERDR_SURFACE0: Color = Color::Rgb(49, 50, 68); // #313244 (Inactive tab pill bg)
+const HERDR_SURFACE1: Color = Color::Rgb(69, 71, 90); // #45475a (Open menu / dim border)
+const HERDR_OVERLAY0: Color = Color::Rgb(108, 112, 134); // #6c7086 (Subtle divider)
+const HERDR_OVERLAY1: Color = Color::Rgb(127, 132, 156); // #7f849c
+const HERDR_SUBTEXT0: Color = Color::Rgb(166, 173, 200); // #a6adc8 (Inactive tab / help fg)
+const HERDR_TEXT: Color = Color::Rgb(205, 214, 244); // #cdd6f4
+const HERDR_MAUVE: Color = Color::Rgb(203, 166, 247); // #cba6f7 (Space selector fg)
+const HERDR_GREEN: Color = Color::Rgb(166, 227, 161); // #a6e3a1 (New tab `+` / Idle fg)
+const HERDR_YELLOW: Color = Color::Rgb(249, 226, 175); // #f9e2af (Working state)
+const HERDR_RED: Color = Color::Rgb(243, 139, 168); // #f38ba8 (Blocked state / Detach fg)
+const HERDR_TEAL: Color = Color::Rgb(148, 226, 213); // #94e2d5 (Done state)
+
+const TOPBAR_UNDERLINE_DIM: Color = HERDR_SURFACE1;
+const TOPBAR_UNDERLINE_ACTIVE: Color = HERDR_ACCENT;
 
 struct PlannedTabBar {
     left_badge: Option<String>,
@@ -690,25 +706,23 @@ fn overflow_badge_label(hidden_count: usize, is_left: bool, compact: bool) -> Op
 fn tab_pill_style(st: AgentState, is_active: bool) -> Style {
     if is_active {
         Style::default()
-            .bg(Color::Rgb(58, 70, 114))
-            .fg(Color::White)
+            .bg(HERDR_ACCENT)
+            .fg(HERDR_PANEL_BG)
             .add_modifier(Modifier::BOLD)
     } else {
         match st {
             AgentState::Blocked => Style::default()
-                .bg(Color::Rgb(56, 26, 34))
-                .fg(Color::LightRed)
+                .bg(Color::Rgb(64, 38, 50))
+                .fg(HERDR_RED)
                 .add_modifier(Modifier::BOLD),
             AgentState::Done => Style::default()
-                .bg(Color::Rgb(24, 46, 36))
-                .fg(Color::LightGreen)
+                .bg(Color::Rgb(34, 54, 52))
+                .fg(HERDR_TEAL)
                 .add_modifier(Modifier::BOLD),
-            AgentState::Working => Style::default()
-                .bg(Color::Rgb(36, 34, 24))
-                .fg(Color::LightYellow),
-            AgentState::Idle | AgentState::None => Style::default()
-                .bg(Color::Rgb(24, 28, 44))
-                .fg(Color::Rgb(160, 170, 205)),
+            AgentState::Working => Style::default().bg(Color::Rgb(56, 50, 38)).fg(HERDR_YELLOW),
+            AgentState::Idle | AgentState::None => {
+                Style::default().bg(HERDR_SURFACE0).fg(HERDR_SUBTEXT0)
+            }
         }
     }
 }
@@ -920,15 +934,11 @@ fn draw_touchbar_pill(
         // - Row 0 (`rect.y`): continuous highlighted top divider line (`▔`) on `style` (`keycap_bg`)
         // - Row 1 (`rect.y + 1`): dead-center button label on `style` (`keycap_bg`)
         // - Row 2 (`rect.y + 2`): subtle bottom bevel (`▁`) on `style` (`keycap_bg`)
-        let top_fg = if emphasized {
-            Color::Rgb(245, 194, 118)
-        } else {
-            Color::Rgb(118, 162, 247)
-        };
+        let top_fg = if emphasized { HERDR_TEXT } else { HERDR_ACCENT };
         let bot_fg = if emphasized {
-            Color::Rgb(210, 155, 80)
+            HERDR_ACCENT
         } else {
-            Color::Rgb(54, 62, 92)
+            HERDR_SURFACE1
         };
         let top_line = "▔".repeat(lw as usize);
         let bot_line = "▁".repeat(lw as usize);
@@ -941,9 +951,9 @@ fn draw_touchbar_pill(
         // - Row 1 (`rect.y + 1`): crisp bottom gloss highlight (`▔`) hugging the lower edge
         //   of Row 0 against the dark bar background so text never appears pushed down.
         let bot_gloss_fg = if emphasized {
-            Color::Rgb(245, 194, 118)
+            HERDR_ACCENT
         } else {
-            Color::Rgb(118, 162, 247)
+            HERDR_SURFACE1
         };
         let bot_line = "▔".repeat(lw as usize);
         buf.set_string(x, rect.y, label, style);
@@ -951,7 +961,7 @@ fn draw_touchbar_pill(
             x,
             rect.y + 1,
             &bot_line,
-            Style::default().bg(Color::Rgb(12, 14, 22)).fg(bot_gloss_fg),
+            Style::default().bg(HERDR_PANEL_BG).fg(bot_gloss_fg),
         );
     } else {
         let ul_color = if emphasized {
@@ -977,9 +987,7 @@ fn render_top_tabbar(
     if rect.width == 0 || rect.height == 0 {
         return;
     }
-    let mut bg_bar = Style::default()
-        .bg(Color::Rgb(12, 14, 22))
-        .fg(Color::Rgb(169, 177, 214));
+    let mut bg_bar = Style::default().bg(HERDR_PANEL_BG).fg(HERDR_TEXT);
     if rect.height == 1 {
         bg_bar = bg_bar
             .add_modifier(Modifier::UNDERLINED)
@@ -997,9 +1005,7 @@ fn render_top_tabbar(
             rect.x,
             rect.y,
             &full_line,
-            Style::default()
-                .bg(Color::Rgb(12, 14, 22))
-                .fg(Color::Rgb(82, 114, 184)),
+            Style::default().bg(HERDR_PANEL_BG).fg(HERDR_ACCENT),
         );
     } else if rect.height == 2 {
         let full_line = "▔".repeat(rect.width as usize);
@@ -1007,9 +1013,7 @@ fn render_top_tabbar(
             rect.x,
             rect.y + 1,
             &full_line,
-            Style::default()
-                .bg(Color::Rgb(12, 14, 22))
-                .fg(Color::Rgb(54, 68, 108)),
+            Style::default().bg(HERDR_PANEL_BG).fg(HERDR_SURFACE1),
         );
     }
 
@@ -1024,8 +1028,8 @@ fn render_top_tabbar(
     // 0. Far Left: Detach button (`[ ⏏ ]`) — equivalent to `^b q` (`Action::Detach`)
     if detach_w > 0 && x + detach_w <= max_x {
         let dstyle = Style::default()
-            .bg(Color::Rgb(48, 28, 38))
-            .fg(Color::Rgb(247, 118, 142))
+            .bg(Color::Rgb(42, 30, 42))
+            .fg(HERDR_RED)
             .add_modifier(Modifier::BOLD);
         draw_touchbar_pill(buf, x, rect, detach_lbl, dstyle, false);
         hits.push(HitRegion {
@@ -1084,11 +1088,11 @@ fn render_top_tabbar(
     if space_w > 0 && x + space_w <= max_x {
         let style = Style::default()
             .bg(if space_menu_open {
-                Color::Rgb(56, 68, 110)
+                HERDR_SURFACE1
             } else {
-                Color::Rgb(32, 38, 60)
+                Color::Rgb(36, 36, 54)
             })
-            .fg(Color::Rgb(125, 207, 255))
+            .fg(HERDR_MAUVE)
             .add_modifier(Modifier::BOLD);
         draw_touchbar_pill(buf, x, rect, &space_lbl, style, false);
         hits.push(HitRegion {
@@ -1106,9 +1110,7 @@ fn render_top_tabbar(
     // Subtle slash divider between Space button and Tab pills
     if x + 1 < avail_end {
         let div_y = if rect.height >= 3 { rect.y + 1 } else { rect.y };
-        let mut div_style = Style::default()
-            .bg(Color::Rgb(12, 14, 22))
-            .fg(Color::Rgb(72, 82, 118));
+        let mut div_style = Style::default().bg(HERDR_PANEL_BG).fg(HERDR_OVERLAY0);
         if rect.height == 1 {
             div_style = div_style
                 .add_modifier(Modifier::UNDERLINED)
@@ -1125,8 +1127,8 @@ fn render_top_tabbar(
         let avail_tabs_w = tabs_limit_x.saturating_sub(x);
         let plan = plan_top_tabbar_pills(world, space, rect.width, avail_tabs_w);
         let overflow_style = Style::default()
-            .bg(Color::Rgb(34, 42, 68))
-            .fg(Color::Rgb(125, 207, 255))
+            .bg(HERDR_SURFACE0)
+            .fg(HERDR_ACCENT)
             .add_modifier(Modifier::BOLD);
 
         let mut drew_any = false;
@@ -1204,8 +1206,8 @@ fn render_top_tabbar(
     // 3. `[ + ]` button immediately after the tabs to add a new Tab
     if x + plus_w <= avail_end {
         let pstyle = Style::default()
-            .bg(Color::Rgb(28, 52, 44))
-            .fg(Color::Rgb(158, 206, 106))
+            .bg(Color::Rgb(32, 46, 42))
+            .fg(HERDR_GREEN)
             .add_modifier(Modifier::BOLD);
         draw_touchbar_pill(buf, x, rect, plus_lbl, pstyle, false);
         hits.push(HitRegion {
@@ -1224,8 +1226,8 @@ fn render_top_tabbar(
     let rx = max_x.saturating_sub(help_w);
     if rx >= x && rx + help_w <= max_x {
         let hstyle = Style::default()
-            .bg(Color::Rgb(34, 40, 62))
-            .fg(Color::Rgb(125, 207, 255))
+            .bg(Color::Rgb(36, 36, 54))
+            .fg(HERDR_SUBTEXT0)
             .add_modifier(Modifier::BOLD);
         draw_touchbar_pill(buf, rx, rect, help_lbl, hstyle, false);
         hits.push(HitRegion {
@@ -1296,8 +1298,8 @@ fn render_bottom_status_bar(
     if rect.width == 0 || rect.height == 0 {
         return;
     }
-    let bar_bg = Color::Rgb(14, 16, 24);
-    let base_style = Style::default().bg(bar_bg).fg(Color::Rgb(160, 168, 200));
+    let bar_bg = HERDR_PANEL_BG;
+    let base_style = Style::default().bg(bar_bg).fg(HERDR_SUBTEXT0);
     f.render_widget(Block::default().style(base_style), rect);
 
     let buf = f.buffer_mut();
@@ -1995,12 +1997,8 @@ fn render_space_menu_modal(
         .title(" ❖ Spaces ")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Rgb(125, 207, 255)))
-        .style(
-            Style::default()
-                .bg(Color::Rgb(18, 20, 32))
-                .fg(Color::Rgb(200, 205, 220)),
-        );
+        .border_style(Style::default().fg(HERDR_ACCENT))
+        .style(Style::default().bg(HERDR_PANEL_BG).fg(HERDR_TEXT));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -2051,22 +2049,18 @@ fn render_space_menu_modal(
         let (r1_style, r2_style) = if is_active {
             (
                 Style::default()
-                    .bg(Color::Rgb(46, 56, 92))
-                    .fg(Color::White)
+                    .bg(HERDR_SURFACE0)
+                    .fg(HERDR_TEXT)
                     .add_modifier(Modifier::BOLD),
-                Style::default()
-                    .bg(Color::Rgb(46, 56, 92))
-                    .fg(Color::Rgb(165, 180, 220)),
+                Style::default().bg(HERDR_SURFACE0).fg(HERDR_SUBTEXT0),
             )
         } else {
             (
                 Style::default()
-                    .bg(Color::Rgb(24, 28, 44))
-                    .fg(Color::Rgb(190, 198, 220))
+                    .bg(HERDR_SURFACE_DIM)
+                    .fg(HERDR_SUBTEXT0)
                     .add_modifier(Modifier::BOLD),
-                Style::default()
-                    .bg(Color::Rgb(24, 28, 44))
-                    .fg(Color::Rgb(115, 125, 155)),
+                Style::default().bg(HERDR_SURFACE_DIM).fg(HERDR_OVERLAY1),
             )
         };
 
@@ -2075,7 +2069,7 @@ fn render_space_menu_modal(
             buf.set_string(inner.x, y + 1, pad_to_width(&row2, w), r2_style);
         }
         if is_active {
-            let accent = Color::Rgb(125, 207, 255);
+            let accent = HERDR_ACCENT;
             buf.set_string(inner.x, y, "▍", r1_style.fg(accent));
             if use_two_row {
                 buf.set_string(inner.x, y + 1, "▍", r2_style.fg(accent));
@@ -3133,17 +3127,21 @@ mod tests {
                 })
                 .unwrap_or_else(|| panic!("expected SelectTab hit region for {tid}"));
             if i == 1 {
-                assert_eq!(buf[(region.rect.x + 1, 0)].fg, Color::LightRed);
+                assert_eq!(buf[(region.rect.x + 1, 0)].fg, HERDR_RED);
+            } else if i == 2 {
+                assert_eq!(buf[(region.rect.x + 1, 0)].bg, HERDR_SURFACE0);
+                assert_eq!(buf[(region.rect.x + 1, 0)].fg, HERDR_SUBTEXT0);
             } else if i == 3 {
-                assert_eq!(buf[(region.rect.x + 1, 0)].fg, Color::White);
+                assert_eq!(buf[(region.rect.x + 1, 0)].bg, HERDR_ACCENT);
+                assert_eq!(buf[(region.rect.x + 1, 0)].fg, HERDR_PANEL_BG);
                 assert_eq!(
                     buf[(region.rect.x + 1, 0)].underline_color,
                     TOPBAR_UNDERLINE_ACTIVE
                 );
             } else if i == 4 {
-                assert_eq!(buf[(region.rect.x + 1, 0)].fg, Color::LightGreen);
+                assert_eq!(buf[(region.rect.x + 1, 0)].fg, HERDR_TEAL);
             } else if i == 5 {
-                assert_eq!(buf[(region.rect.x + 1, 0)].fg, Color::LightYellow);
+                assert_eq!(buf[(region.rect.x + 1, 0)].fg, HERDR_YELLOW);
             }
         }
     }
