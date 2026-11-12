@@ -3,7 +3,7 @@
 //! Read-Only Bottom Agent Status Bar, and modal overlays.
 
 use crate::keys::Action;
-use crate::model::{AgentState, World};
+use crate::model::{AgentState, SharedSpace, World};
 use crate::usage::{render_progress_bar, AgentKind, AgentQuota, QuotaMetric};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -14,7 +14,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Widget},
     Frame,
 };
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 #[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,17 +123,20 @@ fn truncate_to_width(s: &str, max_width: usize) -> String {
         return "…".to_string();
     }
     let target = max_width - 1;
-    let mut out = String::new();
-    let mut w = 0usize;
-    for ch in s.chars() {
-        let cw = ch.width().unwrap_or(0);
-        if w + cw > target {
+    let mut end_byte = 0usize;
+    for (idx, ch) in s.char_indices() {
+        let next = idx + ch.len_utf8();
+        if s[..next].width() > target {
             break;
         }
-        out.push(ch);
-        w += cw;
+        end_byte = next;
     }
-    out.push('…');
+    let mut prefix = s[..end_byte].to_string();
+    let mut out = format!("{prefix}…");
+    while out.width() > max_width && !prefix.is_empty() {
+        prefix.pop();
+        out = format!("{prefix}…");
+    }
     out
 }
 
@@ -651,6 +654,255 @@ pub fn render_ui_with_pads_and_quota(
 const TOPBAR_UNDERLINE_DIM: Color = Color::Rgb(58, 74, 118);
 const TOPBAR_UNDERLINE_ACTIVE: Color = Color::Rgb(245, 194, 118);
 
+struct PlannedTabBar {
+    left_badge: Option<String>,
+    right_badge: Option<String>,
+    pills: Vec<(String, String, AgentState, bool)>,
+}
+
+fn joined_pills_width(labels: &[String]) -> u16 {
+    if labels.is_empty() {
+        0
+    } else {
+        let sum: usize = labels.iter().map(|s| s.width()).sum();
+        sum.saturating_add(labels.len() - 1).min(u16::MAX as usize) as u16
+    }
+}
+
+fn overflow_badge_label(hidden_count: usize, is_left: bool, compact: bool) -> Option<String> {
+    if hidden_count == 0 {
+        None
+    } else if compact {
+        Some(if is_left {
+            format!("‹{hidden_count}")
+        } else {
+            format!("{hidden_count}›")
+        })
+    } else {
+        Some(if is_left {
+            format!(" ‹{hidden_count} ")
+        } else {
+            format!(" {hidden_count}› ")
+        })
+    }
+}
+
+fn tab_pill_style(st: AgentState, is_active: bool) -> Style {
+    if is_active {
+        Style::default()
+            .bg(Color::Rgb(58, 70, 114))
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        match st {
+            AgentState::Blocked => Style::default()
+                .bg(Color::Rgb(56, 26, 34))
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+            AgentState::Done => Style::default()
+                .bg(Color::Rgb(24, 46, 36))
+                .fg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD),
+            AgentState::Working => Style::default()
+                .bg(Color::Rgb(36, 34, 24))
+                .fg(Color::LightYellow),
+            AgentState::Idle | AgentState::None => Style::default()
+                .bg(Color::Rgb(24, 28, 44))
+                .fg(Color::Rgb(160, 170, 205)),
+        }
+    }
+}
+
+fn plan_top_tabbar_pills(
+    world: &World,
+    space: &SharedSpace,
+    rect_width: u16,
+    avail_tabs_w: u16,
+) -> PlannedTabBar {
+    let total_tabs = space.tabs.len();
+    if total_tabs == 0 || avail_tabs_w == 0 {
+        return PlannedTabBar {
+            left_badge: None,
+            right_badge: None,
+            pills: Vec::new(),
+        };
+    }
+
+    let active_ti = world.active_tab_index().min(total_tabs - 1);
+    let full_names: Vec<String> = (0..total_tabs)
+        .map(|ti| world.tab_display_name(space, ti))
+        .collect();
+    let states: Vec<AgentState> = space.tabs.iter().map(|tab| world.tab_state(tab)).collect();
+
+    let index_only_lbl = |ti: usize| format!(" {} ", ti + 1);
+    let titled_lbl = |ti: usize, max_name_w: usize| {
+        let tname = truncate_to_width(&full_names[ti], max_name_w);
+        if tname.is_empty() {
+            index_only_lbl(ti)
+        } else {
+            format!(" {}:{} ", ti + 1, tname)
+        }
+    };
+    let build_all_pills = |labels: Vec<String>| PlannedTabBar {
+        left_badge: None,
+        right_badge: None,
+        pills: labels
+            .into_iter()
+            .enumerate()
+            .map(|(ti, lbl)| (space.tabs[ti].id.clone(), lbl, states[ti], ti == active_ti))
+            .collect(),
+    };
+
+    // Stage 1 & 2: Try fitting all tabs with full or progressively shorter titles.
+    let title_widths: &[usize] = if rect_width >= 64 {
+        &[14, 10, 7, 4]
+    } else if rect_width >= 40 {
+        &[8, 5, 3]
+    } else {
+        &[]
+    };
+    for &max_w in title_widths {
+        let labels: Vec<String> = (0..total_tabs).map(|ti| titled_lbl(ti, max_w)).collect();
+        if joined_pills_width(&labels) <= avail_tabs_w {
+            return build_all_pills(labels);
+        }
+    }
+
+    // Stage 3: Accordion / Fisheye mode — fold inactive tabs to `[ N ]` so all tabs stay visible
+    // in fixed order while expanding the active tab's title into the remaining budget.
+    let mut idx_labels: Vec<String> = (0..total_tabs).map(index_only_lbl).collect();
+    let all_idx_w = joined_pills_width(&idx_labels);
+    if all_idx_w <= avail_tabs_w {
+        let inactive_plus_gaps_w = all_idx_w.saturating_sub(idx_labels[active_ti].width() as u16);
+        let active_budget = avail_tabs_w.saturating_sub(inactive_plus_gaps_w) as usize;
+        let framing = (active_ti + 1).to_string().len() + 3;
+        if rect_width >= 36 && active_budget >= framing + 2 {
+            let max_active_name_w = (active_budget - framing).min(16);
+            let candidate = titled_lbl(active_ti, max_active_name_w);
+            if candidate.width() <= active_budget {
+                idx_labels[active_ti] = candidate;
+            }
+        }
+        return build_all_pills(idx_labels);
+    }
+
+    // Stage 4: Extreme overflow fallback — center a balanced window around `active_ti`
+    // flanked by clickable `[ ‹N ]` / `[ N› ]` hidden-count badges.
+    let mut compact_badges = avail_tabs_w < 18;
+    let mut stage4_labels = idx_labels;
+    if rect_width >= 44 && avail_tabs_w >= 28 {
+        stage4_labels[active_ti] = titled_lbl(active_ti, 6);
+    }
+
+    let window_width = |start: usize, end: usize, labels: &[String], compact: bool| -> u16 {
+        let mut total = 0usize;
+        let mut items = 0usize;
+        if let Some(lb) = overflow_badge_label(start, true, compact) {
+            total = total.saturating_add(lb.width());
+            items += 1;
+        }
+        for lbl in &labels[start..=end] {
+            total = total.saturating_add(lbl.width());
+            items += 1;
+        }
+        if let Some(rb) = overflow_badge_label(total_tabs - 1 - end, false, compact) {
+            total = total.saturating_add(rb.width());
+            items += 1;
+        }
+        total
+            .saturating_add(items.saturating_sub(1))
+            .min(u16::MAX as usize) as u16
+    };
+
+    if window_width(active_ti, active_ti, &stage4_labels, compact_badges) > avail_tabs_w {
+        stage4_labels[active_ti] = index_only_lbl(active_ti);
+    }
+    if window_width(active_ti, active_ti, &stage4_labels, compact_badges) > avail_tabs_w {
+        compact_badges = true;
+    }
+    if window_width(active_ti, active_ti, &stage4_labels, compact_badges) > avail_tabs_w {
+        let max_w = avail_tabs_w as usize;
+        let fallback = if stage4_labels[active_ti].width() <= max_w {
+            stage4_labels[active_ti].clone()
+        } else {
+            let unpadded = (active_ti + 1).to_string();
+            if unpadded.width() <= max_w {
+                unpadded
+            } else {
+                truncate_to_width(&unpadded, max_w)
+            }
+        };
+        let pills = if fallback.is_empty() {
+            Vec::new()
+        } else {
+            vec![(
+                space.tabs[active_ti].id.clone(),
+                fallback,
+                states[active_ti],
+                true,
+            )]
+        };
+        return PlannedTabBar {
+            left_badge: None,
+            right_badge: None,
+            pills,
+        };
+    }
+
+    let mut vis_start = active_ti;
+    let mut vis_end = active_ti;
+    loop {
+        let mut progressed = false;
+        if vis_end + 1 < total_tabs {
+            if window_width(vis_start, vis_end + 1, &stage4_labels, compact_badges) <= avail_tabs_w
+            {
+                vis_end += 1;
+                progressed = true;
+            } else if vis_end + 3 == total_tabs
+                && window_width(vis_start, total_tabs - 1, &stage4_labels, compact_badges)
+                    <= avail_tabs_w
+            {
+                vis_end = total_tabs - 1;
+                progressed = true;
+            }
+        }
+        if vis_start > 0 {
+            if window_width(vis_start - 1, vis_end, &stage4_labels, compact_badges) <= avail_tabs_w
+            {
+                vis_start -= 1;
+                progressed = true;
+            } else if vis_start == 2
+                && window_width(0, vis_end, &stage4_labels, compact_badges) <= avail_tabs_w
+            {
+                vis_start = 0;
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+
+    let left_badge = overflow_badge_label(vis_start, true, compact_badges);
+    let right_badge = overflow_badge_label(total_tabs - 1 - vis_end, false, compact_badges);
+    let pills = (vis_start..=vis_end)
+        .map(|ti| {
+            (
+                space.tabs[ti].id.clone(),
+                stage4_labels[ti].clone(),
+                states[ti],
+                ti == active_ti,
+            )
+        })
+        .collect();
+
+    PlannedTabBar {
+        left_badge,
+        right_badge,
+        pills,
+    }
+}
+
 fn draw_touchbar_pill(
     buf: &mut Buffer,
     x: u16,
@@ -806,11 +1058,16 @@ fn render_top_tabbar(
     };
     let raw_space_lbl = if rect.width < 36 {
         format!(" {arrow} {} ", truncate_to_width(&sname, 5))
-    } else {
+    } else if matches!(sstate, AgentState::Blocked | AgentState::Done) {
         format!(
             " {arrow} {} {} ",
             sstate.symbol(),
             truncate_to_width(&sname, max_space_w.saturating_sub(6))
+        )
+    } else {
+        format!(
+            " {arrow} {} ",
+            truncate_to_width(&sname, max_space_w.saturating_sub(4))
         )
     };
     let space_fit = avail_end.saturating_sub(x) as usize;
@@ -864,109 +1121,44 @@ fn render_top_tabbar(
     // 2. Horizontal Tab pills (`space / tab1 / tab2 ...`) + trailing `[ + ]` button
     let tabs_limit_x = avail_end.saturating_sub(plus_w + 1);
     if let Some(space) = world.active_space() {
-        let active_ti = world.active_tab_index();
         let space_id = space.id.clone();
-        let total_tabs = space.tabs.len();
-        let compact_tabs = rect.width < 64 || total_tabs > 4;
-        let max_tab_name_w = if rect.width < 44 {
-            4usize
-        } else if compact_tabs {
-            8usize
-        } else {
-            14usize
-        };
-
-        // Build formatted labels for all tabs so we can window around `active_ti` if needed
-        let mut tab_pills: Vec<(usize, String, String, AgentState, bool)> =
-            Vec::with_capacity(total_tabs);
-        for (ti, tab) in space.tabs.iter().enumerate() {
-            let is_active = ti == active_ti;
-            let st = world.tab_state(tab);
-            let tname = truncate_to_width(&world.tab_display_name(space, ti), max_tab_name_w);
-            let icon = if matches!(
-                st,
-                AgentState::Blocked | AgentState::Working | AgentState::Done
-            ) {
-                st.symbol()
-            } else if is_active {
-                "●"
-            } else {
-                "○"
-            };
-            let lbl = if rect.width < 40 {
-                format!(" {icon}{} ", ti + 1)
-            } else {
-                format!(" {icon} {}:{} ", ti + 1, tname)
-            };
-            tab_pills.push((ti, tab.id.clone(), lbl, st, is_active));
-        }
-
-        // Ensure `active_ti` (and `active_ti + 1` whenever both fit) is within the visible slice
-        // so selecting the rightmost visible tab reveals the next hidden tab on the right.
         let avail_tabs_w = tabs_limit_x.saturating_sub(x);
-        let total_tabs_w: u16 = tab_pills
-            .iter()
-            .enumerate()
-            .map(|(i, (_, _, lbl, _, _))| lbl.width() as u16 + u16::from(i + 1 < total_tabs))
-            .sum();
-        let tabs_overflow = total_tabs_w > avail_tabs_w;
-        let mut start_idx = 0usize;
-        if avail_tabs_w > 0 && !tab_pills.is_empty() {
-            let lookahead_ti = if active_ti + 1 < total_tabs {
-                let pair_w: u16 = tab_pills[active_ti..=active_ti + 1]
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (_, _, lbl, _, _))| lbl.width() as u16 + u16::from(i == 0))
-                    .sum();
-                if pair_w <= avail_tabs_w {
-                    active_ti + 1
-                } else {
-                    active_ti
-                }
-            } else {
-                active_ti
-            };
-            while start_idx < active_ti {
-                let slice = &tab_pills[start_idx..=lookahead_ti];
-                let needed: u16 = slice
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (_, _, lbl, _, _))| {
-                        lbl.width() as u16 + u16::from(i + 1 < slice.len())
-                    })
-                    .sum();
-                if needed <= avail_tabs_w {
-                    break;
-                }
-                start_idx += 1;
+        let plan = plan_top_tabbar_pills(world, space, rect.width, avail_tabs_w);
+        let overflow_style = Style::default()
+            .bg(Color::Rgb(34, 42, 68))
+            .fg(Color::Rgb(125, 207, 255))
+            .add_modifier(Modifier::BOLD);
+
+        let mut drew_any = false;
+        if let Some(lb) = plan.left_badge {
+            let bw = lb.width() as u16;
+            if bw > 0 && x + bw <= tabs_limit_x {
+                draw_touchbar_pill(buf, x, rect, &lb, overflow_style, false);
+                hits.push(HitRegion {
+                    rect: Rect {
+                        x,
+                        y: rect.y,
+                        width: bw,
+                        height: rect.height,
+                    },
+                    target: HitTarget::TriggerAction(Action::FuzzyFinder),
+                });
+                x += bw;
+                drew_any = true;
             }
         }
 
-        for (_ti, tab_id, lbl, st, is_active) in tab_pills.into_iter().skip(start_idx) {
+        for (tab_id, lbl, st, is_active) in plan.pills {
             let pw = lbl.width() as u16;
-            if x + pw > tabs_limit_x {
+            if pw == 0 {
+                continue;
+            }
+            let next_x = x + u16::from(drew_any);
+            if next_x + pw > tabs_limit_x {
                 break;
             }
-            let fg_col = if is_active {
-                Color::White
-            } else if matches!(st, AgentState::Blocked | AgentState::Done) {
-                state_color(st)
-            } else {
-                Color::Rgb(160, 170, 205)
-            };
-            let bg_col = if is_active {
-                Color::Rgb(58, 70, 114)
-            } else {
-                Color::Rgb(24, 28, 44)
-            };
-            let tstyle = Style::default()
-                .bg(bg_col)
-                .fg(fg_col)
-                .add_modifier(if is_active {
-                    Modifier::BOLD
-                } else {
-                    Modifier::empty()
-                });
+            x = next_x;
+            let tstyle = tab_pill_style(st, is_active);
             draw_touchbar_pill(buf, x, rect, &lbl, tstyle, is_active);
             hits.push(HitRegion {
                 rect: Rect {
@@ -975,19 +1167,37 @@ fn render_top_tabbar(
                     width: pw,
                     height: rect.height,
                 },
-                target: if is_active && tabs_overflow && total_tabs > 1 {
-                    HitTarget::TriggerAction(Action::NextTab)
-                } else {
-                    HitTarget::SelectTab {
-                        space_id: space_id.clone(),
-                        tab_id,
-                    }
+                target: HitTarget::SelectTab {
+                    space_id: space_id.clone(),
+                    tab_id,
                 },
             });
             x += pw;
-            if x < tabs_limit_x {
-                x += 1;
+            drew_any = true;
+        }
+
+        if let Some(rb) = plan.right_badge {
+            let bw = rb.width() as u16;
+            let next_x = x + u16::from(drew_any);
+            if bw > 0 && next_x + bw <= tabs_limit_x {
+                x = next_x;
+                draw_touchbar_pill(buf, x, rect, &rb, overflow_style, false);
+                hits.push(HitRegion {
+                    rect: Rect {
+                        x,
+                        y: rect.y,
+                        width: bw,
+                        height: rect.height,
+                    },
+                    target: HitTarget::TriggerAction(Action::FuzzyFinder),
+                });
+                x += bw;
+                drew_any = true;
             }
+        }
+
+        if drew_any && x + 1 + plus_w <= avail_end {
+            x += 1;
         }
     }
 
@@ -1007,6 +1217,7 @@ fn render_top_tabbar(
             },
             target: HitTarget::NewTab,
         });
+        x += plus_w;
     }
 
     // 4. Far Right: `[ ? ]` Quick Actions & Help button
@@ -2493,7 +2704,7 @@ fn render_fuzzy_modal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{SharedSpace, SharedTab};
+    use crate::model::{SharedTab, TerminalInfo};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -2590,6 +2801,8 @@ mod tests {
         assert!(row0.contains("1:agent"));
         assert!(row0.contains('+'));
         assert!(row0.contains('?'));
+        assert!(!row0.contains('●'));
+        assert!(!row0.contains('○'));
         // Every cell across the entire 1-row Top Tab Bar carries `Modifier::UNDERLINED` with
         // `TOPBAR_UNDERLINE_DIM`, while ONLY the active Tab highlights in `TOPBAR_UNDERLINE_ACTIVE`.
         for col in 0..100u16 {
@@ -2826,24 +3039,54 @@ mod tests {
     }
 
     #[test]
-    fn overflowing_top_tabs_reveal_next_tab_and_allow_cycling_forward() {
-        let backend = TestBackend::new(42, 12);
-        let mut terminal = Terminal::new(backend).unwrap();
+    fn accordion_top_tabs_fold_inactive_pills_and_keep_all_tabs_visible_and_colored() {
         let mut world = World::default();
         world.doc.spaces.push(SharedSpace {
             id: "space-1".to_string(),
             name: "main".to_string(),
-            tabs: (1..=6)
+            tabs: (1..=8)
                 .map(|i| SharedTab {
                     id: format!("tab-{i}"),
                     name: format!("agent-{i}"),
+                    root: serde_json::json!({ "content": { "terminal": format!("term-{i}") } }),
                     ..Default::default()
                 })
                 .collect(),
             ..Default::default()
         });
-        world.select_tab_index(1); // active = tab-2
+        world.terminals.insert(
+            "term-1".to_string(),
+            TerminalInfo {
+                address: "term-1".to_string(),
+                state: "live".to_string(),
+                status_word: Some("blocked".to_string()),
+                ..Default::default()
+            },
+        );
+        world.terminals.insert(
+            "term-4".to_string(),
+            TerminalInfo {
+                address: "term-4".to_string(),
+                state: "live".to_string(),
+                status_word: Some("idle".to_string()),
+                turn: 3,
+                seen_turn: Some(1), // unread finished turn -> AgentState::Done
+                ..Default::default()
+            },
+        );
+        world.terminals.insert(
+            "term-5".to_string(),
+            TerminalInfo {
+                address: "term-5".to_string(),
+                state: "live".to_string(),
+                status_word: Some("working".to_string()),
+                ..Default::default()
+            },
+        );
+        world.select_tab_index(2); // active = tab-3 ("agent-3")
 
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
         let mut hits = Vec::new();
         terminal
             .draw(|f| {
@@ -2866,17 +3109,260 @@ mod tests {
             })
             .unwrap();
 
-        // Tapping the active tab when tabs overflow cycles to NextTab, and the next tab (`tab-3`) is exposed
-        assert!(hits
+        let buf = terminal.backend().buffer();
+        let row0: String = (0..80).map(|x| buf[(x, 0)].symbol()).collect();
+        // Active tab expands its title while inactive tabs fold to `[ N ]` without circles or scrolling
+        assert!(row0.contains(" 3:agent-3 "));
+        assert!(!row0.contains("1:agent-1"));
+        assert!(!row0.contains('●'));
+        assert!(!row0.contains('○'));
+        assert!(!row0.contains('‹'));
+        assert!(!row0.contains('›'));
+
+        // Every single tab (`tab-1` .. `tab-8`) remains directly selectable on row 0
+        for i in 1..=8 {
+            let tid = format!("tab-{i}");
+            let region = hits
+                .iter()
+                .find(|h| {
+                    h.target
+                        == HitTarget::SelectTab {
+                            space_id: "space-1".to_string(),
+                            tab_id: tid.clone(),
+                        }
+                })
+                .unwrap_or_else(|| panic!("expected SelectTab hit region for {tid}"));
+            if i == 1 {
+                assert_eq!(buf[(region.rect.x + 1, 0)].fg, Color::LightRed);
+            } else if i == 3 {
+                assert_eq!(buf[(region.rect.x + 1, 0)].fg, Color::White);
+                assert_eq!(
+                    buf[(region.rect.x + 1, 0)].underline_color,
+                    TOPBAR_UNDERLINE_ACTIVE
+                );
+            } else if i == 4 {
+                assert_eq!(buf[(region.rect.x + 1, 0)].fg, Color::LightGreen);
+            } else if i == 5 {
+                assert_eq!(buf[(region.rect.x + 1, 0)].fg, Color::LightYellow);
+            }
+        }
+    }
+
+    #[test]
+    fn extreme_overflow_top_tabs_show_count_badges_opening_fuzzy_switcher() {
+        let mut world = World::default();
+        world.doc.spaces.push(SharedSpace {
+            id: "space-1".to_string(),
+            name: "main".to_string(),
+            tabs: (1..=12)
+                .map(|i| SharedTab {
+                    id: format!("tab-{i}"),
+                    name: format!("agent-{i}"),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        });
+        world.select_tab_index(5); // active = tab-6 (middle of 12 tabs)
+
+        let backend = TestBackend::new(42, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut hits = Vec::new();
+        terminal
+            .draw(|f| {
+                let geom = render_ui(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::None,
+                );
+                hits = geom.hits;
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let row0: String = (0..42).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(row0.contains('‹'), "expected left overflow badge: {row0:?}");
+        assert!(
+            row0.contains('›'),
+            "expected right overflow badge: {row0:?}"
+        );
+        assert!(row0.contains(" 6 "), "expected active tab 6 pill: {row0:?}");
+        assert!(!hits
             .iter()
             .any(|h| h.target == HitTarget::TriggerAction(Action::NextTab)));
+        assert_eq!(
+            hits.iter()
+                .filter(|h| h.target == HitTarget::TriggerAction(Action::FuzzyFinder))
+                .count(),
+            2,
+            "both left and right overflow badges should open FuzzyFinder"
+        );
         assert!(hits.iter().any(|h| {
             h.target
                 == HitTarget::SelectTab {
                     space_id: "space-1".to_string(),
-                    tab_id: "tab-3".to_string(),
+                    tab_id: "tab-6".to_string(),
                 }
         }));
+
+        // At tab-1 (leftmost), no left badge is shown; only right overflow badge appears
+        world.select_tab_index(0);
+        terminal
+            .draw(|f| {
+                hits = render_ui(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::None,
+                )
+                .hits;
+            })
+            .unwrap();
+        let row0_first: String = (0..42)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect();
+        assert!(!row0_first.contains('‹'));
+        assert!(row0_first.contains('›'));
+        assert_eq!(
+            hits.iter()
+                .filter(|h| h.target == HitTarget::TriggerAction(Action::FuzzyFinder))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn vs16_emoji_and_ultra_narrow_top_tabbar_preserve_width_and_index_visibility() {
+        for sample in ["❤️❤️❤️❤️", "⚠️⚙️❤️", "中文標題測試", "mix❤️中a"]
+        {
+            for max_w in 0..=8 {
+                let t = truncate_to_width(sample, max_w);
+                assert!(
+                    t.width() <= max_w,
+                    "truncate_to_width({sample:?}, {max_w}) = {t:?} has width {} > {max_w}",
+                    t.width()
+                );
+            }
+        }
+
+        // Accordion Stage 3 with VS16 emoji active tab title keeps all trailing tabs visible
+        let mut world = World::default();
+        world.doc.spaces.push(SharedSpace {
+            id: "space-1".to_string(),
+            name: "main".to_string(),
+            tabs: (1..=6)
+                .map(|i| SharedTab {
+                    id: format!("tab-{i}"),
+                    name: if i == 2 {
+                        "❤️❤️❤️❤️❤️❤️".to_string()
+                    } else {
+                        format!("agent-{i}")
+                    },
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        });
+        world.select_tab_index(1);
+
+        let backend = TestBackend::new(46, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut hits = Vec::new();
+        terminal
+            .draw(|f| {
+                hits = render_ui(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::None,
+                )
+                .hits;
+            })
+            .unwrap();
+        for i in 1..=6 {
+            let tid = format!("tab-{i}");
+            assert!(
+                hits.iter().any(|h| {
+                    h.target
+                        == HitTarget::SelectTab {
+                            space_id: "space-1".to_string(),
+                            tab_id: tid.clone(),
+                        }
+                }),
+                "expected {tid} to remain visible when active tab has VS16 emoji"
+            );
+        }
+
+        // Ultra-narrow (`avail_tabs_w = 1..=2`) fallback displays unpadded index `"2"` instead of `"…"`
+        let tiny_backend = TestBackend::new(21, 10);
+        let mut tiny_term = Terminal::new(tiny_backend).unwrap();
+        let mut tiny_hits = Vec::new();
+        tiny_term
+            .draw(|f| {
+                tiny_hits = render_ui(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::None,
+                )
+                .hits;
+            })
+            .unwrap();
+        let active_hit = tiny_hits
+            .iter()
+            .find(|h| {
+                h.target
+                    == HitTarget::SelectTab {
+                        space_id: "space-1".to_string(),
+                        tab_id: "tab-2".to_string(),
+                    }
+            })
+            .expect("expected active tab hit on 21-col viewport");
+        let tiny_buf = tiny_term.backend().buffer();
+        let pill_text: String = (active_hit.rect.x..active_hit.rect.x + active_hit.rect.width)
+            .map(|x| tiny_buf[(x, 0)].symbol())
+            .collect();
+        assert!(
+            pill_text.contains('2'),
+            "expected unpadded active index in {pill_text:?}"
+        );
     }
 
     #[test]

@@ -1024,10 +1024,19 @@ fn execute_action(
         }
         Action::FuzzyFinder => {
             let items = collect_fuzzy_items(world, "");
-            let selected_tab_id = items.first().map(|it| it.tab_id.clone());
+            let active_sid = world.active_space().map(|s| s.id.clone());
+            let active_tid = world.active_tab().map(|t| t.id.clone());
+            let selected = match (active_sid.as_deref(), active_tid.as_deref()) {
+                (Some(sid), Some(tid)) => items
+                    .iter()
+                    .position(|it| it.space_id == sid && it.tab_id == tid)
+                    .unwrap_or(0),
+                _ => 0,
+            };
+            let selected_tab_id = items.get(selected).map(|it| it.tab_id.clone());
             *modal = Modal::Fuzzy {
                 query: String::new(),
-                selected: 0,
+                selected,
                 selected_tab_id,
             };
         }
@@ -1896,6 +1905,30 @@ fn run_app(
                                         items.get(*selected).map(|it| it.tab_id.clone());
                                     dirty = true;
                                 } else if matches!(modal, Modal::None)
+                                    && mev.row < term_rect.y
+                                    && dpad_drag.is_none()
+                                    && !selection.as_ref().is_some_and(|s| s.active)
+                                {
+                                    let had_sticky = prefix_active || ctrl_active || alt_active;
+                                    prefix_active = false;
+                                    ctrl_active = false;
+                                    alt_active = false;
+                                    let had_vis_sel = selection
+                                        .as_ref()
+                                        .is_some_and(TerminalSelection::is_non_empty);
+                                    selection = None;
+                                    selection_screen = None;
+                                    selection_vt_seq = None;
+                                    let prev_ti = world.active_tab_index();
+                                    world.prev_tab();
+                                    let tab_changed = world.active_tab_index() != prev_ti;
+                                    if tab_changed {
+                                        world.mark_active_seen(core);
+                                    }
+                                    if tab_changed || had_sticky || had_vis_sel {
+                                        dirty = true;
+                                    }
+                                } else if matches!(modal, Modal::None)
                                     && mev.row >= term_rect.y
                                     && mev.row < term_rect.y.saturating_add(term_rect.height)
                                     && !is_on_dpad_disc(last_dpad_rect, mev.column, mev.row)
@@ -1955,6 +1988,30 @@ fn run_app(
                                         *selected = (cur_sel + 1).min(items.len() - 1);
                                         *selected_tab_id =
                                             items.get(*selected).map(|it| it.tab_id.clone());
+                                        dirty = true;
+                                    }
+                                } else if matches!(modal, Modal::None)
+                                    && mev.row < term_rect.y
+                                    && dpad_drag.is_none()
+                                    && !selection.as_ref().is_some_and(|s| s.active)
+                                {
+                                    let had_sticky = prefix_active || ctrl_active || alt_active;
+                                    prefix_active = false;
+                                    ctrl_active = false;
+                                    alt_active = false;
+                                    let had_vis_sel = selection
+                                        .as_ref()
+                                        .is_some_and(TerminalSelection::is_non_empty);
+                                    selection = None;
+                                    selection_screen = None;
+                                    selection_vt_seq = None;
+                                    let prev_ti = world.active_tab_index();
+                                    world.next_tab();
+                                    let tab_changed = world.active_tab_index() != prev_ti;
+                                    if tab_changed {
+                                        world.mark_active_seen(core);
+                                    }
+                                    if tab_changed || had_sticky || had_vis_sel {
                                         dirty = true;
                                     }
                                 } else if matches!(modal, Modal::None)
