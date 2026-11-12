@@ -107,6 +107,82 @@ struct Cli {
     /// Hide the dual floating touch `+` cross pads
     #[arg(long, conflicts_with = "touch")]
     no_touch: bool,
+
+    /// Allow running `hct` nested inside an active `hc`, `herdr`, `tmux`, `zellij`, or GNU `screen` session
+    #[arg(long)]
+    allow_nested: bool,
+
+    /// Refuse running `hct` nested inside another terminal multiplexer (overrides `ui.allow_nested = true`)
+    #[arg(long, conflicts_with = "allow_nested")]
+    no_allow_nested: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NestedMultiplexer {
+    program: &'static str,
+    env_var: &'static str,
+    value: String,
+}
+
+fn resolve_allow_nested(cli_allow: bool, cli_no_allow: bool, cfg_allow: Option<bool>) -> bool {
+    if cli_allow {
+        true
+    } else if cli_no_allow {
+        false
+    } else {
+        cfg_allow.unwrap_or(false)
+    }
+}
+
+fn detect_nested_multiplexer<F>(mut get_env: F) -> Option<NestedMultiplexer>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    const CHECKS: &[(&str, &str, bool)] = &[
+        ("hc (herdr-core)", "HC_TERMINAL_ID", false),
+        ("hc (herdr-core)", "HC_TERMINAL_SOCKET", false),
+        ("herdr", "HERDR_PANE_ID", false),
+        ("herdr", "HERDR_SOCKET_PATH", false),
+        ("herdr", "HERDR_ENV", true),
+        ("tmux", "TMUX", false),
+        ("zellij", "ZELLIJ", false),
+        ("zellij", "ZELLIJ_SESSION_NAME", false),
+        ("GNU screen", "STY", false),
+    ];
+
+    for &(program, env_var, is_bool_flag) in CHECKS {
+        if let Some(raw) = get_env(env_var) {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if is_bool_flag && (trimmed == "0" || trimmed.eq_ignore_ascii_case("false")) {
+                continue;
+            }
+            return Some(NestedMultiplexer {
+                program,
+                env_var,
+                value: trimmed.to_string(),
+            });
+        }
+    }
+    None
+}
+
+fn format_nested_session_error(nested: &NestedMultiplexer) -> String {
+    let detail = if !nested.value.contains('/')
+        && !nested.value.contains('\\')
+        && nested.value.chars().count() <= 32
+    {
+        format!("{}={}", nested.env_var, nested.value)
+    } else {
+        format!("${}", nested.env_var)
+    };
+    format!(
+        "Sessions should not be nested: already inside an active {} session (detected {}).\n\
+         Detach or open a plain terminal first, or pass `hct --allow-nested` (or set `ui.allow_nested = true` in config.toml) to force.",
+        nested.program, detail
+    )
 }
 
 struct AttachedTerminal {
@@ -395,6 +471,25 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
+fn format_osc52_sequence(b64: &str, in_tmux: bool, in_screen: bool) -> String {
+    if in_tmux {
+        format!("\x1bPtmux;\x1b\x1b]52;c;{b64}\x07\x1b\\\x1b]52;c;{b64}\x07")
+    } else if in_screen {
+        // GNU screen caps individual DCS passthrough blocks (historically 256 bytes);
+        // chunking into <=76-byte DCS frames forwards arbitrarily long OSC 52 payloads intact.
+        let osc = format!("\x1b]52;c;{b64}\x07");
+        let mut out = String::with_capacity(osc.len() + (osc.len() / 76 + 1) * 4);
+        for chunk in osc.as_bytes().chunks(76) {
+            out.push_str("\x1bP");
+            out.push_str(std::str::from_utf8(chunk).unwrap_or(""));
+            out.push_str("\x1b\\");
+        }
+        out
+    } else {
+        format!("\x1b]52;c;{b64}\x07\x1b]52;;{b64}\x07")
+    }
+}
+
 fn copy_to_clipboard(text: &str) {
     if text.is_empty() {
         return;
@@ -403,15 +498,11 @@ fn copy_to_clipboard(text: &str) {
     // so remote SSH clients (iPad Termius, Blink, ShellFish, WezTerm, Kitty, iTerm2, Ghostty)
     // automatically update the client device's native clipboard.
     let b64 = base64_encode(text.as_bytes());
+    let in_tmux = std::env::var_os("TMUX").is_some_and(|v| !v.is_empty());
+    let in_screen = std::env::var_os("STY").is_some_and(|v| !v.is_empty());
+    let seq = format_osc52_sequence(&b64, in_tmux, in_screen);
     let mut stdout = io::stdout();
-    if std::env::var_os("TMUX").is_some() {
-        let _ = write!(
-            stdout,
-            "\x1bPtmux;\x1b\x1b]52;c;{b64}\x07\x1b\\\x1b]52;c;{b64}\x07"
-        );
-    } else {
-        let _ = write!(stdout, "\x1b]52;c;{b64}\x07\x1b]52;;{b64}\x07");
-    }
+    let _ = stdout.write_all(seq.as_bytes());
     let _ = stdout.flush();
 
     // 2. Also attempt local clipboard helper in a detached background thread when a local display server is active
@@ -556,6 +647,18 @@ fn paste_text_into_app(
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let file_cfg = FileConfig::load();
+    let allow_nested = resolve_allow_nested(
+        cli.allow_nested,
+        cli.no_allow_nested,
+        file_cfg.ui.allow_nested,
+    );
+    if !allow_nested {
+        if let Some(nested) = detect_nested_multiplexer(|k| {
+            std::env::var_os(k).map(|v| v.to_string_lossy().into_owned())
+        }) {
+            anyhow::bail!("{}", format_nested_session_error(&nested));
+        }
+    }
     let prefix_spec = file_cfg
         .keys
         .prefix
@@ -2535,5 +2638,139 @@ mod tests {
         assert!(!active_needs_sync(Some("t1"), None, false, Some(&retry_t1)));
         // Switching to a different terminal bypasses the previous terminal's retry backoff immediately
         assert!(active_needs_sync(Some("t2"), None, false, Some(&retry_t1)));
+    }
+
+    #[test]
+    fn detect_nested_multiplexer_catches_hc_herdr_tmux_zellij_and_screen() {
+        let env_from = |pairs: &[(&str, &str)]| {
+            let map: BTreeMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect();
+            detect_nested_multiplexer(|k| map.get(k).cloned())
+        };
+
+        assert_eq!(env_from(&[]), None);
+        assert_eq!(
+            env_from(&[("TMUX", "   "), ("HERDR_ENV", "0"), ("STY", "")]),
+            None
+        );
+        assert_eq!(env_from(&[("HERDR_ENV", "false")]), None);
+
+        assert_eq!(
+            env_from(&[("HC_TERMINAL_ID", "t18")]),
+            Some(NestedMultiplexer {
+                program: "hc (herdr-core)",
+                env_var: "HC_TERMINAL_ID",
+                value: "t18".to_string(),
+            })
+        );
+        assert_eq!(
+            env_from(&[("HC_TERMINAL_SOCKET", "/tmp/hc/default.sock")]),
+            Some(NestedMultiplexer {
+                program: "hc (herdr-core)",
+                env_var: "HC_TERMINAL_SOCKET",
+                value: "/tmp/hc/default.sock".to_string(),
+            })
+        );
+        assert_eq!(
+            env_from(&[("HERDR_PANE_ID", "w1:p1")]),
+            Some(NestedMultiplexer {
+                program: "herdr",
+                env_var: "HERDR_PANE_ID",
+                value: "w1:p1".to_string(),
+            })
+        );
+        assert_eq!(
+            env_from(&[("HERDR_ENV", "1")]),
+            Some(NestedMultiplexer {
+                program: "herdr",
+                env_var: "HERDR_ENV",
+                value: "1".to_string(),
+            })
+        );
+        assert_eq!(
+            env_from(&[("TMUX", "/tmp/tmux-1000/default,42,0")]),
+            Some(NestedMultiplexer {
+                program: "tmux",
+                env_var: "TMUX",
+                value: "/tmp/tmux-1000/default,42,0".to_string(),
+            })
+        );
+        // Zellij sets `ZELLIJ=0` inside active panes; must NOT be ignored as falsey
+        assert_eq!(
+            env_from(&[("ZELLIJ", "0")]),
+            Some(NestedMultiplexer {
+                program: "zellij",
+                env_var: "ZELLIJ",
+                value: "0".to_string(),
+            })
+        );
+        assert_eq!(
+            env_from(&[("ZELLIJ_SESSION_NAME", "work")]),
+            Some(NestedMultiplexer {
+                program: "zellij",
+                env_var: "ZELLIJ_SESSION_NAME",
+                value: "work".to_string(),
+            })
+        );
+        assert_eq!(
+            env_from(&[("STY", "1234.pts-0.box")]),
+            Some(NestedMultiplexer {
+                program: "GNU screen",
+                env_var: "STY",
+                value: "1234.pts-0.box".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn nested_error_message_and_cli_override_behave_consistently() {
+        let short_msg = format_nested_session_error(&NestedMultiplexer {
+            program: "herdr",
+            env_var: "HERDR_PANE_ID",
+            value: "w1:p1".to_string(),
+        });
+        assert!(short_msg.contains("HERDR_PANE_ID=w1:p1"));
+        assert!(short_msg.contains("--allow-nested"));
+
+        let path_msg = format_nested_session_error(&NestedMultiplexer {
+            program: "tmux",
+            env_var: "TMUX",
+            value: "/tmp/tmux-1000/default,42,0".to_string(),
+        });
+        assert!(path_msg.contains("detected $TMUX"));
+        assert!(!path_msg.contains("/tmp/tmux-1000"));
+
+        assert!(!resolve_allow_nested(false, false, None));
+        assert!(resolve_allow_nested(false, false, Some(true)));
+        assert!(!resolve_allow_nested(false, true, Some(true)));
+        assert!(resolve_allow_nested(true, false, Some(false)));
+
+        let parsed = Cli::try_parse_from(["hct", "--allow-nested"]).unwrap();
+        assert!(parsed.allow_nested);
+        assert!(!parsed.no_allow_nested);
+
+        assert!(Cli::try_parse_from(["hct", "--allow-nested", "--no-allow-nested"]).is_err());
+    }
+
+    #[test]
+    fn format_osc52_sequence_supports_plain_tmux_and_chunked_screen_dcs() {
+        let plain = format_osc52_sequence("YWJj", false, false);
+        assert_eq!(plain, "\x1b]52;c;YWJj\x07\x1b]52;;YWJj\x07");
+
+        let tmux = format_osc52_sequence("YWJj", true, true);
+        assert_eq!(
+            tmux,
+            "\x1bPtmux;\x1b\x1b]52;c;YWJj\x07\x1b\\\x1b]52;c;YWJj\x07"
+        );
+
+        let long_b64 = "A".repeat(120);
+        let screen = format_osc52_sequence(&long_b64, false, true);
+        assert!(screen.starts_with("\x1bP\x1b]52;c;"));
+        assert!(screen.ends_with("\x07\x1b\\"));
+        // Verify stripping DCS wrappers reconstructs the exact OSC 52 payload
+        let unwrapped = screen.replace("\x1bP", "").replace("\x1b\\", "");
+        assert_eq!(unwrapped, format!("\x1b]52;c;{long_b64}\x07"));
     }
 }

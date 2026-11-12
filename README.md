@@ -32,6 +32,8 @@ A fast, lightweight **multi-tab TUI client** for [`herdr-core` (`hc`)](https://g
   Compatible with `~/.config/herdr/config.toml` and `~/.config/herdr-tui/config.toml`.
 - **Shared Attention (`herdr.seen`)**
   Follows the `herdr.seen=<turn>` label specification so viewing a finished agent in `hct` clears its unread `done` indicator across all connected devices.
+- **Anti-Nesting Guard (防嵌套启动保护)**
+  Automatically refuses to launch inside an already active `hc` (`herdr-core` / `hct`), `herdr`, `tmux`, `zellij`, or GNU `screen` session to prevent prefix-key collisions, mouse/OSC 52 clipboard breakage, and terminal feedback loops. Pass `hct --allow-nested` (or set `ui.allow_nested = true` in `config.toml`) to override when needed.
 
 ---
 

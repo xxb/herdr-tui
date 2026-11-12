@@ -54,6 +54,7 @@ pub struct UiFileConfig {
     pub sidebar_start_collapsed: Option<bool>,
     pub mobile_width_threshold: Option<u16>,
     pub touch_mode: Option<bool>,
+    pub allow_nested: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Default)]
@@ -318,5 +319,14 @@ mod tests {
 
         let ctrl_delete = KeyEvent::new(KeyCode::Delete, KeyModifiers::CONTROL);
         assert_eq!(encode_key_event(&ctrl_delete, false), b"\x1b[3;5~");
+    }
+
+    #[test]
+    fn file_config_parses_allow_nested_flag() {
+        let default_cfg: FileConfig = toml::from_str("").unwrap();
+        assert_eq!(default_cfg.ui.allow_nested, None);
+
+        let nested_cfg: FileConfig = toml::from_str("[ui]\nallow_nested = true\n").unwrap();
+        assert_eq!(nested_cfg.ui.allow_nested, Some(true));
     }
 }
