@@ -195,11 +195,15 @@ struct AttachedTerminal {
     vt_seq: u64,
 }
 
+fn non_zero_u16(v: u16) -> std::num::NonZeroU16 {
+    std::num::NonZeroU16::new(v).unwrap_or(std::num::NonZeroU16::MIN)
+}
+
 impl AttachedTerminal {
     fn new(channel: u32, cols: u16, rows: u16) -> Self {
         Self {
             channel,
-            parser: vt100::Parser::new(rows, cols, SCROLLBACK_LINES),
+            parser: vt100::Parser::new(non_zero_u16(rows), non_zero_u16(cols), SCROLLBACK_LINES),
             cols,
             rows,
             utf8_tail: Vec::new(),
@@ -420,10 +424,9 @@ fn sanitize_vt_stream<'a>(
         }
         if has_fe0f && i + 3 <= slice.len() && &slice[i..i + 3] == b"\xef\xb8\x8f" {
             // U+FE0F (Variation Selector-16) requests 2-column emoji presentation for preceding
-            // 1-column symbols (such as U+2699 '⚙' or U+26A0 '⚠'). Because the `vt100` crate
-            // measures codepoints individually via `unicode-width` (where '⚙' is width 1 and
-            // U+FE0F is width 0), replacing U+FE0F with an ASCII space after a width-1 non-ASCII
-            // symbol keeps column positions aligned with Ghostty, modern terminals, and CLI tools.
+            // 1-column symbols (such as U+2699 '⚙' or U+26A0 '⚠'). Replacing U+FE0F with an ASCII
+            // space after a width-1 non-ASCII symbol guarantees identical 2-column grid alignment
+            // across both Grapheme-Cluster terminals (Ghostty, Kitty) and legacy SSH clients.
             if *prev_width1_symbol {
                 out.push(b' ');
                 *prev_width1_symbol = false;
@@ -835,7 +838,7 @@ fn sync_attached_terminals(
             if cur.cols != cols || cur.rows != rows {
                 cur.cols = cols;
                 cur.rows = rows;
-                cur.parser.set_size(rows, cols);
+                cur.parser.set_size(non_zero_u16(rows), non_zero_u16(cols));
                 core.resize_channel(cur.channel, cols, rows);
             }
             if active_addr.as_ref() != Some(addr) {
@@ -876,7 +879,7 @@ fn sync_attached_terminals(
                     if resize_siblings {
                         sib.cols = cols;
                         sib.rows = rows;
-                        sib.parser.set_size(rows, cols);
+                        sib.parser.set_size(non_zero_u16(rows), non_zero_u16(cols));
                         core.resize_channel(sib.channel, cols, rows);
                     } else {
                         outcome.has_unresized_siblings = true;
@@ -2188,7 +2191,7 @@ fn run_app(
         }
 
         if let Some(att) = active_addr.as_ref().and_then(|a| attached_map.get_mut(a)) {
-            att.parser.set_scrollback(scrollback_offset);
+            att.parser.screen_mut().set_scrollback(scrollback_offset);
             scrollback_offset = att.parser.screen().scrollback();
         }
 
@@ -2564,7 +2567,7 @@ mod tests {
             encode_wheel_for_terminal(att.parser.screen(), true, 5, 2),
             None
         );
-        att.parser.set_scrollback(3);
+        att.parser.screen_mut().set_scrollback(3);
         assert_eq!(att.parser.screen().scrollback(), 3);
 
         // Alternate screen without mouse capture sends Up/Down arrow keys

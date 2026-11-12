@@ -346,11 +346,8 @@ impl TerminalSelection {
         }
         let ((sr, sc), (er, ec)) = self.normalized();
         let (scr_rows, scr_cols) = screen.size();
-        if scr_rows == 0 || scr_cols == 0 {
-            return String::new();
-        }
-        let end_row = er.min(scr_rows.saturating_sub(1));
-        let end_col_excl = ec.min(scr_cols.saturating_sub(1)).saturating_add(1);
+        let end_row = er.min(scr_rows.get() - 1);
+        let end_col_excl = ec.min(scr_cols.get() - 1).saturating_add(1);
         screen.contents_between(sr, sc, end_row, end_col_excl)
     }
 }
@@ -2134,8 +2131,8 @@ struct VtScreenWidget<'a> {
 impl Widget for VtScreenWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let (scr_rows, scr_cols) = self.screen.size();
-        let rows = area.height.min(scr_rows);
-        let cols = area.width.min(scr_cols);
+        let rows = area.height.min(scr_rows.get());
+        let cols = area.width.min(scr_cols.get());
         let active_sel = self.selection.filter(|s| s.is_non_empty());
         let sel_bounds = active_sel.map(|s| s.normalized());
 
@@ -2172,6 +2169,9 @@ impl Widget for VtScreenWidget<'_> {
                     if cell.bold() {
                         st = st.add_modifier(Modifier::BOLD);
                     }
+                    if cell.dim() {
+                        st = st.add_modifier(Modifier::DIM);
+                    }
                     if cell.italic() {
                         st = st.add_modifier(Modifier::ITALIC);
                     }
@@ -2184,13 +2184,12 @@ impl Widget for VtScreenWidget<'_> {
                     st
                 };
 
-                let sym_buf: String;
                 let sym = if cell.has_contents() {
-                    sym_buf = cell.contents();
-                    if sym_buf.is_empty() {
+                    let s = cell.contents();
+                    if s.is_empty() {
                         " "
                     } else {
-                        &sym_buf
+                        s
                     }
                 } else {
                     " "
@@ -3526,7 +3525,8 @@ mod tests {
 
     #[test]
     fn terminal_selection_extracts_single_and_multiline_text() {
-        let mut parser = vt100::Parser::new(10, 12, 100);
+        let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
+        let mut parser = vt100::Parser::new(nz(10), nz(12), 100);
         parser.process(b"hello world\r\nsecond line");
         let sel = TerminalSelection {
             anchor: (0, 6),
@@ -3536,7 +3536,7 @@ mod tests {
         assert_eq!(sel.extract_text(parser.screen()), "world\nsecond");
 
         // Soft-wrapped lines (no `\r\n`) should be joined without inserting a spurious newline
-        let mut wrap_parser = vt100::Parser::new(10, 10, 100);
+        let mut wrap_parser = vt100::Parser::new(nz(10), nz(10), 100);
         wrap_parser.process(b"abcdefghijklmno");
         let wrap_sel = TerminalSelection {
             anchor: (0, 0),
@@ -3547,6 +3547,40 @@ mod tests {
             wrap_sel.extract_text(wrap_parser.screen()),
             "abcdefghijklmno"
         );
+    }
+
+    #[test]
+    fn vt_screen_widget_renders_sgr2_dim_and_preserves_other_modifiers() {
+        let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
+        let mut parser = vt100::Parser::new(nz(4), nz(50), 0);
+        parser.process(b"\x1b[2mfaint\x1b[0m \x1b[2;3mdim_it\x1b[22m it_only\x1b[0m plain");
+
+        let backend = TestBackend::new(50, 4);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            f.render_widget(
+                VtScreenWidget {
+                    screen: parser.screen(),
+                    selection: None,
+                },
+                f.area(),
+            );
+        })
+        .unwrap();
+
+        let buf = term.backend().buffer();
+        // "faint" at col 0..5 -> DIM only
+        assert_eq!(buf[(0, 0)].symbol(), "f");
+        assert_eq!(buf[(0, 0)].modifier, Modifier::DIM);
+        // "dim_it" at col 6..12 -> DIM | ITALIC
+        assert_eq!(buf[(6, 0)].symbol(), "d");
+        assert_eq!(buf[(6, 0)].modifier, Modifier::DIM | Modifier::ITALIC);
+        // "it_only" at col 13..20 (after SGR 22 normal intensity) -> ITALIC only
+        assert_eq!(buf[(13, 0)].symbol(), "i");
+        assert_eq!(buf[(13, 0)].modifier, Modifier::ITALIC);
+        // "plain" at col 21..26 -> empty modifiers
+        assert_eq!(buf[(21, 0)].symbol(), "p");
+        assert_eq!(buf[(21, 0)].modifier, Modifier::empty());
     }
 
     #[test]
