@@ -648,6 +648,9 @@ pub fn render_ui_with_pads_and_quota(
     }
 }
 
+const TOPBAR_UNDERLINE_DIM: Color = Color::Rgb(58, 74, 118);
+const TOPBAR_UNDERLINE_ACTIVE: Color = Color::Rgb(245, 194, 118);
+
 fn draw_touchbar_pill(
     buf: &mut Buffer,
     x: u16,
@@ -699,13 +702,14 @@ fn draw_touchbar_pill(
             Style::default().bg(Color::Rgb(12, 14, 22)).fg(bot_gloss_fg),
         );
     } else {
-        let pill_style = if emphasized {
-            style
-                .add_modifier(Modifier::UNDERLINED)
-                .underline_color(Color::Rgb(245, 194, 118))
+        let ul_color = if emphasized {
+            TOPBAR_UNDERLINE_ACTIVE
         } else {
-            style
+            TOPBAR_UNDERLINE_DIM
         };
+        let pill_style = style
+            .add_modifier(Modifier::UNDERLINED)
+            .underline_color(ul_color);
         buf.set_string(x, rect.y, label, pill_style);
     }
 }
@@ -721,9 +725,14 @@ fn render_top_tabbar(
     if rect.width == 0 || rect.height == 0 {
         return;
     }
-    let bg_bar = Style::default()
+    let mut bg_bar = Style::default()
         .bg(Color::Rgb(12, 14, 22))
         .fg(Color::Rgb(169, 177, 214));
+    if rect.height == 1 {
+        bg_bar = bg_bar
+            .add_modifier(Modifier::UNDERLINED)
+            .underline_color(TOPBAR_UNDERLINE_DIM);
+    }
     f.render_widget(Block::default().style(bg_bar), rect);
 
     let mut x = rect.x;
@@ -824,7 +833,7 @@ fn render_top_tabbar(
             })
             .fg(Color::Rgb(125, 207, 255))
             .add_modifier(Modifier::BOLD);
-        draw_touchbar_pill(buf, x, rect, &space_lbl, style, space_menu_open);
+        draw_touchbar_pill(buf, x, rect, &space_lbl, style, false);
         hits.push(HitRegion {
             rect: Rect {
                 x,
@@ -840,14 +849,15 @@ fn render_top_tabbar(
     // Subtle slash divider between Space button and Tab pills
     if x + 1 < avail_end {
         let div_y = if rect.height >= 3 { rect.y + 1 } else { rect.y };
-        buf.set_string(
-            x,
-            div_y,
-            "╱",
-            Style::default()
-                .bg(Color::Rgb(12, 14, 22))
-                .fg(Color::Rgb(72, 82, 118)),
-        );
+        let mut div_style = Style::default()
+            .bg(Color::Rgb(12, 14, 22))
+            .fg(Color::Rgb(72, 82, 118));
+        if rect.height == 1 {
+            div_style = div_style
+                .add_modifier(Modifier::UNDERLINED)
+                .underline_color(TOPBAR_UNDERLINE_DIM);
+        }
+        buf.set_string(x, div_y, "╱", div_style);
         x += 1;
     }
 
@@ -2580,20 +2590,26 @@ mod tests {
         assert!(row0.contains("1:agent"));
         assert!(row0.contains('+'));
         assert!(row0.contains('?'));
+        // Every cell across the entire 1-row Top Tab Bar carries `Modifier::UNDERLINED` with
+        // `TOPBAR_UNDERLINE_DIM`, while ONLY the active Tab highlights in `TOPBAR_UNDERLINE_ACTIVE`.
+        for col in 0..100u16 {
+            assert!(
+                buf[(col, 0)].modifier.contains(Modifier::UNDERLINED),
+                "expected col {col} on row 0 to be underlined"
+            );
+        }
         let active_byte = row0
             .find("1:agent")
             .expect("expected active tab label on row 0");
         let active_x = row0[..active_byte].chars().count() as u16;
-        assert!(buf[(active_x, 0)].modifier.contains(Modifier::UNDERLINED));
-        assert_eq!(
-            buf[(active_x, 0)].underline_color,
-            Color::Rgb(245, 194, 118)
-        );
+        assert_eq!(buf[(active_x, 0)].underline_color, TOPBAR_UNDERLINE_ACTIVE);
         let inactive_byte = row0
             .find("2:shell")
             .expect("expected inactive tab label on row 0");
         let inactive_x = row0[..inactive_byte].chars().count() as u16;
-        assert!(!buf[(inactive_x, 0)].modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(buf[(inactive_x, 0)].underline_color, TOPBAR_UNDERLINE_DIM);
+        assert_eq!(buf[(7, 0)].underline_color, TOPBAR_UNDERLINE_DIM);
+        assert_eq!(buf[(80, 0)].underline_color, TOPBAR_UNDERLINE_DIM);
 
         // Bottom 1-row read-only Agent Status Bar exposes ExitScrollback on row 23
         assert!(hits.iter().any(|h| h.target == HitTarget::ExitScrollback
