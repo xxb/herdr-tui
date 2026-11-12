@@ -14,7 +14,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Widget},
     Frame,
 };
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 #[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,17 +123,20 @@ fn truncate_to_width(s: &str, max_width: usize) -> String {
         return "…".to_string();
     }
     let target = max_width - 1;
-    let mut out = String::new();
-    let mut w = 0usize;
-    for ch in s.chars() {
-        let cw = ch.width().unwrap_or(0);
-        if w + cw > target {
+    let mut end_byte = 0usize;
+    for (idx, ch) in s.char_indices() {
+        let next = idx + ch.len_utf8();
+        if s[..next].width() > target {
             break;
         }
-        out.push(ch);
-        w += cw;
+        end_byte = next;
     }
-    out.push('…');
+    let mut prefix = s[..end_byte].to_string();
+    let mut out = format!("{prefix}…");
+    while out.width() > max_width && !prefix.is_empty() {
+        prefix.pop();
+        out = format!("{prefix}…");
+    }
     out
 }
 
@@ -661,7 +664,8 @@ fn joined_pills_width(labels: &[String]) -> u16 {
     if labels.is_empty() {
         0
     } else {
-        labels.iter().map(|s| s.width() as u16).sum::<u16>() + (labels.len() as u16 - 1)
+        let sum: usize = labels.iter().map(|s| s.width()).sum();
+        sum.saturating_add(labels.len() - 1).min(u16::MAX as usize) as u16
     }
 }
 
@@ -774,7 +778,10 @@ fn plan_top_tabbar_pills(
         let framing = (active_ti + 1).to_string().len() + 3;
         if rect_width >= 36 && active_budget >= framing + 2 {
             let max_active_name_w = (active_budget - framing).min(16);
-            idx_labels[active_ti] = titled_lbl(active_ti, max_active_name_w);
+            let candidate = titled_lbl(active_ti, max_active_name_w);
+            if candidate.width() <= active_budget {
+                idx_labels[active_ti] = candidate;
+            }
         }
         return build_all_pills(idx_labels);
     }
@@ -788,21 +795,23 @@ fn plan_top_tabbar_pills(
     }
 
     let window_width = |start: usize, end: usize, labels: &[String], compact: bool| -> u16 {
-        let mut total = 0u16;
-        let mut items = 0u16;
+        let mut total = 0usize;
+        let mut items = 0usize;
         if let Some(lb) = overflow_badge_label(start, true, compact) {
-            total += lb.width() as u16;
+            total = total.saturating_add(lb.width());
             items += 1;
         }
         for lbl in &labels[start..=end] {
-            total += lbl.width() as u16;
+            total = total.saturating_add(lbl.width());
             items += 1;
         }
         if let Some(rb) = overflow_badge_label(total_tabs - 1 - end, false, compact) {
-            total += rb.width() as u16;
+            total = total.saturating_add(rb.width());
             items += 1;
         }
-        total + items.saturating_sub(1)
+        total
+            .saturating_add(items.saturating_sub(1))
+            .min(u16::MAX as usize) as u16
     };
 
     if window_width(active_ti, active_ti, &stage4_labels, compact_badges) > avail_tabs_w {
@@ -812,7 +821,17 @@ fn plan_top_tabbar_pills(
         compact_badges = true;
     }
     if window_width(active_ti, active_ti, &stage4_labels, compact_badges) > avail_tabs_w {
-        let fallback = truncate_to_width(&stage4_labels[active_ti], avail_tabs_w as usize);
+        let max_w = avail_tabs_w as usize;
+        let fallback = if stage4_labels[active_ti].width() <= max_w {
+            stage4_labels[active_ti].clone()
+        } else {
+            let unpadded = (active_ti + 1).to_string();
+            if unpadded.width() <= max_w {
+                unpadded
+            } else {
+                truncate_to_width(&unpadded, max_w)
+            }
+        };
         let pills = if fallback.is_empty() {
             Vec::new()
         } else {
@@ -3228,6 +3247,121 @@ mod tests {
                 .filter(|h| h.target == HitTarget::TriggerAction(Action::FuzzyFinder))
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn vs16_emoji_and_ultra_narrow_top_tabbar_preserve_width_and_index_visibility() {
+        for sample in ["❤️❤️❤️❤️", "⚠️⚙️❤️", "中文標題測試", "mix❤️中a"]
+        {
+            for max_w in 0..=8 {
+                let t = truncate_to_width(sample, max_w);
+                assert!(
+                    t.width() <= max_w,
+                    "truncate_to_width({sample:?}, {max_w}) = {t:?} has width {} > {max_w}",
+                    t.width()
+                );
+            }
+        }
+
+        // Accordion Stage 3 with VS16 emoji active tab title keeps all trailing tabs visible
+        let mut world = World::default();
+        world.doc.spaces.push(SharedSpace {
+            id: "space-1".to_string(),
+            name: "main".to_string(),
+            tabs: (1..=6)
+                .map(|i| SharedTab {
+                    id: format!("tab-{i}"),
+                    name: if i == 2 {
+                        "❤️❤️❤️❤️❤️❤️".to_string()
+                    } else {
+                        format!("agent-{i}")
+                    },
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        });
+        world.select_tab_index(1);
+
+        let backend = TestBackend::new(46, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut hits = Vec::new();
+        terminal
+            .draw(|f| {
+                hits = render_ui(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::None,
+                )
+                .hits;
+            })
+            .unwrap();
+        for i in 1..=6 {
+            let tid = format!("tab-{i}");
+            assert!(
+                hits.iter().any(|h| {
+                    h.target
+                        == HitTarget::SelectTab {
+                            space_id: "space-1".to_string(),
+                            tab_id: tid.clone(),
+                        }
+                }),
+                "expected {tid} to remain visible when active tab has VS16 emoji"
+            );
+        }
+
+        // Ultra-narrow (`avail_tabs_w = 1..=2`) fallback displays unpadded index `"2"` instead of `"…"`
+        let tiny_backend = TestBackend::new(21, 10);
+        let mut tiny_term = Terminal::new(tiny_backend).unwrap();
+        let mut tiny_hits = Vec::new();
+        tiny_term
+            .draw(|f| {
+                tiny_hits = render_ui(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::None,
+                )
+                .hits;
+            })
+            .unwrap();
+        let active_hit = tiny_hits
+            .iter()
+            .find(|h| {
+                h.target
+                    == HitTarget::SelectTab {
+                        space_id: "space-1".to_string(),
+                        tab_id: "tab-2".to_string(),
+                    }
+            })
+            .expect("expected active tab hit on 21-col viewport");
+        let tiny_buf = tiny_term.backend().buffer();
+        let pill_text: String = (active_hit.rect.x..active_hit.rect.x + active_hit.rect.width)
+            .map(|x| tiny_buf[(x, 0)].symbol())
+            .collect();
+        assert!(
+            pill_text.contains('2'),
+            "expected unpadded active index in {pill_text:?}"
         );
     }
 

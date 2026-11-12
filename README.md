@@ -42,7 +42,7 @@ A fast, lightweight **multi-tab TUI client** for [`herdr-core` (`hc`)](https://g
 
 | Action / 功能 | Prefix Shortcut (`Ctrl+b`) | Direct / Touch Shortcut |
 |---|---|---|
-| **Next / Previous Tab** (切换标签页) | `^b n` / `^b p` | `Alt+Right` / `Alt+Left` or Tap Tab |
+| **Next / Previous Tab** (切换标签页) | `^b n` / `^b p` | `Alt+Right` / `Alt+Left`, Tap Tab, or Wheel on top bar |
 | **Select Tab 1..9** (跳转标签页 1..9) | `^b 1` .. `^b 9` | `Alt+1` .. `Alt+9` |
 | **New Tab in Space** (新建标签页) | `^b c` | Tap `[ + ]` on top tab bar |
 | **Rename Current Tab** (重命名标签页) | `^b ,` | — |
@@ -51,7 +51,7 @@ A fast, lightweight **multi-tab TUI client** for [`herdr-core` (`hc`)](https://g
 | **New Space** (新建工作区) | `^b C` (or `^b s`) | Tap `[ + New Space ]` in Space menu |
 | **Rename Current Space** (重命名工作区) | `^b $` (or `^b R`) | — |
 | **Toggle Space Menu** (展开/收起工作区浮层菜单) | `^b b` | Tap `[ ▾ Space ]` on top tab bar |
-| **Quick Fuzzy Switcher** (模糊搜索跳转) | `^b w` (or `^b f`) | — |
+| **Quick Fuzzy Switcher** (模糊搜索跳转) | `^b w` (or `^b f`) | Tap `[ ‹N ]` / `[ N› ]` overflow badge |
 | **Jump to Alert Agent** (跳转待处理 Agent) | `^b a` | — |
 | **Cycle Pane in Split Tab** (多窗格轮换) | `^b o` | — |
 | **Scrollback Mode** (历史回滚查看) | `^b [` | Mouse Wheel Up / Down |
