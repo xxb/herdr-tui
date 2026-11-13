@@ -65,6 +65,16 @@ pub struct AgentQuota {
     pub metrics: Vec<QuotaMetric>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum QuotaFetchOutcome {
+    /// Definitive quota snapshot (possibly empty when credentials/files are absent or a session
+    /// such as Freebuff has expired and must clear any previously cached metrics).
+    Authoritative(Vec<QuotaMetric>),
+    /// External/API helper timed out or transiently failed with no local fallback available;
+    /// retain last-known-good cached metrics if present and retry shortly.
+    TransientError,
+}
+
 struct CacheEntry {
     fetched_at: Instant,
     ttl: Duration,
@@ -101,7 +111,7 @@ impl UsageTracker {
 
     fn new_with_collector<C, F>(mut collector: C, waker: F) -> Self
     where
-        C: FnMut(AgentKind, &mut ClaudeFileCache) -> AgentQuota + Send + 'static,
+        C: FnMut(AgentKind, &mut ClaudeFileCache) -> QuotaFetchOutcome + Send + 'static,
         F: Fn() + Send + 'static,
     {
         let state = Arc::new(Mutex::new(TrackerState::default()));
@@ -125,35 +135,49 @@ impl UsageTracker {
                     guard.in_flight.remove(&kind);
                     continue;
                 }
-                let collected = collector(kind, &mut claude_cache);
+                let outcome = collector(kind, &mut claude_cache);
                 let normal_ttl = cache_ttl_for_agent(kind);
                 {
                     let mut guard = state_bg.lock().unwrap();
                     guard.in_flight.remove(&kind);
                     let now = Instant::now();
-                    let next_entry = if collected.metrics.is_empty() {
-                        if let Some(prev) = guard
-                            .cache
-                            .get(&kind)
-                            .filter(|e| !e.quota.metrics.is_empty())
-                        {
+                    let next_entry = match outcome {
+                        QuotaFetchOutcome::Authoritative(metrics) => {
+                            let ttl = if metrics.is_empty() {
+                                EMPTY_RETRY_TTL
+                            } else {
+                                normal_ttl
+                            };
                             CacheEntry {
                                 fetched_at: now,
-                                ttl: EMPTY_RETRY_TTL,
-                                quota: prev.quota.clone(),
-                            }
-                        } else {
-                            CacheEntry {
-                                fetched_at: now,
-                                ttl: EMPTY_RETRY_TTL,
-                                quota: collected,
+                                ttl,
+                                quota: AgentQuota {
+                                    agent: kind,
+                                    metrics,
+                                },
                             }
                         }
-                    } else {
-                        CacheEntry {
-                            fetched_at: now,
-                            ttl: normal_ttl,
-                            quota: collected,
+                        QuotaFetchOutcome::TransientError => {
+                            if let Some(prev) = guard
+                                .cache
+                                .get(&kind)
+                                .filter(|e| !e.quota.metrics.is_empty())
+                            {
+                                CacheEntry {
+                                    fetched_at: now,
+                                    ttl: EMPTY_RETRY_TTL,
+                                    quota: prev.quota.clone(),
+                                }
+                            } else {
+                                CacheEntry {
+                                    fetched_at: now,
+                                    ttl: EMPTY_RETRY_TTL,
+                                    quota: AgentQuota {
+                                        agent: kind,
+                                        metrics: Vec::new(),
+                                    },
+                                }
+                            }
                         }
                     };
                     guard.cache.insert(kind, next_entry);
@@ -371,6 +395,28 @@ pub fn parse_utc_iso8601_secs(s: &str) -> Option<u64> {
     u64::try_from(utc_secs).ok()
 }
 
+fn kill_helper_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        const SIGKILL: i32 = 9;
+        if let Ok(pgid) = i32::try_from(child.id()) {
+            if pgid > 0 {
+                // SAFETY: `child` was spawned with `process_group(0)` so `pgid` is its isolated
+                // process group ID (`> 0`). Sending `SIGKILL` to `-pgid` terminates both the
+                // helper and any descendants holding open the stdout pipe.
+                unsafe {
+                    let _ = kill(-pgid, SIGKILL);
+                }
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn run_command_stdout_with_timeout<I, S>(prog: &str, args: I, timeout: Duration) -> Option<String>
 where
     I: IntoIterator<Item = S>,
@@ -403,25 +449,28 @@ where
         match child.try_wait() {
             Ok(Some(status)) => {
                 if !status.success() {
+                    kill_helper_process_group(&mut child);
                     return None;
                 }
                 let rem = deadline
                     .saturating_duration_since(Instant::now())
                     .clamp(Duration::from_millis(20), Duration::from_millis(250));
-                let buf = rx.recv_timeout(rem).ok()?.ok()?;
+                let Ok(read_res) = rx.recv_timeout(rem) else {
+                    kill_helper_process_group(&mut child);
+                    return None;
+                };
+                let buf = read_res.ok()?;
                 return Some(String::from_utf8_lossy(&buf).into_owned());
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_helper_process_group(&mut child);
                     return None;
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_helper_process_group(&mut child);
                 return None;
             }
         }
@@ -457,18 +506,16 @@ fn collect_quota_for_agent(
     kind: AgentKind,
     cfg: &QuotaFileConfig,
     claude_cache: &mut ClaudeFileCache,
-) -> AgentQuota {
+) -> QuotaFetchOutcome {
     let now_secs = now_unix_secs();
-    let metrics = match kind {
+    match kind {
         AgentKind::Codex => collect_codex_metrics(now_secs),
-        AgentKind::Claude => collect_claude_metrics(now_secs, cfg, claude_cache),
+        AgentKind::Claude => {
+            QuotaFetchOutcome::Authoritative(collect_claude_metrics(now_secs, cfg, claude_cache))
+        }
         AgentKind::OpenCode => collect_opencode_metrics(now_secs, cfg),
         AgentKind::Antigravity => collect_antigravity_metrics(now_secs, cfg),
-        AgentKind::Freebuff => collect_freebuff_metrics(now_secs),
-    };
-    AgentQuota {
-        agent: kind,
-        metrics,
+        AgentKind::Freebuff => QuotaFetchOutcome::Authoritative(collect_freebuff_metrics(now_secs)),
     }
 }
 
@@ -710,24 +757,32 @@ pub fn collect_codex_metrics_from_sessions_dir(
     best.map(|(_, m)| m).unwrap_or_default()
 }
 
-fn collect_codex_metrics(now_secs: u64) -> Vec<QuotaMetric> {
+fn collect_codex_metrics(now_secs: u64) -> QuotaFetchOutcome {
     let Some(home) = home_dir() else {
-        return Vec::new();
+        return QuotaFetchOutcome::Authoritative(Vec::new());
     };
+    let has_auth_file = home.join(".codex/auth.json").is_file();
     if let Some(wham_metrics) = fetch_codex_wham_usage(&home, now_secs) {
-        return wham_metrics;
+        return QuotaFetchOutcome::Authoritative(wham_metrics);
     }
     let sessions_dir = home.join(".codex/sessions");
-    collect_codex_metrics_from_sessions_dir(&sessions_dir, now_secs)
+    let local_metrics = collect_codex_metrics_from_sessions_dir(&sessions_dir, now_secs);
+    if !local_metrics.is_empty() {
+        QuotaFetchOutcome::Authoritative(local_metrics)
+    } else if has_auth_file {
+        QuotaFetchOutcome::TransientError
+    } else {
+        QuotaFetchOutcome::Authoritative(Vec::new())
+    }
 }
 
-fn collect_opencode_metrics(_now_secs: u64, cfg: &QuotaFileConfig) -> Vec<QuotaMetric> {
+fn collect_opencode_metrics(_now_secs: u64, cfg: &QuotaFileConfig) -> QuotaFetchOutcome {
     let Some(home) = home_dir() else {
-        return Vec::new();
+        return QuotaFetchOutcome::Authoritative(Vec::new());
     };
     let db_path = home.join(".local/share/opencode/opencode.db");
     if !db_path.is_file() {
-        return Vec::new();
+        return QuotaFetchOutcome::Authoritative(Vec::new());
     }
     let daily_limit = cfg.opencode_daily_requests.unwrap_or(200).max(1);
     let limit_5h = cfg.opencode_5h_requests.unwrap_or(80).max(1);
@@ -770,10 +825,10 @@ print(json.dumps({"day_reqs": day_reqs, "day_toks": day_toks, "five_reqs": five_
         [OsStr::new("-c"), OsStr::new(script), db_path.as_os_str()],
         QUOTA_LOCAL_HELPER_TIMEOUT,
     ) else {
-        return Vec::new();
+        return QuotaFetchOutcome::TransientError;
     };
     let Ok(val) = serde_json::from_str::<Value>(&stdout) else {
-        return Vec::new();
+        return QuotaFetchOutcome::TransientError;
     };
     let day_reqs = val.get("day_reqs").and_then(Value::as_u64).unwrap_or(0);
     let day_toks = val.get("day_toks").and_then(Value::as_u64).unwrap_or(0);
@@ -783,7 +838,7 @@ print(json.dumps({"day_reqs": day_reqs, "day_toks": day_toks, "five_reqs": five_
     let day_used_pct = ((day_reqs as f64 / daily_limit as f64) * 100.0).clamp(0.0, 100.0);
     let five_used_pct = ((five_reqs as f64 / limit_5h as f64) * 100.0).clamp(0.0, 100.0);
 
-    vec![
+    QuotaFetchOutcome::Authoritative(vec![
         QuotaMetric {
             window_label: "今日".to_string(),
             remaining_percent: (100.0 - day_used_pct).clamp(0.0, 100.0),
@@ -800,7 +855,7 @@ print(json.dumps({"day_reqs": day_reqs, "day_toks": day_toks, "five_reqs": five_
                 format_tokens(five_toks)
             )),
         },
-    ]
+    ])
 }
 
 type ClaudeFileEntry = (SystemTime, u64, Vec<(String, u64, u64)>);
@@ -1412,15 +1467,21 @@ pub fn count_antigravity_transcript_steps_in_str(
     (steps_5h, steps_day)
 }
 
-fn collect_antigravity_metrics(now_secs: u64, cfg: &QuotaFileConfig) -> Vec<QuotaMetric> {
+fn collect_antigravity_metrics(now_secs: u64, cfg: &QuotaFileConfig) -> QuotaFetchOutcome {
     if let Some(api_metrics) = fetch_antigravity_api_quota(now_secs) {
-        return api_metrics;
+        return QuotaFetchOutcome::Authoritative(api_metrics);
     }
 
     let Some(home) = home_dir() else {
-        return Vec::new();
+        return QuotaFetchOutcome::Authoritative(Vec::new());
     };
     let brain_dir = home.join(".gemini/antigravity-cli/brain");
+    let has_oauth_token = home
+        .join(".gemini/antigravity-cli/antigravity-oauth-token")
+        .is_file();
+    if has_oauth_token && !brain_dir.is_dir() {
+        return QuotaFetchOutcome::TransientError;
+    }
     let limit_5h = cfg.agy_5h_steps.unwrap_or(300).max(1);
     let limit_day = cfg.agy_daily_steps.unwrap_or(1000).max(1);
 
@@ -1454,7 +1515,7 @@ fn collect_antigravity_metrics(now_secs: u64, cfg: &QuotaFileConfig) -> Vec<Quot
     let used_5h = ((steps_5h as f64 / limit_5h as f64) * 100.0).clamp(0.0, 100.0);
     let used_day = ((steps_day as f64 / limit_day as f64) * 100.0).clamp(0.0, 100.0);
 
-    vec![
+    QuotaFetchOutcome::Authoritative(vec![
         QuotaMetric {
             window_label: "5h".to_string(),
             remaining_percent: (100.0 - used_5h).clamp(0.0, 100.0),
@@ -1465,7 +1526,7 @@ fn collect_antigravity_metrics(now_secs: u64, cfg: &QuotaFileConfig) -> Vec<Quot
             remaining_percent: (100.0 - used_day).clamp(0.0, 100.0),
             detail: Some(format!("{steps_day}/{limit_day} steps")),
         },
-    ]
+    ])
 }
 
 pub fn parse_freebuff_session_quota_json(text: &str, now_secs: u64) -> Option<Vec<QuotaMetric>> {
@@ -1879,7 +1940,7 @@ mod tests {
     }
 
     #[test]
-    fn run_command_stdout_with_timeout_captures_output_and_kills_hung_process() {
+    fn run_command_stdout_with_timeout_captures_output_and_kills_hung_process_group() {
         let out = run_command_stdout_with_timeout(
             "sh",
             ["-c", "printf 'quota-ok'"],
@@ -1891,15 +1952,52 @@ mod tests {
             run_command_stdout_with_timeout("sh", ["-c", "exit 3"], Duration::from_secs(2));
         assert!(failed.is_none());
 
+        let pid_file =
+            std::env::temp_dir().join(format!("hct_test_pgkill_{}.pid", std::process::id()));
+        let _ = fs::remove_file(&pid_file);
+
         let t0 = Instant::now();
-        let hung =
-            run_command_stdout_with_timeout("sh", ["-c", "sleep 30"], Duration::from_millis(120));
+        let hung = run_command_stdout_with_timeout(
+            "sh",
+            [
+                OsStr::new("-c"),
+                OsStr::new("sleep 30 & echo $! > \"$1\"; wait"),
+                OsStr::new("_"),
+                pid_file.as_os_str(),
+            ],
+            Duration::from_millis(150),
+        );
         assert!(hung.is_none());
         assert!(t0.elapsed() < Duration::from_secs(3));
+
+        #[cfg(unix)]
+        if let Ok(raw_pid) = fs::read_to_string(&pid_file) {
+            let _ = fs::remove_file(&pid_file);
+            if let Ok(desc_pid) = raw_pid.trim().parse::<i32>() {
+                extern "C" {
+                    fn kill(pid: i32, sig: i32) -> i32;
+                }
+                let wait_deadline = Instant::now() + Duration::from_millis(500);
+                let mut alive = true;
+                while Instant::now() < wait_deadline {
+                    let rc = unsafe { kill(desc_pid, 0) };
+                    if rc != 0 {
+                        alive = false;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert!(
+                    !alive,
+                    "descendant pid {desc_pid} survived process-group timeout kill"
+                );
+            }
+        }
+        let _ = fs::remove_file(&pid_file);
     }
 
     #[test]
-    fn usage_tracker_deduplicates_inflight_requests_and_retains_stale_metrics() {
+    fn usage_tracker_deduplicates_inflight_retains_transient_errors_and_clears_expired() {
         use crate::model::{SharedSpace, SharedTab};
         use std::sync::atomic::AtomicUsize;
 
@@ -1941,50 +2039,53 @@ mod tests {
 
         let world_agy = world_for_agent("t_agy", "antigravity");
         let world_codex = world_for_agent("t_codex", "codex");
+        let world_freebuff = world_for_agent("t_fb", "freebuff");
 
         let (agy_started_tx, agy_started_rx) = mpsc::channel();
         let (unblock_agy_tx, unblock_agy_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
         let codex_calls = Arc::new(AtomicUsize::new(0));
         let codex_calls_bg = Arc::clone(&codex_calls);
+        let fb_calls = Arc::new(AtomicUsize::new(0));
+        let fb_calls_bg = Arc::clone(&fb_calls);
 
         let tracker = UsageTracker::new_with_collector(
             move |kind, _| match kind {
                 AgentKind::Antigravity => {
                     let _ = agy_started_tx.send(());
                     let _ = unblock_agy_rx.recv_timeout(Duration::from_secs(3));
-                    AgentQuota {
-                        agent: AgentKind::Antigravity,
-                        metrics: vec![QuotaMetric {
-                            window_label: "5h".to_string(),
-                            remaining_percent: 90.0,
-                            detail: None,
-                        }],
-                    }
+                    QuotaFetchOutcome::Authoritative(vec![QuotaMetric {
+                        window_label: "5h".to_string(),
+                        remaining_percent: 90.0,
+                        detail: None,
+                    }])
                 }
                 AgentKind::Codex => {
                     let n = codex_calls_bg.fetch_add(1, Ordering::SeqCst);
                     if n == 0 {
-                        AgentQuota {
-                            agent: AgentKind::Codex,
-                            metrics: vec![QuotaMetric {
-                                window_label: "5h".to_string(),
-                                remaining_percent: 83.0,
-                                detail: None,
-                            }],
-                        }
+                        QuotaFetchOutcome::Authoritative(vec![QuotaMetric {
+                            window_label: "5h".to_string(),
+                            remaining_percent: 83.0,
+                            detail: None,
+                        }])
                     } else {
-                        // Simulate a transient empty fetch on subsequent refresh
-                        AgentQuota {
-                            agent: AgentKind::Codex,
-                            metrics: Vec::new(),
-                        }
+                        QuotaFetchOutcome::TransientError
                     }
                 }
-                other => AgentQuota {
-                    agent: other,
-                    metrics: Vec::new(),
-                },
+                AgentKind::Freebuff => {
+                    let n = fb_calls_bg.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        QuotaFetchOutcome::Authoritative(vec![QuotaMetric {
+                            window_label: "会话".to_string(),
+                            remaining_percent: 75.0,
+                            detail: None,
+                        }])
+                    } else {
+                        // Session expired -> authoritative empty result must clear cached metrics
+                        QuotaFetchOutcome::Authoritative(Vec::new())
+                    }
+                }
+                _ => QuotaFetchOutcome::Authoritative(Vec::new()),
             },
             move || {
                 let _ = done_tx.send(());
@@ -2004,7 +2105,6 @@ mod tests {
         assert!(initial_codex.metrics.is_empty());
 
         unblock_agy_tx.send(()).unwrap();
-        // Wait for both Antigravity and Codex completions
         done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
 
@@ -2016,7 +2116,7 @@ mod tests {
         assert_eq!(populated_codex.metrics.len(), 1);
         assert_eq!(populated_codex.metrics[0].remaining_percent, 83.0);
 
-        // Force-expire Codex's cache entry and verify a transient empty refresh preserves 83%
+        // TransientError on Codex retains 83%
         {
             let mut guard = tracker.state.lock().unwrap();
             if let Some(entry) = guard.cache.get_mut(&AgentKind::Codex) {
@@ -2026,9 +2126,30 @@ mod tests {
         let _ = tracker.focused_quota(&world_codex);
         done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(codex_calls.load(Ordering::SeqCst), 2);
-
         let retained_codex = tracker.focused_quota(&world_codex).unwrap();
         assert_eq!(retained_codex.metrics.len(), 1);
         assert_eq!(retained_codex.metrics[0].remaining_percent, 83.0);
+
+        // Authoritative empty on Freebuff (expired session) clears cached metrics immediately
+        let _ = tracker.focused_quota(&world_freebuff);
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            tracker.focused_quota(&world_freebuff).unwrap().metrics[0].remaining_percent,
+            75.0
+        );
+        {
+            let mut guard = tracker.state.lock().unwrap();
+            if let Some(entry) = guard.cache.get_mut(&AgentKind::Freebuff) {
+                entry.ttl = Duration::ZERO;
+            }
+        }
+        let _ = tracker.focused_quota(&world_freebuff);
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(fb_calls.load(Ordering::SeqCst), 2);
+        assert!(tracker
+            .focused_quota(&world_freebuff)
+            .unwrap()
+            .metrics
+            .is_empty());
     }
 }
