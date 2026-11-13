@@ -56,6 +56,8 @@ const CREDIT_FLUSH_THRESHOLD_BYTES: usize = 16 * 1024;
 const SIBLING_RESIZE_DEBOUNCE: Duration = Duration::from_millis(80);
 const ATTACH_RETRY_DELAY: Duration = Duration::from_millis(250);
 const CLIPBOARD_READ_TIMEOUT: Duration = Duration::from_millis(200);
+const HORIZ_WHEEL_QUIET_GAP: Duration = Duration::from_millis(160);
+const VERT_WHEEL_BLEED_GUARD: Duration = Duration::from_millis(180);
 
 enum AppEvent {
     Core(CoreMessage),
@@ -1156,6 +1158,127 @@ struct FloatingDPadDrag {
     tap_target: Option<HitTarget>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HorizontalSwipeDir {
+    Prev,
+    Next,
+}
+
+#[derive(Clone, Debug, Default)]
+struct HorizontalWheelGestureState {
+    last_viewport_vertical_wheel_at: Option<Instant>,
+    last_top_bar_vertical_wheel_at: Option<Instant>,
+    last_horiz_dir: Option<HorizontalSwipeDir>,
+    last_horiz_event_at: Option<Instant>,
+}
+
+impl HorizontalWheelGestureState {
+    fn record_viewport_vertical_wheel(&mut self, now: Instant) {
+        self.last_viewport_vertical_wheel_at = Some(now);
+    }
+
+    fn record_top_bar_vertical_wheel(&mut self, now: Instant) {
+        self.last_top_bar_vertical_wheel_at = Some(now);
+    }
+
+    fn reset_burst(&mut self) {
+        self.last_horiz_dir = None;
+        self.last_horiz_event_at = None;
+    }
+
+    fn accept_horizontal_wheel(
+        &mut self,
+        dir: HorizontalSwipeDir,
+        on_top_bar_or_space_menu: bool,
+        now: Instant,
+    ) -> bool {
+        let bleed_ref = if on_top_bar_or_space_menu {
+            self.last_top_bar_vertical_wheel_at
+        } else {
+            self.last_viewport_vertical_wheel_at
+        };
+        if bleed_ref.is_some_and(|t| now.saturating_duration_since(t) < VERT_WHEEL_BLEED_GUARD) {
+            return false;
+        }
+        if self.last_horiz_dir == Some(dir)
+            && self
+                .last_horiz_event_at
+                .is_some_and(|t| now.saturating_duration_since(t) < HORIZ_WHEEL_QUIET_GAP)
+        {
+            self.last_horiz_event_at = Some(now);
+            return false;
+        }
+        self.last_horiz_dir = Some(dir);
+        self.last_horiz_event_at = Some(now);
+        true
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_horizontal_wheel_event(
+    dir: HorizontalSwipeDir,
+    mev_row: u16,
+    term_rect: Rect,
+    now: Instant,
+    horiz_wheel: &mut HorizontalWheelGestureState,
+    core: &CoreClient,
+    world: &mut World,
+    modal: &Modal,
+    dpad_drag_active: bool,
+    prefix_active: &mut bool,
+    ctrl_active: &mut bool,
+    alt_active: &mut bool,
+    selection: &mut Option<TerminalSelection>,
+    selection_screen: &mut Option<vt100::Screen>,
+    selection_vt_seq: &mut Option<u64>,
+) -> bool {
+    if matches!(modal, Modal::SpaceMenu) {
+        if !horiz_wheel.accept_horizontal_wheel(dir, true, now) {
+            return false;
+        }
+        let prev_sid = world.active_space().map(|s| s.id.clone());
+        match dir {
+            HorizontalSwipeDir::Prev => world.prev_space(),
+            HorizontalSwipeDir::Next => world.next_space(),
+        }
+        let space_changed = world.active_space().map(|s| s.id.as_str()) != prev_sid.as_deref();
+        if space_changed {
+            world.mark_active_seen(core);
+        }
+        return space_changed;
+    }
+    if !matches!(modal, Modal::None)
+        || dpad_drag_active
+        || selection.as_ref().is_some_and(|s| s.active)
+    {
+        return false;
+    }
+    let on_top_bar = mev_row < term_rect.y;
+    if !horiz_wheel.accept_horizontal_wheel(dir, on_top_bar, now) {
+        return false;
+    }
+    let had_sticky = *prefix_active || *ctrl_active || *alt_active;
+    *prefix_active = false;
+    *ctrl_active = false;
+    *alt_active = false;
+    let had_vis_sel = selection
+        .as_ref()
+        .is_some_and(TerminalSelection::is_non_empty);
+    *selection = None;
+    *selection_screen = None;
+    *selection_vt_seq = None;
+    let prev_ti = world.active_tab_index();
+    match dir {
+        HorizontalSwipeDir::Prev => world.prev_tab(),
+        HorizontalSwipeDir::Next => world.next_tab(),
+    }
+    let tab_changed = world.active_tab_index() != prev_ti;
+    if tab_changed {
+        world.mark_active_seen(core);
+    }
+    tab_changed || had_sticky || had_vis_sel
+}
+
 fn record_credit(pending: &mut Vec<(u32, u32)>, channel: u32, bytes: u32) {
     if bytes == 0 {
         return;
@@ -1248,6 +1371,7 @@ fn run_app_loop(
     let mut dpad_pos: Option<(u16, u16)> = None;
     let mut last_dpad_rect: Option<Rect> = None;
     let mut dpad_drag: Option<FloatingDPadDrag> = None;
+    let mut horiz_wheel = HorizontalWheelGestureState::default();
     let mut selection: Option<TerminalSelection> = None;
     let mut selection_screen: Option<vt100::Screen> = None;
     let mut selection_vt_seq: Option<u64> = None;
@@ -1525,6 +1649,7 @@ fn run_app_loop(
                         }
                         Event::Mouse(mev) => match mev.kind {
                             MouseEventKind::Down(MouseButton::Left) => {
+                                horiz_wheel.reset_burst();
                                 let mx = mev.column;
                                 let my = mev.row;
                                 let had_vis_sel = selection
@@ -2010,7 +2135,9 @@ fn run_app_loop(
                                 }
                             }
                             MouseEventKind::ScrollUp => {
+                                let wheel_now = Instant::now();
                                 if matches!(modal, Modal::SpaceMenu) {
+                                    horiz_wheel.record_top_bar_vertical_wheel(wheel_now);
                                     world.prev_space();
                                     world.mark_active_seen(core);
                                     dirty = true;
@@ -2020,6 +2147,7 @@ fn run_app_loop(
                                     ref mut selected_tab_id,
                                 } = modal
                                 {
+                                    horiz_wheel.record_viewport_vertical_wheel(wheel_now);
                                     let items = collect_fuzzy_items(world, query);
                                     let cur_sel = resolve_fuzzy_selection(
                                         &items,
@@ -2036,6 +2164,7 @@ fn run_app_loop(
                                     && dpad_drag.is_none()
                                     && !selection.as_ref().is_some_and(|s| s.active)
                                 {
+                                    horiz_wheel.record_top_bar_vertical_wheel(wheel_now);
                                     let had_sticky = prefix_active || ctrl_active || alt_active;
                                     prefix_active = false;
                                     ctrl_active = false;
@@ -2061,6 +2190,7 @@ fn run_app_loop(
                                     && !is_on_dpad_disc(last_dpad_rect, mev.column, mev.row)
                                     && !is_on_dpad_disc(last_mod_rect, mev.column, mev.row)
                                 {
+                                    horiz_wheel.record_viewport_vertical_wheel(wheel_now);
                                     if selection
                                         .as_ref()
                                         .is_some_and(TerminalSelection::is_non_empty)
@@ -2094,7 +2224,9 @@ fn run_app_loop(
                                 }
                             }
                             MouseEventKind::ScrollDown => {
+                                let wheel_now = Instant::now();
                                 if matches!(modal, Modal::SpaceMenu) {
+                                    horiz_wheel.record_top_bar_vertical_wheel(wheel_now);
                                     world.next_space();
                                     world.mark_active_seen(core);
                                     dirty = true;
@@ -2104,6 +2236,7 @@ fn run_app_loop(
                                     ref mut selected_tab_id,
                                 } = modal
                                 {
+                                    horiz_wheel.record_viewport_vertical_wheel(wheel_now);
                                     let items = collect_fuzzy_items(world, query);
                                     if !items.is_empty() {
                                         let cur_sel = resolve_fuzzy_selection(
@@ -2122,6 +2255,7 @@ fn run_app_loop(
                                     && dpad_drag.is_none()
                                     && !selection.as_ref().is_some_and(|s| s.active)
                                 {
+                                    horiz_wheel.record_top_bar_vertical_wheel(wheel_now);
                                     let had_sticky = prefix_active || ctrl_active || alt_active;
                                     prefix_active = false;
                                     ctrl_active = false;
@@ -2147,6 +2281,7 @@ fn run_app_loop(
                                     && !is_on_dpad_disc(last_dpad_rect, mev.column, mev.row)
                                     && !is_on_dpad_disc(last_mod_rect, mev.column, mev.row)
                                 {
+                                    horiz_wheel.record_viewport_vertical_wheel(wheel_now);
                                     if selection
                                         .as_ref()
                                         .is_some_and(TerminalSelection::is_non_empty)
@@ -2179,9 +2314,36 @@ fn run_app_loop(
                                     }
                                 }
                             }
+                            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => {
+                                let dir = if matches!(mev.kind, MouseEventKind::ScrollLeft) {
+                                    HorizontalSwipeDir::Prev
+                                } else {
+                                    HorizontalSwipeDir::Next
+                                };
+                                if handle_horizontal_wheel_event(
+                                    dir,
+                                    mev.row,
+                                    term_rect,
+                                    Instant::now(),
+                                    &mut horiz_wheel,
+                                    core,
+                                    world,
+                                    &modal,
+                                    dpad_drag.is_some(),
+                                    &mut prefix_active,
+                                    &mut ctrl_active,
+                                    &mut alt_active,
+                                    &mut selection,
+                                    &mut selection_screen,
+                                    &mut selection_vt_seq,
+                                ) {
+                                    dirty = true;
+                                }
+                            }
                             _ => {}
                         },
                         Event::Key(kev) if kev.kind == KeyEventKind::Press => {
+                            horiz_wheel.reset_burst();
                             let had_drag_or_sel = dpad_drag.as_ref().is_some_and(|d| d.moved)
                                 || selection
                                     .as_ref()
@@ -3260,5 +3422,278 @@ mod tests {
         )
         .unwrap();
         assert_eq!(modal, Modal::None);
+    }
+
+    #[test]
+    fn horizontal_wheel_switches_tabs_and_spaces_with_momentum_and_vertical_bleed_guards() {
+        use crate::model::{make_single_terminal_tab, SharedSpace};
+        use serde_json::Map;
+
+        let core = CoreClient::dummy_for_tests();
+        let mut world = World::default();
+        world.doc.spaces.push(SharedSpace {
+            id: "sp1".to_string(),
+            name: "alpha".to_string(),
+            folder: "/work/alpha".to_string(),
+            tabs: vec![
+                make_single_terminal_tab("tb1", "one", "t1"),
+                make_single_terminal_tab("tb2", "two", "t2"),
+                make_single_terminal_tab("tb3", "three", "t3"),
+            ],
+            rest: Map::new(),
+        });
+        world.doc.spaces.push(SharedSpace {
+            id: "sp2".to_string(),
+            name: "beta".to_string(),
+            folder: "/work/beta".to_string(),
+            tabs: vec![make_single_terminal_tab("tb4", "four", "t4")],
+            rest: Map::new(),
+        });
+        world.clamp_selection();
+        assert_eq!(world.active_tab_index(), 0);
+
+        let term_rect = Rect::new(0, 1, 80, 22);
+        let mut horiz_wheel = HorizontalWheelGestureState::default();
+        let mut modal = Modal::None;
+        let mut prefix_active = true;
+        let mut ctrl_active = true;
+        let mut alt_active = false;
+        let mut done_sel = TerminalSelection::new(2, 4);
+        done_sel.head = (2, 10);
+        done_sel.active = false;
+        let mut selection = Some(done_sel);
+        let mut selection_screen = None;
+        let mut selection_vt_seq = None;
+
+        let t0 = Instant::now();
+
+        // 1. ScrollRight (natural swipe left) inside viewport switches Tab 0 -> Tab 1 immediately
+        //    and clears sticky modifiers + completed selection highlight.
+        assert!(handle_horizontal_wheel_event(
+            HorizontalSwipeDir::Next,
+            10,
+            term_rect,
+            t0,
+            &mut horiz_wheel,
+            &core,
+            &mut world,
+            &modal,
+            false,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut selection,
+            &mut selection_screen,
+            &mut selection_vt_seq,
+        ));
+        assert_eq!(world.active_tab_index(), 1);
+        assert!(!prefix_active && !ctrl_active);
+        assert!(selection.is_none());
+
+        // 2. Momentum inertia tail (packets arriving every 16ms..80ms in same direction) is coalesced
+        //    so a single trackpad flick or fast thumb swipe never overshoots multiple tabs!
+        for ms in [16u64, 40, 90, 150, 230] {
+            assert!(!handle_horizontal_wheel_event(
+                HorizontalSwipeDir::Next,
+                10,
+                term_rect,
+                t0 + Duration::from_millis(ms),
+                &mut horiz_wheel,
+                &core,
+                &mut world,
+                &modal,
+                false,
+                &mut prefix_active,
+                &mut ctrl_active,
+                &mut alt_active,
+                &mut selection,
+                &mut selection_screen,
+                &mut selection_vt_seq,
+            ));
+        }
+        assert_eq!(world.active_tab_index(), 1);
+
+        // 3. Reversing direction (ScrollLeft) bypasses same-direction quiet gap with zero latency -> Tab 1 -> Tab 0!
+        assert!(handle_horizontal_wheel_event(
+            HorizontalSwipeDir::Prev,
+            10,
+            term_rect,
+            t0 + Duration::from_millis(250),
+            &mut horiz_wheel,
+            &core,
+            &mut world,
+            &modal,
+            false,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut selection,
+            &mut selection_screen,
+            &mut selection_vt_seq,
+        ));
+        assert_eq!(world.active_tab_index(), 0);
+
+        // 4. After HORIZ_WHEEL_QUIET_GAP elapses, a second deliberate swipe in the same direction steps cleanly -> Tab 2 (wrap)
+        let t_next = t0 + Duration::from_millis(250) + HORIZ_WHEEL_QUIET_GAP;
+        assert!(handle_horizontal_wheel_event(
+            HorizontalSwipeDir::Prev,
+            10,
+            term_rect,
+            t_next,
+            &mut horiz_wheel,
+            &core,
+            &mut world,
+            &modal,
+            false,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut selection,
+            &mut selection_screen,
+            &mut selection_vt_seq,
+        ));
+        assert_eq!(world.active_tab_index(), 2);
+
+        // 5. Diagonal trackpad bleed during viewport vertical scroll is suppressed within VERT_WHEEL_BLEED_GUARD,
+        //    while explicit top-bar (row 0) horizontal scroll remains unaffected by viewport vertical scroll!
+        let t_vert = t_next + Duration::from_secs(1);
+        horiz_wheel.record_viewport_vertical_wheel(t_vert);
+        assert!(!handle_horizontal_wheel_event(
+            HorizontalSwipeDir::Next,
+            10,
+            term_rect,
+            t_vert + Duration::from_millis(40),
+            &mut horiz_wheel,
+            &core,
+            &mut world,
+            &modal,
+            false,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut selection,
+            &mut selection_screen,
+            &mut selection_vt_seq,
+        ));
+        assert_eq!(world.active_tab_index(), 2);
+
+        // Top bar (row 0 < term_rect.y) switches tabs unless top bar itself just scrolled vertically
+        assert!(handle_horizontal_wheel_event(
+            HorizontalSwipeDir::Next,
+            0,
+            term_rect,
+            t_vert + Duration::from_millis(50),
+            &mut horiz_wheel,
+            &core,
+            &mut world,
+            &modal,
+            false,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut selection,
+            &mut selection_screen,
+            &mut selection_vt_seq,
+        ));
+        assert_eq!(world.active_tab_index(), 0);
+
+        horiz_wheel.record_top_bar_vertical_wheel(t_vert + Duration::from_millis(300));
+        assert!(!handle_horizontal_wheel_event(
+            HorizontalSwipeDir::Next,
+            0,
+            term_rect,
+            t_vert + Duration::from_millis(320),
+            &mut horiz_wheel,
+            &core,
+            &mut world,
+            &modal,
+            false,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut selection,
+            &mut selection_screen,
+            &mut selection_vt_seq,
+        ));
+        assert_eq!(world.active_tab_index(), 0);
+
+        // 6. Active text selection drag, floating D-pad drag, or blocking modals (Help) block tab switches
+        let t_guards = t_vert + Duration::from_secs(2);
+        let mut active_sel = Some(TerminalSelection::new(3, 3));
+        assert!(!handle_horizontal_wheel_event(
+            HorizontalSwipeDir::Next,
+            10,
+            term_rect,
+            t_guards,
+            &mut horiz_wheel,
+            &core,
+            &mut world,
+            &modal,
+            false,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut active_sel,
+            &mut selection_screen,
+            &mut selection_vt_seq,
+        ));
+        assert!(!handle_horizontal_wheel_event(
+            HorizontalSwipeDir::Next,
+            10,
+            term_rect,
+            t_guards,
+            &mut horiz_wheel,
+            &core,
+            &mut world,
+            &modal,
+            true,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut selection,
+            &mut selection_screen,
+            &mut selection_vt_seq,
+        ));
+        modal = Modal::Help;
+        assert!(!handle_horizontal_wheel_event(
+            HorizontalSwipeDir::Next,
+            10,
+            term_rect,
+            t_guards,
+            &mut horiz_wheel,
+            &core,
+            &mut world,
+            &modal,
+            false,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut selection,
+            &mut selection_screen,
+            &mut selection_vt_seq,
+        ));
+        assert_eq!(world.active_tab_index(), 0);
+
+        // 7. In Modal::SpaceMenu, horizontal wheel switches Spaces cleanly
+        modal = Modal::SpaceMenu;
+        assert_eq!(world.active_space().map(|s| s.id.as_str()), Some("sp1"));
+        assert!(handle_horizontal_wheel_event(
+            HorizontalSwipeDir::Next,
+            10,
+            term_rect,
+            t_guards + Duration::from_secs(1),
+            &mut horiz_wheel,
+            &core,
+            &mut world,
+            &modal,
+            false,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut selection,
+            &mut selection_screen,
+            &mut selection_vt_seq,
+        ));
+        assert_eq!(world.active_space().map(|s| s.id.as_str()), Some("sp2"));
     }
 }
