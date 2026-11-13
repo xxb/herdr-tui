@@ -375,7 +375,7 @@ impl World {
     pub fn load_initial(&mut self, core: &CoreClient, snapshot: &Value) -> Result<()> {
         self.apply_terminals_snapshot(snapshot);
         self.fetch_doc(core)?;
-        self.reconcile_and_sync(core)?;
+        self.reconcile_and_sync_initial(core)?;
         Ok(())
     }
 
@@ -384,7 +384,7 @@ impl World {
             self.terminals.clear();
             for item in arr {
                 if let Some(info) = TerminalInfo::from_json(item) {
-                    if info.state == "live" {
+                    if matches!(info.state.as_str(), "live" | "starting" | "created") {
                         self.terminals.insert(info.address.clone(), info);
                     }
                 }
@@ -419,7 +419,13 @@ impl World {
         }
 
         match ev_type {
-            "created" | "started" | "finished" => EventDisposition::NeedsLifecycleSync,
+            "finished" => {
+                if let Some(addr) = params.get("terminal").and_then(Value::as_str) {
+                    self.terminals.remove(addr);
+                }
+                EventDisposition::NeedsLifecycleSync
+            }
+            "created" | "started" => EventDisposition::NeedsLifecycleSync,
             "foreground" | "title" | "renamed" | "turn" | "labels" | "status" => {
                 let Some(addr) = params.get("terminal").and_then(Value::as_str) else {
                     return EventDisposition::NeedsTerminalRefresh;
@@ -793,34 +799,73 @@ impl World {
         changed
     }
 
-    /// Reconcile `doc("herdr-app")` with live terminals in `herdr-core` and persist with CAS rebase.
+    pub fn has_live_tabs(&self) -> bool {
+        self.doc.spaces.iter().any(|s| {
+            s.tabs.iter().any(|tab| {
+                let mut has_live = false;
+                visit_terminals(&tab.root, &mut |t| {
+                    if self.terminals.contains_key(t) {
+                        has_live = true;
+                    }
+                });
+                has_live
+            })
+        })
+    }
+
+    pub fn should_exit_when_empty(&self) -> bool {
+        self.terminals.is_empty() && !self.has_live_tabs()
+    }
+
+    /// Reconcile `doc("herdr-app")` with live terminals during runtime without respawning
+    /// replacement shells when the last live tab exits or closes.
     pub fn reconcile_and_sync(&mut self, core: &CoreClient) -> Result<bool> {
+        self.reconcile_and_sync_inner(core, false)
+    }
+
+    /// Reconcile `doc("herdr-app")` on initial `hct` startup, spawning a single background
+    /// shell only if the session currently has zero live terminals.
+    pub fn reconcile_and_sync_initial(&mut self, core: &CoreClient) -> Result<bool> {
+        self.reconcile_and_sync_inner(core, true)
+    }
+
+    fn reconcile_and_sync_inner(
+        &mut self,
+        core: &CoreClient,
+        spawn_if_empty: bool,
+    ) -> Result<bool> {
         if self.doc_has_unseen_terminals() {
             self.refresh_terminals(core)?;
         }
         let mut any_changed = self.reconcile_doc_in_place();
 
-        // Ensure at least one live terminal exists if all spaces/tabs are empty
-        let needs_spawn =
-            self.doc.spaces.is_empty() || self.doc.spaces.iter().all(|s| s.tabs.is_empty());
-        if needs_spawn {
-            let cwd = self
-                .doc
-                .spaces
-                .first()
-                .map(|s| s.folder.clone())
-                .filter(|f| !f.is_empty())
-                .unwrap_or_else(|| {
-                    std::env::current_dir()
-                        .ok()
-                        .and_then(|p| p.to_str().map(String::from))
-                        .unwrap_or_else(|| "/".to_string())
-                });
-            let run_res = core.call("terminal.run", json!({ "cwd": cwd, "bg": true }))?;
-            if let Some(info) = TerminalInfo::from_json(&run_res) {
-                self.terminals.insert(info.address.clone(), info);
-                if self.reconcile_doc_in_place() {
-                    any_changed = true;
+        // Only spawn an initial shell on startup (`spawn_if_empty == true`) when the session
+        // genuinely has zero live terminals; never respawn during runtime when the user exits
+        // or closes the last remaining tab.
+        if spawn_if_empty && self.should_exit_when_empty() {
+            self.refresh_terminals(core)?;
+            if self.reconcile_doc_in_place() {
+                any_changed = true;
+            }
+            if self.should_exit_when_empty() {
+                let cwd = self
+                    .doc
+                    .spaces
+                    .first()
+                    .map(|s| s.folder.clone())
+                    .filter(|f| !f.is_empty())
+                    .unwrap_or_else(|| {
+                        std::env::current_dir()
+                            .ok()
+                            .and_then(|p| p.to_str().map(String::from))
+                            .unwrap_or_else(|| "/".to_string())
+                    });
+                let run_res = core.call("terminal.run", json!({ "cwd": cwd, "bg": true }))?;
+                if let Some(info) = TerminalInfo::from_json(&run_res) {
+                    self.terminals.insert(info.address.clone(), info);
+                    if self.reconcile_doc_in_place() {
+                        any_changed = true;
+                    }
                 }
             }
         }
@@ -1562,5 +1607,68 @@ mod tests {
             world.apply_core_event(&remote_doc_ev),
             EventDisposition::NeedsDocSync
         );
+    }
+
+    #[test]
+    fn finishing_last_terminal_marks_world_empty_instead_of_respawning() {
+        let mut world = World::default();
+        world.terminals.insert(
+            "t1".to_string(),
+            TerminalInfo {
+                address: "t1".to_string(),
+                state: "live".to_string(),
+                cwd: "/work/app".to_string(),
+                ..Default::default()
+            },
+        );
+        world.terminals.insert(
+            "t2".to_string(),
+            TerminalInfo {
+                address: "t2".to_string(),
+                state: "live".to_string(),
+                cwd: "/work/app".to_string(),
+                ..Default::default()
+            },
+        );
+        world.doc.spaces.push(SharedSpace {
+            id: "sp1".to_string(),
+            name: "work".to_string(),
+            folder: "/work/app".to_string(),
+            tabs: vec![
+                make_single_terminal_tab("tb1", "", "t1"),
+                make_single_terminal_tab("tb2", "", "t2"),
+            ],
+            rest: Map::new(),
+        });
+        world.clamp_selection();
+        assert!(world.has_live_tabs());
+        assert!(!world.should_exit_when_empty());
+
+        // First tab exits: session stays active with 1 live tab
+        let fin_t1 = json!({
+            "params": { "type": "finished", "terminal": "t1" }
+        });
+        assert_eq!(
+            world.apply_core_event(&fin_t1),
+            EventDisposition::NeedsLifecycleSync
+        );
+        assert!(!world.terminals.contains_key("t1"));
+        assert!(world.reconcile_doc_in_place());
+        assert_eq!(world.doc.spaces[0].tabs.len(), 1);
+        assert_eq!(world.doc.spaces[0].tabs[0].id, "tb2");
+        assert!(!world.should_exit_when_empty());
+
+        // Last remaining tab exits (e.g. Ctrl+D): world becomes empty so hct exits cleanly
+        let fin_t2 = json!({
+            "params": { "type": "finished", "terminal": "t2" }
+        });
+        assert_eq!(
+            world.apply_core_event(&fin_t2),
+            EventDisposition::NeedsLifecycleSync
+        );
+        assert!(world.terminals.is_empty());
+        assert!(world.reconcile_doc_in_place());
+        assert!(world.doc.spaces[0].tabs.is_empty());
+        assert!(world.should_exit_when_empty());
     }
 }

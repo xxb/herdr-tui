@@ -24,15 +24,19 @@ use crate::usage::UsageTracker;
 use anyhow::Result;
 use clap::Parser;
 use crossterm::{
-    cursor::Show,
+    cursor::{MoveTo, Show},
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
         Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute, queue,
+    style::{
+        Attribute as CrosstermAttribute, Color as CrosstermColor, SetAttribute, SetBackgroundColor,
+        SetForegroundColor, SetUnderlineColor,
+    },
     terminal::{
-        disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
-        EnterAlternateScreen, LeaveAlternateScreen,
+        disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, Clear, ClearType,
+        EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
     },
 };
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
@@ -68,20 +72,63 @@ fn should_forward_input_event(ev: &Event) -> bool {
     }
 }
 
+fn write_terminal_enter_sequence<W: Write>(w: &mut W) -> io::Result<()> {
+    execute!(
+        w,
+        SetForegroundColor(CrosstermColor::Reset),
+        SetBackgroundColor(CrosstermColor::Reset),
+        SetUnderlineColor(CrosstermColor::Reset),
+        SetAttribute(CrosstermAttribute::Reset),
+        EnterAlternateScreen,
+        Clear(ClearType::All),
+        MoveTo(0, 0),
+        EnableMouseCapture,
+        EnableBracketedPaste,
+    )
+}
+
+fn write_terminal_leave_sequence<W: Write>(w: &mut W) -> io::Result<()> {
+    execute!(
+        w,
+        EndSynchronizedUpdate,
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        SetForegroundColor(CrosstermColor::Reset),
+        SetBackgroundColor(CrosstermColor::Reset),
+        SetUnderlineColor(CrosstermColor::Reset),
+        SetAttribute(CrosstermAttribute::Reset),
+        Clear(ClearType::All),
+        MoveTo(0, 0),
+        LeaveAlternateScreen,
+        SetForegroundColor(CrosstermColor::Reset),
+        SetBackgroundColor(CrosstermColor::Reset),
+        SetUnderlineColor(CrosstermColor::Reset),
+        SetAttribute(CrosstermAttribute::Reset),
+        Show,
+    )
+}
+
+fn drain_pending_input_events() {
+    for _ in 0..256 {
+        match event::poll(Duration::ZERO) {
+            Ok(true) => {
+                if event::read().is_err() {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+}
+
 struct TerminalCleanupGuard;
 
 impl Drop for TerminalCleanupGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
         let mut stdout = io::stdout();
-        let _ = execute!(
-            stdout,
-            EndSynchronizedUpdate,
-            DisableBracketedPaste,
-            DisableMouseCapture,
-            LeaveAlternateScreen,
-            Show
-        );
+        let _ = write_terminal_leave_sequence(&mut stdout);
+        drain_pending_input_events();
+        let _ = disable_raw_mode();
     }
 }
 
@@ -243,7 +290,7 @@ fn trailing_incomplete_vt_or_utf8_len(buf: &[u8]) -> usize {
     if buf[buf.len() - 1] == 0x1b {
         return 1;
     }
-    let max_csi_back = buf.len().min(32);
+    let max_csi_back = buf.len().min(128);
     for back in 2..=max_csi_back {
         let idx = buf.len() - back;
         if buf[idx] == 0x1b && buf[idx + 1] == b'[' {
@@ -349,6 +396,15 @@ fn sanitize_vt_stream<'a>(
                 let intermediates = &slice[param_end..inter_end];
                 let final_byte = slice[p];
                 *prev_width1_symbol = false;
+                // DECSTR (`CSI ! p` — Soft Terminal Reset), emitted at the start of every
+                // `herdr-core` attach replay and by modern shells/TUIs, is ignored by `vt100`.
+                // Translate it into SGR reset + full scroll margins + origin off + autowrap on +
+                // cursor visible + normal keypad so stale scroll regions or styles never linger.
+                if intermediates == b"!" && params.is_empty() && final_byte == b'p' {
+                    out.extend_from_slice(b"\x1b[0m\x1b[r\x1b[?6l\x1b[?7h\x1b[?25h\x1b>");
+                    i = p + 1;
+                    continue;
+                }
                 if intermediates.is_empty() {
                     if params == b"?9001" && (final_byte == b'h' || final_byte == b'l') {
                         i = p + 1;
@@ -356,6 +412,24 @@ fn sanitize_vt_stream<'a>(
                     }
                     if params.iter().all(|&b| b.is_ascii_digit() || b == b';') {
                         match final_byte {
+                            // CHT (`CSI n I` — Cursor Forward Tabulation) -> `n` HT (`\t`) stops
+                            b'I' => {
+                                let count = std::str::from_utf8(params)
+                                    .ok()
+                                    .and_then(|s| s.split(';').next())
+                                    .and_then(|s| {
+                                        if s.is_empty() {
+                                            Some(1usize)
+                                        } else {
+                                            s.parse::<usize>().ok()
+                                        }
+                                    })
+                                    .unwrap_or(1)
+                                    .clamp(1, 256);
+                                out.extend(std::iter::repeat_n(b'\t', count));
+                                i = p + 1;
+                                continue;
+                            }
                             // ECMA-48 HVP (`CSI row ; col f`), used heavily by `btop` (`Mv::to`),
                             // is identical to CUP (`CSI row ; col H`), which `vt100` supports.
                             b'f' => {
@@ -690,18 +764,14 @@ fn main() -> Result<()> {
     world.load_initial(&core, &snapshot)?;
 
     // Setup terminal with an immediate RAII guard so any setup or runtime error
-    // restores raw mode, alternate screen, mouse capture, and cursor visibility.
+    // restores raw mode, alternate screen, mouse capture, SGR state, and cursor visibility.
     enable_raw_mode()?;
     let _cleanup_guard = TerminalCleanupGuard;
     let mut stdout = BufWriter::with_capacity(64 * 1024, io::stdout());
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableBracketedPaste
-    )?;
+    write_terminal_enter_sequence(&mut stdout)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
 
     let term_size = terminal.size()?;
     let initial_area = Rect::new(0, 0, term_size.width, term_size.height);
@@ -755,22 +825,15 @@ fn main() -> Result<()> {
         touch_mode,
     );
 
-    input_running.store(false, Ordering::Relaxed);
+    // Disable mouse capture, bracketed paste, and alternate screen BEFORE disabling raw mode
+    // so late mouse/terminal packets never echo onto the outer shell prompt.
+    input_running.store(false, Ordering::SeqCst);
+    let leave_ok = write_terminal_leave_sequence(terminal.backend_mut()).is_ok();
     drop(app_rx);
     let _ = input_thread.join();
-
-    // Restore terminal cleanly
-    if disable_raw_mode().is_ok()
-        && execute!(
-            terminal.backend_mut(),
-            EndSynchronizedUpdate,
-            DisableBracketedPaste,
-            DisableMouseCapture,
-            LeaveAlternateScreen
-        )
-        .is_ok()
-        && terminal.show_cursor().is_ok()
-    {
+    drain_pending_input_events();
+    let raw_ok = disable_raw_mode().is_ok();
+    if leave_ok && raw_ok {
         std::mem::forget(_cleanup_guard);
     }
 
@@ -1120,7 +1183,46 @@ fn run_app(
 ) -> Result<()> {
     let mut attached_map: BTreeMap<String, AttachedTerminal> = BTreeMap::new();
     let mut active_addr: Option<String> = None;
+    let res = run_app_loop(
+        terminal,
+        core,
+        app_rx,
+        world,
+        usage_tracker,
+        prefix_spec,
+        sidebar_open,
+        sidebar_width,
+        mobile_threshold,
+        touch_mode,
+        &mut attached_map,
+        &mut active_addr,
+    );
+    if let Some(prev_att) = active_addr.as_deref().and_then(|a| attached_map.get(a)) {
+        core.set_focus(prev_att.channel, false);
+    }
+    for att in attached_map.values() {
+        core.detach_channel(att.channel);
+    }
+    res
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_app_loop(
+    terminal: &mut Terminal<CrosstermBackend<BufWriter<io::Stdout>>>,
+    core: &CoreClient,
+    app_rx: &mpsc::Receiver<AppEvent>,
+    world: &mut World,
+    usage_tracker: &UsageTracker,
+    prefix_spec: &str,
+    sidebar_open: &mut bool,
+    sidebar_width: u16,
+    mobile_threshold: u16,
+    touch_mode: bool,
+    attached_map: &mut BTreeMap<String, AttachedTerminal>,
+    active_addr: &mut Option<String>,
+) -> Result<()> {
     let mut first_frame_drawn = false;
+    let mut force_clear = true;
     let mut prefix_active = false;
     let mut ctrl_active = false;
     let mut alt_active = false;
@@ -1153,6 +1255,9 @@ fn run_app(
     let mut pending_credit_bytes: usize = 0;
 
     loop {
+        if world.should_exit_when_empty() {
+            return Ok(());
+        }
         let now = Instant::now();
         if copied_until.is_some_and(|t| now >= t) {
             copied_until = None;
@@ -1196,8 +1301,8 @@ fn run_app(
             let sync_out = sync_attached_terminals(
                 core,
                 world,
-                &mut attached_map,
-                &mut active_addr,
+                attached_map,
+                active_addr,
                 term_rect,
                 &mut scrollback_offset,
                 first_frame_drawn,
@@ -1216,7 +1321,7 @@ fn run_app(
             if sync_out.has_unresized_siblings && pending_sibling_resize_at.is_none() {
                 pending_sibling_resize_at = Some(Instant::now() + SIBLING_RESIZE_DEBOUNCE);
             }
-            if active_addr != prev_addr {
+            if *active_addr != prev_addr {
                 selection = None;
                 selection_screen = None;
                 selection_vt_seq = None;
@@ -1343,7 +1448,7 @@ fn run_app(
                         need_sync_terminals = true;
                         attached_map.retain(|_, a| a.channel != channel);
                         if active_channel == Some(channel) {
-                            active_addr = None;
+                            *active_addr = None;
                             active_channel = None;
                         }
                         pending_lifecycle_sync = true;
@@ -1383,6 +1488,7 @@ fn run_app(
                             pending_sibling_resize_at =
                                 Some(Instant::now() + SIBLING_RESIZE_DEBOUNCE);
                             need_sync_terminals = true;
+                            force_clear = true;
                             dirty = true;
                         }
                         Event::Paste(text) => {
@@ -2154,6 +2260,10 @@ fn run_app(
             world.mark_active_seen(core);
         }
 
+        if world.should_exit_when_empty() {
+            return Ok(());
+        }
+
         // If the active terminal or viewport dimensions changed while draining events,
         // resync immediately before drawing so the tab header and terminal screen never mismatch.
         let has_active_att = active_addr
@@ -2220,6 +2330,10 @@ fn run_app(
             let mod_dragging = dpad_drag.as_ref().is_some_and(|d| d.is_mod && d.moved);
             let dpad_dragging = dpad_drag.as_ref().is_some_and(|d| !d.is_mod && d.moved);
             queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+            if force_clear {
+                terminal.clear()?;
+                force_clear = false;
+            }
             terminal.draw(|f| {
                 let geom = render_ui_with_pads_and_quota(
                     f,
@@ -2281,36 +2395,11 @@ fn handle_key_event(
         *alt_active = false;
         ui_changed = true;
     }
-    // 1. Handle active Modal first
+
+    // 1. Handle text-input and confirmation modals first so typed characters are never intercepted
     match modal {
-        Modal::SpaceMenu => {
-            match kev.code {
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
-                    *modal = Modal::None;
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    world.prev_space();
-                    world.mark_active_seen(core);
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    world.next_space();
-                    world.mark_active_seen(core);
-                }
-                KeyCode::Char('c' | 'C' | '+') => {
-                    *modal = Modal::Prompt {
-                        kind: PromptKind::NewSpace,
-                        input: String::new(),
-                    };
-                }
-                _ => {}
-            }
-            return Ok(KeyOutcome::UiChanged);
-        }
-        Modal::Help => {
-            *modal = Modal::None;
-            return Ok(KeyOutcome::UiChanged);
-        }
         Modal::ConfirmCloseTab { tab_id, .. } => {
+            *prefix_active = false;
             let target_id = tab_id.clone();
             match kev.code {
                 KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
@@ -2325,6 +2414,7 @@ fn handle_key_event(
             return Ok(KeyOutcome::UiChanged);
         }
         Modal::Prompt { kind, input } => {
+            *prefix_active = false;
             let k = kind.clone();
             match kev.code {
                 KeyCode::Esc => {
@@ -2364,6 +2454,7 @@ fn handle_key_event(
             selected,
             selected_tab_id,
         } => {
+            *prefix_active = false;
             let items = collect_fuzzy_items(world, query);
             let cur_sel =
                 resolve_fuzzy_selection(&items, *selected, selected_tab_id.as_deref()).unwrap_or(0);
@@ -2421,13 +2512,23 @@ fn handle_key_event(
             }
             return Ok(KeyOutcome::UiChanged);
         }
-        Modal::None => {}
+        Modal::SpaceMenu | Modal::Help | Modal::None => {}
     }
 
     // 2. Prefix mode active (`Ctrl+b` pressed previously or `[^B]` tapped)
+    // Checked before `SpaceMenu`/`Help` so `^b b` and `^b ?` toggle those popovers closed cleanly.
     if *prefix_active {
         *prefix_active = false;
         if let Some(action) = match_prefix_action(&kev, prefix_spec) {
+            if matches!(modal, Modal::SpaceMenu | Modal::Help) {
+                if action == Action::SendPrefix {
+                    *modal = Modal::None;
+                    return Ok(KeyOutcome::UiChanged);
+                }
+                if !matches!(action, Action::ToggleSidebar | Action::ToggleHelp) {
+                    *modal = Modal::None;
+                }
+            }
             if execute_action(
                 action,
                 core,
@@ -2440,17 +2541,76 @@ fn handle_key_event(
             )? {
                 return Ok(KeyOutcome::Quit);
             }
+        } else if matches!(modal, Modal::SpaceMenu | Modal::Help) && kev.code == KeyCode::Esc {
+            *modal = Modal::None;
         }
         return Ok(KeyOutcome::UiChanged);
     }
 
-    // 3. Check if prefix key was pressed
+    // 3. Check if prefix key was pressed (`Ctrl+b`)
     if is_prefix_key(&kev, prefix_spec) {
         *prefix_active = true;
         return Ok(KeyOutcome::UiChanged);
     }
 
-    // 4. Direct global shortcuts (`Alt+Left/Right/Up/Down/1..9`, `Ctrl+\`)
+    // 4. Handle non-prefix keys inside `SpaceMenu` and `Help` popovers
+    match modal {
+        Modal::SpaceMenu => {
+            if match_direct_action(&kev) == Some(Action::Detach) {
+                *modal = Modal::None;
+                return Ok(KeyOutcome::Quit);
+            }
+            let no_ctrl_alt = !kev
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+            match kev.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    *modal = Modal::None;
+                }
+                KeyCode::Char('q' | 'b') if no_ctrl_alt => {
+                    *modal = Modal::None;
+                }
+                KeyCode::Char('c') if kev.modifiers.contains(KeyModifiers::CONTROL) => {
+                    *modal = Modal::None;
+                }
+                KeyCode::Up => {
+                    world.prev_space();
+                    world.mark_active_seen(core);
+                }
+                KeyCode::Char('k') if no_ctrl_alt => {
+                    world.prev_space();
+                    world.mark_active_seen(core);
+                }
+                KeyCode::Down => {
+                    world.next_space();
+                    world.mark_active_seen(core);
+                }
+                KeyCode::Char('j') if no_ctrl_alt => {
+                    world.next_space();
+                    world.mark_active_seen(core);
+                }
+                KeyCode::Char('c' | 'C' | '+') if no_ctrl_alt => {
+                    *modal = Modal::Prompt {
+                        kind: PromptKind::NewSpace,
+                        input: String::new(),
+                    };
+                }
+                _ => {}
+            }
+            return Ok(KeyOutcome::UiChanged);
+        }
+        Modal::Help => {
+            if match_direct_action(&kev) == Some(Action::Detach) {
+                *modal = Modal::None;
+                return Ok(KeyOutcome::Quit);
+            }
+            *modal = Modal::None;
+            return Ok(KeyOutcome::UiChanged);
+        }
+        _ => {}
+    }
+
+    // 5. Direct global shortcuts (`Alt+Left/Right/Up/Down/1..9`, `Ctrl+\`)
     if let Some(action) = match_direct_action(&kev) {
         if execute_action(
             action,
@@ -2844,5 +3004,234 @@ mod tests {
         let rendered = Cli::command().render_version();
         assert_eq!(rendered, format!("hct {BUILD_VERSION}\n"));
         assert!(BUILD_VERSION.starts_with(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn terminal_enter_and_leave_sequences_reset_sgr_and_clear_alt_screen() {
+        let mut enter_buf = Vec::new();
+        write_terminal_enter_sequence(&mut enter_buf).unwrap();
+        let enter_str = String::from_utf8_lossy(&enter_buf);
+        let reset_idx = enter_str.find("\x1b[0m").expect("SGR reset on enter");
+        let alt_enter_idx = enter_str
+            .find("\x1b[?1049h")
+            .expect("EnterAlternateScreen on enter");
+        let clear_enter_idx = enter_str
+            .find("\x1b[2J")
+            .expect("Clear(ClearType::All) on enter");
+        assert!(reset_idx < alt_enter_idx);
+        assert!(alt_enter_idx < clear_enter_idx);
+
+        let mut leave_buf = Vec::new();
+        write_terminal_leave_sequence(&mut leave_buf).unwrap();
+        let leave_str = String::from_utf8_lossy(&leave_buf);
+        let disable_mouse_idx = leave_str
+            .find("\x1b[?1000l")
+            .expect("DisableMouseCapture on leave");
+        let clear_leave_idx = leave_str
+            .find("\x1b[2J")
+            .expect("Clear(ClearType::All) before LeaveAlternateScreen");
+        let alt_leave_idx = leave_str
+            .find("\x1b[?1049l")
+            .expect("LeaveAlternateScreen on leave");
+        let show_cursor_idx = leave_str
+            .rfind("\x1b[?25h")
+            .expect("Show cursor after LeaveAlternateScreen");
+        assert!(disable_mouse_idx < alt_leave_idx);
+        assert!(clear_leave_idx < alt_leave_idx);
+        assert!(alt_leave_idx < show_cursor_idx);
+    }
+
+    #[test]
+    fn sanitize_vt_stream_handles_decstr_cht_and_long_split_truecolor_csi() {
+        // 1. DECSTR (`\x1b[!p`, emitted by herdr-core attach replay) resets DECSTBM scroll region
+        //    and SGR attributes, and CHT (`\x1b[2I`) advances two tab stops cleanly.
+        let mut att = AttachedTerminal::new(1, 30, 6);
+        // Set a restricted scroll region (rows 2..3) and bold red SGR, then send `\x18\x1b[!p`
+        att.process_vt_bytes(b"\x1b[2;3r\x1b[1;31m");
+        att.process_vt_bytes(b"\x18\x1b[!p\x1b[1;1HA\x1b[2IB\r\n1\r\n2\r\n3\r\n4\r\n5");
+        let scr = att.parser.screen();
+        // Because DECSTR reset DECSTBM (1..6), scrolling after row 6 scrolled row 1 off normally
+        // instead of trapping scrolling inside rows 2..3, and SGR was reset on '5'.
+        let bottom_cell = scr.cell(5, 0).unwrap();
+        assert_eq!(bottom_cell.contents(), "5");
+        assert!(!bottom_cell.bold());
+
+        // Check CHT (`\x1b[2I`) expanded to two tab stops (col 0 -> col 16)
+        let mut att_tab = AttachedTerminal::new(2, 30, 3);
+        att_tab.process_vt_bytes(b"X\x1b[2IY");
+        assert_eq!(att_tab.parser.screen().cell(0, 0).unwrap().contents(), "X");
+        assert_eq!(att_tab.parser.screen().cell(0, 16).unwrap().contents(), "Y");
+
+        // 2. >32-byte TrueColor SGR CSI split 1 byte at a time never leaks raw CSI text
+        let long_sgr = b"\x1b[0;1;3;4;38;2;137;180;250;48;2;30;30;46mOK\x1b[0m";
+        assert!(long_sgr.len() > 40);
+        let mut att_split = AttachedTerminal::new(3, 20, 3);
+        for b in long_sgr {
+            att_split.process_vt_bytes(std::slice::from_ref(b));
+        }
+        assert_eq!(att_split.parser.screen().contents_between(0, 0, 0, 2), "OK");
+    }
+
+    #[test]
+    fn prefix_b_and_prefix_help_toggle_popovers_open_and_closed() {
+        let core = CoreClient::dummy_for_tests();
+        let mut world = World::default();
+        let prefix = "Ctrl+b";
+        let mut sidebar_open = false;
+        let mut prefix_active = false;
+        let mut ctrl_active = false;
+        let mut alt_active = false;
+        let mut scrollback_offset = 0;
+        let mut modal = Modal::None;
+        let rect = Rect::new(0, 1, 80, 22);
+
+        let ctrl_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        let plain_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE);
+        let qmark = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+
+        // First `^b b` opens `Modal::SpaceMenu`
+        assert_eq!(
+            handle_key_event(
+                ctrl_b,
+                &core,
+                &mut world,
+                None,
+                prefix,
+                &mut sidebar_open,
+                &mut prefix_active,
+                &mut ctrl_active,
+                &mut alt_active,
+                &mut scrollback_offset,
+                &mut modal,
+                rect,
+            )
+            .unwrap(),
+            KeyOutcome::UiChanged
+        );
+        assert!(prefix_active);
+        assert_eq!(modal, Modal::None);
+
+        assert_eq!(
+            handle_key_event(
+                plain_b,
+                &core,
+                &mut world,
+                None,
+                prefix,
+                &mut sidebar_open,
+                &mut prefix_active,
+                &mut ctrl_active,
+                &mut alt_active,
+                &mut scrollback_offset,
+                &mut modal,
+                rect,
+            )
+            .unwrap(),
+            KeyOutcome::UiChanged
+        );
+        assert!(!prefix_active);
+        assert_eq!(modal, Modal::SpaceMenu);
+
+        // Second `^b b` hides `Modal::SpaceMenu`
+        handle_key_event(
+            ctrl_b,
+            &core,
+            &mut world,
+            None,
+            prefix,
+            &mut sidebar_open,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut scrollback_offset,
+            &mut modal,
+            rect,
+        )
+        .unwrap();
+        assert!(prefix_active);
+        assert_eq!(modal, Modal::SpaceMenu);
+
+        handle_key_event(
+            plain_b,
+            &core,
+            &mut world,
+            None,
+            prefix,
+            &mut sidebar_open,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut scrollback_offset,
+            &mut modal,
+            rect,
+        )
+        .unwrap();
+        assert!(!prefix_active);
+        assert_eq!(modal, Modal::None);
+
+        // `^b ?` opens `Modal::Help`, and a second `^b ?` closes it cleanly
+        handle_key_event(
+            ctrl_b,
+            &core,
+            &mut world,
+            None,
+            prefix,
+            &mut sidebar_open,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut scrollback_offset,
+            &mut modal,
+            rect,
+        )
+        .unwrap();
+        handle_key_event(
+            qmark,
+            &core,
+            &mut world,
+            None,
+            prefix,
+            &mut sidebar_open,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut scrollback_offset,
+            &mut modal,
+            rect,
+        )
+        .unwrap();
+        assert_eq!(modal, Modal::Help);
+
+        handle_key_event(
+            ctrl_b,
+            &core,
+            &mut world,
+            None,
+            prefix,
+            &mut sidebar_open,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut scrollback_offset,
+            &mut modal,
+            rect,
+        )
+        .unwrap();
+        handle_key_event(
+            qmark,
+            &core,
+            &mut world,
+            None,
+            prefix,
+            &mut sidebar_open,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut scrollback_offset,
+            &mut modal,
+            rect,
+        )
+        .unwrap();
+        assert_eq!(modal, Modal::None);
     }
 }

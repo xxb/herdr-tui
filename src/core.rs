@@ -367,4 +367,43 @@ impl CoreClient {
         payload[2..4].copy_from_slice(&rows.to_le_bytes());
         let _ = self.send_frame(channel, wire::RESIZE, &payload);
     }
+
+    #[cfg(test)]
+    pub(crate) fn dummy_for_tests() -> TestCoreClient {
+        let mut child = Command::new("sh")
+            .args(["-c", "cat >/dev/null"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn dummy sink");
+        let stdin = child.stdin.take().expect("dummy stdin");
+        TestCoreClient(Self {
+            _child: child,
+            writer: Arc::new(Mutex::new(BufWriter::new(stdin))),
+            next_id: AtomicU64::new(1),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            events_channel: Arc::new(Mutex::new(None)),
+        })
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct TestCoreClient(pub(crate) CoreClient);
+
+#[cfg(test)]
+impl std::ops::Deref for TestCoreClient {
+    type Target = CoreClient;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestCoreClient {
+    fn drop(&mut self) {
+        let _ = self.0._child.kill();
+        let _ = self.0._child.wait();
+    }
 }

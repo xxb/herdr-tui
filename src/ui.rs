@@ -2184,27 +2184,47 @@ impl Widget for VtScreenWidget<'_> {
                     st
                 };
 
-                let sym = if cell.has_contents() {
-                    let s = cell.contents();
-                    if s.is_empty() {
-                        " "
-                    } else {
-                        s
-                    }
+                let raw_sym = if cell.has_contents() {
+                    cell.contents()
                 } else {
-                    " "
+                    ""
                 };
-                if let Some(dst) = buf.cell_mut((x, y)) {
-                    dst.set_symbol(sym);
-                    dst.set_style(style);
-                }
-                if is_wide && c + 1 < cols {
-                    if let Some(dst_next) = buf.cell_mut((x + 1, y)) {
-                        dst_next.set_symbol("");
-                        dst_next.set_style(style);
+                if is_wide {
+                    if c + 1 >= cols {
+                        if let Some(dst) = buf.cell_mut((x, y)) {
+                            dst.reset();
+                            dst.set_symbol(" ");
+                            dst.set_style(style);
+                        }
+                        c += 1;
+                    } else {
+                        if let Some(dst) = buf.cell_mut((x, y)) {
+                            dst.reset();
+                            let sym = if raw_sym.width() == 2 { raw_sym } else { " " };
+                            dst.set_symbol(sym);
+                            dst.set_style(style);
+                        }
+                        if let Some(dst_next) = buf.cell_mut((x + 1, y)) {
+                            dst_next.reset();
+                            dst_next.set_style(style);
+                        }
+                        c += 2;
                     }
-                    c += 2;
                 } else {
+                    let sym = if raw_sym.is_empty() || raw_sym == " " {
+                        " "
+                    } else if (raw_sym.len() == 1 && raw_sym.as_bytes()[0].is_ascii_graphic())
+                        || raw_sym.width() == 1
+                    {
+                        raw_sym
+                    } else {
+                        " "
+                    };
+                    if let Some(dst) = buf.cell_mut((x, y)) {
+                        dst.reset();
+                        dst.set_symbol(sym);
+                        dst.set_style(style);
+                    }
                     c += 1;
                 }
             }
@@ -3629,6 +3649,35 @@ mod tests {
         // "plain" at col 21..26 -> empty modifiers
         assert_eq!(buf[(21, 0)].symbol(), "p");
         assert_eq!(buf[(21, 0)].modifier, Modifier::empty());
+    }
+
+    #[test]
+    fn vt_screen_widget_resets_wide_trailing_cells_and_clamps_right_edge_wide_glyph() {
+        let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
+        let mut parser = vt100::Parser::new(nz(2), nz(6), 0);
+        parser.process("中A漢".as_bytes());
+
+        // Render into a 5-column viewport so "漢" at col 3..5 fits on 6-col, while at 4-col it hits right edge
+        let backend = TestBackend::new(4, 2);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            f.render_widget(
+                VtScreenWidget {
+                    screen: parser.screen(),
+                    selection: None,
+                },
+                f.area(),
+            );
+        })
+        .unwrap();
+
+        let buf = term.backend().buffer();
+        assert_eq!(buf[(0, 0)].symbol(), "中");
+        // Trailing cell of wide glyph uses reset (" "), never zero-width ""
+        assert_eq!(buf[(1, 0)].symbol(), " ");
+        assert_eq!(buf[(2, 0)].symbol(), "A");
+        // Wide glyph at col 3 (where c + 1 >= 4) is clamped to a space so it never overflows
+        assert_eq!(buf[(3, 0)].symbol(), " ");
     }
 
     #[test]
