@@ -265,11 +265,34 @@ impl AttachedTerminal {
 
     fn process_vt_bytes(&mut self, payload: &[u8]) {
         let clean = sanitize_vt_stream(payload, &mut self.utf8_tail, &mut self.prev_width1_symbol);
-        if !clean.is_empty() {
-            self.parser.process(&clean);
-            self.vt_seq = self.vt_seq.wrapping_add(1);
+        if clean.is_empty() {
+            return;
         }
+        const DECSTR: &[u8] = b"\x1b[!p";
+        let mut rest: &[u8] = &clean;
+        while let Some(idx) = rest.windows(DECSTR.len()).position(|w| w == DECSTR) {
+            if idx > 0 {
+                self.parser.process(&rest[..idx]);
+            }
+            apply_decstr(&mut self.parser);
+            rest = &rest[idx + DECSTR.len()..];
+        }
+        if !rest.is_empty() {
+            self.parser.process(rest);
+        }
+        self.vt_seq = self.vt_seq.wrapping_add(1);
     }
+}
+
+/// Emulate DECSTR (`CSI ! p` — Soft Terminal Reset), which `herdr-core` emits on attach replay
+/// and `vt100` otherwise ignores as `unhandled_csi`. Resets SGR, cursor/keypad/origin modes,
+/// scroll margins (`DECSTBM`), cursor visibility, and saved-cursor state (`DECSC`) while
+/// preserving the active physical cursor position (unlike `CSI r` / `CSI ?6l` alone, which home).
+fn apply_decstr(parser: &mut vt100::Parser) {
+    let (row, col) = parser.screen().cursor_position();
+    parser.process(b"\x1b[0m\x1b[?1l\x1b[?6l\x1b[r\x1b[?25h\x1b>\x1b7");
+    let restore = format!("\x1b[{};{}H", row.saturating_add(1), col.saturating_add(1));
+    parser.process(restore.as_bytes());
 }
 
 fn last_utf8_char(buf: &[u8]) -> Option<char> {
@@ -396,15 +419,6 @@ fn sanitize_vt_stream<'a>(
                 let intermediates = &slice[param_end..inter_end];
                 let final_byte = slice[p];
                 *prev_width1_symbol = false;
-                // DECSTR (`CSI ! p` — Soft Terminal Reset), emitted at the start of every
-                // `herdr-core` attach replay and by modern shells/TUIs, is ignored by `vt100`.
-                // Translate it into SGR reset + full scroll margins + origin off + autowrap on +
-                // cursor visible + normal keypad so stale scroll regions or styles never linger.
-                if intermediates == b"!" && params.is_empty() && final_byte == b'p' {
-                    out.extend_from_slice(b"\x1b[0m\x1b[r\x1b[?6l\x1b[?7h\x1b[?25h\x1b>");
-                    i = p + 1;
-                    continue;
-                }
                 if intermediates.is_empty() {
                     if params == b"?9001" && (final_byte == b'h' || final_byte == b'l') {
                         i = p + 1;
@@ -3043,21 +3057,34 @@ mod tests {
 
     #[test]
     fn sanitize_vt_stream_handles_decstr_cht_and_long_split_truecolor_csi() {
-        // 1. DECSTR (`\x1b[!p`, emitted by herdr-core attach replay) resets DECSTBM scroll region
-        //    and SGR attributes, and CHT (`\x1b[2I`) advances two tab stops cleanly.
-        let mut att = AttachedTerminal::new(1, 30, 6);
-        // Set a restricted scroll region (rows 2..3) and bold red SGR, then send `\x18\x1b[!p`
+        // 1. DECSTR (`\x1b[!p`, emitted by herdr-core attach replay) resets DECSTBM scroll region,
+        //    origin/cursor modes, and SGR attributes while preserving the active cursor position!
+        let mut att_pos = AttachedTerminal::new(1, 30, 6);
+        let decstr_mid_screen = b"\x1b[2;4r\x1b[?1h\x1b[1;31m\x1b[5;10H\x1b[!pX";
+        for b in decstr_mid_screen {
+            att_pos.process_vt_bytes(std::slice::from_ref(b));
+        }
+        let scr_pos = att_pos.parser.screen();
+        assert_eq!(scr_pos.cursor_position(), (4, 10));
+        let cell_x = scr_pos.cell(4, 9).unwrap();
+        assert_eq!(cell_x.contents(), "X");
+        assert!(!cell_x.bold());
+        assert!(!scr_pos.application_cursor());
+        // Saved cursor state (`ESC 8`) was also reset to home (0, 0) by DECSTR
+        att_pos.process_vt_bytes(b"\x1b8Z");
+        assert_eq!(att_pos.parser.screen().cell(0, 0).unwrap().contents(), "Z");
+
+        // Also verify full-screen scrolling works normally after DECSTR clears a narrow DECSTBM
+        let mut att = AttachedTerminal::new(2, 30, 6);
         att.process_vt_bytes(b"\x1b[2;3r\x1b[1;31m");
         att.process_vt_bytes(b"\x18\x1b[!p\x1b[1;1HA\x1b[2IB\r\n1\r\n2\r\n3\r\n4\r\n5");
         let scr = att.parser.screen();
-        // Because DECSTR reset DECSTBM (1..6), scrolling after row 6 scrolled row 1 off normally
-        // instead of trapping scrolling inside rows 2..3, and SGR was reset on '5'.
         let bottom_cell = scr.cell(5, 0).unwrap();
         assert_eq!(bottom_cell.contents(), "5");
         assert!(!bottom_cell.bold());
 
         // Check CHT (`\x1b[2I`) expanded to two tab stops (col 0 -> col 16)
-        let mut att_tab = AttachedTerminal::new(2, 30, 3);
+        let mut att_tab = AttachedTerminal::new(3, 30, 3);
         att_tab.process_vt_bytes(b"X\x1b[2IY");
         assert_eq!(att_tab.parser.screen().cell(0, 0).unwrap().contents(), "X");
         assert_eq!(att_tab.parser.screen().cell(0, 16).unwrap().contents(), "Y");
@@ -3065,7 +3092,7 @@ mod tests {
         // 2. >32-byte TrueColor SGR CSI split 1 byte at a time never leaks raw CSI text
         let long_sgr = b"\x1b[0;1;3;4;38;2;137;180;250;48;2;30;30;46mOK\x1b[0m";
         assert!(long_sgr.len() > 40);
-        let mut att_split = AttachedTerminal::new(3, 20, 3);
+        let mut att_split = AttachedTerminal::new(4, 20, 3);
         for b in long_sgr {
             att_split.process_vt_bytes(std::slice::from_ref(b));
         }
