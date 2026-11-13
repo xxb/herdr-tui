@@ -4,7 +4,8 @@
 use crate::keys::QuotaFileConfig;
 use crate::model::{TerminalInfo, World};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -16,6 +17,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CACHE_TTL: Duration = Duration::from_secs(10);
 const AGY_CACHE_TTL: Duration = Duration::from_secs(30);
+const EMPTY_RETRY_TTL: Duration = Duration::from_secs(5);
+const QUOTA_API_HELPER_TIMEOUT: Duration = Duration::from_secs(6);
+const QUOTA_LOCAL_HELPER_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_HELPER_STDOUT_BYTES: u64 = 2 * 1024 * 1024;
 
 fn cache_ttl_for_agent(kind: AgentKind) -> Duration {
     match kind {
@@ -60,8 +65,20 @@ pub struct AgentQuota {
     pub metrics: Vec<QuotaMetric>,
 }
 
+struct CacheEntry {
+    fetched_at: Instant,
+    ttl: Duration,
+    quota: AgentQuota,
+}
+
+#[derive(Default)]
+struct TrackerState {
+    cache: HashMap<AgentKind, CacheEntry>,
+    in_flight: HashSet<AgentKind>,
+}
+
 pub struct UsageTracker {
-    cache: Arc<Mutex<HashMap<AgentKind, (Instant, AgentQuota)>>>,
+    state: Arc<Mutex<TrackerState>>,
     revision: Arc<AtomicU64>,
     req_tx: SyncSender<AgentKind>,
 }
@@ -76,28 +93,70 @@ impl UsageTracker {
     where
         F: Fn() + Send + 'static,
     {
-        let cache: Arc<Mutex<HashMap<AgentKind, (Instant, AgentQuota)>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        Self::new_with_collector(
+            move |kind, claude_cache| collect_quota_for_agent(kind, &cfg, claude_cache),
+            waker,
+        )
+    }
+
+    fn new_with_collector<C, F>(mut collector: C, waker: F) -> Self
+    where
+        C: FnMut(AgentKind, &mut ClaudeFileCache) -> AgentQuota + Send + 'static,
+        F: Fn() + Send + 'static,
+    {
+        let state = Arc::new(Mutex::new(TrackerState::default()));
         let revision = Arc::new(AtomicU64::new(0));
         let (req_tx, req_rx) = mpsc::sync_channel::<AgentKind>(8);
-        let cache_bg = Arc::clone(&cache);
+        let state_bg = Arc::clone(&state);
         let rev_bg = Arc::clone(&revision);
 
         std::thread::spawn(move || {
             let mut claude_cache = ClaudeFileCache::default();
             while let Ok(kind) = req_rx.recv() {
-                let ttl = cache_ttl_for_agent(kind);
                 let should_collect = {
-                    let guard = cache_bg.lock().unwrap();
-                    guard.get(&kind).is_none_or(|(ts, _)| ts.elapsed() >= ttl)
+                    let guard = state_bg.lock().unwrap();
+                    guard
+                        .cache
+                        .get(&kind)
+                        .is_none_or(|entry| entry.fetched_at.elapsed() >= entry.ttl)
                 };
                 if !should_collect {
+                    let mut guard = state_bg.lock().unwrap();
+                    guard.in_flight.remove(&kind);
                     continue;
                 }
-                let quota = collect_quota_for_agent(kind, &cfg, &mut claude_cache);
+                let collected = collector(kind, &mut claude_cache);
+                let normal_ttl = cache_ttl_for_agent(kind);
                 {
-                    let mut guard = cache_bg.lock().unwrap();
-                    guard.insert(kind, (Instant::now(), quota));
+                    let mut guard = state_bg.lock().unwrap();
+                    guard.in_flight.remove(&kind);
+                    let now = Instant::now();
+                    let next_entry = if collected.metrics.is_empty() {
+                        if let Some(prev) = guard
+                            .cache
+                            .get(&kind)
+                            .filter(|e| !e.quota.metrics.is_empty())
+                        {
+                            CacheEntry {
+                                fetched_at: now,
+                                ttl: EMPTY_RETRY_TTL,
+                                quota: prev.quota.clone(),
+                            }
+                        } else {
+                            CacheEntry {
+                                fetched_at: now,
+                                ttl: EMPTY_RETRY_TTL,
+                                quota: collected,
+                            }
+                        }
+                    } else {
+                        CacheEntry {
+                            fetched_at: now,
+                            ttl: normal_ttl,
+                            quota: collected,
+                        }
+                    };
+                    guard.cache.insert(kind, next_entry);
                 }
                 rev_bg.fetch_add(1, Ordering::Release);
                 waker();
@@ -105,7 +164,7 @@ impl UsageTracker {
         });
 
         Self {
-            cache,
+            state,
             revision,
             req_tx,
         }
@@ -117,23 +176,26 @@ impl UsageTracker {
 
     pub fn focused_quota(&self, world: &World) -> Option<AgentQuota> {
         let kind = detect_focused_agent(world)?;
-        let ttl = cache_ttl_for_agent(kind);
-        let mut need_refresh = false;
+        let mut enqueue = false;
         let cached = {
-            let guard = self.cache.lock().unwrap();
-            if let Some((ts, q)) = guard.get(&kind) {
-                if ts.elapsed() >= ttl {
-                    need_refresh = true;
-                }
-                Some(q.clone())
-            } else {
-                need_refresh = true;
-                None
+            let mut guard = self.state.lock().unwrap();
+            let (entry_opt, expired) = match guard.cache.get(&kind) {
+                Some(entry) => (
+                    Some(entry.quota.clone()),
+                    entry.fetched_at.elapsed() >= entry.ttl,
+                ),
+                None => (None, true),
+            };
+            if expired && !guard.in_flight.contains(&kind) {
+                guard.in_flight.insert(kind);
+                enqueue = true;
             }
+            entry_opt
         };
 
-        if need_refresh {
-            let _ = self.req_tx.try_send(kind);
+        if enqueue && self.req_tx.try_send(kind).is_err() {
+            let mut guard = self.state.lock().unwrap();
+            guard.in_flight.remove(&kind);
         }
 
         Some(cached.unwrap_or_else(|| AgentQuota {
@@ -309,21 +371,70 @@ pub fn parse_utc_iso8601_secs(s: &str) -> Option<u64> {
     u64::try_from(utc_secs).ok()
 }
 
+fn run_command_stdout_with_timeout<I, S>(prog: &str, args: I, timeout: Duration) -> Option<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut cmd = Command::new(prog);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn().ok()?;
+    let stdout = child.stdout.take()?;
+    let (tx, rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let res = stdout
+            .take(MAX_HELPER_STDOUT_BYTES)
+            .read_to_end(&mut buf)
+            .map(|_| buf);
+        let _ = tx.send(res);
+    });
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let rem = deadline
+                    .saturating_duration_since(Instant::now())
+                    .clamp(Duration::from_millis(20), Duration::from_millis(250));
+                let buf = rx.recv_timeout(rem).ok()?.ok()?;
+                return Some(String::from_utf8_lossy(&buf).into_owned());
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 fn local_utc_offset_secs() -> i64 {
     static OFFSET: OnceLock<i64> = OnceLock::new();
     *OFFSET.get_or_init(|| {
-        let Ok(out) = Command::new("date")
-            .arg("+%z")
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
+        let Some(s) = run_command_stdout_with_timeout("date", ["+%z"], Duration::from_secs(2))
         else {
             return 0;
         };
-        if !out.status.success() {
-            return 0;
-        }
-        let s = String::from_utf8_lossy(&out.stdout);
         let trimmed = s.trim();
         if trimmed.len() >= 5 {
             let sign: i64 = if trimmed.starts_with('-') { -1 } else { 1 };
@@ -566,18 +677,11 @@ req = urllib.request.Request("https://chatgpt.com/backend-api/wham/usage", heade
 out = urllib.request.urlopen(req, timeout=4).read().decode("utf-8", errors="ignore")
 print(out)
 "#;
-    let output = Command::new("python3")
-        .arg("-c")
-        .arg(script)
-        .arg(&auth_path)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
+    let text = run_command_stdout_with_timeout(
+        "python3",
+        [OsStr::new("-c"), OsStr::new(script), auth_path.as_os_str()],
+        QUOTA_API_HELPER_TIMEOUT,
+    )?;
     parse_codex_wham_usage_json(&text, now_secs)
 }
 
@@ -661,20 +765,14 @@ for ts, raw in rows:
 print(json.dumps({"day_reqs": day_reqs, "day_toks": day_toks, "five_reqs": five_reqs, "five_toks": five_toks}))
 "#;
 
-    let Ok(output) = Command::new("python3")
-        .arg("-c")
-        .arg(script)
-        .arg(&db_path)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-    else {
+    let Some(stdout) = run_command_stdout_with_timeout(
+        "python3",
+        [OsStr::new("-c"), OsStr::new(script), db_path.as_os_str()],
+        QUOTA_LOCAL_HELPER_TIMEOUT,
+    ) else {
         return Vec::new();
     };
-    if !output.status.success() {
-        return Vec::new();
-    }
-    let Ok(val) = serde_json::from_slice::<Value>(&output.stdout) else {
+    let Ok(val) = serde_json::from_str::<Value>(&stdout) else {
         return Vec::new();
     };
     let day_reqs = val.get("day_reqs").and_then(Value::as_u64).unwrap_or(0);
@@ -1046,11 +1144,32 @@ pub fn parse_antigravity_quota_summary(text: &str, now_secs: u64) -> Option<Vec<
     }
 }
 
-fn fetch_antigravity_api_quota(now_secs: u64) -> Option<Vec<QuotaMetric>> {
-    let script = r#"
-import ctypes, datetime, json, mmap, os, re, shutil, sys, time, urllib.parse, urllib.request
+const AGY_QUOTA_PYTHON_SCRIPT: &str = r#"
+import ctypes, datetime, json, mmap, os, re, shutil, sys, threading, time, urllib.parse, urllib.request
 
-def load_agy_token():
+home = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("HOME", "")
+libsecret_thread_started = False
+
+def load_file_token():
+    if not home:
+        return None
+    tok_file = os.path.join(home, ".gemini/antigravity-cli/antigravity-oauth-token")
+    if not os.path.isfile(tok_file):
+        return None
+    try:
+        with open(tok_file, "r", encoding="utf-8", errors="ignore") as f:
+            obj = json.load(f)
+        if isinstance(obj, dict) and isinstance(obj.get("token"), dict):
+            tok = obj["token"]
+            if tok.get("access_token") or tok.get("refresh_token"):
+                return obj
+    except Exception:
+        pass
+    return None
+
+def _lookup_libsecret_raw():
+    if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+        return None
     lib = None
     for cand in ("libsecret-1.so.0", "/usr/lib/libsecret-1.so.0", "/usr/lib/x86_64-linux-gnu/libsecret-1.so.0"):
         try:
@@ -1059,54 +1178,114 @@ def load_agy_token():
         except Exception:
             pass
     if lib is None and os.path.isdir("/nix/store"):
-        with os.scandir("/nix/store") as it:
-            for e in it:
-                if "libsecret-" in e.name and not e.name.endswith(".drv"):
-                    p = os.path.join(e.path, "lib/libsecret-1.so.0")
-                    if os.path.exists(p):
-                        try:
-                            lib = ctypes.CDLL(p)
-                            break
-                        except Exception:
-                            pass
-    if lib is not None:
         try:
-            class SecretSchemaAttribute(ctypes.Structure):
-                _fields_ = [("name", ctypes.c_char_p), ("type", ctypes.c_int)]
-            class SecretSchema(ctypes.Structure):
-                _fields_ = [("name", ctypes.c_char_p), ("flags", ctypes.c_int), ("attributes", SecretSchemaAttribute * 32)]
-            attrs = (SecretSchemaAttribute * 32)()
-            attrs[0] = SecretSchemaAttribute(b"service", 0)
-            attrs[1] = SecretSchemaAttribute(b"username", 0)
-            attrs[2] = SecretSchemaAttribute(None, 0)
-            schema = SecretSchema(b"org.freedesktop.Secret.Generic", 2, attrs)
-            lib.secret_password_lookup_sync.restype = ctypes.c_char_p
-            raw = lib.secret_password_lookup_sync(
-                ctypes.byref(schema), None, None, b"service", b"gemini", b"username", b"antigravity", None
-            )
-            if raw:
-                return json.loads(raw.decode("utf-8", errors="ignore"))
+            with os.scandir("/nix/store") as it:
+                for e in it:
+                    if "libsecret-" in e.name and not e.name.endswith(".drv"):
+                        p = os.path.join(e.path, "lib/libsecret-1.so.0")
+                        if os.path.exists(p):
+                            try:
+                                lib = ctypes.CDLL(p)
+                                break
+                            except Exception:
+                                pass
         except Exception:
             pass
-    home = os.environ.get("HOME", "")
-    tok_file = os.path.join(home, ".gemini/antigravity-cli/antigravity-oauth-token")
-    if os.path.isfile(tok_file):
-        with open(tok_file, "r", encoding="utf-8", errors="ignore") as f:
-            return json.load(f)
+    if lib is None:
+        return None
+    try:
+        class SecretSchemaAttribute(ctypes.Structure):
+            _fields_ = [("name", ctypes.c_char_p), ("type", ctypes.c_int)]
+        class SecretSchema(ctypes.Structure):
+            _fields_ = [("name", ctypes.c_char_p), ("flags", ctypes.c_int), ("attributes", SecretSchemaAttribute * 32)]
+        attrs = (SecretSchemaAttribute * 32)()
+        attrs[0] = SecretSchemaAttribute(b"service", 0)
+        attrs[1] = SecretSchemaAttribute(b"username", 0)
+        attrs[2] = SecretSchemaAttribute(None, 0)
+        schema = SecretSchema(b"org.freedesktop.Secret.Generic", 2, attrs)
+        lib.secret_password_lookup_sync.restype = ctypes.c_char_p
+        raw = lib.secret_password_lookup_sync(
+            ctypes.byref(schema),
+            ctypes.c_void_p(None),
+            ctypes.c_void_p(None),
+            b"service",
+            b"gemini",
+            b"username",
+            b"antigravity",
+            ctypes.c_char_p(None),
+        )
+        if raw:
+            return json.loads(raw.decode("utf-8", errors="ignore"))
+    except Exception:
+        pass
     return None
 
+def load_libsecret_token(timeout_sec=1.0):
+    global libsecret_thread_started
+    if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+        return None
+    holder = [None]
+    def runner():
+        holder[0] = _lookup_libsecret_raw()
+    libsecret_thread_started = True
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    t.join(timeout=timeout_sec)
+    return holder[0]
+
+def finish(code, payload=None):
+    if payload is not None:
+        sys.stdout.write(payload)
+        if not payload.endswith("\n"):
+            sys.stdout.write("\n")
+        sys.stdout.flush()
+    if libsecret_thread_started:
+        os._exit(code)
+    sys.exit(code)
+
+def candidate_agy_binaries():
+    seen = set()
+    raw_cands = [
+        shutil.which("agy"),
+        os.path.join(home, ".local/bin/agy") if home else None,
+        "/run/current-system/sw/bin/agy",
+    ]
+    for p in raw_cands:
+        if not p or not os.path.isfile(p):
+            continue
+        rp = os.path.realpath(p)
+        if rp not in seen:
+            seen.add(rp)
+            yield rp
+        try:
+            sz = os.path.getsize(rp)
+            if 0 < sz < 65536:
+                with open(rp, "rb") as wf:
+                    wbytes = wf.read()
+                for m in re.findall(rb"/nix/store/[A-Za-z0-9._+-]+/[^\s\"']+", wbytes):
+                    wp = os.path.realpath(m.decode("ascii", errors="ignore"))
+                    if os.path.isfile(wp) and wp not in seen:
+                        seen.add(wp)
+                        yield wp
+        except Exception:
+            pass
+
 def refresh_oauth_token(refresh_token):
-    agy_bin = shutil.which("agy") or "/run/current-system/sw/bin/agy"
     cid_bytes = None
     csec_bytes = None
-    with open(agy_bin, "rb") as f:
-        if os.fstat(f.fileno()).st_size > 0:
-            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                cid_m = re.search(rb"[0-9]{10,}-[a-z0-9]+\.apps\.googleusercontent\.com", mm)
-                csec_m = re.search(rb"GOCSPX-[A-Za-z0-9_-]{24,36}", mm)
-                if cid_m and csec_m:
-                    cid_bytes = cid_m.group(0)
-                    csec_bytes = csec_m.group(0)
+    for agy_bin in candidate_agy_binaries():
+        try:
+            with open(agy_bin, "rb") as f:
+                if os.fstat(f.fileno()).st_size > 0:
+                    with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                        cid_m = re.search(rb"[0-9]{10,}-[a-z0-9]+\.apps\.googleusercontent\.com", mm)
+                        csec_m = re.search(rb"GOCSPX-[A-Za-z0-9_-]{24,36}", mm)
+                        if cid_m and csec_m:
+                            cid_bytes = cid_m.group(0)
+                            csec_bytes = csec_m.group(0)
+                            break
+        except Exception:
+            pass
     if not cid_bytes or not csec_bytes:
         return None
     data = urllib.parse.urlencode({
@@ -1132,52 +1311,66 @@ def query_quota(access_token, auth_method):
     )
     return urllib.request.urlopen(req, timeout=4).read().decode("utf-8", errors="ignore")
 
-obj = load_agy_token()
-if not obj:
-    sys.exit(1)
-auth_method = (obj.get("auth_method") or "consumer").strip() or "consumer"
-tok_info = obj.get("token") or {}
-access_token = tok_info.get("access_token")
-refresh_token = tok_info.get("refresh_token")
-expiry_str = tok_info.get("expiry") or ""
-need_refresh = True
-if access_token and expiry_str:
+def try_fetch_with_token_obj(obj):
+    if not isinstance(obj, dict):
+        return None
+    auth_method = (obj.get("auth_method") or "consumer").strip() or "consumer"
+    tok_info = obj.get("token") or {}
+    if not isinstance(tok_info, dict):
+        return None
+    access_token = tok_info.get("access_token")
+    refresh_token = tok_info.get("refresh_token")
+    expiry_str = tok_info.get("expiry") or ""
+    need_refresh = True
+    if access_token and expiry_str:
+        try:
+            exp_ts = datetime.datetime.fromisoformat(expiry_str.replace("Z", "+00:00")).timestamp()
+            if exp_ts > time.time() + 60:
+                need_refresh = False
+        except Exception:
+            pass
+    if need_refresh and refresh_token:
+        try:
+            refreshed = refresh_oauth_token(refresh_token)
+            if refreshed:
+                access_token = refreshed
+        except Exception:
+            pass
+    if not access_token:
+        return None
     try:
-        exp_ts = datetime.datetime.fromisoformat(expiry_str.replace("Z", "+00:00")).timestamp()
-        if exp_ts > time.time() + 60:
-            need_refresh = False
+        return query_quota(access_token, auth_method)
     except Exception:
-        pass
+        if not need_refresh and refresh_token:
+            try:
+                refreshed = refresh_oauth_token(refresh_token)
+                if refreshed:
+                    return query_quota(refreshed, auth_method)
+            except Exception:
+                pass
+        return None
 
-if need_refresh and refresh_token:
-    access_token = refresh_oauth_token(refresh_token)
+for loader in (load_file_token, load_libsecret_token):
+    cand = loader()
+    if cand:
+        out = try_fetch_with_token_obj(cand)
+        if out:
+            finish(0, out)
 
-if not access_token:
-    sys.exit(1)
-
-try:
-    out = query_quota(access_token, auth_method)
-except Exception:
-    if not need_refresh and refresh_token:
-        access_token = refresh_oauth_token(refresh_token)
-        out = query_quota(access_token, auth_method)
-    else:
-        raise
-
-print(out)
+finish(1)
 "#;
 
-    let output = Command::new("python3")
-        .arg("-c")
-        .arg(script)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
+fn fetch_antigravity_api_quota(now_secs: u64) -> Option<Vec<QuotaMetric>> {
+    let home = home_dir()?;
+    let text = run_command_stdout_with_timeout(
+        "python3",
+        [
+            OsStr::new("-c"),
+            OsStr::new(AGY_QUOTA_PYTHON_SCRIPT),
+            home.as_os_str(),
+        ],
+        QUOTA_API_HELPER_TIMEOUT,
+    )?;
     parse_antigravity_quota_summary(&text, now_secs)
 }
 
@@ -1683,5 +1876,159 @@ mod tests {
         let m2 = collect_claude_metrics_from_dir_cached(&tmp_dir, now_secs, &cfg, &mut cache);
         let _ = fs::remove_dir_all(&tmp_dir);
         assert!((m2[0].remaining_percent - 50.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn run_command_stdout_with_timeout_captures_output_and_kills_hung_process() {
+        let out = run_command_stdout_with_timeout(
+            "sh",
+            ["-c", "printf 'quota-ok'"],
+            Duration::from_secs(2),
+        );
+        assert_eq!(out.as_deref(), Some("quota-ok"));
+
+        let failed =
+            run_command_stdout_with_timeout("sh", ["-c", "exit 3"], Duration::from_secs(2));
+        assert!(failed.is_none());
+
+        let t0 = Instant::now();
+        let hung =
+            run_command_stdout_with_timeout("sh", ["-c", "sleep 30"], Duration::from_millis(120));
+        assert!(hung.is_none());
+        assert!(t0.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn usage_tracker_deduplicates_inflight_requests_and_retains_stale_metrics() {
+        use crate::model::{SharedSpace, SharedTab};
+        use std::sync::atomic::AtomicUsize;
+
+        fn world_for_agent(addr: &str, name: &str) -> World {
+            let mut world = World::default();
+            world.terminals.insert(
+                addr.to_string(),
+                TerminalInfo {
+                    address: addr.to_string(),
+                    title: name.to_string(),
+                    fg_name: Some(name.to_string()),
+                    ..Default::default()
+                },
+            );
+            world.doc.spaces.push(SharedSpace {
+                id: "s1".to_string(),
+                name: "Main".to_string(),
+                folder: String::new(),
+                tabs: vec![SharedTab {
+                    id: "tab1".to_string(),
+                    name: name.to_string(),
+                    root: serde_json::json!({
+                        "type": "block",
+                        "content": { "terminal": addr }
+                    }),
+                    rest: Default::default(),
+                }],
+                rest: Default::default(),
+            });
+            world.active_space_idx = 0;
+            world
+                .active_tab_by_space
+                .insert("s1".to_string(), "tab1".to_string());
+            world
+                .active_term_by_tab
+                .insert("tab1".to_string(), addr.to_string());
+            world
+        }
+
+        let world_agy = world_for_agent("t_agy", "antigravity");
+        let world_codex = world_for_agent("t_codex", "codex");
+
+        let (agy_started_tx, agy_started_rx) = mpsc::channel();
+        let (unblock_agy_tx, unblock_agy_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let codex_calls = Arc::new(AtomicUsize::new(0));
+        let codex_calls_bg = Arc::clone(&codex_calls);
+
+        let tracker = UsageTracker::new_with_collector(
+            move |kind, _| match kind {
+                AgentKind::Antigravity => {
+                    let _ = agy_started_tx.send(());
+                    let _ = unblock_agy_rx.recv_timeout(Duration::from_secs(3));
+                    AgentQuota {
+                        agent: AgentKind::Antigravity,
+                        metrics: vec![QuotaMetric {
+                            window_label: "5h".to_string(),
+                            remaining_percent: 90.0,
+                            detail: None,
+                        }],
+                    }
+                }
+                AgentKind::Codex => {
+                    let n = codex_calls_bg.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        AgentQuota {
+                            agent: AgentKind::Codex,
+                            metrics: vec![QuotaMetric {
+                                window_label: "5h".to_string(),
+                                remaining_percent: 83.0,
+                                detail: None,
+                            }],
+                        }
+                    } else {
+                        // Simulate a transient empty fetch on subsequent refresh
+                        AgentQuota {
+                            agent: AgentKind::Codex,
+                            metrics: Vec::new(),
+                        }
+                    }
+                }
+                other => AgentQuota {
+                    agent: other,
+                    metrics: Vec::new(),
+                },
+            },
+            move || {
+                let _ = done_tx.send(());
+            },
+        );
+
+        // Simulate 32 rapid render frames while Antigravity is still in flight;
+        // in-flight deduplication must keep channel space free for Codex.
+        for _ in 0..32 {
+            let q = tracker.focused_quota(&world_agy).unwrap();
+            assert_eq!(q.agent, AgentKind::Antigravity);
+        }
+        agy_started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        // Switch focus to Codex while Antigravity is blocked; Codex must still enqueue cleanly.
+        let initial_codex = tracker.focused_quota(&world_codex).unwrap();
+        assert!(initial_codex.metrics.is_empty());
+
+        unblock_agy_tx.send(()).unwrap();
+        // Wait for both Antigravity and Codex completions
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let populated_agy = tracker.focused_quota(&world_agy).unwrap();
+        assert_eq!(populated_agy.metrics.len(), 1);
+        assert_eq!(populated_agy.metrics[0].remaining_percent, 90.0);
+
+        let populated_codex = tracker.focused_quota(&world_codex).unwrap();
+        assert_eq!(populated_codex.metrics.len(), 1);
+        assert_eq!(populated_codex.metrics[0].remaining_percent, 83.0);
+
+        // Force-expire Codex's cache entry and verify a transient empty refresh preserves 83%
+        {
+            let mut guard = tracker.state.lock().unwrap();
+            if let Some(entry) = guard.cache.get_mut(&AgentKind::Codex) {
+                entry.ttl = Duration::ZERO;
+            }
+        }
+        let _ = tracker.focused_quota(&world_codex);
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(codex_calls.load(Ordering::SeqCst), 2);
+
+        let retained_codex = tracker.focused_quota(&world_codex).unwrap();
+        assert_eq!(retained_codex.metrics.len(), 1);
+        assert_eq!(retained_codex.metrics[0].remaining_percent, 83.0);
     }
 }
