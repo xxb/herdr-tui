@@ -2406,7 +2406,7 @@ fn render_help_modal(f: &mut Frame, area: Rect, hits: &mut Vec<HitRegion>) {
         Line::from("  Left Floating Cross (+)  Tap Esc / Ctl / ^B / Alt / Tab (drag to move)"),
         Line::from("  Right Floating Cross (+) Tap ↑ / ← / ⎘ (Paste) / → / ↓ (drag to move)"),
         Line::from("  Clipboard Copy / Paste   Drag text to copy (OSC 52); Tap ⎘ to paste"),
-        Line::from("  Next / Prev Tab          ^b n / ^b p   or  Alt+Right / Alt+Left"),
+        Line::from("  Next / Prev Tab          ^b n / ^b p, Alt+Right / Left, or Horiz Swipe"),
         Line::from("  Switch Tab 1..9          ^b 1..9       or  Alt+1..9"),
         Line::from("  New Tab in Space         ^b c          or  Tap [ + ] on top tab bar"),
         Line::from("  Rename / Close Tab       ^b , (rename) /   ^b x (close)"),

@@ -17,7 +17,7 @@ A fast, lightweight **multi-tab TUI client** for [`herdr-core` (`hc`)](https://g
   - **Top Tab Bar**: Displays `[ ⏏ ] [ ▾ Space ] ╱ [ 1:tab1 ] [ 2:tab2 ] [ + ] ... [ ? ]` along the top edge, with `[ ⏏ ]` on the far left for one-tap detach (`^b q`), classic `herdr` Catppuccin high-contrast accent fill (`#89b4fa` / `#181825`) on the active tab, and zero-width color-coded Agent states (`Blocked` / `Done` / `Working`).
   - **Accordion Folding & Overflow Count Badges**: When many tabs are open, inactive tabs automatically fold into compact `[ 1 ] [ 2 ] [ 3:active ] [ 4 ]` pills so all tabs stay visible in fixed order without disorienting horizontal scrolling; on extreme tab counts, clickable `[ ‹N ]` / `[ N› ]` badges open the Quick Fuzzy Switcher directly.
   - **Secondary Space Popover (`^b b` or Tap `[ ▾ Space ]`)**: Tapping the Space button opens a floating popover menu listing all Spaces with live Agent status and a `[ + New Space ]` button—eliminating the need for a permanent Left Sidebar so the terminal viewport always enjoys 100% horizontal width.
-  - **Direct Tab Switching & `[ + ]` New Tab**: Tap any Tab pill on the top bar (or scroll the mouse wheel over the top bar) to switch tabs, or tap `[ + ]` on the right of the tabs to add a new Tab.
+  - **Direct Tab Switching & `[ + ]` New Tab**: Tap any Tab pill on the top bar, swipe horizontally / use horizontal mouse wheel (`ScrollLeft` / `ScrollRight`) anywhere in the TUI, or scroll the vertical mouse wheel over the top bar to switch tabs; tap `[ + ]` on the right of the tabs to add a new Tab.
 - **Dual Floating Draggable Semi-Transparent `+` Cross Pads (`hct --touch` 开启双悬浮可拖动半透明十字按钮盘)**
   - Enabled with `hct --touch` (hidden by default when running `hct` on desktop without `--touch`).
   - **Left Modifier Cross (`Esc` / `Ctl` / `^B` / `Alt` / `Tab`)**: `15 × 7` hollow-corner `+` cross with `Esc` (top), sticky `Ctl` (left), sticky `^B` prefix (center), sticky `Alt` (right), and `Tab` (bottom).
@@ -42,12 +42,12 @@ A fast, lightweight **multi-tab TUI client** for [`herdr-core` (`hc`)](https://g
 
 | Action / 功能 | Prefix Shortcut (`Ctrl+b`) | Direct / Touch Shortcut |
 |---|---|---|
-| **Next / Previous Tab** (切换标签页) | `^b n` / `^b p` | `Alt+Right` / `Alt+Left`, Tap Tab, or Wheel on top bar |
+| **Next / Previous Tab** (切换标签页) | `^b n` / `^b p` | `Alt+Right` / `Alt+Left`, Horiz Swipe / Tilt Wheel, Tap Tab, or Wheel on top bar |
 | **Select Tab 1..9** (跳转标签页 1..9) | `^b 1` .. `^b 9` | `Alt+1` .. `Alt+9` |
 | **New Tab in Space** (新建标签页) | `^b c` | Tap `[ + ]` on top tab bar |
 | **Rename Current Tab** (重命名标签页) | `^b ,` | — |
 | **Close Current Tab** (关闭当前标签页) | `^b x` | — |
-| **Next / Previous Space** (切换工作区) | `^b Down` / `^b Up` | `Alt+Down` / `Alt+Up` or Tap Space |
+| **Next / Previous Space** (切换工作区) | `^b Down` / `^b Up` | `Alt+Down` / `Alt+Up`, Tap Space, or Wheel / Horiz Swipe in Space menu |
 | **New Space** (新建工作区) | `^b C` (or `^b s`) | Tap `[ + New Space ]` in Space menu |
 | **Rename Current Space** (重命名工作区) | `^b $` (or `^b R`) | — |
 | **Toggle Space Menu** (展开/收起工作区浮层菜单) | `^b b` | Tap `[ ▾ Space ]` on top tab bar |
