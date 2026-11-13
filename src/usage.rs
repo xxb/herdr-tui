@@ -19,6 +19,7 @@ const CACHE_TTL: Duration = Duration::from_secs(10);
 const AGY_CACHE_TTL: Duration = Duration::from_secs(30);
 const EMPTY_RETRY_TTL: Duration = Duration::from_secs(5);
 const QUOTA_API_HELPER_TIMEOUT: Duration = Duration::from_secs(6);
+const AGY_QUOTA_HELPER_TIMEOUT: Duration = Duration::from_secs(20);
 const QUOTA_LOCAL_HELPER_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_HELPER_STDOUT_BYTES: u64 = 2 * 1024 * 1024;
 
@@ -1424,7 +1425,7 @@ fn fetch_antigravity_api_quota(now_secs: u64) -> Option<Vec<QuotaMetric>> {
             OsStr::new(AGY_QUOTA_PYTHON_SCRIPT),
             home.as_os_str(),
         ],
-        QUOTA_API_HELPER_TIMEOUT,
+        AGY_QUOTA_HELPER_TIMEOUT,
     )?;
     parse_antigravity_quota_summary(&text, now_secs)
 }
@@ -1977,11 +1978,27 @@ mod tests {
                 extern "C" {
                     fn kill(pid: i32, sig: i32) -> i32;
                 }
+                let is_terminated = |pid: i32| -> bool {
+                    if unsafe { kill(pid, 0) } != 0 {
+                        return true;
+                    }
+                    // In containers where PID 1 does not reap orphaned grandchildren, a killed
+                    // descendant remains in zombie (`Z`) / dead (`X`) state even though `kill(pid, 0)`
+                    // still returns 0.
+                    if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
+                        if let Some((_, after_comm)) = stat.rfind(')').map(|i| stat.split_at(i + 1))
+                        {
+                            if let Some(state_ch) = after_comm.trim_start().chars().next() {
+                                return matches!(state_ch, 'Z' | 'X' | 'x');
+                            }
+                        }
+                    }
+                    false
+                };
                 let wait_deadline = Instant::now() + Duration::from_millis(500);
                 let mut alive = true;
                 while Instant::now() < wait_deadline {
-                    let rc = unsafe { kill(desc_pid, 0) };
-                    if rc != 0 {
+                    if is_terminated(desc_pid) {
                         alive = false;
                         break;
                     }
