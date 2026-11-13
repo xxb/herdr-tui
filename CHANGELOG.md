@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.0](https://github.com/xxb/herdr-tui/compare/v0.2.0...v0.3.0) (2026-11-13)
+
+
+### Features
+
+* **mouse:** support horizontal wheel tab switching with inertia & bleed guards ([#41](https://github.com/xxb/herdr-tui/issues/41)) ([#42](https://github.com/xxb/herdr-tui/issues/42)) ([125f9d8](https://github.com/xxb/herdr-tui/commit/125f9d8ec0e7e9d1b5cf14c36ca24ba4513e8e0e))
+
+
+### Bug Fixes
+
+* **mouse:** isolate WheelZone scopes and guard SpaceMenu wheel drags & modifiers ([#44](https://github.com/xxb/herdr-tui/issues/44)) ([a57fa5d](https://github.com/xxb/herdr-tui/commit/a57fa5d63bd3b3bf8f9f8a88057d6e3d6930acd8)), closes [#43](https://github.com/xxb/herdr-tui/issues/43)
+* **tui:** eliminate detach/re-entry screen artifacts, exit on last tab close, and toggle Space menu with ^b b ([#40](https://github.com/xxb/herdr-tui/issues/40)) ([517c002](https://github.com/xxb/herdr-tui/commit/517c002e95b6b2371b4e09da7780feed4c562b4b))
+* **usage:** prevent hung libsecret D-Bus calls from wedging agent quota bar ([#37](https://github.com/xxb/herdr-tui/issues/37)) ([8ce778f](https://github.com/xxb/herdr-tui/commit/8ce778fe47ac532b8884e80265f9d638dfc7584e))
+
 ## [0.2.0](https://github.com/xxb/herdr-tui/compare/v0.1.0...v0.2.0) (2026-11-13)
 
 
