@@ -73,6 +73,7 @@ Run:
 
 ```bash
 hct
+hct --version
 ```
 
 ---

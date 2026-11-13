@@ -2267,12 +2267,22 @@ fn render_help_modal(f: &mut Frame, area: Rect, hits: &mut Vec<HitRegion>) {
         target: HitTarget::ModalNoop,
     });
 
-    let block = Block::default()
+    let version_badge = format!(" hct {} ", crate::BUILD_VERSION);
+    let mut block = Block::default()
         .title(" Quick Actions & Help ")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Rgb(122, 162, 247)))
         .style(Style::default().bg(Color::Rgb(20, 22, 34)).fg(Color::White));
+    if usize::from(popup.width) > version_badge.width() + 2 {
+        block = block.title_bottom(
+            Line::from(Span::styled(
+                version_badge,
+                Style::default().fg(Color::Rgb(147, 153, 178)),
+            ))
+            .right_aligned(),
+        );
+    }
     let inner = block.inner(popup);
 
     // Reflow the 12 touch quick-action buttons across available inner width so narrow mobile
@@ -3521,6 +3531,44 @@ mod tests {
         assert!(hits
             .iter()
             .any(|h| h.target == HitTarget::TriggerAction(Action::Detach)));
+    }
+
+    #[test]
+    fn help_modal_displays_build_version_on_wide_viewport() {
+        let backend = TestBackend::new(80, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let world = World::default();
+
+        terminal
+            .draw(|f| {
+                let _ = render_ui(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::Help,
+                );
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let rendered: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains(&format!("hct {}", crate::BUILD_VERSION)));
     }
 
     #[test]
