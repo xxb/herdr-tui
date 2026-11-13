@@ -1164,17 +1164,75 @@ enum HorizontalSwipeDir {
     Next,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WheelZone {
+    Viewport,
+    TopBar,
+    SpaceMenu,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HorizBurstScope {
+    /// Suppressed by a blocking modal (`Help`, `Fuzzy`, etc.) or active drag (`dpad_drag` /
+    /// `selection.active`); coalesces trailing horizontal inertia across modal/drag dismissal.
+    Global,
+    /// Accepted tab switch in `Modal::None` (`Viewport` or `TopBar`); coalesces same-direction
+    /// horizontal inertia across `Viewport <-> TopBar` without blocking `Modal::SpaceMenu`.
+    TabSwitch,
+    /// Accepted space switch in `Modal::SpaceMenu`; coalesces same-direction horizontal inertia
+    /// inside `SpaceMenu` without blocking explicit tab swipes after closing `SpaceMenu`.
+    SpaceSwitch,
+    /// Zone-scoped vertical-to-horizontal diagonal bleed suppression (e.g. `Viewport` bleed never
+    /// blocks explicit Row 0 `TopBar` horizontal wheel scrolling).
+    BleedInZone(WheelZone),
+}
+
+impl HorizBurstScope {
+    fn accepted_for_zone(zone: WheelZone) -> Self {
+        match zone {
+            WheelZone::Viewport | WheelZone::TopBar => Self::TabSwitch,
+            WheelZone::SpaceMenu => Self::SpaceSwitch,
+        }
+    }
+
+    fn matches_zone(self, zone: WheelZone) -> bool {
+        match self {
+            Self::Global => true,
+            Self::TabSwitch => matches!(zone, WheelZone::Viewport | WheelZone::TopBar),
+            Self::SpaceSwitch => zone == WheelZone::SpaceMenu,
+            Self::BleedInZone(z) => z == zone,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VertBurstScope {
+    Global,
+    Zone(WheelZone),
+}
+
+impl VertBurstScope {
+    fn matches_zone(self, zone: WheelZone) -> bool {
+        match self {
+            Self::Global => true,
+            Self::Zone(z) => z == zone,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct HorizontalWheelGestureState {
     last_viewport_vertical_wheel_at: Option<Instant>,
     last_top_bar_vertical_wheel_at: Option<Instant>,
+    last_space_menu_vertical_wheel_at: Option<Instant>,
     last_horiz_dir: Option<HorizontalSwipeDir>,
     last_horiz_event_at: Option<Instant>,
-    /// `None` = global suppression (accepted switch or modal/drag guard); `Some(zone)` = zone-scoped vertical bleed suppression.
-    last_horiz_bleed_zone: Option<bool>,
-    active_horiz_switch_burst: bool,
-    last_rejected_top_bar_vert_dir: Option<bool>,
-    last_rejected_top_bar_vert_at: Option<Instant>,
+    last_horiz_scope: Option<HorizBurstScope>,
+    /// UI zone of the currently active accepted horizontal switch burst, if any.
+    active_horiz_switch_zone: Option<WheelZone>,
+    last_rejected_vert_scope: Option<VertBurstScope>,
+    last_rejected_vert_dir: Option<bool>,
+    last_rejected_vert_at: Option<Instant>,
 }
 
 impl HorizontalWheelGestureState {
@@ -1182,8 +1240,27 @@ impl HorizontalWheelGestureState {
         self.last_viewport_vertical_wheel_at = Some(now);
     }
 
-    fn record_suppressed_top_bar_vertical_wheel(&mut self, now: Instant) {
-        self.last_top_bar_vertical_wheel_at = Some(now);
+    fn set_zone_vertical_wheel(&mut self, zone: WheelZone, now: Instant) {
+        match zone {
+            WheelZone::Viewport => self.last_viewport_vertical_wheel_at = Some(now),
+            WheelZone::TopBar => self.last_top_bar_vertical_wheel_at = Some(now),
+            WheelZone::SpaceMenu => self.last_space_menu_vertical_wheel_at = Some(now),
+        }
+    }
+
+    fn zone_vertical_wheel_at(&self, zone: WheelZone) -> Option<Instant> {
+        match zone {
+            WheelZone::Viewport => self.last_viewport_vertical_wheel_at,
+            WheelZone::TopBar => self.last_top_bar_vertical_wheel_at,
+            WheelZone::SpaceMenu => self.last_space_menu_vertical_wheel_at,
+        }
+    }
+
+    fn record_suppressed_vertical_wheel(&mut self, zone: WheelZone, scroll_up: bool, now: Instant) {
+        self.set_zone_vertical_wheel(zone, now);
+        self.last_rejected_vert_scope = Some(VertBurstScope::Global);
+        self.last_rejected_vert_dir = Some(scroll_up);
+        self.last_rejected_vert_at = Some(now);
     }
 
     fn record_suppressed_horizontal_wheel(&mut self, dir: HorizontalSwipeDir, now: Instant) {
@@ -1192,71 +1269,88 @@ impl HorizontalWheelGestureState {
                 .last_horiz_event_at
                 .is_some_and(|t| now.saturating_duration_since(t) < HORIZ_WHEEL_QUIET_GAP);
         if !continuing_same_burst {
-            self.active_horiz_switch_burst = false;
+            self.active_horiz_switch_zone = None;
         }
         self.last_horiz_dir = Some(dir);
         self.last_horiz_event_at = Some(now);
-        self.last_horiz_bleed_zone = None;
+        self.last_horiz_scope = Some(HorizBurstScope::Global);
     }
 
-    /// Guards top-bar / `Modal::SpaceMenu` vertical wheel switches when an accepted horizontal
-    /// wheel burst is active within `VERT_WHEEL_BLEED_GUARD` (and coalesces any continuous
-    /// rejected vertical bleed stream across `HORIZ_WHEEL_QUIET_GAP`), so diagonal gestures
-    /// arriving in either packet ordering never switch tabs or spaces twice.
-    fn accept_top_bar_vertical_wheel(&mut self, scroll_up: bool, now: Instant) -> bool {
-        let continuing_rejected_vert_burst = self.last_rejected_top_bar_vert_dir == Some(scroll_up)
+    /// Guards `TopBar` / `Modal::SpaceMenu` vertical wheel switches when an accepted horizontal
+    /// wheel burst in the *same* `WheelZone` is active within `VERT_WHEEL_BLEED_GUARD` (and
+    /// coalesces any continuous rejected/suppressed vertical stream across `HORIZ_WHEEL_QUIET_GAP`),
+    /// so diagonal gestures in either packet ordering never switch twice while cross-zone gestures
+    /// (`Viewport` horizontal -> `TopBar` vertical, or `TopBar` <-> `SpaceMenu`) remain responsive.
+    fn accept_vertical_switch_wheel(
+        &mut self,
+        zone: WheelZone,
+        scroll_up: bool,
+        now: Instant,
+    ) -> bool {
+        let continuing_rejected_vert_burst = self
+            .last_rejected_vert_scope
+            .is_some_and(|s| s.matches_zone(zone))
+            && self.last_rejected_vert_dir == Some(scroll_up)
             && self
-                .last_rejected_top_bar_vert_at
+                .last_rejected_vert_at
                 .is_some_and(|t| now.saturating_duration_since(t) < HORIZ_WHEEL_QUIET_GAP);
-        let in_horiz_bleed_guard = self.active_horiz_switch_burst
+        let in_horiz_bleed_guard = self.active_horiz_switch_zone == Some(zone)
             && self
                 .last_horiz_event_at
                 .is_some_and(|t| now.saturating_duration_since(t) < VERT_WHEEL_BLEED_GUARD);
         if continuing_rejected_vert_burst || in_horiz_bleed_guard {
-            self.last_rejected_top_bar_vert_dir = Some(scroll_up);
-            self.last_rejected_top_bar_vert_at = Some(now);
+            let next_scope = if continuing_rejected_vert_burst
+                && self.last_rejected_vert_scope == Some(VertBurstScope::Global)
+            {
+                VertBurstScope::Global
+            } else {
+                VertBurstScope::Zone(zone)
+            };
+            self.last_rejected_vert_scope = Some(next_scope);
+            self.last_rejected_vert_dir = Some(scroll_up);
+            self.last_rejected_vert_at = Some(now);
             return false;
         }
-        self.last_rejected_top_bar_vert_dir = None;
-        self.last_rejected_top_bar_vert_at = None;
-        self.last_top_bar_vertical_wheel_at = Some(now);
+        self.last_rejected_vert_scope = None;
+        self.last_rejected_vert_dir = None;
+        self.last_rejected_vert_at = None;
+        self.set_zone_vertical_wheel(zone, now);
         true
     }
 
     fn accept_horizontal_wheel(
         &mut self,
         dir: HorizontalSwipeDir,
-        on_top_bar_or_space_menu: bool,
+        zone: WheelZone,
         now: Instant,
     ) -> bool {
-        let zone_matches = self
-            .last_horiz_bleed_zone
-            .is_none_or(|z| z == on_top_bar_or_space_menu);
-        if zone_matches
+        let scope_matches = self.last_horiz_scope.is_some_and(|s| s.matches_zone(zone));
+        if scope_matches
             && self.last_horiz_dir == Some(dir)
             && self
                 .last_horiz_event_at
                 .is_some_and(|t| now.saturating_duration_since(t) < HORIZ_WHEEL_QUIET_GAP)
         {
             self.last_horiz_event_at = Some(now);
+            if self.active_horiz_switch_zone.is_some() {
+                self.active_horiz_switch_zone = Some(zone);
+            }
             return false;
         }
-        let bleed_ref = if on_top_bar_or_space_menu {
-            self.last_top_bar_vertical_wheel_at
-        } else {
-            self.last_viewport_vertical_wheel_at
-        };
-        if bleed_ref.is_some_and(|t| now.saturating_duration_since(t) < VERT_WHEEL_BLEED_GUARD) {
+        if self
+            .zone_vertical_wheel_at(zone)
+            .is_some_and(|t| now.saturating_duration_since(t) < VERT_WHEEL_BLEED_GUARD)
+        {
             self.last_horiz_dir = Some(dir);
             self.last_horiz_event_at = Some(now);
-            self.last_horiz_bleed_zone = Some(on_top_bar_or_space_menu);
-            self.active_horiz_switch_burst = false;
+            self.last_horiz_scope = Some(HorizBurstScope::BleedInZone(zone));
+            self.active_horiz_switch_zone = None;
             return false;
         }
         self.last_horiz_dir = Some(dir);
         self.last_horiz_event_at = Some(now);
-        self.last_horiz_bleed_zone = None;
-        self.active_horiz_switch_burst = true;
+        self.last_horiz_scope = Some(HorizBurstScope::accepted_for_zone(zone));
+        self.active_horiz_switch_zone = Some(zone);
         true
     }
 }
@@ -1269,6 +1363,7 @@ fn handle_top_bar_or_space_vertical_wheel(
     core: &CoreClient,
     world: &mut World,
     modal: &Modal,
+    dpad_drag_active: bool,
     prefix_active: &mut bool,
     ctrl_active: &mut bool,
     alt_active: &mut bool,
@@ -1276,21 +1371,17 @@ fn handle_top_bar_or_space_vertical_wheel(
     selection_screen: &mut Option<vt100::Screen>,
     selection_vt_seq: &mut Option<u64>,
 ) -> bool {
-    if !horiz_wheel.accept_top_bar_vertical_wheel(scroll_up, now) {
+    let zone = if matches!(modal, Modal::SpaceMenu) {
+        WheelZone::SpaceMenu
+    } else {
+        WheelZone::TopBar
+    };
+    if dpad_drag_active || selection.as_ref().is_some_and(|s| s.active) {
+        horiz_wheel.record_suppressed_vertical_wheel(zone, scroll_up, now);
         return false;
     }
-    if matches!(modal, Modal::SpaceMenu) {
-        let prev_sid = world.active_space().map(|s| s.id.clone());
-        if scroll_up {
-            world.prev_space();
-        } else {
-            world.next_space();
-        }
-        let space_changed = world.active_space().map(|s| s.id.as_str()) != prev_sid.as_deref();
-        if space_changed {
-            world.mark_active_seen(core);
-        }
-        return space_changed;
+    if !horiz_wheel.accept_vertical_switch_wheel(zone, scroll_up, now) {
+        return false;
     }
     let had_sticky = *prefix_active || *ctrl_active || *alt_active;
     *prefix_active = false;
@@ -1302,6 +1393,19 @@ fn handle_top_bar_or_space_vertical_wheel(
     *selection = None;
     *selection_screen = None;
     *selection_vt_seq = None;
+    if matches!(modal, Modal::SpaceMenu) {
+        let prev_sid = world.active_space().map(|s| s.id.clone());
+        if scroll_up {
+            world.prev_space();
+        } else {
+            world.next_space();
+        }
+        let space_changed = world.active_space().map(|s| s.id.as_str()) != prev_sid.as_deref();
+        if space_changed {
+            world.mark_active_seen(core);
+        }
+        return space_changed || had_sticky || had_vis_sel;
+    }
     let prev_ti = world.active_tab_index();
     if scroll_up {
         world.prev_tab();
@@ -1333,30 +1437,21 @@ fn handle_horizontal_wheel_event(
     selection_screen: &mut Option<vt100::Screen>,
     selection_vt_seq: &mut Option<u64>,
 ) -> bool {
-    if matches!(modal, Modal::SpaceMenu) {
-        if !horiz_wheel.accept_horizontal_wheel(dir, true, now) {
-            return false;
-        }
-        let prev_sid = world.active_space().map(|s| s.id.clone());
-        match dir {
-            HorizontalSwipeDir::Prev => world.prev_space(),
-            HorizontalSwipeDir::Next => world.next_space(),
-        }
-        let space_changed = world.active_space().map(|s| s.id.as_str()) != prev_sid.as_deref();
-        if space_changed {
-            world.mark_active_seen(core);
-        }
-        return space_changed;
-    }
-    if !matches!(modal, Modal::None)
-        || dpad_drag_active
+    if dpad_drag_active
         || selection.as_ref().is_some_and(|s| s.active)
+        || !matches!(modal, Modal::None | Modal::SpaceMenu)
     {
         horiz_wheel.record_suppressed_horizontal_wheel(dir, now);
         return false;
     }
-    let on_top_bar = mev_row < term_rect.y;
-    if !horiz_wheel.accept_horizontal_wheel(dir, on_top_bar, now) {
+    let zone = if matches!(modal, Modal::SpaceMenu) {
+        WheelZone::SpaceMenu
+    } else if mev_row < term_rect.y {
+        WheelZone::TopBar
+    } else {
+        WheelZone::Viewport
+    };
+    if !horiz_wheel.accept_horizontal_wheel(dir, zone, now) {
         return false;
     }
     let had_sticky = *prefix_active || *ctrl_active || *alt_active;
@@ -1369,6 +1464,18 @@ fn handle_horizontal_wheel_event(
     *selection = None;
     *selection_screen = None;
     *selection_vt_seq = None;
+    if matches!(modal, Modal::SpaceMenu) {
+        let prev_sid = world.active_space().map(|s| s.id.clone());
+        match dir {
+            HorizontalSwipeDir::Prev => world.prev_space(),
+            HorizontalSwipeDir::Next => world.next_space(),
+        }
+        let space_changed = world.active_space().map(|s| s.id.as_str()) != prev_sid.as_deref();
+        if space_changed {
+            world.mark_active_seen(core);
+        }
+        return space_changed || had_sticky || had_vis_sel;
+    }
     let prev_ti = world.active_tab_index();
     match dir {
         HorizontalSwipeDir::Prev => world.prev_tab(),
@@ -2245,6 +2352,7 @@ fn run_app_loop(
                                         core,
                                         world,
                                         &modal,
+                                        dpad_drag.is_some(),
                                         &mut prefix_active,
                                         &mut ctrl_active,
                                         &mut alt_active,
@@ -2260,7 +2368,14 @@ fn run_app_loop(
                                     ref mut selected_tab_id,
                                 } = modal
                                 {
-                                    horiz_wheel.record_viewport_vertical_wheel(wheel_now);
+                                    let fuzzy_zone = if mev.row < term_rect.y {
+                                        WheelZone::TopBar
+                                    } else {
+                                        WheelZone::Viewport
+                                    };
+                                    horiz_wheel.record_suppressed_vertical_wheel(
+                                        fuzzy_zone, true, wheel_now,
+                                    );
                                     let items = collect_fuzzy_items(world, query);
                                     let cur_sel = resolve_fuzzy_selection(
                                         &items,
@@ -2272,11 +2387,7 @@ fn run_app_loop(
                                     *selected_tab_id =
                                         items.get(*selected).map(|it| it.tab_id.clone());
                                     dirty = true;
-                                } else if matches!(modal, Modal::None)
-                                    && mev.row < term_rect.y
-                                    && dpad_drag.is_none()
-                                    && !selection.as_ref().is_some_and(|s| s.active)
-                                {
+                                } else if matches!(modal, Modal::None) && mev.row < term_rect.y {
                                     if handle_top_bar_or_space_vertical_wheel(
                                         true,
                                         wheel_now,
@@ -2284,6 +2395,7 @@ fn run_app_loop(
                                         core,
                                         world,
                                         &modal,
+                                        dpad_drag.is_some(),
                                         &mut prefix_active,
                                         &mut ctrl_active,
                                         &mut alt_active,
@@ -2294,6 +2406,8 @@ fn run_app_loop(
                                         dirty = true;
                                     }
                                 } else if matches!(modal, Modal::None)
+                                    && dpad_drag.is_none()
+                                    && !selection.as_ref().is_some_and(|s| s.active)
                                     && mev.row >= term_rect.y
                                     && mev.row < term_rect.y.saturating_add(term_rect.height)
                                     && !is_on_dpad_disc(last_dpad_rect, mev.column, mev.row)
@@ -2331,9 +2445,17 @@ fn run_app_loop(
                                         }
                                     }
                                 } else if mev.row < term_rect.y {
-                                    horiz_wheel.record_suppressed_top_bar_vertical_wheel(wheel_now);
+                                    horiz_wheel.record_suppressed_vertical_wheel(
+                                        WheelZone::TopBar,
+                                        true,
+                                        wheel_now,
+                                    );
                                 } else {
-                                    horiz_wheel.record_viewport_vertical_wheel(wheel_now);
+                                    horiz_wheel.record_suppressed_vertical_wheel(
+                                        WheelZone::Viewport,
+                                        true,
+                                        wheel_now,
+                                    );
                                 }
                             }
                             MouseEventKind::ScrollDown => {
@@ -2346,6 +2468,7 @@ fn run_app_loop(
                                         core,
                                         world,
                                         &modal,
+                                        dpad_drag.is_some(),
                                         &mut prefix_active,
                                         &mut ctrl_active,
                                         &mut alt_active,
@@ -2361,7 +2484,14 @@ fn run_app_loop(
                                     ref mut selected_tab_id,
                                 } = modal
                                 {
-                                    horiz_wheel.record_viewport_vertical_wheel(wheel_now);
+                                    let fuzzy_zone = if mev.row < term_rect.y {
+                                        WheelZone::TopBar
+                                    } else {
+                                        WheelZone::Viewport
+                                    };
+                                    horiz_wheel.record_suppressed_vertical_wheel(
+                                        fuzzy_zone, false, wheel_now,
+                                    );
                                     let items = collect_fuzzy_items(world, query);
                                     if !items.is_empty() {
                                         let cur_sel = resolve_fuzzy_selection(
@@ -2375,11 +2505,7 @@ fn run_app_loop(
                                             items.get(*selected).map(|it| it.tab_id.clone());
                                         dirty = true;
                                     }
-                                } else if matches!(modal, Modal::None)
-                                    && mev.row < term_rect.y
-                                    && dpad_drag.is_none()
-                                    && !selection.as_ref().is_some_and(|s| s.active)
-                                {
+                                } else if matches!(modal, Modal::None) && mev.row < term_rect.y {
                                     if handle_top_bar_or_space_vertical_wheel(
                                         false,
                                         wheel_now,
@@ -2387,6 +2513,7 @@ fn run_app_loop(
                                         core,
                                         world,
                                         &modal,
+                                        dpad_drag.is_some(),
                                         &mut prefix_active,
                                         &mut ctrl_active,
                                         &mut alt_active,
@@ -2397,6 +2524,8 @@ fn run_app_loop(
                                         dirty = true;
                                     }
                                 } else if matches!(modal, Modal::None)
+                                    && dpad_drag.is_none()
+                                    && !selection.as_ref().is_some_and(|s| s.active)
                                     && mev.row >= term_rect.y
                                     && mev.row < term_rect.y.saturating_add(term_rect.height)
                                     && !is_on_dpad_disc(last_dpad_rect, mev.column, mev.row)
@@ -2434,9 +2563,17 @@ fn run_app_loop(
                                         }
                                     }
                                 } else if mev.row < term_rect.y {
-                                    horiz_wheel.record_suppressed_top_bar_vertical_wheel(wheel_now);
+                                    horiz_wheel.record_suppressed_vertical_wheel(
+                                        WheelZone::TopBar,
+                                        false,
+                                        wheel_now,
+                                    );
                                 } else {
-                                    horiz_wheel.record_viewport_vertical_wheel(wheel_now);
+                                    horiz_wheel.record_suppressed_vertical_wheel(
+                                        WheelZone::Viewport,
+                                        false,
+                                        wheel_now,
+                                    );
                                 }
                             }
                             MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => {
@@ -3731,6 +3868,7 @@ mod tests {
                 &core,
                 &mut world,
                 &modal,
+                false,
                 &mut prefix_active,
                 &mut ctrl_active,
                 &mut alt_active,
@@ -3751,6 +3889,7 @@ mod tests {
             &core,
             &mut world,
             &modal,
+            false,
             &mut prefix_active,
             &mut ctrl_active,
             &mut alt_active,
@@ -3787,6 +3926,7 @@ mod tests {
             &core,
             &mut world,
             &modal,
+            false,
             &mut prefix_active,
             &mut ctrl_active,
             &mut alt_active,
@@ -3976,14 +4116,59 @@ mod tests {
         ));
         assert_eq!(world.active_tab_index(), 1);
 
-        // 7. In Modal::SpaceMenu, horizontal wheel switches Spaces cleanly
-        modal = Modal::SpaceMenu;
-        assert_eq!(world.active_space().map(|s| s.id.as_str()), Some("sp1"));
+        // 7. Zone isolation (`Viewport` <-> `TopBar` <-> `SpaceMenu`) and `SpaceMenu` drag/sticky guards:
+        // 7a. Viewport horizontal swipe (`row = 10`) does NOT block explicit Row 0 vertical wheel (`row = 0`)
+        let t_zones = t_guards + Duration::from_secs(4);
         assert!(handle_horizontal_wheel_event(
             HorizontalSwipeDir::Next,
             10,
             term_rect,
-            t_guards + Duration::from_secs(4),
+            t_zones,
+            &mut horiz_wheel,
+            &core,
+            &mut world,
+            &modal,
+            false,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut selection,
+            &mut selection_screen,
+            &mut selection_vt_seq,
+        ));
+        assert_eq!(world.active_tab_index(), 2);
+        assert!(handle_top_bar_or_space_vertical_wheel(
+            true,
+            t_zones + Duration::from_millis(60),
+            &mut horiz_wheel,
+            &core,
+            &mut world,
+            &modal,
+            false,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut selection,
+            &mut selection_screen,
+            &mut selection_vt_seq,
+        ));
+        assert_eq!(world.active_tab_index(), 1);
+
+        // 7b. Row 0 vertical wheel at +60ms does NOT block `Modal::SpaceMenu` horizontal wheel at +100ms,
+        //     and accepted space wheel switches clear sticky modifiers + completed selection!
+        modal = Modal::SpaceMenu;
+        prefix_active = true;
+        ctrl_active = true;
+        alt_active = true;
+        let mut space_done_sel = TerminalSelection::new(1, 2);
+        space_done_sel.head = (1, 8);
+        space_done_sel.active = false;
+        selection = Some(space_done_sel);
+        assert!(handle_horizontal_wheel_event(
+            HorizontalSwipeDir::Next,
+            10,
+            term_rect,
+            t_zones + Duration::from_millis(100),
             &mut horiz_wheel,
             &core,
             &mut world,
@@ -3997,5 +4182,119 @@ mod tests {
             &mut selection_vt_seq,
         ));
         assert_eq!(world.active_space().map(|s| s.id.as_str()), Some("sp2"));
+        assert!(!prefix_active && !ctrl_active && !alt_active);
+        assert!(selection.is_none());
+
+        // 7c. Active `dpad_drag` / `selection.active` inside `Modal::SpaceMenu` blocks both
+        //     horizontal & vertical space switches (including trailing inertia after drag release).
+        let t_space_drag = t_zones + Duration::from_secs(1);
+        assert!(!handle_horizontal_wheel_event(
+            HorizontalSwipeDir::Prev,
+            10,
+            term_rect,
+            t_space_drag,
+            &mut horiz_wheel,
+            &core,
+            &mut world,
+            &modal,
+            true,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut selection,
+            &mut selection_screen,
+            &mut selection_vt_seq,
+        ));
+        assert!(!handle_top_bar_or_space_vertical_wheel(
+            true,
+            t_space_drag + Duration::from_millis(20),
+            &mut horiz_wheel,
+            &core,
+            &mut world,
+            &modal,
+            true,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut selection,
+            &mut selection_screen,
+            &mut selection_vt_seq,
+        ));
+        // Trailing vertical & horizontal inertia immediately after releasing D-pad in SpaceMenu stays suppressed
+        assert!(!handle_top_bar_or_space_vertical_wheel(
+            true,
+            t_space_drag + Duration::from_millis(60),
+            &mut horiz_wheel,
+            &core,
+            &mut world,
+            &modal,
+            false,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut selection,
+            &mut selection_screen,
+            &mut selection_vt_seq,
+        ));
+        assert!(!handle_horizontal_wheel_event(
+            HorizontalSwipeDir::Prev,
+            10,
+            term_rect,
+            t_space_drag + Duration::from_millis(70),
+            &mut horiz_wheel,
+            &core,
+            &mut world,
+            &modal,
+            false,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut selection,
+            &mut selection_screen,
+            &mut selection_vt_seq,
+        ));
+        assert_eq!(world.active_space().map(|s| s.id.as_str()), Some("sp2"));
+
+        // 7d. Switching spaces via wheel in `Modal::SpaceMenu` and immediately closing to `Modal::None`
+        //     allows immediate same-direction tab swiping on `Viewport` (`SpaceMenu` <-> `ModalNone` isolation).
+        let t_space_to_tab = t_space_drag + Duration::from_secs(1);
+        assert!(handle_horizontal_wheel_event(
+            HorizontalSwipeDir::Prev,
+            10,
+            term_rect,
+            t_space_to_tab,
+            &mut horiz_wheel,
+            &core,
+            &mut world,
+            &modal,
+            false,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut selection,
+            &mut selection_screen,
+            &mut selection_vt_seq,
+        ));
+        assert_eq!(world.active_space().map(|s| s.id.as_str()), Some("sp1"));
+        assert_eq!(world.active_tab_index(), 1);
+        modal = Modal::None;
+        assert!(handle_horizontal_wheel_event(
+            HorizontalSwipeDir::Prev,
+            10,
+            term_rect,
+            t_space_to_tab + Duration::from_millis(40),
+            &mut horiz_wheel,
+            &core,
+            &mut world,
+            &modal,
+            false,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut selection,
+            &mut selection_screen,
+            &mut selection_vt_seq,
+        ));
+        assert_eq!(world.active_tab_index(), 0);
     }
 }
