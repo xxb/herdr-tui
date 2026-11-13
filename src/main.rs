@@ -1170,6 +1170,11 @@ struct HorizontalWheelGestureState {
     last_top_bar_vertical_wheel_at: Option<Instant>,
     last_horiz_dir: Option<HorizontalSwipeDir>,
     last_horiz_event_at: Option<Instant>,
+    /// `None` = global suppression (accepted switch or modal/drag guard); `Some(zone)` = zone-scoped vertical bleed suppression.
+    last_horiz_bleed_zone: Option<bool>,
+    active_horiz_switch_burst: bool,
+    last_rejected_top_bar_vert_dir: Option<bool>,
+    last_rejected_top_bar_vert_at: Option<Instant>,
 }
 
 impl HorizontalWheelGestureState {
@@ -1177,17 +1182,43 @@ impl HorizontalWheelGestureState {
         self.last_viewport_vertical_wheel_at = Some(now);
     }
 
-    /// Guards top-bar / `Modal::SpaceMenu` vertical wheel switches when a horizontal wheel
-    /// switch was already accepted within `VERT_WHEEL_BLEED_GUARD`, so diagonal gestures
-    /// arriving as `ScrollRight` -> `ScrollDown` (as well as `ScrollDown` -> `ScrollRight`)
-    /// never switch tabs or spaces twice.
-    fn accept_top_bar_vertical_wheel(&mut self, now: Instant) -> bool {
-        if self
-            .last_horiz_event_at
-            .is_some_and(|t| now.saturating_duration_since(t) < VERT_WHEEL_BLEED_GUARD)
-        {
+    fn record_suppressed_top_bar_vertical_wheel(&mut self, now: Instant) {
+        self.last_top_bar_vertical_wheel_at = Some(now);
+    }
+
+    fn record_suppressed_horizontal_wheel(&mut self, dir: HorizontalSwipeDir, now: Instant) {
+        let continuing_same_burst = self.last_horiz_dir == Some(dir)
+            && self
+                .last_horiz_event_at
+                .is_some_and(|t| now.saturating_duration_since(t) < HORIZ_WHEEL_QUIET_GAP);
+        if !continuing_same_burst {
+            self.active_horiz_switch_burst = false;
+        }
+        self.last_horiz_dir = Some(dir);
+        self.last_horiz_event_at = Some(now);
+        self.last_horiz_bleed_zone = None;
+    }
+
+    /// Guards top-bar / `Modal::SpaceMenu` vertical wheel switches when an accepted horizontal
+    /// wheel burst is active within `VERT_WHEEL_BLEED_GUARD` (and coalesces any continuous
+    /// rejected vertical bleed stream across `HORIZ_WHEEL_QUIET_GAP`), so diagonal gestures
+    /// arriving in either packet ordering never switch tabs or spaces twice.
+    fn accept_top_bar_vertical_wheel(&mut self, scroll_up: bool, now: Instant) -> bool {
+        let continuing_rejected_vert_burst = self.last_rejected_top_bar_vert_dir == Some(scroll_up)
+            && self
+                .last_rejected_top_bar_vert_at
+                .is_some_and(|t| now.saturating_duration_since(t) < HORIZ_WHEEL_QUIET_GAP);
+        let in_horiz_bleed_guard = self.active_horiz_switch_burst
+            && self
+                .last_horiz_event_at
+                .is_some_and(|t| now.saturating_duration_since(t) < VERT_WHEEL_BLEED_GUARD);
+        if continuing_rejected_vert_burst || in_horiz_bleed_guard {
+            self.last_rejected_top_bar_vert_dir = Some(scroll_up);
+            self.last_rejected_top_bar_vert_at = Some(now);
             return false;
         }
+        self.last_rejected_top_bar_vert_dir = None;
+        self.last_rejected_top_bar_vert_at = None;
         self.last_top_bar_vertical_wheel_at = Some(now);
         true
     }
@@ -1198,7 +1229,11 @@ impl HorizontalWheelGestureState {
         on_top_bar_or_space_menu: bool,
         now: Instant,
     ) -> bool {
-        if self.last_horiz_dir == Some(dir)
+        let zone_matches = self
+            .last_horiz_bleed_zone
+            .is_none_or(|z| z == on_top_bar_or_space_menu);
+        if zone_matches
+            && self.last_horiz_dir == Some(dir)
             && self
                 .last_horiz_event_at
                 .is_some_and(|t| now.saturating_duration_since(t) < HORIZ_WHEEL_QUIET_GAP)
@@ -1212,10 +1247,16 @@ impl HorizontalWheelGestureState {
             self.last_viewport_vertical_wheel_at
         };
         if bleed_ref.is_some_and(|t| now.saturating_duration_since(t) < VERT_WHEEL_BLEED_GUARD) {
+            self.last_horiz_dir = Some(dir);
+            self.last_horiz_event_at = Some(now);
+            self.last_horiz_bleed_zone = Some(on_top_bar_or_space_menu);
+            self.active_horiz_switch_burst = false;
             return false;
         }
         self.last_horiz_dir = Some(dir);
         self.last_horiz_event_at = Some(now);
+        self.last_horiz_bleed_zone = None;
+        self.active_horiz_switch_burst = true;
         true
     }
 }
@@ -1235,7 +1276,7 @@ fn handle_top_bar_or_space_vertical_wheel(
     selection_screen: &mut Option<vt100::Screen>,
     selection_vt_seq: &mut Option<u64>,
 ) -> bool {
-    if !horiz_wheel.accept_top_bar_vertical_wheel(now) {
+    if !horiz_wheel.accept_top_bar_vertical_wheel(scroll_up, now) {
         return false;
     }
     if matches!(modal, Modal::SpaceMenu) {
@@ -1311,6 +1352,7 @@ fn handle_horizontal_wheel_event(
         || dpad_drag_active
         || selection.as_ref().is_some_and(|s| s.active)
     {
+        horiz_wheel.record_suppressed_horizontal_wheel(dir, now);
         return false;
     }
     let on_top_bar = mev_row < term_rect.y;
@@ -2288,6 +2330,10 @@ fn run_app_loop(
                                             dirty = true;
                                         }
                                     }
+                                } else if mev.row < term_rect.y {
+                                    horiz_wheel.record_suppressed_top_bar_vertical_wheel(wheel_now);
+                                } else {
+                                    horiz_wheel.record_viewport_vertical_wheel(wheel_now);
                                 }
                             }
                             MouseEventKind::ScrollDown => {
@@ -2387,6 +2433,10 @@ fn run_app_loop(
                                             dirty = true;
                                         }
                                     }
+                                } else if mev.row < term_rect.y {
+                                    horiz_wheel.record_suppressed_top_bar_vertical_wheel(wheel_now);
+                                } else {
+                                    horiz_wheel.record_viewport_vertical_wheel(wheel_now);
                                 }
                             }
                             MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => {
@@ -3671,25 +3721,29 @@ mod tests {
             &mut selection_vt_seq,
         ));
         assert_eq!(world.active_tab_index(), 0);
-        // Ordering B (`ScrollRight` -> `ScrollDown` on row 0): trailing vertical packet within 180ms MUST NOT switch a 2nd tab!
-        assert!(!handle_top_bar_or_space_vertical_wheel(
-            false,
-            t_vert + Duration::from_millis(65),
-            &mut horiz_wheel,
-            &core,
-            &mut world,
-            &modal,
-            &mut prefix_active,
-            &mut ctrl_active,
-            &mut alt_active,
-            &mut selection,
-            &mut selection_screen,
-            &mut selection_vt_seq,
-        ));
+        // Ordering B (`ScrollRight` -> continuous `ScrollDown` stream on row 0):
+        // trailing vertical packets stay suppressed even after 180ms until a quiet gap
+        for ms in [90_u64, 150, 200, 250] {
+            assert!(!handle_top_bar_or_space_vertical_wheel(
+                false,
+                t_vert + Duration::from_millis(ms),
+                &mut horiz_wheel,
+                &core,
+                &mut world,
+                &modal,
+                &mut prefix_active,
+                &mut ctrl_active,
+                &mut alt_active,
+                &mut selection,
+                &mut selection_screen,
+                &mut selection_vt_seq,
+            ));
+        }
         assert_eq!(world.active_tab_index(), 0);
 
-        // Ordering A (`ScrollDown` -> `ScrollRight` on row 0): vertical switches Tab 0 -> Tab 1, trailing horizontal is suppressed!
-        let t_order_a = t_vert + Duration::from_millis(400);
+        // Ordering A (`ScrollDown` -> continuous `ScrollRight` stream on row 0):
+        // vertical switches Tab 0 -> Tab 1, and rejected horizontal burst stays coalesced past 180ms
+        let t_order_a = t_vert + Duration::from_millis(500);
         assert!(handle_top_bar_or_space_vertical_wheel(
             false,
             t_order_a,
@@ -3705,16 +3759,34 @@ mod tests {
             &mut selection_vt_seq,
         ));
         assert_eq!(world.active_tab_index(), 1);
-        assert!(!handle_horizontal_wheel_event(
-            HorizontalSwipeDir::Next,
-            0,
-            term_rect,
-            t_order_a + Duration::from_millis(20),
+        for ms in [40_u64, 100, 150, 200, 250] {
+            assert!(!handle_horizontal_wheel_event(
+                HorizontalSwipeDir::Next,
+                0,
+                term_rect,
+                t_order_a + Duration::from_millis(ms),
+                &mut horiz_wheel,
+                &core,
+                &mut world,
+                &modal,
+                false,
+                &mut prefix_active,
+                &mut ctrl_active,
+                &mut alt_active,
+                &mut selection,
+                &mut selection_screen,
+                &mut selection_vt_seq,
+            ));
+        }
+        assert_eq!(world.active_tab_index(), 1);
+        // Rejected horizontal bleed does NOT block subsequent intentional vertical top-bar scrolling
+        assert!(handle_top_bar_or_space_vertical_wheel(
+            true,
+            t_order_a + Duration::from_millis(270),
             &mut horiz_wheel,
             &core,
             &mut world,
             &modal,
-            false,
             &mut prefix_active,
             &mut ctrl_active,
             &mut alt_active,
@@ -3722,12 +3794,36 @@ mod tests {
             &mut selection_screen,
             &mut selection_vt_seq,
         ));
-        assert_eq!(world.active_tab_index(), 1);
+        assert_eq!(world.active_tab_index(), 0);
+
+        // Viewport vertical scroll followed by continuous `ScrollRight` stream past 180ms stays suppressed
+        let t_vp_bleed = t_order_a + Duration::from_secs(1);
+        horiz_wheel.record_viewport_vertical_wheel(t_vp_bleed);
+        for ms in [40_u64, 100, 150, 200, 250] {
+            assert!(!handle_horizontal_wheel_event(
+                HorizontalSwipeDir::Next,
+                10,
+                term_rect,
+                t_vp_bleed + Duration::from_millis(ms),
+                &mut horiz_wheel,
+                &core,
+                &mut world,
+                &modal,
+                false,
+                &mut prefix_active,
+                &mut ctrl_active,
+                &mut alt_active,
+                &mut selection,
+                &mut selection_screen,
+                &mut selection_vt_seq,
+            ));
+        }
+        assert_eq!(world.active_tab_index(), 0);
 
         // Typing immediately after a horizontal tab switch does NOT reset momentum suppression
-        let t_type = t_order_a + Duration::from_secs(1);
+        let t_type = t_vp_bleed + Duration::from_secs(1);
         assert!(handle_horizontal_wheel_event(
-            HorizontalSwipeDir::Prev,
+            HorizontalSwipeDir::Next,
             10,
             term_rect,
             t_type,
@@ -3743,7 +3839,7 @@ mod tests {
             &mut selection_screen,
             &mut selection_vt_seq,
         ));
-        assert_eq!(world.active_tab_index(), 0);
+        assert_eq!(world.active_tab_index(), 1);
         let mut sidebar_open = false;
         let mut scrollback_offset = 0;
         handle_key_event(
@@ -3762,7 +3858,7 @@ mod tests {
         )
         .unwrap();
         assert!(!handle_horizontal_wheel_event(
-            HorizontalSwipeDir::Prev,
+            HorizontalSwipeDir::Next,
             10,
             term_rect,
             t_type + Duration::from_millis(40),
@@ -3778,14 +3874,14 @@ mod tests {
             &mut selection_screen,
             &mut selection_vt_seq,
         ));
-        assert_eq!(world.active_tab_index(), 0);
+        assert_eq!(world.active_tab_index(), 1);
 
         // Interleaved viewport vertical wheel during a horizontal momentum stream keeps
         // extending horizontal burst coalescing past VERT_WHEEL_BLEED_GUARD (180ms)
         horiz_wheel.record_viewport_vertical_wheel(t_type + Duration::from_millis(50));
         for ms in [90_u64, 150, 220, 260] {
             assert!(!handle_horizontal_wheel_event(
-                HorizontalSwipeDir::Prev,
+                HorizontalSwipeDir::Next,
                 10,
                 term_rect,
                 t_type + Duration::from_millis(ms),
@@ -3802,7 +3898,7 @@ mod tests {
                 &mut selection_vt_seq,
             ));
         }
-        assert_eq!(world.active_tab_index(), 0);
+        assert_eq!(world.active_tab_index(), 1);
 
         // 6. Active text selection drag, floating D-pad drag, or blocking modals (Help) block tab switches
         let t_guards = t_type + Duration::from_secs(2);
@@ -3828,7 +3924,7 @@ mod tests {
             HorizontalSwipeDir::Next,
             10,
             term_rect,
-            t_guards,
+            t_guards + Duration::from_secs(1),
             &mut horiz_wheel,
             &core,
             &mut world,
@@ -3846,7 +3942,7 @@ mod tests {
             HorizontalSwipeDir::Next,
             10,
             term_rect,
-            t_guards,
+            t_guards + Duration::from_secs(2),
             &mut horiz_wheel,
             &core,
             &mut world,
@@ -3859,7 +3955,26 @@ mod tests {
             &mut selection_screen,
             &mut selection_vt_seq,
         ));
-        assert_eq!(world.active_tab_index(), 0);
+        // Trailing inertia immediately after closing Modal::Help stays suppressed
+        modal = Modal::None;
+        assert!(!handle_horizontal_wheel_event(
+            HorizontalSwipeDir::Next,
+            10,
+            term_rect,
+            t_guards + Duration::from_secs(2) + Duration::from_millis(40),
+            &mut horiz_wheel,
+            &core,
+            &mut world,
+            &modal,
+            false,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut selection,
+            &mut selection_screen,
+            &mut selection_vt_seq,
+        ));
+        assert_eq!(world.active_tab_index(), 1);
 
         // 7. In Modal::SpaceMenu, horizontal wheel switches Spaces cleanly
         modal = Modal::SpaceMenu;
@@ -3868,7 +3983,7 @@ mod tests {
             HorizontalSwipeDir::Next,
             10,
             term_rect,
-            t_guards + Duration::from_secs(1),
+            t_guards + Duration::from_secs(4),
             &mut horiz_wheel,
             &core,
             &mut world,
