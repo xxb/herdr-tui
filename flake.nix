@@ -23,15 +23,26 @@
         system:
         let
           pkgs = pkgsFor system;
+          cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+          gitRev =
+            if self ? shortRev then
+              self.shortRev
+            else if self ? dirtyShortRev then
+              self.dirtyShortRev
+            else
+              "";
           herdr-tui = pkgs.rustPlatform.buildRustPackage {
-            pname = "herdr-tui";
-            version = "0.1.0";
+            pname = cargoToml.package.name;
+            version = cargoToml.package.version;
             src = ./.;
             cargoLock = {
               lockFile = ./Cargo.lock;
             };
+            env = lib.optionalAttrs (gitRev != "") {
+              HCT_GIT_SHA = gitRev;
+            };
             meta = with lib; {
-              description = "Lightweight multi-tab TUI client for herdr-core (hc) with bidirectional Space/Tab sync";
+              inherit (cargoToml.package) description;
               license = licenses.asl20;
               mainProgram = "hct";
             };

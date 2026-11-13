@@ -3,7 +3,11 @@ mod keys;
 mod model;
 mod ui;
 mod usage;
+#[cfg(test)]
+mod version;
 mod wire;
+
+pub(crate) const BUILD_VERSION: &str = env!("HCT_BUILD_VERSION");
 
 use crate::core::{CoreClient, CoreMessage};
 use crate::keys::{
@@ -84,7 +88,7 @@ impl Drop for TerminalCleanupGuard {
 #[derive(Parser, Debug)]
 #[command(
     name = "hct",
-    version,
+    version = BUILD_VERSION,
     about = "herdr-tui (hct) — Multi-tab TUI client for herdr-core (hc) with bidirectional Space/Tab sync"
 )]
 struct Cli {
@@ -2832,5 +2836,13 @@ mod tests {
         // Verify stripping DCS wrappers reconstructs the exact OSC 52 payload
         let unwrapped = screen.replace("\x1bP", "").replace("\x1b\\", "");
         assert_eq!(unwrapped, format!("\x1b]52;c;{long_b64}\x07"));
+    }
+
+    #[test]
+    fn cli_version_flag_embeds_build_version() {
+        use clap::CommandFactory;
+        let rendered = Cli::command().render_version();
+        assert_eq!(rendered, format!("hct {BUILD_VERSION}\n"));
+        assert!(BUILD_VERSION.starts_with(env!("CARGO_PKG_VERSION")));
     }
 }
