@@ -1,6 +1,6 @@
 [package]
 name = "herdr-tui"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Lightweight multi-tab TUI client for herdr-core (hc) with bidirectional Space/Tab sync"
