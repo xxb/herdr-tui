@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/xxb/herdr-tui/compare/v0.3.0...v0.3.1) (2026-11-15)
+
+
+### Bug Fixes
+
+* **vt:** emulate CBT, DECAWM (?7l/?7h), deferred-wrap cursor ops, and Mode 2027 widths ([#46](https://github.com/xxb/herdr-tui/issues/46)) ([9ad4545](https://github.com/xxb/herdr-tui/commit/9ad4545ba9b978a78661d7d6a560a539522464d2))
+
 ## [0.3.0](https://github.com/xxb/herdr-tui/compare/v0.2.0...v0.3.0) (2026-11-13)
 
 
