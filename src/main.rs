@@ -238,13 +238,67 @@ fn format_nested_session_error(nested: &NestedMultiplexer) -> String {
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlStringKind {
+    Osc,
+    StOnly,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GraphemeState {
+    cluster_cols: u8,
+    prev_emoji_symbol: bool,
+    ascii_keycap_base: bool,
+    after_zwj: bool,
+    suppress_zero_width: bool,
+}
+
+impl GraphemeState {
+    fn from_char(ch: char) -> Self {
+        if ch.is_ascii() {
+            if is_ascii_keycap_base(ch as u8) {
+                Self {
+                    cluster_cols: 1,
+                    ascii_keycap_base: true,
+                    ..Self::default()
+                }
+            } else {
+                Self::default()
+            }
+        } else {
+            match UnicodeWidthChar::width(ch) {
+                Some(2) => Self {
+                    cluster_cols: 2,
+                    prev_emoji_symbol: true,
+                    ..Self::default()
+                },
+                Some(1) => Self {
+                    cluster_cols: 1,
+                    prev_emoji_symbol: is_emoji_symbol_width1(ch),
+                    ..Self::default()
+                },
+                _ => Self::default(),
+            }
+        }
+    }
+}
+
 struct AttachedTerminal {
     channel: u32,
     parser: vt100::Parser,
     cols: u16,
     rows: u16,
     utf8_tail: Vec<u8>,
-    prev_width1_symbol: bool,
+    sanitize_ctrl_str: Option<ControlStringKind>,
+    feed_ctrl_str: Option<ControlStringKind>,
+    grapheme: GraphemeState,
+    autowrap: bool,
+    saved_autowrap: bool,
+    alt_saved_autowrap: bool,
+    dropped_wide_at_margin: bool,
+    last_printed_char: Option<char>,
+    scroll_top: u16,
+    main_scroll_top: u16,
     vt_seq: u64,
 }
 
@@ -260,30 +314,546 @@ impl AttachedTerminal {
             cols,
             rows,
             utf8_tail: Vec::new(),
-            prev_width1_symbol: false,
+            sanitize_ctrl_str: None,
+            feed_ctrl_str: None,
+            grapheme: GraphemeState::default(),
+            autowrap: true,
+            saved_autowrap: true,
+            alt_saved_autowrap: true,
+            dropped_wide_at_margin: false,
+            last_printed_char: None,
+            scroll_top: 0,
+            main_scroll_top: 0,
             vt_seq: 0,
         }
     }
 
+    fn resize(&mut self, cols: u16, rows: u16) {
+        self.cols = cols;
+        self.rows = rows;
+        self.scroll_top = 0;
+        self.main_scroll_top = 0;
+        self.dropped_wide_at_margin = false;
+        self.parser.set_size(non_zero_u16(rows), non_zero_u16(cols));
+    }
+
     fn process_vt_bytes(&mut self, payload: &[u8]) {
-        let clean = sanitize_vt_stream(payload, &mut self.utf8_tail, &mut self.prev_width1_symbol);
+        let clean = sanitize_vt_stream(
+            payload,
+            &mut self.utf8_tail,
+            &mut self.sanitize_ctrl_str,
+            &mut self.grapheme,
+        );
         if clean.is_empty() {
             return;
         }
-        const DECSTR: &[u8] = b"\x1b[!p";
-        let mut rest: &[u8] = &clean;
-        while let Some(idx) = rest.windows(DECSTR.len()).position(|w| w == DECSTR) {
-            if idx > 0 {
-                self.parser.process(&rest[..idx]);
-            }
-            apply_decstr(&mut self.parser);
-            rest = &rest[idx + DECSTR.len()..];
-        }
-        if !rest.is_empty() {
-            self.parser.process(rest);
-        }
+        self.feed_sanitized_bytes(&clean);
         self.vt_seq = self.vt_seq.wrapping_add(1);
     }
+
+    fn clamp_pending_wrap(&mut self) {
+        let cols = self.parser.screen().size().1.get().max(1);
+        let (_, col) = self.parser.screen().cursor_position();
+        if col >= cols {
+            let seq = format!("\x1b[{cols}G");
+            self.parser.process(seq.as_bytes());
+        }
+    }
+
+    fn feed_char_no_autowrap(&mut self, ch: char, utf8_bytes: &[u8]) {
+        let Some(cw) = UnicodeWidthChar::width(ch).or_else(|| ((ch as u32) >= 256).then_some(1))
+        else {
+            return;
+        };
+        let w = (cw as u16).min(2);
+        let cols = self.parser.screen().size().1.get().max(1);
+        let (_, col) = self.parser.screen().cursor_position();
+
+        if w == 0 {
+            // Keep `vt100` at `pos.col == cols` lazily after printing in the rightmost column so
+            // zero-width combining marks attach natively to the last printed base cell (`cols - 1`,
+            // or `cols - 2` for wide glyphs). Suppress marks only after an overflowing wide glyph
+            // at the right margin could not be drawn.
+            if !self.dropped_wide_at_margin && col > 0 {
+                self.parser.process(utf8_bytes);
+            }
+            return;
+        }
+
+        self.last_printed_char = Some(ch);
+        if w == 1 {
+            if col >= cols {
+                self.clamp_pending_wrap();
+            }
+            self.parser.process(utf8_bytes);
+            self.dropped_wide_at_margin = false;
+        } else if cols >= 2 {
+            if col.saturating_add(2) <= cols {
+                self.parser.process(utf8_bytes);
+                self.dropped_wide_at_margin = false;
+            } else {
+                // Wide character cannot fit in the single remaining column (`cols - 1`) while
+                // DECAWM (`?7l`) forbids auto-wrapping onto the next row.
+                self.clamp_pending_wrap();
+                self.dropped_wide_at_margin = true;
+            }
+        } else {
+            self.dropped_wide_at_margin = true;
+        }
+    }
+
+    fn feed_sanitized_bytes(&mut self, clean: &[u8]) {
+        let mut plain_start = 0usize;
+        let mut i = 0usize;
+
+        while i < clean.len() {
+            if let Some(kind) = self.feed_ctrl_str {
+                let b = clean[i];
+                if (kind == ControlStringKind::Osc && b == 0x07) || b == 0x18 || b == 0x1a {
+                    self.feed_ctrl_str = None;
+                    i += 1;
+                    continue;
+                }
+                if b == 0x1b {
+                    self.feed_ctrl_str = None;
+                    if i + 1 < clean.len() && clean[i + 1] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    // Unclosed control string interrupted by a new ESC introducer; fall through.
+                } else {
+                    i += 1;
+                    continue;
+                }
+            }
+
+            let b = clean[i];
+            if b == 0x1b {
+                if i + 1 >= clean.len() {
+                    break;
+                }
+                let next = clean[i + 1];
+                if next == b']' {
+                    self.feed_ctrl_str = Some(ControlStringKind::Osc);
+                    i += 2;
+                    continue;
+                }
+                if matches!(next, b'P' | b'X' | b'^' | b'_') {
+                    self.feed_ctrl_str = Some(ControlStringKind::StOnly);
+                    i += 2;
+                    continue;
+                }
+                if next == b'[' {
+                    let param_start = i + 2;
+                    let mut p = param_start;
+                    while p < clean.len() && (0x30..=0x3F).contains(&clean[p]) {
+                        p += 1;
+                    }
+                    let param_end = p;
+                    while p < clean.len() && (0x20..=0x2F).contains(&clean[p]) {
+                        p += 1;
+                    }
+                    let inter_end = p;
+                    if p < clean.len() && (0x40..=0x7E).contains(&clean[p]) {
+                        let params = &clean[param_start..param_end];
+                        let intermediates = &clean[param_end..inter_end];
+                        let final_byte = clean[p];
+
+                        // DECSTR (`CSI ! p` — Soft Terminal Reset)
+                        if params.is_empty() && intermediates == b"!" && final_byte == b'p' {
+                            if plain_start < i {
+                                self.parser.process(&clean[plain_start..i]);
+                            }
+                            apply_decstr(&mut self.parser);
+                            self.autowrap = true;
+                            self.saved_autowrap = true;
+                            self.dropped_wide_at_margin = false;
+                            self.scroll_top = 0;
+                            i = p + 1;
+                            plain_start = i;
+                            continue;
+                        }
+
+                        if intermediates.is_empty() {
+                            if params.starts_with(b"?")
+                                && (final_byte == b'h' || final_byte == b'l')
+                            {
+                                let set = final_byte == b'h';
+                                let touches_state = params[1..].split(|&c| c == b';').any(|seg| {
+                                    matches!(seg, b"6" | b"7" | b"47" | b"1047" | b"1048" | b"1049")
+                                });
+                                if touches_state {
+                                    if plain_start < i {
+                                        self.parser.process(&clean[plain_start..i]);
+                                    }
+                                    let was_alt = self.parser.screen().alternate_screen();
+                                    for seg in params[1..].split(|&c| c == b';') {
+                                        match seg {
+                                            b"7" => {
+                                                self.clamp_pending_wrap();
+                                                self.autowrap = set;
+                                                self.dropped_wide_at_margin = false;
+                                            }
+                                            b"6" => {
+                                                self.dropped_wide_at_margin = false;
+                                            }
+                                            b"1048" => {
+                                                if set {
+                                                    if !self.autowrap {
+                                                        self.clamp_pending_wrap();
+                                                    }
+                                                    self.saved_autowrap = self.autowrap;
+                                                } else {
+                                                    self.autowrap = self.saved_autowrap;
+                                                }
+                                                self.dropped_wide_at_margin = false;
+                                            }
+                                            b"47" | b"1047" => {
+                                                if set && !was_alt {
+                                                    self.main_scroll_top = self.scroll_top;
+                                                    self.scroll_top = 0;
+                                                } else if !set && was_alt {
+                                                    self.scroll_top = self.main_scroll_top;
+                                                }
+                                                self.dropped_wide_at_margin = false;
+                                            }
+                                            b"1049" => {
+                                                if set && !was_alt {
+                                                    if !self.autowrap {
+                                                        self.clamp_pending_wrap();
+                                                    }
+                                                    self.alt_saved_autowrap = self.autowrap;
+                                                    self.main_scroll_top = self.scroll_top;
+                                                    self.scroll_top = 0;
+                                                } else if !set && was_alt {
+                                                    self.autowrap = self.alt_saved_autowrap;
+                                                    self.scroll_top = self.main_scroll_top;
+                                                }
+                                                self.dropped_wide_at_margin = false;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    self.parser.process(&clean[i..=p]);
+                                    i = p + 1;
+                                    plain_start = i;
+                                    continue;
+                                }
+                            } else if !self.autowrap
+                                && params.starts_with(b"?")
+                                && matches!(final_byte, b'J' | b'K')
+                            {
+                                if plain_start < i {
+                                    self.parser.process(&clean[plain_start..i]);
+                                }
+                                self.dropped_wide_at_margin = false;
+                                self.clamp_pending_wrap();
+                                self.parser.process(&clean[i..=p]);
+                                i = p + 1;
+                                plain_start = i;
+                                continue;
+                            } else if params.iter().all(|&c| c.is_ascii_digit() || c == b';') {
+                                match final_byte {
+                                    // CBT (`CSI Ps Z` — Cursor Backward Tabulation)
+                                    b'Z' => {
+                                        if plain_start < i {
+                                            self.parser.process(&clean[plain_start..i]);
+                                        }
+                                        self.dropped_wide_at_margin = false;
+                                        let count =
+                                            parse_csi_param_default(params, 0, 1).clamp(1, 512);
+                                        let cols = self.parser.screen().size().1.get().max(1);
+                                        let (_, col) = self.parser.screen().cursor_position();
+                                        let mut target = col.min(cols - 1);
+                                        for _ in 0..count {
+                                            target =
+                                                if target == 0 { 0 } else { (target - 1) & !7 };
+                                        }
+                                        let seq = format!("\x1b[{}G", target + 1);
+                                        self.parser.process(seq.as_bytes());
+                                        i = p + 1;
+                                        plain_start = i;
+                                        continue;
+                                    }
+                                    // CUB (`CSI Ps D` — Cursor Backward): clamp deferred-wrap first
+                                    b'D' => {
+                                        if plain_start < i {
+                                            self.parser.process(&clean[plain_start..i]);
+                                        }
+                                        self.dropped_wide_at_margin = false;
+                                        let cols = self.parser.screen().size().1.get().max(1);
+                                        let (_, col) = self.parser.screen().cursor_position();
+                                        if col >= cols {
+                                            let count = parse_csi_param_default(params, 0, 1)
+                                                .min(cols as usize)
+                                                as u16;
+                                            let target = (cols - 1).saturating_sub(count);
+                                            let seq = format!("\x1b[{}G", target + 1);
+                                            self.parser.process(seq.as_bytes());
+                                        } else {
+                                            self.parser.process(&clean[i..=p]);
+                                        }
+                                        i = p + 1;
+                                        plain_start = i;
+                                        continue;
+                                    }
+                                    // Vertical cursor motions clear pending_wrap in xterm/Ghostty
+                                    b'A' | b'B' | b'd' => {
+                                        if plain_start < i {
+                                            self.parser.process(&clean[plain_start..i]);
+                                        }
+                                        self.dropped_wide_at_margin = false;
+                                        self.clamp_pending_wrap();
+                                        self.parser.process(&clean[i..=p]);
+                                        i = p + 1;
+                                        plain_start = i;
+                                        continue;
+                                    }
+                                    // REP (`CSI Ps b` — Repeat Preceding Graphic Character)
+                                    b'b' if !self.autowrap => {
+                                        if plain_start < i {
+                                            self.parser.process(&clean[plain_start..i]);
+                                        }
+                                        let count =
+                                            parse_csi_param_default(params, 0, 1).clamp(1, 4096);
+                                        if let Some(ch) = self.last_printed_char {
+                                            let mut utf8 = [0u8; 4];
+                                            let encoded = ch.encode_utf8(&mut utf8);
+                                            for _ in 0..count {
+                                                self.feed_char_no_autowrap(ch, encoded.as_bytes());
+                                            }
+                                        }
+                                        i = p + 1;
+                                        plain_start = i;
+                                        continue;
+                                    }
+                                    // DECSTBM (`CSI top ; bot r` — Set Top and Bottom Margins)
+                                    b'r' => {
+                                        if plain_start < i {
+                                            self.parser.process(&clean[plain_start..i]);
+                                        }
+                                        self.dropped_wide_at_margin = false;
+                                        let rows = self.parser.screen().size().0.get().max(1);
+                                        let top = (parse_csi_param_default(params, 0, 1) as u16)
+                                            .max(1)
+                                            - 1;
+                                        let bot =
+                                            (parse_csi_param_default(params, 1, rows as usize)
+                                                as u16)
+                                                .max(1)
+                                                .saturating_sub(1)
+                                                .min(rows - 1);
+                                        self.scroll_top = if top < bot { top } else { 0 };
+                                        self.parser.process(&clean[i..=p]);
+                                        i = p + 1;
+                                        plain_start = i;
+                                        continue;
+                                    }
+                                    b'C' | b'G' | b'H' | b'J' | b'K' | b'L' | b'M' | b'P'
+                                    | b'S' | b'T' | b'X' | b'@' => {
+                                        if !self.autowrap
+                                            && matches!(
+                                                final_byte,
+                                                b'J' | b'K' | b'X' | b'@' | b'P'
+                                            )
+                                        {
+                                            if plain_start < i {
+                                                self.parser.process(&clean[plain_start..i]);
+                                            }
+                                            self.dropped_wide_at_margin = false;
+                                            self.clamp_pending_wrap();
+                                            self.parser.process(&clean[i..=p]);
+                                            i = p + 1;
+                                            plain_start = i;
+                                            continue;
+                                        }
+                                        self.dropped_wide_at_margin = false;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        i = p + 1;
+                        continue;
+                    }
+                    // Malformed/aborted CSI sequence without valid final byte
+                    i = p;
+                    continue;
+                }
+
+                // Standard 2-byte or intermediate ESC sequence (`ESC <0x20..=0x2F>* <0x30..=0x7E>`)
+                let mut e = i + 1;
+                while e < clean.len() && (0x20..=0x2F).contains(&clean[e]) {
+                    e += 1;
+                }
+                if e < clean.len() && (0x30..=0x7E).contains(&clean[e]) {
+                    if e == i + 1 {
+                        match clean[e] {
+                            b'7' => {
+                                if plain_start < i {
+                                    self.parser.process(&clean[plain_start..i]);
+                                }
+                                if !self.autowrap {
+                                    self.clamp_pending_wrap();
+                                }
+                                self.saved_autowrap = self.autowrap;
+                                self.dropped_wide_at_margin = false;
+                                self.parser.process(b"\x1b7");
+                                i = e + 1;
+                                plain_start = i;
+                                continue;
+                            }
+                            b'8' => {
+                                if plain_start < i {
+                                    self.parser.process(&clean[plain_start..i]);
+                                }
+                                self.autowrap = self.saved_autowrap;
+                                self.dropped_wide_at_margin = false;
+                                self.parser.process(b"\x1b8");
+                                i = e + 1;
+                                plain_start = i;
+                                continue;
+                            }
+                            b'c' => {
+                                if plain_start < i {
+                                    self.parser.process(&clean[plain_start..i]);
+                                }
+                                self.autowrap = true;
+                                self.saved_autowrap = true;
+                                self.alt_saved_autowrap = true;
+                                self.dropped_wide_at_margin = false;
+                                self.last_printed_char = None;
+                                self.scroll_top = 0;
+                                self.main_scroll_top = 0;
+                                self.parser.process(b"\x1bc");
+                                i = e + 1;
+                                plain_start = i;
+                                continue;
+                            }
+                            b'M' => {
+                                if plain_start < i {
+                                    self.parser.process(&clean[plain_start..i]);
+                                }
+                                self.dropped_wide_at_margin = false;
+                                self.clamp_pending_wrap();
+                                let (row, _) = self.parser.screen().cursor_position();
+                                // Guard against vt100-0.18.1 `row_dec_scroll` scrolling
+                                // `[scroll_top..=scroll_bottom]` when cursor is at row 0 above `scroll_top`.
+                                if !(row == 0 && self.scroll_top > 0) {
+                                    self.parser.process(b"\x1bM");
+                                }
+                                i = e + 1;
+                                plain_start = i;
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+                    i = e + 1;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+
+            // C0 control characters
+            if b < 0x20 || b == 0x7f {
+                match b {
+                    0x08 => {
+                        if plain_start < i {
+                            self.parser.process(&clean[plain_start..i]);
+                        }
+                        self.dropped_wide_at_margin = false;
+                        let cols = self.parser.screen().size().1.get().max(1);
+                        let (_, col) = self.parser.screen().cursor_position();
+                        if col >= cols {
+                            let target = (cols - 1).saturating_sub(1);
+                            let seq = format!("\x1b[{}G", target + 1);
+                            self.parser.process(seq.as_bytes());
+                        } else {
+                            self.parser.process(b"\x08");
+                        }
+                        i += 1;
+                        plain_start = i;
+                        continue;
+                    }
+                    0x0a..=0x0c => {
+                        self.dropped_wide_at_margin = false;
+                        if i > plain_start && clean[i - 1] == b'\r' {
+                            i += 1;
+                            continue;
+                        }
+                        if plain_start < i {
+                            self.parser.process(&clean[plain_start..i]);
+                        }
+                        self.clamp_pending_wrap();
+                        self.parser.process(&clean[i..=i]);
+                        i += 1;
+                        plain_start = i;
+                        continue;
+                    }
+                    0x09 | 0x0d => {
+                        self.dropped_wide_at_margin = false;
+                    }
+                    _ => {}
+                }
+                i += 1;
+                continue;
+            }
+
+            // Printable ASCII or UTF-8 character
+            if !self.autowrap {
+                if plain_start < i {
+                    self.parser.process(&clean[plain_start..i]);
+                }
+                if b.is_ascii() {
+                    self.feed_char_no_autowrap(b as char, &clean[i..=i]);
+                    i += 1;
+                } else if let Some((ch, ch_len)) = next_utf8_char(&clean[i..]) {
+                    self.feed_char_no_autowrap(ch, &clean[i..i + ch_len]);
+                    i += ch_len;
+                } else {
+                    i += 1;
+                }
+                plain_start = i;
+                continue;
+            }
+
+            if b.is_ascii() {
+                self.last_printed_char = Some(b as char);
+                self.dropped_wide_at_margin = false;
+                i += 1;
+            } else if let Some((ch, ch_len)) = next_utf8_char(&clean[i..]) {
+                if UnicodeWidthChar::width(ch).unwrap_or(1) > 0 {
+                    self.last_printed_char = Some(ch);
+                    self.dropped_wide_at_margin = false;
+                }
+                i += ch_len;
+            } else {
+                i += 1;
+            }
+        }
+
+        if plain_start < clean.len() {
+            self.parser.process(&clean[plain_start..]);
+        }
+    }
+}
+
+fn parse_csi_param_default(params: &[u8], index: usize, default: usize) -> usize {
+    std::str::from_utf8(params)
+        .ok()
+        .and_then(|s| s.split(';').nth(index))
+        .and_then(|s| {
+            if s.is_empty() {
+                Some(default)
+            } else {
+                s.parse::<usize>()
+                    .ok()
+                    .map(|v| if v == 0 { default } else { v })
+            }
+        })
+        .unwrap_or(default)
 }
 
 /// Emulate DECSTR (`CSI ! p` — Soft Terminal Reset), which `herdr-core` emits on attach replay
@@ -291,9 +861,15 @@ impl AttachedTerminal {
 /// scroll margins (`DECSTBM`), cursor visibility, and saved-cursor state (`DECSC`) while
 /// preserving the active physical cursor position (unlike `CSI r` / `CSI ?6l` alone, which home).
 fn apply_decstr(parser: &mut vt100::Parser) {
+    let (_, scr_cols) = parser.screen().size();
     let (row, col) = parser.screen().cursor_position();
+    let clamped_col = col.min(scr_cols.get().saturating_sub(1));
     parser.process(b"\x1b[0m\x1b[?1l\x1b[?6l\x1b[r\x1b[?25h\x1b>\x1b7");
-    let restore = format!("\x1b[{};{}H", row.saturating_add(1), col.saturating_add(1));
+    let restore = format!(
+        "\x1b[{};{}H",
+        row.saturating_add(1),
+        clamped_col.saturating_add(1)
+    );
     parser.process(restore.as_bytes());
 }
 
@@ -312,17 +888,26 @@ fn trailing_incomplete_vt_or_utf8_len(buf: &[u8]) -> usize {
     if buf.is_empty() {
         return 0;
     }
-    if buf[buf.len() - 1] == 0x1b {
-        return 1;
-    }
-    let max_csi_back = buf.len().min(128);
-    for back in 2..=max_csi_back {
-        let idx = buf.len() - back;
-        if buf[idx] == 0x1b && buf[idx + 1] == b'[' {
-            if buf[idx + 2..].iter().all(|&b| (0x20..=0x3F).contains(&b)) {
-                return back;
+    let search_start = buf.len().saturating_sub(512);
+    if let Some(rel) = buf[search_start..].iter().rposition(|&b| b == 0x1b) {
+        let esc_idx = search_start + rel;
+        let tail = &buf[esc_idx + 1..];
+        if tail.is_empty() {
+            return 1;
+        }
+        if tail[0] == b'[' {
+            let mut p = 1;
+            while p < tail.len() && (0x30..=0x3F).contains(&tail[p]) {
+                p += 1;
             }
-            break;
+            while p < tail.len() && (0x20..=0x2F).contains(&tail[p]) {
+                p += 1;
+            }
+            if p == tail.len() {
+                return buf.len() - esc_idx;
+            }
+        } else if tail.len() <= 16 && tail.iter().all(|&b| (0x20..=0x2F).contains(&b)) {
+            return buf.len() - esc_idx;
         }
     }
     let max_back = buf.len().min(3);
@@ -359,14 +944,34 @@ fn next_utf8_char(slice: &[u8]) -> Option<(char, usize)> {
     }
 }
 
-fn is_width1_non_ascii(ch: char) -> bool {
-    !ch.is_ascii() && UnicodeWidthChar::width(ch) == Some(1)
+fn is_ascii_keycap_base(b: u8) -> bool {
+    matches!(b, b'0'..=b'9' | b'#' | b'*')
+}
+
+fn is_emoji_symbol_width1(ch: char) -> bool {
+    !ch.is_ascii()
+        && ch >= '\u{2000}'
+        && !matches!(ch, '\u{1F1E6}'..='\u{1F1FF}')
+        && UnicodeWidthChar::width(ch) == Some(1)
+}
+
+fn is_skin_tone_modifier(ch: char) -> bool {
+    matches!(ch, '\u{1F3FB}'..='\u{1F3FF}')
+}
+
+fn has_special_grapheme_bytes(slice: &[u8]) -> bool {
+    slice.windows(3).any(|w| {
+        w == b"\xef\xb8\x8f" // U+FE0F (VS16)
+            || w == b"\xe2\x80\x8d" // U+200D (ZWJ)
+            || w == b"\xf0\x9f\x8f" // U+1F3FB..=U+1F3FF lead bytes
+    })
 }
 
 fn sanitize_vt_stream<'a>(
     payload: &'a [u8],
     utf8_tail: &mut Vec<u8>,
-    prev_width1_symbol: &mut bool,
+    ctrl_str: &mut Option<ControlStringKind>,
+    grapheme: &mut GraphemeState,
 ) -> Cow<'a, [u8]> {
     let combined: Cow<'a, [u8]> = if utf8_tail.is_empty() {
         Cow::Borrowed(payload)
@@ -389,156 +994,263 @@ fn sanitize_vt_stream<'a>(
     }
 
     let has_esc = slice.contains(&0x1b);
-    let has_fe0f = slice.windows(3).any(|w| w == b"\xef\xb8\x8f");
-
-    if !has_esc && !has_fe0f {
-        *prev_width1_symbol = last_utf8_char(slice).is_some_and(is_width1_non_ascii);
-        return match combined {
-            Cow::Borrowed(b) => Cow::Borrowed(&b[..valid_len]),
-            Cow::Owned(mut v) => {
-                v.truncate(valid_len);
-                Cow::Owned(v)
-            }
-        };
+    if ctrl_str.is_none()
+        && !grapheme.after_zwj
+        && !grapheme.suppress_zero_width
+        && !has_esc
+        && !has_special_grapheme_bytes(slice)
+    {
+        let last_ch = last_utf8_char(slice);
+        if last_ch.and_then(UnicodeWidthChar::width) != Some(0) {
+            *grapheme = last_ch.map_or_else(GraphemeState::default, GraphemeState::from_char);
+            return match combined {
+                Cow::Borrowed(b) => Cow::Borrowed(&b[..valid_len]),
+                Cow::Owned(mut v) => {
+                    v.truncate(valid_len);
+                    Cow::Owned(v)
+                }
+            };
+        }
     }
 
     let mut out = Vec::with_capacity(slice.len());
     let mut i = 0;
     while i < slice.len() {
-        if has_esc && slice[i] == 0x1b && i + 1 < slice.len() && slice[i + 1] == b'[' {
-            let param_start = i + 2;
-            let mut p = param_start;
-            while p < slice.len() && (0x30..=0x3F).contains(&slice[p]) {
-                p += 1;
+        if let Some(kind) = *ctrl_str {
+            let b = slice[i];
+            if (kind == ControlStringKind::Osc && b == 0x07) || b == 0x18 || b == 0x1a {
+                out.push(b);
+                *ctrl_str = None;
+                i += 1;
+                continue;
             }
-            let param_end = p;
-            while p < slice.len() && (0x20..=0x2F).contains(&slice[p]) {
-                p += 1;
+            if b == 0x1b {
+                *ctrl_str = None;
+                if i + 1 < slice.len() && slice[i + 1] == b'\\' {
+                    out.extend_from_slice(b"\x1b\\");
+                    i += 2;
+                    continue;
+                }
+            } else {
+                out.push(b);
+                i += 1;
+                continue;
             }
-            let inter_end = p;
-            if p < slice.len() && (0x40..=0x7E).contains(&slice[p]) {
-                let params = &slice[param_start..param_end];
-                let intermediates = &slice[param_end..inter_end];
-                let final_byte = slice[p];
-                *prev_width1_symbol = false;
-                if intermediates.is_empty() {
-                    if params == b"?9001" && (final_byte == b'h' || final_byte == b'l') {
-                        i = p + 1;
-                        continue;
+        }
+
+        if has_esc && slice[i] == 0x1b && i + 1 < slice.len() {
+            *grapheme = GraphemeState::default();
+            let next = slice[i + 1];
+            if next == b']' {
+                *ctrl_str = Some(ControlStringKind::Osc);
+                out.extend_from_slice(b"\x1b]");
+                i += 2;
+                continue;
+            }
+            if matches!(next, b'P' | b'X' | b'^' | b'_') {
+                *ctrl_str = Some(ControlStringKind::StOnly);
+                out.extend_from_slice(&slice[i..i + 2]);
+                i += 2;
+                continue;
+            }
+            if next == b'[' {
+                let param_start = i + 2;
+                let mut p = param_start;
+                while p < slice.len() && (0x30..=0x3F).contains(&slice[p]) {
+                    p += 1;
+                }
+                let param_end = p;
+                while p < slice.len() && (0x20..=0x2F).contains(&slice[p]) {
+                    p += 1;
+                }
+                let inter_end = p;
+                if p < slice.len() && (0x40..=0x7E).contains(&slice[p]) {
+                    let params = &slice[param_start..param_end];
+                    let intermediates = &slice[param_end..inter_end];
+                    let final_byte = slice[p];
+                    if intermediates.is_empty() {
+                        if params == b"?9001" && (final_byte == b'h' || final_byte == b'l') {
+                            i = p + 1;
+                            continue;
+                        }
+                        if params.iter().all(|&b| b.is_ascii_digit() || b == b';') {
+                            match final_byte {
+                                // CHT (`CSI n I` — Cursor Forward Tabulation) -> `n` HT (`\t`) stops
+                                b'I' => {
+                                    let count = parse_csi_param_default(params, 0, 1).clamp(1, 256);
+                                    out.extend(std::iter::repeat_n(b'\t', count));
+                                    i = p + 1;
+                                    continue;
+                                }
+                                // ECMA-48 HVP (`CSI row ; col f`), used heavily by `btop` (`Mv::to`),
+                                // is identical to CUP (`CSI row ; col H`), which `vt100` supports.
+                                b'f' => {
+                                    out.extend_from_slice(b"\x1b[");
+                                    out.extend_from_slice(params);
+                                    out.push(b'H');
+                                    i = p + 1;
+                                    continue;
+                                }
+                                // HPA (`CSI col \``) -> CHA (`CSI col G`)
+                                b'`' => {
+                                    out.extend_from_slice(b"\x1b[");
+                                    out.extend_from_slice(params);
+                                    out.push(b'G');
+                                    i = p + 1;
+                                    continue;
+                                }
+                                // HPR (`CSI n a`) -> CUF (`CSI n C`)
+                                b'a' => {
+                                    out.extend_from_slice(b"\x1b[");
+                                    out.extend_from_slice(params);
+                                    out.push(b'C');
+                                    i = p + 1;
+                                    continue;
+                                }
+                                // VPR (`CSI n e`) -> CUD (`CSI n B`)
+                                b'e' => {
+                                    out.extend_from_slice(b"\x1b[");
+                                    out.extend_from_slice(params);
+                                    out.push(b'B');
+                                    i = p + 1;
+                                    continue;
+                                }
+                                // CNL (`CSI n E`) -> CUD (`CSI n B`) + CR (`\r`)
+                                b'E' => {
+                                    out.extend_from_slice(b"\x1b[");
+                                    out.extend_from_slice(params);
+                                    out.extend_from_slice(b"B\r");
+                                    i = p + 1;
+                                    continue;
+                                }
+                                // CPL (`CSI n F`) -> CUU (`CSI n A`) + CR (`\r`)
+                                b'F' => {
+                                    out.extend_from_slice(b"\x1b[");
+                                    out.extend_from_slice(params);
+                                    out.extend_from_slice(b"A\r");
+                                    i = p + 1;
+                                    continue;
+                                }
+                                // SCOSC (`CSI s`) -> DECSC (`ESC 7`)
+                                b's' if params.is_empty() => {
+                                    out.extend_from_slice(b"\x1b7");
+                                    i = p + 1;
+                                    continue;
+                                }
+                                // SCORC (`CSI u`) -> DECRC (`ESC 8`)
+                                b'u' if params.is_empty() => {
+                                    out.extend_from_slice(b"\x1b8");
+                                    i = p + 1;
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
                     }
-                    if params.iter().all(|&b| b.is_ascii_digit() || b == b';') {
-                        match final_byte {
-                            // CHT (`CSI n I` — Cursor Forward Tabulation) -> `n` HT (`\t`) stops
-                            b'I' => {
-                                let count = std::str::from_utf8(params)
-                                    .ok()
-                                    .and_then(|s| s.split(';').next())
-                                    .and_then(|s| {
-                                        if s.is_empty() {
-                                            Some(1usize)
-                                        } else {
-                                            s.parse::<usize>().ok()
-                                        }
-                                    })
-                                    .unwrap_or(1)
-                                    .clamp(1, 256);
-                                out.extend(std::iter::repeat_n(b'\t', count));
-                                i = p + 1;
+                    out.extend_from_slice(&slice[i..=p]);
+                    i = p + 1;
+                    continue;
+                }
+                out.extend_from_slice(&slice[i..p]);
+                i = p;
+                continue;
+            } else {
+                let mut e = i + 1;
+                while e < slice.len() && (0x20..=0x2F).contains(&slice[e]) {
+                    e += 1;
+                }
+                if e < slice.len() && (0x30..=0x7E).contains(&slice[e]) {
+                    if e == i + 1 {
+                        match slice[e] {
+                            // IND (`ESC D` — Index) -> LF (`\n`)
+                            b'D' => {
+                                out.push(b'\n');
+                                i = e + 1;
                                 continue;
                             }
-                            // ECMA-48 HVP (`CSI row ; col f`), used heavily by `btop` (`Mv::to`),
-                            // is identical to CUP (`CSI row ; col H`), which `vt100` supports.
-                            b'f' => {
-                                out.extend_from_slice(b"\x1b[");
-                                out.extend_from_slice(params);
-                                out.push(b'H');
-                                i = p + 1;
-                                continue;
-                            }
-                            // HPA (`CSI col \``) -> CHA (`CSI col G`)
-                            b'`' => {
-                                out.extend_from_slice(b"\x1b[");
-                                out.extend_from_slice(params);
-                                out.push(b'G');
-                                i = p + 1;
-                                continue;
-                            }
-                            // HPR (`CSI n a`) -> CUF (`CSI n C`)
-                            b'a' => {
-                                out.extend_from_slice(b"\x1b[");
-                                out.extend_from_slice(params);
-                                out.push(b'C');
-                                i = p + 1;
-                                continue;
-                            }
-                            // VPR (`CSI n e`) -> CUD (`CSI n B`)
-                            b'e' => {
-                                out.extend_from_slice(b"\x1b[");
-                                out.extend_from_slice(params);
-                                out.push(b'B');
-                                i = p + 1;
-                                continue;
-                            }
-                            // CNL (`CSI n E`) -> CUD (`CSI n B`) + CR (`\r`)
+                            // NEL (`ESC E` — Next Line) -> CR + LF (`\r\n`)
                             b'E' => {
-                                out.extend_from_slice(b"\x1b[");
-                                out.extend_from_slice(params);
-                                out.extend_from_slice(b"B\r");
-                                i = p + 1;
-                                continue;
-                            }
-                            // CPL (`CSI n F`) -> CUU (`CSI n A`) + CR (`\r`)
-                            b'F' => {
-                                out.extend_from_slice(b"\x1b[");
-                                out.extend_from_slice(params);
-                                out.extend_from_slice(b"A\r");
-                                i = p + 1;
-                                continue;
-                            }
-                            // SCOSC (`CSI s`) -> DECSC (`ESC 7`)
-                            b's' if params.is_empty() => {
-                                out.extend_from_slice(b"\x1b7");
-                                i = p + 1;
-                                continue;
-                            }
-                            // SCORC (`CSI u`) -> DECRC (`ESC 8`)
-                            b'u' if params.is_empty() => {
-                                out.extend_from_slice(b"\x1b8");
-                                i = p + 1;
+                                out.extend_from_slice(b"\r\n");
+                                i = e + 1;
                                 continue;
                             }
                             _ => {}
                         }
                     }
+                    out.extend_from_slice(&slice[i..=e]);
+                    i = e + 1;
+                    continue;
                 }
-                out.extend_from_slice(&slice[i..=p]);
-                i = p + 1;
-                continue;
             }
         }
-        if has_fe0f && i + 3 <= slice.len() && &slice[i..i + 3] == b"\xef\xb8\x8f" {
-            // U+FE0F (Variation Selector-16) requests 2-column emoji presentation for preceding
-            // 1-column symbols (such as U+2699 '⚙' or U+26A0 '⚠'). Replacing U+FE0F with an ASCII
-            // space after a width-1 non-ASCII symbol guarantees identical 2-column grid alignment
-            // across both Grapheme-Cluster terminals (Ghostty, Kitty) and legacy SSH clients.
-            if *prev_width1_symbol {
-                out.push(b' ');
-                *prev_width1_symbol = false;
-            }
-            i += 3;
-            continue;
-        }
+
         if slice[i].is_ascii() {
-            out.push(slice[i]);
-            *prev_width1_symbol = false;
+            let b = slice[i];
+            if b < 0x20 || b == 0x7f {
+                out.push(b);
+                *grapheme = GraphemeState::default();
+            } else if grapheme.after_zwj {
+                grapheme.after_zwj = false;
+                grapheme.suppress_zero_width = true;
+            } else {
+                out.push(b);
+                *grapheme = GraphemeState::from_char(b as char);
+            }
             i += 1;
         } else if let Some((ch, ch_len)) = next_utf8_char(&slice[i..]) {
-            out.extend_from_slice(&slice[i..i + ch_len]);
-            *prev_width1_symbol = is_width1_non_ascii(ch);
+            if ch == '\u{FE0F}' {
+                // U+FE0F (Variation Selector-16) requests 2-column emoji presentation for
+                // preceding 1-column symbols (such as U+2699 '⚙', U+26A0 '⚠', or keycap bases
+                // `[0-9#*]`). Emitting an ASCII space widens 1-column bases to 2 columns
+                // identically across `vt100`, Grapheme-Cluster terminals, and SSH clients.
+                if grapheme.cluster_cols == 1 {
+                    out.push(b' ');
+                    grapheme.cluster_cols = 2;
+                    grapheme.prev_emoji_symbol = true;
+                    grapheme.ascii_keycap_base = false;
+                    grapheme.suppress_zero_width = true;
+                } else if grapheme.cluster_cols >= 2 {
+                    grapheme.suppress_zero_width = true;
+                }
+            } else if ch == '\u{FE0E}' {
+                if !grapheme.suppress_zero_width {
+                    out.extend_from_slice(&slice[i..i + ch_len]);
+                }
+                *grapheme = GraphemeState::default();
+            } else if ch == '\u{200D}'
+                && (grapheme.cluster_cols >= 2
+                    || (grapheme.cluster_cols == 1 && grapheme.prev_emoji_symbol))
+            {
+                if grapheme.cluster_cols == 1 {
+                    out.push(b' ');
+                    grapheme.cluster_cols = 2;
+                }
+                grapheme.after_zwj = true;
+                grapheme.suppress_zero_width = true;
+            } else if grapheme.after_zwj {
+                grapheme.after_zwj = false;
+                grapheme.suppress_zero_width = true;
+            } else if is_skin_tone_modifier(ch)
+                && (grapheme.cluster_cols >= 2
+                    || (grapheme.cluster_cols == 1 && grapheme.prev_emoji_symbol))
+            {
+                if grapheme.cluster_cols == 1 {
+                    out.push(b' ');
+                    grapheme.cluster_cols = 2;
+                }
+                grapheme.suppress_zero_width = true;
+            } else if UnicodeWidthChar::width(ch) == Some(0) {
+                if !grapheme.suppress_zero_width {
+                    out.extend_from_slice(&slice[i..i + ch_len]);
+                }
+            } else {
+                out.extend_from_slice(&slice[i..i + ch_len]);
+                *grapheme = GraphemeState::from_char(ch);
+            }
             i += ch_len;
         } else {
             out.push(slice[i]);
-            *prev_width1_symbol = false;
+            *grapheme = GraphemeState::default();
             i += 1;
         }
     }
@@ -919,9 +1631,7 @@ fn sync_attached_terminals(
     if let Some(ref addr) = want_addr {
         if let Some(cur) = attached_map.get_mut(addr) {
             if cur.cols != cols || cur.rows != rows {
-                cur.cols = cols;
-                cur.rows = rows;
-                cur.parser.set_size(non_zero_u16(rows), non_zero_u16(cols));
+                cur.resize(cols, rows);
                 core.resize_channel(cur.channel, cols, rows);
             }
             if active_addr.as_ref() != Some(addr) {
@@ -960,9 +1670,7 @@ fn sync_attached_terminals(
             if let Some(sib) = attached_map.get_mut(&sib_addr) {
                 if sib.cols != cols || sib.rows != rows {
                     if resize_siblings {
-                        sib.cols = cols;
-                        sib.rows = rows;
-                        sib.parser.set_size(non_zero_u16(rows), non_zero_u16(cols));
+                        sib.resize(cols, rows);
                         core.resize_channel(sib.channel, cols, rows);
                     } else {
                         outcome.has_unresized_siblings = true;
@@ -4296,5 +5004,290 @@ mod tests {
             &mut selection_vt_seq,
         ));
         assert_eq!(world.active_tab_index(), 0);
+    }
+
+    #[test]
+    fn cbt_deferred_wrap_bs_cub_and_vertical_motions_match_xterm_ghostty() {
+        // 1. CBT (`CSI Ps Z`) steps backward across 8-column tab stops (0, 8, 16, 24)
+        let mut att = AttachedTerminal::new(1, 24, 5);
+        att.process_vt_bytes(b"\x1b[1;19H*\x1b[ZA\x1b[2ZB\x1b[99ZC");
+        let scr = att.parser.screen();
+        // `1;19H` -> col 18 ('*'), after '*' col is 19 -> `\x1b[Z` lands on 16 ('A', col->17),
+        // `\x1b[2Z` -> 16 then 8 ('B', col->9), `\x1b[99Z` -> 0 ('C').
+        assert_eq!(scr.cell(0, 18).unwrap().contents(), "*");
+        assert_eq!(scr.cell(0, 16).unwrap().contents(), "A");
+        assert_eq!(scr.cell(0, 8).unwrap().contents(), "B");
+        assert_eq!(scr.cell(0, 0).unwrap().contents(), "C");
+
+        // CBT from deferred-wrap (`col == cols == 24`, visual col 23) lands on tab stop 16
+        let mut att_wrap_cbt = AttachedTerminal::new(2, 24, 3);
+        att_wrap_cbt.process_vt_bytes(&b"x".repeat(24));
+        att_wrap_cbt.process_vt_bytes(b"\x1b[Z!");
+        assert_eq!(
+            att_wrap_cbt.parser.screen().cell(0, 16).unwrap().contents(),
+            "!"
+        );
+        assert_eq!(att_wrap_cbt.parser.screen().cursor_position().0, 0);
+
+        // 2. BS (`0x08`) and CUB (`CSI Ps D`) from deferred-wrap subtract from `cols - 1`, not `cols`
+        let mut att_bs = AttachedTerminal::new(3, 10, 3);
+        att_bs.process_vt_bytes(b"0123456789\x08X");
+        assert_eq!(
+            att_bs.parser.screen().contents_between(0, 0, 0, 10),
+            "01234567X9"
+        );
+        assert_eq!(att_bs.parser.screen().cursor_position().0, 0);
+
+        let mut att_cub = AttachedTerminal::new(4, 10, 3);
+        att_cub.process_vt_bytes(b"0123456789\x1b[3DY");
+        assert_eq!(
+            att_cub.parser.screen().contents_between(0, 0, 0, 10),
+            "012345Y789"
+        );
+        assert_eq!(att_cub.parser.screen().cursor_position().0, 0);
+
+        // 3. Bare LF / IND (`ESC D`) / NEL (`ESC E`) / CUU (`CSI A`) clear pending_wrap
+        let mut att_vert = AttachedTerminal::new(5, 10, 4);
+        att_vert.process_vt_bytes(b"0123456789\x1bDZ\x1bEOK\x1b[2;10H!\x1b[A?");
+        let scr_v = att_vert.parser.screen();
+        assert_eq!(scr_v.cell(0, 9).unwrap().contents(), "?");
+        assert_eq!(scr_v.cell(1, 9).unwrap().contents(), "!");
+        assert_eq!(scr_v.contents_between(2, 0, 2, 2), "OK");
+
+        // 4. RI (`ESC M`) at row 0 outside DECSTBM (`\x1b[2;4r`) must NOT scroll rows 1..=3
+        let mut att_ri = AttachedTerminal::new(6, 10, 4);
+        att_ri.process_vt_bytes(b"\x1b[1;1HT\x1b[2;1HR1\x1b[3;1HR2\x1b[2;4r\x1b[1;1H\x1bM");
+        let scr_ri = att_ri.parser.screen();
+        assert_eq!(scr_ri.contents_between(0, 0, 0, 1), "T");
+        assert_eq!(scr_ri.contents_between(1, 0, 1, 2), "R1");
+        assert_eq!(scr_ri.contents_between(2, 0, 2, 2), "R2");
+    }
+
+    #[test]
+    fn decawm_mode_7_clamps_narrow_wide_and_rep_at_right_margin_without_wrapping() {
+        // 1. Narrow & REP overflow under `?7l` (including compound `?7;25l`) stays on row 0
+        let mut att = AttachedTerminal::new(1, 10, 3);
+        att.process_vt_bytes("\x1b[?7;25l─\x1b[25bZ\x1b[?7;25h".as_bytes());
+        let scr = att.parser.screen();
+        assert_eq!(scr.cursor_position(), (0, 9));
+        assert_eq!(scr.contents_between(0, 0, 0, 10), "─────────Z");
+        assert_eq!(scr.contents_between(1, 0, 1, 10), "");
+
+        // 2. Wide CJK exact fit at `cols - 2..=cols - 1` and wide overflow at `cols - 1` under `?7l`
+        let mut att_wide = AttachedTerminal::new(2, 10, 3);
+        // 5 CJK chars = 10 cols exact fit + 1 extra CJK char that must NOT wrap to row 1
+        let wide_line = b"\x1b[?7l\xe4\xb8\xad\xe6\x96\x87\xe6\xb5\x8b\xe8\xaf\x95\xe8\xa1\x8c\xe5\xa4\x9a\x1b[?7h";
+        att_wide.process_vt_bytes(wide_line);
+        assert_eq!(att_wide.parser.screen().cursor_position(), (0, 9));
+        assert_eq!(
+            att_wide.parser.screen().contents_between(0, 0, 0, 10),
+            "中文测试行"
+        );
+        assert_eq!(att_wide.parser.screen().contents_between(1, 0, 1, 10), "");
+
+        // 1 ASCII + 5 CJK chars = 11 cols: 5th CJK arrives at col 9 (`cols - 1`) and must NOT wrap
+        let mut att_odd = AttachedTerminal::new(3, 10, 3);
+        for b in
+            b"\x1b[?7lA\xe4\xb8\xad\xe6\x96\x87\xe6\xb5\x8b\xe8\xaf\x95\xe8\xa1\x8c\x1b(B\x1b[?7h"
+        {
+            att_odd.process_vt_bytes(std::slice::from_ref(b));
+        }
+        assert_eq!(att_odd.parser.screen().cursor_position(), (0, 9));
+        assert_eq!(
+            att_odd.parser.screen().contents_between(0, 0, 0, 9),
+            "A中文测试"
+        );
+        assert_eq!(att_odd.parser.screen().contents_between(1, 0, 1, 10), "");
+
+        // 3. `putCellLR` at bottom-right cell `(cols - 1, rows - 1)` never scrolls or sets pending_wrap
+        let mut att_lr = AttachedTerminal::new(4, 10, 3);
+        att_lr.process_vt_bytes("TOP\r\nMID\r\nBOT\x1b[3;10H\x1b[?7l╯\x1b[?7h".as_bytes());
+        assert_eq!(att_lr.parser.screen().cursor_position(), (2, 9));
+        assert_eq!(att_lr.parser.screen().contents_between(0, 0, 0, 3), "TOP");
+        assert_eq!(att_lr.parser.screen().cell(2, 9).unwrap().contents(), "╯");
+
+        // 4. DECSC/DECRC (`\x1b7`/`\x1b8`) and DECSTR (`\x1b[!p`) preserve/reset DECAWM accurately
+        let mut att_save = AttachedTerminal::new(5, 8, 3);
+        att_save.process_vt_bytes(b"\x1b[?7l\x1b7\x1b[?7h\x1b81234567890\x1b[?7h");
+        assert_eq!(att_save.parser.screen().cursor_position(), (0, 7));
+        assert_eq!(
+            att_save.parser.screen().contents_between(0, 0, 0, 8),
+            "12345670"
+        );
+        att_save.process_vt_bytes(b"\x1b[?7l\x1b[!p\r123456789");
+        assert_eq!(att_save.parser.screen().cursor_position().0, 1);
+
+        // 5. Right-margin combining marks (`\u{0301}`) attach to the base cell under `?7l`
+        //    (both single-chunk and 1-byte-at-a-time), and 1-/2-column viewports never underflow.
+        let comb_stream = "\x1b[?7l123456789e\u{0301}\u{0327}\x1b[?7h".as_bytes();
+        let mut att_comb_whole = AttachedTerminal::new(6, 10, 2);
+        att_comb_whole.process_vt_bytes(comb_stream);
+        let mut att_comb_split = AttachedTerminal::new(7, 10, 2);
+        for b in comb_stream {
+            att_comb_split.process_vt_bytes(std::slice::from_ref(b));
+        }
+        for att_c in [&att_comb_whole, &att_comb_split] {
+            let scr_c = att_c.parser.screen();
+            assert_eq!(scr_c.cursor_position(), (0, 9));
+            assert_eq!(scr_c.cell(0, 9).unwrap().contents(), "e\u{0301}\u{0327}");
+            assert_eq!(scr_c.contents_between(1, 0, 1, 10), "");
+        }
+
+        // 2-column and 1-column viewports with wide characters + combining marks under `?7l`
+        let mut att_two_col = AttachedTerminal::new(8, 2, 2);
+        att_two_col.process_vt_bytes("\x1b[?7l中\u{0301}文\u{0302}\x1b[?7h".as_bytes());
+        assert_eq!(att_two_col.parser.screen().cursor_position(), (0, 1));
+        assert_eq!(
+            att_two_col.parser.screen().cell(0, 0).unwrap().contents(),
+            "中\u{0301}"
+        );
+        assert_eq!(att_two_col.parser.screen().contents_between(1, 0, 1, 2), "");
+
+        let mut att_one_col = AttachedTerminal::new(9, 1, 2);
+        att_one_col.process_vt_bytes("\x1b[?7lA中\u{0302}\x1b[?7h".as_bytes());
+        assert_eq!(att_one_col.parser.screen().cursor_position(), (0, 0));
+        assert_eq!(
+            att_one_col.parser.screen().cell(0, 0).unwrap().contents(),
+            "A"
+        );
+        assert_eq!(att_one_col.parser.screen().contents_between(1, 0, 1, 1), "");
+    }
+
+    #[test]
+    fn mode_2027_multi_codepoint_emoji_clusters_align_to_two_columns_across_byte_splits() {
+        // Every Mode 2027 emoji cluster below occupies 2 columns in Ghostty / ultraviolet:
+        // 👨‍💻 (ZWJ), 👍🏻 (skin tone), 🏳️‍🌈 (VS16+ZWJ), 🤦🏻‍♂️ (skin+ZWJ+gender+VS16),
+        // 1️⃣ (keycap), 🇨🇳 (flag pair), ☝🏻 (width-1+skin).
+        let frame = concat!(
+            "\x1b]0;👨‍💻 ⚙️ title\x07",
+            "\x1b[H",
+            "│👨‍💻│👍🏻│\r\n",
+            "│🏳️‍🌈│🤦🏻‍♂️│\r\n",
+            "│1️⃣│🇨🇳│\r\n",
+            "│☝🏻│⚙️│"
+        )
+        .as_bytes();
+
+        let mut att_whole = AttachedTerminal::new(1, 16, 4);
+        att_whole.process_vt_bytes(frame);
+
+        let mut att_split = AttachedTerminal::new(2, 16, 4);
+        for b in frame {
+            att_split.process_vt_bytes(std::slice::from_ref(b));
+        }
+
+        for scr in [att_whole.parser.screen(), att_split.parser.screen()] {
+            for r in 0..4 {
+                assert_eq!(
+                    scr.cell(r, 0).unwrap().contents(),
+                    "│",
+                    "row {r} col 0 border"
+                );
+                assert_eq!(
+                    scr.cell(r, 3).unwrap().contents(),
+                    "│",
+                    "row {r} col 3 border"
+                );
+                assert_eq!(
+                    scr.cell(r, 6).unwrap().contents(),
+                    "│",
+                    "row {r} col 6 border"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inline_relative_cursor_autoscroll_never_duplicates_lines_on_cbt_decawm_and_cjk() {
+        // Reproduces Bubble Tea v2 `googleCursedRenderer` + `ultraviolet` inline relative-cursor
+        // rendering & `writePrepend` auto-scrolling on a 24x6 viewport with CJK text, Mode 2027
+        // multi-codepoint emojis, `CBT` (`\x1b[Z`/`\x1b[2Z`), `?7l`/`?7h`, `REP`, and `putCellLR`.
+        let mut stream = Vec::new();
+
+        // Initial inline frame (6 rows: rows 0..=5), leaving cursor at bottom-right `(23, 5)`.
+        stream.extend_from_slice(
+            concat!(
+                "╭──────────────────────╮\r\n",
+                "\x1b[?7l│ 第一行：你好世界 👨‍💻  │\x1b[?7h\x1b[24G\r\n",
+                "\x1b[?7l│ 第二行：状态正常 👍🏻  │\x1b[?7h\x1b[24G\r\n",
+                "\x1b[?7l│ 第三行：继续输出 🏳️‍🌈  │\x1b[?7h\x1b[24G\r\n",
+                "│                 [OK] │\x1b[2Zstatus\r\n",
+                "╰\x1b[?7l─\x1b[21b╯\x1b[?7h"
+            )
+            .as_bytes(),
+        );
+
+        // Auto-scroll tick 1 (`writePrepend`): relative `\r\x1b[5A` from `cur.Y = 5` back to row 0,
+        // prepend scrolled-off top border + line 1 into scrollback, clear downward, repaint 6 rows.
+        stream.extend_from_slice(
+            concat!(
+                "\r\x1b[5A",
+                "╭──────────────────────╮\x1b[K\r\n",
+                "│ 第一行：你好世界 👨‍💻  │\x1b[K\r\n",
+                "\x1b[J",
+                "\x1b[?7l│ 第二行：状态正常 👍🏻  │\x1b[?7h\x1b[24G\r\n",
+                "\x1b[?7l│ 第三行：继续输出 🏳️‍🌈  │\x1b[?7h\x1b[24G\r\n",
+                "\x1b[?7l│ 第四行：步骤 1️⃣ 完成 │\x1b[?7h\x1b[24G\r\n",
+                "\x1b[?7l│ 第五行：排版对齐 ⚙️  │\x1b[?7h\x1b[24G\r\n",
+                "│                 [OK] │\x1b[2Zready!\r\n",
+                "╰\x1b[?7l─\x1b[21b╯\x1b[?7h"
+            )
+            .as_bytes(),
+        );
+
+        // Auto-scroll tick 2 (`writePrepend`): relative `\r\x1b[5A` again, prepend line 2, repaint.
+        stream.extend_from_slice(
+            concat!(
+                "\r\x1b[5A",
+                "│ 第二行：状态正常 👍🏻  │\x1b[K\r\n",
+                "\x1b[J",
+                "\x1b[?7l│ 第三行：继续输出 🏳️‍🌈  │\x1b[?7h\x1b[24G\r\n",
+                "\x1b[?7l│ 第四行：步骤 1️⃣ 完成 │\x1b[?7h\x1b[24G\r\n",
+                "\x1b[?7l│ 第五行：排版对齐 ⚙️  │\x1b[?7h\x1b[24G\r\n",
+                "\x1b[?7l│ 第六行：没有重复行！ │\x1b[?7h\x1b[24G\r\n",
+                "│                 [OK] │\x1b[2Zdone!!\r\n",
+                "╰\x1b[?7l─\x1b[21b╯\x1b[?7h"
+            )
+            .as_bytes(),
+        );
+
+        let mut att_whole = AttachedTerminal::new(1, 24, 6);
+        att_whole.process_vt_bytes(&stream);
+
+        let mut att_split = AttachedTerminal::new(2, 24, 6);
+        for b in &stream {
+            att_split.process_vt_bytes(std::slice::from_ref(b));
+        }
+
+        for att in [&mut att_whole, &mut att_split] {
+            let scr = att.parser.screen();
+            assert_eq!(scr.cursor_position(), (5, 23));
+            for r in 0..5 {
+                assert_eq!(scr.cell(r, 0).unwrap().contents(), "│", "row {r} left");
+                assert_eq!(scr.cell(r, 23).unwrap().contents(), "│", "row {r} right");
+            }
+            assert_eq!(scr.cell(5, 0).unwrap().contents(), "╰");
+            assert_eq!(scr.cell(5, 23).unwrap().contents(), "╯");
+            assert!(scr.contents_between(0, 0, 0, 24).contains("第三行"));
+            assert!(scr.contents_between(1, 0, 1, 24).contains("第四行"));
+            assert!(scr.contents_between(2, 0, 2, 24).contains("第五行"));
+            assert!(scr.contents_between(3, 0, 3, 24).contains("第六行"));
+            assert_eq!(
+                scr.contents_between(4, 0, 4, 24),
+                "│       done!!    [OK] │"
+            );
+
+            // Inspect scrollback: exactly 3 lines scrolled off, with zero duplicate rows!
+            att.parser.screen_mut().set_scrollback(100);
+            let sb = att.parser.screen();
+            assert_eq!(
+                sb.scrollback(),
+                3,
+                "exact scrollback count without extra wraps"
+            );
+            assert_eq!(sb.contents_between(0, 0, 0, 24), "╭──────────────────────╮");
+            assert!(sb.contents_between(1, 0, 1, 24).contains("第一行"));
+            assert!(sb.contents_between(2, 0, 2, 24).contains("第二行"));
+        }
     }
 }

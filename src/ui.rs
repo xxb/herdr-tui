@@ -568,7 +568,8 @@ pub fn render_ui_with_pads_and_quota(
         );
         if matches!(modal, Modal::None) && scrollback_offset == 0 && !scr.hide_cursor() {
             let (row, col) = scr.cursor_position();
-            let cx = term_rect.x.saturating_add(col);
+            let clamped_col = col.min(term_rect.width.saturating_sub(1));
+            let cx = term_rect.x.saturating_add(clamped_col);
             let cy = term_rect.y.saturating_add(row);
             if cx < term_rect.x + term_rect.width && cy < term_rect.y + term_rect.height {
                 f.set_cursor_position((cx, cy));
