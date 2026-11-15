@@ -295,7 +295,7 @@ struct AttachedTerminal {
     autowrap: bool,
     saved_autowrap: bool,
     alt_saved_autowrap: bool,
-    clamped_right_margin: bool,
+    dropped_wide_at_margin: bool,
     last_printed_char: Option<char>,
     scroll_top: u16,
     main_scroll_top: u16,
@@ -320,7 +320,7 @@ impl AttachedTerminal {
             autowrap: true,
             saved_autowrap: true,
             alt_saved_autowrap: true,
-            clamped_right_margin: false,
+            dropped_wide_at_margin: false,
             last_printed_char: None,
             scroll_top: 0,
             main_scroll_top: 0,
@@ -333,7 +333,7 @@ impl AttachedTerminal {
         self.rows = rows;
         self.scroll_top = 0;
         self.main_scroll_top = 0;
-        self.clamped_right_margin = false;
+        self.dropped_wide_at_margin = false;
         self.parser.set_size(non_zero_u16(rows), non_zero_u16(cols));
     }
 
@@ -370,7 +370,11 @@ impl AttachedTerminal {
         let (_, col) = self.parser.screen().cursor_position();
 
         if w == 0 {
-            if !self.clamped_right_margin && col > 0 {
+            // Keep `vt100` at `pos.col == cols` lazily after printing in the rightmost column so
+            // zero-width combining marks attach natively to the last printed base cell (`cols - 1`,
+            // or `cols - 2` for wide glyphs). Suppress marks only after an overflowing wide glyph
+            // at the right margin could not be drawn.
+            if !self.dropped_wide_at_margin && col > 0 {
                 self.parser.process(utf8_bytes);
             }
             return;
@@ -382,26 +386,19 @@ impl AttachedTerminal {
                 self.clamp_pending_wrap();
             }
             self.parser.process(utf8_bytes);
-            if self.parser.screen().cursor_position().1 >= cols {
-                self.clamp_pending_wrap();
-                self.clamped_right_margin = true;
-            } else {
-                self.clamped_right_margin = false;
-            }
+            self.dropped_wide_at_margin = false;
         } else if cols >= 2 {
-            if col <= cols - 3 {
+            if col.saturating_add(2) <= cols {
                 self.parser.process(utf8_bytes);
-                self.clamped_right_margin = false;
-            } else if col == cols - 2 {
-                self.parser.process(utf8_bytes);
-                self.clamp_pending_wrap();
-                self.clamped_right_margin = true;
+                self.dropped_wide_at_margin = false;
             } else {
                 // Wide character cannot fit in the single remaining column (`cols - 1`) while
                 // DECAWM (`?7l`) forbids auto-wrapping onto the next row.
                 self.clamp_pending_wrap();
-                self.clamped_right_margin = true;
+                self.dropped_wide_at_margin = true;
             }
+        } else {
+            self.dropped_wide_at_margin = true;
         }
     }
 
@@ -470,7 +467,7 @@ impl AttachedTerminal {
                             apply_decstr(&mut self.parser);
                             self.autowrap = true;
                             self.saved_autowrap = true;
-                            self.clamped_right_margin = false;
+                            self.dropped_wide_at_margin = false;
                             self.scroll_top = 0;
                             i = p + 1;
                             plain_start = i;
@@ -495,18 +492,21 @@ impl AttachedTerminal {
                                             b"7" => {
                                                 self.clamp_pending_wrap();
                                                 self.autowrap = set;
-                                                self.clamped_right_margin = false;
+                                                self.dropped_wide_at_margin = false;
                                             }
                                             b"6" => {
-                                                self.clamped_right_margin = false;
+                                                self.dropped_wide_at_margin = false;
                                             }
                                             b"1048" => {
                                                 if set {
+                                                    if !self.autowrap {
+                                                        self.clamp_pending_wrap();
+                                                    }
                                                     self.saved_autowrap = self.autowrap;
                                                 } else {
                                                     self.autowrap = self.saved_autowrap;
                                                 }
-                                                self.clamped_right_margin = false;
+                                                self.dropped_wide_at_margin = false;
                                             }
                                             b"47" | b"1047" => {
                                                 if set && !was_alt {
@@ -515,10 +515,13 @@ impl AttachedTerminal {
                                                 } else if !set && was_alt {
                                                     self.scroll_top = self.main_scroll_top;
                                                 }
-                                                self.clamped_right_margin = false;
+                                                self.dropped_wide_at_margin = false;
                                             }
                                             b"1049" => {
                                                 if set && !was_alt {
+                                                    if !self.autowrap {
+                                                        self.clamp_pending_wrap();
+                                                    }
                                                     self.alt_saved_autowrap = self.autowrap;
                                                     self.main_scroll_top = self.scroll_top;
                                                     self.scroll_top = 0;
@@ -526,7 +529,7 @@ impl AttachedTerminal {
                                                     self.autowrap = self.alt_saved_autowrap;
                                                     self.scroll_top = self.main_scroll_top;
                                                 }
-                                                self.clamped_right_margin = false;
+                                                self.dropped_wide_at_margin = false;
                                             }
                                             _ => {}
                                         }
@@ -536,6 +539,19 @@ impl AttachedTerminal {
                                     plain_start = i;
                                     continue;
                                 }
+                            } else if !self.autowrap
+                                && params.starts_with(b"?")
+                                && matches!(final_byte, b'J' | b'K')
+                            {
+                                if plain_start < i {
+                                    self.parser.process(&clean[plain_start..i]);
+                                }
+                                self.dropped_wide_at_margin = false;
+                                self.clamp_pending_wrap();
+                                self.parser.process(&clean[i..=p]);
+                                i = p + 1;
+                                plain_start = i;
+                                continue;
                             } else if params.iter().all(|&c| c.is_ascii_digit() || c == b';') {
                                 match final_byte {
                                     // CBT (`CSI Ps Z` — Cursor Backward Tabulation)
@@ -543,7 +559,7 @@ impl AttachedTerminal {
                                         if plain_start < i {
                                             self.parser.process(&clean[plain_start..i]);
                                         }
-                                        self.clamped_right_margin = false;
+                                        self.dropped_wide_at_margin = false;
                                         let count =
                                             parse_csi_param_default(params, 0, 1).clamp(1, 512);
                                         let cols = self.parser.screen().size().1.get().max(1);
@@ -564,7 +580,7 @@ impl AttachedTerminal {
                                         if plain_start < i {
                                             self.parser.process(&clean[plain_start..i]);
                                         }
-                                        self.clamped_right_margin = false;
+                                        self.dropped_wide_at_margin = false;
                                         let cols = self.parser.screen().size().1.get().max(1);
                                         let (_, col) = self.parser.screen().cursor_position();
                                         if col >= cols {
@@ -586,7 +602,7 @@ impl AttachedTerminal {
                                         if plain_start < i {
                                             self.parser.process(&clean[plain_start..i]);
                                         }
-                                        self.clamped_right_margin = false;
+                                        self.dropped_wide_at_margin = false;
                                         self.clamp_pending_wrap();
                                         self.parser.process(&clean[i..=p]);
                                         i = p + 1;
@@ -616,7 +632,7 @@ impl AttachedTerminal {
                                         if plain_start < i {
                                             self.parser.process(&clean[plain_start..i]);
                                         }
-                                        self.clamped_right_margin = false;
+                                        self.dropped_wide_at_margin = false;
                                         let rows = self.parser.screen().size().0.get().max(1);
                                         let top = (parse_csi_param_default(params, 0, 1) as u16)
                                             .max(1)
@@ -635,7 +651,23 @@ impl AttachedTerminal {
                                     }
                                     b'C' | b'G' | b'H' | b'J' | b'K' | b'L' | b'M' | b'P'
                                     | b'S' | b'T' | b'X' | b'@' => {
-                                        self.clamped_right_margin = false;
+                                        if !self.autowrap
+                                            && matches!(
+                                                final_byte,
+                                                b'J' | b'K' | b'X' | b'@' | b'P'
+                                            )
+                                        {
+                                            if plain_start < i {
+                                                self.parser.process(&clean[plain_start..i]);
+                                            }
+                                            self.dropped_wide_at_margin = false;
+                                            self.clamp_pending_wrap();
+                                            self.parser.process(&clean[i..=p]);
+                                            i = p + 1;
+                                            plain_start = i;
+                                            continue;
+                                        }
+                                        self.dropped_wide_at_margin = false;
                                     }
                                     _ => {}
                                 }
@@ -661,8 +693,11 @@ impl AttachedTerminal {
                                 if plain_start < i {
                                     self.parser.process(&clean[plain_start..i]);
                                 }
+                                if !self.autowrap {
+                                    self.clamp_pending_wrap();
+                                }
                                 self.saved_autowrap = self.autowrap;
-                                self.clamped_right_margin = false;
+                                self.dropped_wide_at_margin = false;
                                 self.parser.process(b"\x1b7");
                                 i = e + 1;
                                 plain_start = i;
@@ -673,7 +708,7 @@ impl AttachedTerminal {
                                     self.parser.process(&clean[plain_start..i]);
                                 }
                                 self.autowrap = self.saved_autowrap;
-                                self.clamped_right_margin = false;
+                                self.dropped_wide_at_margin = false;
                                 self.parser.process(b"\x1b8");
                                 i = e + 1;
                                 plain_start = i;
@@ -686,7 +721,7 @@ impl AttachedTerminal {
                                 self.autowrap = true;
                                 self.saved_autowrap = true;
                                 self.alt_saved_autowrap = true;
-                                self.clamped_right_margin = false;
+                                self.dropped_wide_at_margin = false;
                                 self.last_printed_char = None;
                                 self.scroll_top = 0;
                                 self.main_scroll_top = 0;
@@ -699,7 +734,7 @@ impl AttachedTerminal {
                                 if plain_start < i {
                                     self.parser.process(&clean[plain_start..i]);
                                 }
-                                self.clamped_right_margin = false;
+                                self.dropped_wide_at_margin = false;
                                 self.clamp_pending_wrap();
                                 let (row, _) = self.parser.screen().cursor_position();
                                 // Guard against vt100-0.18.1 `row_dec_scroll` scrolling
@@ -728,7 +763,7 @@ impl AttachedTerminal {
                         if plain_start < i {
                             self.parser.process(&clean[plain_start..i]);
                         }
-                        self.clamped_right_margin = false;
+                        self.dropped_wide_at_margin = false;
                         let cols = self.parser.screen().size().1.get().max(1);
                         let (_, col) = self.parser.screen().cursor_position();
                         if col >= cols {
@@ -743,7 +778,7 @@ impl AttachedTerminal {
                         continue;
                     }
                     0x0a..=0x0c => {
-                        self.clamped_right_margin = false;
+                        self.dropped_wide_at_margin = false;
                         if i > plain_start && clean[i - 1] == b'\r' {
                             i += 1;
                             continue;
@@ -758,7 +793,7 @@ impl AttachedTerminal {
                         continue;
                     }
                     0x09 | 0x0d => {
-                        self.clamped_right_margin = false;
+                        self.dropped_wide_at_margin = false;
                     }
                     _ => {}
                 }
@@ -786,12 +821,12 @@ impl AttachedTerminal {
 
             if b.is_ascii() {
                 self.last_printed_char = Some(b as char);
-                self.clamped_right_margin = false;
+                self.dropped_wide_at_margin = false;
                 i += 1;
             } else if let Some((ch, ch_len)) = next_utf8_char(&clean[i..]) {
                 if UnicodeWidthChar::width(ch).unwrap_or(1) > 0 {
                     self.last_printed_char = Some(ch);
-                    self.clamped_right_margin = false;
+                    self.dropped_wide_at_margin = false;
                 }
                 i += ch_len;
             } else {
@@ -5073,14 +5108,49 @@ mod tests {
 
         // 4. DECSC/DECRC (`\x1b7`/`\x1b8`) and DECSTR (`\x1b[!p`) preserve/reset DECAWM accurately
         let mut att_save = AttachedTerminal::new(5, 8, 3);
-        att_save.process_vt_bytes(b"\x1b[?7l\x1b7\x1b[?7h\x1b81234567890");
+        att_save.process_vt_bytes(b"\x1b[?7l\x1b7\x1b[?7h\x1b81234567890\x1b[?7h");
         assert_eq!(att_save.parser.screen().cursor_position(), (0, 7));
         assert_eq!(
             att_save.parser.screen().contents_between(0, 0, 0, 8),
             "12345670"
         );
-        att_save.process_vt_bytes(b"\x1b[!p\r123456789");
+        att_save.process_vt_bytes(b"\x1b[?7l\x1b[!p\r123456789");
         assert_eq!(att_save.parser.screen().cursor_position().0, 1);
+
+        // 5. Right-margin combining marks (`\u{0301}`) attach to the base cell under `?7l`
+        //    (both single-chunk and 1-byte-at-a-time), and 1-/2-column viewports never underflow.
+        let comb_stream = "\x1b[?7l123456789e\u{0301}\u{0327}\x1b[?7h".as_bytes();
+        let mut att_comb_whole = AttachedTerminal::new(6, 10, 2);
+        att_comb_whole.process_vt_bytes(comb_stream);
+        let mut att_comb_split = AttachedTerminal::new(7, 10, 2);
+        for b in comb_stream {
+            att_comb_split.process_vt_bytes(std::slice::from_ref(b));
+        }
+        for att_c in [&att_comb_whole, &att_comb_split] {
+            let scr_c = att_c.parser.screen();
+            assert_eq!(scr_c.cursor_position(), (0, 9));
+            assert_eq!(scr_c.cell(0, 9).unwrap().contents(), "e\u{0301}\u{0327}");
+            assert_eq!(scr_c.contents_between(1, 0, 1, 10), "");
+        }
+
+        // 2-column and 1-column viewports with wide characters + combining marks under `?7l`
+        let mut att_two_col = AttachedTerminal::new(8, 2, 2);
+        att_two_col.process_vt_bytes("\x1b[?7l中\u{0301}文\u{0302}\x1b[?7h".as_bytes());
+        assert_eq!(att_two_col.parser.screen().cursor_position(), (0, 1));
+        assert_eq!(
+            att_two_col.parser.screen().cell(0, 0).unwrap().contents(),
+            "中\u{0301}"
+        );
+        assert_eq!(att_two_col.parser.screen().contents_between(1, 0, 1, 2), "");
+
+        let mut att_one_col = AttachedTerminal::new(9, 1, 2);
+        att_one_col.process_vt_bytes("\x1b[?7lA中\u{0302}\x1b[?7h".as_bytes());
+        assert_eq!(att_one_col.parser.screen().cursor_position(), (0, 0));
+        assert_eq!(
+            att_one_col.parser.screen().cell(0, 0).unwrap().contents(),
+            "A"
+        );
+        assert_eq!(att_one_col.parser.screen().contents_between(1, 0, 1, 1), "");
     }
 
     #[test]
