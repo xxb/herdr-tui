@@ -2129,11 +2129,32 @@ struct VtScreenWidget<'a> {
     selection: Option<&'a TerminalSelection>,
 }
 
+/// Resolve how many rows and columns of the vt100 screen to paint into `area`.
+///
+/// The screen and the viewport are expected to agree: `term_rect` is what
+/// `sync_attached_terminals` hands to the core channel as the pty size, so a
+/// disagreement means a frame was drawn between the viewport changing and the
+/// channel resize landing.
+///
+/// Clamping is safe in that window because `ratatui` resets the back buffer on
+/// every `swap_buffers` and clears the region on `autoresize`, so cells this
+/// function declines to paint are already blank rather than stale. What the
+/// clamp must not do is paint outside `area`, which would corrupt the tab bar or
+/// the status bar.
+///
+/// Returns `(rows, cols)`.
+fn vt_render_dims(screen: (u16, u16), area: Rect) -> (u16, u16) {
+    let (scr_cols, scr_rows) = screen;
+    (area.height.min(scr_rows), area.width.min(scr_cols))
+}
+
 impl Widget for VtScreenWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let (scr_rows, scr_cols) = self.screen.size();
-        let rows = area.height.min(scr_rows.get());
-        let cols = area.width.min(scr_cols.get());
+        let (scr_cols, scr_rows) = {
+            let (r, c) = self.screen.size();
+            (c.get(), r.get())
+        };
+        let (rows, cols) = vt_render_dims((scr_cols, scr_rows), area);
         let active_sel = self.selection.filter(|s| s.is_non_empty());
         let sel_bounds = active_sel.map(|s| s.normalized());
 
@@ -3650,6 +3671,94 @@ mod tests {
         // "plain" at col 21..26 -> empty modifiers
         assert_eq!(buf[(21, 0)].symbol(), "p");
         assert_eq!(buf[(21, 0)].modifier, Modifier::empty());
+    }
+
+    #[test]
+    fn vt_render_dims_clamps_to_the_smaller_of_screen_and_viewport() {
+        let area = |w, h| Rect {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        };
+
+        // Matching sizes paint everything.
+        assert_eq!(vt_render_dims((80, 24), area(80, 24)), (24, 80));
+
+        // Screen larger than the viewport (shrink before the channel resize landed):
+        // clip to the viewport so nothing spills into the tab or status bar.
+        assert_eq!(vt_render_dims((120, 40), area(80, 24)), (24, 80));
+
+        // Viewport larger than the screen (grow before the parser was resized):
+        // paint only what the screen has, leaving the rest to the cleared buffer.
+        assert_eq!(vt_render_dims((80, 24), area(120, 40)), (24, 80));
+
+        // Zero-sized viewport paints nothing rather than underflowing.
+        assert_eq!(vt_render_dims((80, 24), area(0, 0)), (0, 0));
+    }
+
+    #[test]
+    fn vt_screen_widget_leaves_rows_beyond_the_screen_blank_when_viewport_is_taller() {
+        let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
+        let mut parser = vt100::Parser::new(nz(2), nz(10), 0);
+        parser.process(b"top\r\nmid");
+
+        // Viewport is taller than the 2-row screen: the extra rows must stay blank
+        // and must not repeat or corrupt the screen contents.
+        let backend = TestBackend::new(10, 5);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            f.render_widget(
+                VtScreenWidget {
+                    screen: parser.screen(),
+                    selection: None,
+                },
+                f.area(),
+            );
+        })
+        .unwrap();
+
+        let buf = term.backend().buffer();
+        assert_eq!(buf[(0, 0)].symbol(), "t");
+        assert_eq!(buf[(0, 1)].symbol(), "m");
+        for y in 2..5 {
+            for x in 0..10 {
+                assert_eq!(
+                    buf[(x, y)].symbol(),
+                    " ",
+                    "row {y} col {x} should be blank, not stale or duplicated content"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vt_screen_widget_does_not_paint_past_a_shorter_viewport() {
+        let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
+        let mut parser = vt100::Parser::new(nz(5), nz(10), 0);
+        parser.process(b"r0\r\nr1\r\nr2\r\nr3\r\nr4");
+
+        // Viewport shows only 2 of the 5 rows; the widget must clip, not overflow.
+        let backend = TestBackend::new(10, 2);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            f.render_widget(
+                VtScreenWidget {
+                    screen: parser.screen(),
+                    selection: None,
+                },
+                f.area(),
+            );
+        })
+        .unwrap();
+
+        let buf = term.backend().buffer();
+        assert_eq!(buf[(0, 0)].symbol(), "r");
+        assert_eq!(buf[(1, 0)].symbol(), "0");
+        assert_eq!(buf[(0, 1)].symbol(), "r");
+        assert_eq!(buf[(1, 1)].symbol(), "1");
+        // Buffer is exactly 2 rows tall, so reaching here without a panic is the
+        // assertion that nothing was written outside the area.
     }
 
     #[test]
