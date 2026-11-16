@@ -2181,7 +2181,7 @@ impl HorizontalWheelGestureState {
 
 #[allow(clippy::too_many_arguments)]
 fn try_activate_space_slop_tap(
-    had_drag_snapshot: bool,
+    was_dragged: bool,
     anchor_col: u16,
     anchor_row: u16,
     up_col: u16,
@@ -2192,7 +2192,7 @@ fn try_activate_space_slop_tap(
     ctrl_active: &mut bool,
     alt_active: &mut bool,
 ) -> bool {
-    if had_drag_snapshot
+    if was_dragged
         || !matches!(*modal, Modal::None)
         || !is_in_rect(space_slop_rect, anchor_col, anchor_row)
         || !is_in_rect(space_slop_rect, up_col, up_row)
@@ -3054,6 +3054,7 @@ fn run_app_loop(
                                         let new_head = (rel_row, rel_col);
                                         if sel.head != new_head {
                                             sel.head = new_head;
+                                            sel.dragged = true;
                                             if sel.is_non_empty() && selection_screen.is_none() {
                                                 selection_screen =
                                                     active_att.map(|a| a.parser.screen().clone());
@@ -3194,22 +3195,21 @@ fn run_app_loop(
                                                 term_rect.x.saturating_add(sel.anchor.1);
                                             let anchor_row =
                                                 term_rect.y.saturating_add(sel.anchor.0);
-                                            let had_drag_snap = snap.is_some();
+                                            let was_dragged = sel.dragged || snap.is_some();
+                                            let slop_toggled = try_activate_space_slop_tap(
+                                                was_dragged,
+                                                anchor_col,
+                                                anchor_row,
+                                                mev.column,
+                                                mev.row,
+                                                last_space_slop_rect,
+                                                &mut modal,
+                                                &mut prefix_active,
+                                                &mut ctrl_active,
+                                                &mut alt_active,
+                                            );
                                             selection = None;
-                                            if had_drag_snap
-                                                || try_activate_space_slop_tap(
-                                                    false,
-                                                    anchor_col,
-                                                    anchor_row,
-                                                    mev.column,
-                                                    mev.row,
-                                                    last_space_slop_rect,
-                                                    &mut modal,
-                                                    &mut prefix_active,
-                                                    &mut ctrl_active,
-                                                    &mut alt_active,
-                                                )
-                                            {
+                                            if was_dragged || slop_toggled {
                                                 dirty = true;
                                             }
                                         }
@@ -5432,9 +5432,9 @@ mod tests {
     #[test]
     fn space_slop_tap_opens_space_menu_on_stationary_top_left_tap_only() {
         let slop = Some(Rect {
-            x: 4,
+            x: 5,
             y: 1,
-            width: 12,
+            width: 10,
             height: 2,
         });
 
@@ -5458,7 +5458,8 @@ mod tests {
         assert_eq!(modal, Modal::SpaceMenu);
         assert!(!prefix_active && !ctrl_active && !alt_active);
 
-        // Cancelled text-selection drag returning to anchor (`had_drag_snapshot = true`) does NOT open SpaceMenu
+        // Cancelled text-selection drag returning to anchor (`was_dragged = true`, even pre-attach)
+        // does NOT open SpaceMenu
         let mut modal = Modal::None;
         assert!(!try_activate_space_slop_tap(
             true,
@@ -5491,7 +5492,7 @@ mod tests {
             false,
             6,
             1,
-            16,
+            15,
             1,
             slop,
             &mut modal,

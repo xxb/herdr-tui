@@ -308,6 +308,7 @@ pub struct TerminalSelection {
     pub anchor: (u16, u16),
     pub head: (u16, u16),
     pub active: bool,
+    pub dragged: bool,
 }
 
 impl TerminalSelection {
@@ -316,6 +317,7 @@ impl TerminalSelection {
             anchor: (row, col),
             head: (row, col),
             active: true,
+            dragged: false,
         }
     }
 
@@ -599,10 +601,8 @@ pub fn render_ui_with_pads_and_quota(
     let space_bounds = render_top_tabbar(f, top_rect, world, space_menu_open, &mut hits);
     let space_slop_rect = if matches!(modal, Modal::None) && term_rect.height > 0 {
         space_bounds.and_then(|(sx, send)| {
-            let slop_x = sx.saturating_sub(1).max(term_rect.x);
-            let slop_end = send
-                .saturating_add(1)
-                .min(term_rect.x.saturating_add(term_rect.width));
+            let slop_x = sx.max(term_rect.x);
+            let slop_end = send.min(term_rect.x.saturating_add(term_rect.width));
             let slop_w = slop_end.saturating_sub(slop_x);
             let slop_h = if term_rect.height >= 4 { 2 } else { 1 };
             (slop_w > 0).then_some(Rect {
@@ -2899,9 +2899,10 @@ mod tests {
         let slop = space_slop_out.expect("expected invisible vertical Space hit-slop rect");
         assert_eq!(slop.y, 1);
         assert_eq!(slop.height, 2);
-        assert!(is_in_rect(Some(slop), 4, 1));
-        assert!(is_in_rect(Some(slop), slash_col + 1, 2));
-        assert!(!is_in_rect(Some(slop), slash_col + 2, 1));
+        assert!(!is_in_rect(Some(slop), 4, 1));
+        assert!(is_in_rect(Some(slop), 5, 1));
+        assert!(is_in_rect(Some(slop), slash_col, 2));
+        assert!(!is_in_rect(Some(slop), slash_col + 1, 1));
         assert!(!is_in_rect(Some(slop), 7, 3));
 
         // Top Bar exposes compact 1-row Tab pill, [ + ] (NewTab), and [ ? ] (ToggleHelp)
@@ -3705,6 +3706,7 @@ mod tests {
             anchor: (0, 6),
             head: (1, 5),
             active: false,
+            dragged: true,
         };
         assert_eq!(sel.extract_text(parser.screen()), "world\nsecond");
 
@@ -3715,6 +3717,7 @@ mod tests {
             anchor: (0, 0),
             head: (1, 4),
             active: false,
+            dragged: true,
         };
         assert_eq!(
             wrap_sel.extract_text(wrap_parser.screen()),
