@@ -2193,9 +2193,10 @@ fn try_activate_space_slop_tap(
     alt_active: &mut bool,
 ) -> bool {
     if was_dragged
+        || anchor_col != up_col
+        || anchor_row != up_row
         || !matches!(*modal, Modal::None)
         || !is_in_rect(space_slop_rect, anchor_col, anchor_row)
-        || !is_in_rect(space_slop_rect, up_col, up_row)
     {
         return false;
     }
@@ -3042,26 +3043,13 @@ fn run_app_loop(
                                         }
                                     }
                                 } else if let Some(ref mut sel) = selection {
-                                    if sel.active && term_rect.width > 0 && term_rect.height > 0 {
-                                        let rel_col = mev
-                                            .column
-                                            .saturating_sub(term_rect.x)
-                                            .min(term_rect.width.saturating_sub(1));
-                                        let rel_row = mev
-                                            .row
-                                            .saturating_sub(term_rect.y)
-                                            .min(term_rect.height.saturating_sub(1));
-                                        let new_head = (rel_row, rel_col);
-                                        if sel.head != new_head {
-                                            sel.head = new_head;
-                                            sel.dragged = true;
-                                            if sel.is_non_empty() && selection_screen.is_none() {
-                                                selection_screen =
-                                                    active_att.map(|a| a.parser.screen().clone());
-                                                selection_vt_seq = active_att.map(|a| a.vt_seq);
-                                            }
-                                            dirty = true;
+                                    if sel.update_drag(term_rect, mev.column, mev.row) {
+                                        if sel.is_non_empty() && selection_screen.is_none() {
+                                            selection_screen =
+                                                active_att.map(|a| a.parser.screen().clone());
+                                            selection_vt_seq = active_att.map(|a| a.vt_seq);
                                         }
+                                        dirty = true;
                                     }
                                 }
                             }
@@ -3209,7 +3197,7 @@ fn run_app_loop(
                                                 &mut alt_active,
                                             );
                                             selection = None;
-                                            if was_dragged || slop_toggled {
+                                            if snap.is_some() || slop_toggled {
                                                 dirty = true;
                                             }
                                         }
@@ -5474,6 +5462,41 @@ mod tests {
             &mut alt_active,
         ));
         assert_eq!(modal, Modal::None);
+
+        // Dragging straight upward from Row 1 onto Row 0 (clamped back to anchor) still marks `dragged = true`
+        // so returning to the anchor on release does NOT open SpaceMenu!
+        let mut up_drag_sel = TerminalSelection::new(0, 6);
+        let drag_rect = Rect::new(0, 1, 80, 22);
+        assert!(!up_drag_sel.update_drag(drag_rect, 6, 0));
+        assert!(up_drag_sel.dragged);
+        let mut modal = Modal::None;
+        assert!(!try_activate_space_slop_tap(
+            up_drag_sel.dragged,
+            6,
+            1,
+            6,
+            1,
+            slop,
+            &mut modal,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+        ));
+        assert_eq!(modal, Modal::None);
+
+        // Releasing at a different cell even without an intermediate Drag event does NOT open SpaceMenu
+        assert!(!try_activate_space_slop_tap(
+            false,
+            6,
+            1,
+            7,
+            1,
+            slop,
+            &mut modal,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+        ));
 
         // Anchor or release outside `space_slop_rect`, or active modal, does NOT open SpaceMenu
         assert!(!try_activate_space_slop_tap(

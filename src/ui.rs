@@ -325,6 +325,30 @@ impl TerminalSelection {
         self.anchor != self.head
     }
 
+    pub fn update_drag(&mut self, term_rect: Rect, mouse_col: u16, mouse_row: u16) -> bool {
+        if !self.active || term_rect.width == 0 || term_rect.height == 0 {
+            return false;
+        }
+        let anchor_col = term_rect.x.saturating_add(self.anchor.1);
+        let anchor_row = term_rect.y.saturating_add(self.anchor.0);
+        if mouse_col != anchor_col || mouse_row != anchor_row {
+            self.dragged = true;
+        }
+        let rel_col = mouse_col
+            .saturating_sub(term_rect.x)
+            .min(term_rect.width.saturating_sub(1));
+        let rel_row = mouse_row
+            .saturating_sub(term_rect.y)
+            .min(term_rect.height.saturating_sub(1));
+        let new_head = (rel_row, rel_col);
+        if self.head != new_head {
+            self.head = new_head;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn normalized(&self) -> ((u16, u16), (u16, u16)) {
         if self.anchor <= self.head {
             (self.anchor, self.head)
