@@ -16,7 +16,7 @@ use crate::keys::{
 };
 use crate::model::{EventDisposition, World};
 use crate::ui::{
-    collect_fuzzy_items, compute_terminal_rect, find_hit_target, is_on_dpad_disc,
+    collect_fuzzy_items, compute_terminal_rect, find_hit_target, is_in_rect, is_on_dpad_disc,
     render_ui_with_pads_and_quota, resolve_dpad_disc_rect, resolve_fuzzy_selection,
     resolve_mod_cross_rect, HitRegion, HitTarget, Modal, PromptKind, TerminalSelection,
 };
@@ -2180,6 +2180,33 @@ impl HorizontalWheelGestureState {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn try_activate_space_slop_tap(
+    had_drag_snapshot: bool,
+    anchor_col: u16,
+    anchor_row: u16,
+    up_col: u16,
+    up_row: u16,
+    space_slop_rect: Option<Rect>,
+    modal: &mut Modal,
+    prefix_active: &mut bool,
+    ctrl_active: &mut bool,
+    alt_active: &mut bool,
+) -> bool {
+    if had_drag_snapshot
+        || !matches!(*modal, Modal::None)
+        || !is_in_rect(space_slop_rect, anchor_col, anchor_row)
+        || !is_in_rect(space_slop_rect, up_col, up_row)
+    {
+        return false;
+    }
+    *prefix_active = false;
+    *ctrl_active = false;
+    *alt_active = false;
+    *modal = Modal::SpaceMenu;
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_top_bar_or_space_vertical_wheel(
     scroll_up: bool,
     now: Instant,
@@ -2403,6 +2430,7 @@ fn run_app_loop(
     let mut last_mod_rect: Option<Rect> = None;
     let mut dpad_pos: Option<(u16, u16)> = None;
     let mut last_dpad_rect: Option<Rect> = None;
+    let mut last_space_slop_rect: Option<Rect> = None;
     let mut dpad_drag: Option<FloatingDPadDrag> = None;
     let mut horiz_wheel = HorizontalWheelGestureState::default();
     let mut selection: Option<TerminalSelection> = None;
@@ -3162,7 +3190,28 @@ fn run_app_loop(
                                             }
                                             dirty = true;
                                         } else {
+                                            let anchor_col =
+                                                term_rect.x.saturating_add(sel.anchor.1);
+                                            let anchor_row =
+                                                term_rect.y.saturating_add(sel.anchor.0);
+                                            let had_drag_snap = snap.is_some();
                                             selection = None;
+                                            if had_drag_snap
+                                                || try_activate_space_slop_tap(
+                                                    false,
+                                                    anchor_col,
+                                                    anchor_row,
+                                                    mev.column,
+                                                    mev.row,
+                                                    last_space_slop_rect,
+                                                    &mut modal,
+                                                    &mut prefix_active,
+                                                    &mut ctrl_active,
+                                                    &mut alt_active,
+                                                )
+                                            {
+                                                dirty = true;
+                                            }
                                         }
                                     }
                                 }
@@ -3620,6 +3669,7 @@ fn run_app_loop(
                 last_hits = geom.hits;
                 last_mod_rect = geom.mod_rect;
                 last_dpad_rect = geom.dpad_rect;
+                last_space_slop_rect = geom.space_slop_rect;
             })?;
             execute!(terminal.backend_mut(), EndSynchronizedUpdate)?;
             dirty = false;
@@ -5377,5 +5427,91 @@ mod tests {
             assert!(sb.contents_between(1, 0, 1, 24).contains("第一行"));
             assert!(sb.contents_between(2, 0, 2, 24).contains("第二行"));
         }
+    }
+
+    #[test]
+    fn space_slop_tap_opens_space_menu_on_stationary_top_left_tap_only() {
+        let slop = Some(Rect {
+            x: 4,
+            y: 1,
+            width: 12,
+            height: 2,
+        });
+
+        // Stationary tap inside `space_slop_rect` (Row 1 or Row 2) clears sticky modifiers and opens SpaceMenu
+        let mut modal = Modal::None;
+        let mut prefix_active = true;
+        let mut ctrl_active = true;
+        let mut alt_active = true;
+        assert!(try_activate_space_slop_tap(
+            false,
+            6,
+            2,
+            6,
+            2,
+            slop,
+            &mut modal,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+        ));
+        assert_eq!(modal, Modal::SpaceMenu);
+        assert!(!prefix_active && !ctrl_active && !alt_active);
+
+        // Cancelled text-selection drag returning to anchor (`had_drag_snapshot = true`) does NOT open SpaceMenu
+        let mut modal = Modal::None;
+        assert!(!try_activate_space_slop_tap(
+            true,
+            6,
+            1,
+            6,
+            1,
+            slop,
+            &mut modal,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+        ));
+        assert_eq!(modal, Modal::None);
+
+        // Anchor or release outside `space_slop_rect`, or active modal, does NOT open SpaceMenu
+        assert!(!try_activate_space_slop_tap(
+            false,
+            6,
+            3,
+            6,
+            2,
+            slop,
+            &mut modal,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+        ));
+        assert!(!try_activate_space_slop_tap(
+            false,
+            6,
+            1,
+            16,
+            1,
+            slop,
+            &mut modal,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+        ));
+        let mut help_modal = Modal::Help;
+        assert!(!try_activate_space_slop_tap(
+            false,
+            6,
+            1,
+            6,
+            1,
+            slop,
+            &mut help_modal,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+        ));
+        assert_eq!(help_modal, Modal::Help);
     }
 }
