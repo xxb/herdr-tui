@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.2](https://github.com/xxb/herdr-tui/compare/v0.3.1...v0.3.2) (2026-11-16)
+
+
+### Bug Fixes
+
+* **mouse:** prevent vertical scrolling from false-triggering tab switches ([#52](https://github.com/xxb/herdr-tui/issues/52)) ([9a92ba1](https://github.com/xxb/herdr-tui/commit/9a92ba135367169c66cc32e25af3db612991580b))
+* **ui:** make VtScreenWidget viewport clamping explicit and tested ([#49](https://github.com/xxb/herdr-tui/issues/49)) ([4149d4e](https://github.com/xxb/herdr-tui/commit/4149d4ec2bbace17abb7e14777e7cb8c264c17ae)), closes [#48](https://github.com/xxb/herdr-tui/issues/48)
+
 ## [0.3.1](https://github.com/xxb/herdr-tui/compare/v0.3.0...v0.3.1) (2026-11-15)
 
 
