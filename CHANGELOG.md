@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.3](https://github.com/xxb/herdr-tui/compare/v0.3.2...v0.3.3) (2026-11-16)
+
+
+### Bug Fixes
+
+* **ui:** expand top-left Space button hit area without enlarging visual pill ([#54](https://github.com/xxb/herdr-tui/issues/54)) ([8c4134c](https://github.com/xxb/herdr-tui/commit/8c4134c2f6f6fd800ada9af53a51f5f63efe6203))
+
 ## [0.3.2](https://github.com/xxb/herdr-tui/compare/v0.3.1...v0.3.2) (2026-11-16)
 
 
