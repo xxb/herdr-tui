@@ -16,7 +16,7 @@ use crate::keys::{
 };
 use crate::model::{EventDisposition, World};
 use crate::ui::{
-    collect_fuzzy_items, compute_terminal_rect, find_hit_target, is_on_dpad_disc,
+    collect_fuzzy_items, compute_terminal_rect, find_hit_target, is_in_rect, is_on_dpad_disc,
     render_ui_with_pads_and_quota, resolve_dpad_disc_rect, resolve_fuzzy_selection,
     resolve_mod_cross_rect, HitRegion, HitTarget, Modal, PromptKind, TerminalSelection,
 };
@@ -2180,6 +2180,34 @@ impl HorizontalWheelGestureState {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn try_activate_space_slop_tap(
+    was_dragged: bool,
+    anchor_col: u16,
+    anchor_row: u16,
+    up_col: u16,
+    up_row: u16,
+    space_slop_rect: Option<Rect>,
+    modal: &mut Modal,
+    prefix_active: &mut bool,
+    ctrl_active: &mut bool,
+    alt_active: &mut bool,
+) -> bool {
+    if was_dragged
+        || anchor_col != up_col
+        || anchor_row != up_row
+        || !matches!(*modal, Modal::None)
+        || !is_in_rect(space_slop_rect, anchor_col, anchor_row)
+    {
+        return false;
+    }
+    *prefix_active = false;
+    *ctrl_active = false;
+    *alt_active = false;
+    *modal = Modal::SpaceMenu;
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_top_bar_or_space_vertical_wheel(
     scroll_up: bool,
     now: Instant,
@@ -2403,6 +2431,7 @@ fn run_app_loop(
     let mut last_mod_rect: Option<Rect> = None;
     let mut dpad_pos: Option<(u16, u16)> = None;
     let mut last_dpad_rect: Option<Rect> = None;
+    let mut last_space_slop_rect: Option<Rect> = None;
     let mut dpad_drag: Option<FloatingDPadDrag> = None;
     let mut horiz_wheel = HorizontalWheelGestureState::default();
     let mut selection: Option<TerminalSelection> = None;
@@ -3014,25 +3043,13 @@ fn run_app_loop(
                                         }
                                     }
                                 } else if let Some(ref mut sel) = selection {
-                                    if sel.active && term_rect.width > 0 && term_rect.height > 0 {
-                                        let rel_col = mev
-                                            .column
-                                            .saturating_sub(term_rect.x)
-                                            .min(term_rect.width.saturating_sub(1));
-                                        let rel_row = mev
-                                            .row
-                                            .saturating_sub(term_rect.y)
-                                            .min(term_rect.height.saturating_sub(1));
-                                        let new_head = (rel_row, rel_col);
-                                        if sel.head != new_head {
-                                            sel.head = new_head;
-                                            if sel.is_non_empty() && selection_screen.is_none() {
-                                                selection_screen =
-                                                    active_att.map(|a| a.parser.screen().clone());
-                                                selection_vt_seq = active_att.map(|a| a.vt_seq);
-                                            }
-                                            dirty = true;
+                                    if sel.update_drag(term_rect, mev.column, mev.row) {
+                                        if sel.is_non_empty() && selection_screen.is_none() {
+                                            selection_screen =
+                                                active_att.map(|a| a.parser.screen().clone());
+                                            selection_vt_seq = active_att.map(|a| a.vt_seq);
                                         }
+                                        dirty = true;
                                     }
                                 }
                             }
@@ -3162,7 +3179,27 @@ fn run_app_loop(
                                             }
                                             dirty = true;
                                         } else {
+                                            let anchor_col =
+                                                term_rect.x.saturating_add(sel.anchor.1);
+                                            let anchor_row =
+                                                term_rect.y.saturating_add(sel.anchor.0);
+                                            let was_dragged = sel.dragged || snap.is_some();
+                                            let slop_toggled = try_activate_space_slop_tap(
+                                                was_dragged,
+                                                anchor_col,
+                                                anchor_row,
+                                                mev.column,
+                                                mev.row,
+                                                last_space_slop_rect,
+                                                &mut modal,
+                                                &mut prefix_active,
+                                                &mut ctrl_active,
+                                                &mut alt_active,
+                                            );
                                             selection = None;
+                                            if snap.is_some() || slop_toggled {
+                                                dirty = true;
+                                            }
                                         }
                                     }
                                 }
@@ -3620,6 +3657,7 @@ fn run_app_loop(
                 last_hits = geom.hits;
                 last_mod_rect = geom.mod_rect;
                 last_dpad_rect = geom.dpad_rect;
+                last_space_slop_rect = geom.space_slop_rect;
             })?;
             execute!(terminal.backend_mut(), EndSynchronizedUpdate)?;
             dirty = false;
@@ -5377,5 +5415,127 @@ mod tests {
             assert!(sb.contents_between(1, 0, 1, 24).contains("第一行"));
             assert!(sb.contents_between(2, 0, 2, 24).contains("第二行"));
         }
+    }
+
+    #[test]
+    fn space_slop_tap_opens_space_menu_on_stationary_top_left_tap_only() {
+        let slop = Some(Rect {
+            x: 5,
+            y: 1,
+            width: 10,
+            height: 2,
+        });
+
+        // Stationary tap inside `space_slop_rect` (Row 1 or Row 2) clears sticky modifiers and opens SpaceMenu
+        let mut modal = Modal::None;
+        let mut prefix_active = true;
+        let mut ctrl_active = true;
+        let mut alt_active = true;
+        assert!(try_activate_space_slop_tap(
+            false,
+            6,
+            2,
+            6,
+            2,
+            slop,
+            &mut modal,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+        ));
+        assert_eq!(modal, Modal::SpaceMenu);
+        assert!(!prefix_active && !ctrl_active && !alt_active);
+
+        // Cancelled text-selection drag returning to anchor (`was_dragged = true`, even pre-attach)
+        // does NOT open SpaceMenu
+        let mut modal = Modal::None;
+        assert!(!try_activate_space_slop_tap(
+            true,
+            6,
+            1,
+            6,
+            1,
+            slop,
+            &mut modal,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+        ));
+        assert_eq!(modal, Modal::None);
+
+        // Dragging straight upward from Row 1 onto Row 0 (clamped back to anchor) still marks `dragged = true`
+        // so returning to the anchor on release does NOT open SpaceMenu!
+        let mut up_drag_sel = TerminalSelection::new(0, 6);
+        let drag_rect = Rect::new(0, 1, 80, 22);
+        assert!(!up_drag_sel.update_drag(drag_rect, 6, 0));
+        assert!(up_drag_sel.dragged);
+        let mut modal = Modal::None;
+        assert!(!try_activate_space_slop_tap(
+            up_drag_sel.dragged,
+            6,
+            1,
+            6,
+            1,
+            slop,
+            &mut modal,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+        ));
+        assert_eq!(modal, Modal::None);
+
+        // Releasing at a different cell even without an intermediate Drag event does NOT open SpaceMenu
+        assert!(!try_activate_space_slop_tap(
+            false,
+            6,
+            1,
+            7,
+            1,
+            slop,
+            &mut modal,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+        ));
+
+        // Anchor or release outside `space_slop_rect`, or active modal, does NOT open SpaceMenu
+        assert!(!try_activate_space_slop_tap(
+            false,
+            6,
+            3,
+            6,
+            2,
+            slop,
+            &mut modal,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+        ));
+        assert!(!try_activate_space_slop_tap(
+            false,
+            6,
+            1,
+            15,
+            1,
+            slop,
+            &mut modal,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+        ));
+        let mut help_modal = Modal::Help;
+        assert!(!try_activate_space_slop_tap(
+            false,
+            6,
+            1,
+            6,
+            1,
+            slop,
+            &mut help_modal,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+        ));
+        assert_eq!(help_modal, Modal::Help);
     }
 }

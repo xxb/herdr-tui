@@ -219,6 +219,16 @@ pub struct UiGeometry {
     pub hits: Vec<HitRegion>,
     pub mod_rect: Option<Rect>,
     pub dpad_rect: Option<Rect>,
+    pub space_slop_rect: Option<Rect>,
+}
+
+pub fn is_in_rect(rect: Option<Rect>, col: u16, row: u16) -> bool {
+    rect.is_some_and(|r| {
+        col >= r.x
+            && col < r.x.saturating_add(r.width)
+            && row >= r.y
+            && row < r.y.saturating_add(r.height)
+    })
 }
 
 fn cross_pad_dimensions(term_rect: Rect) -> Option<(u16, u16)> {
@@ -298,6 +308,7 @@ pub struct TerminalSelection {
     pub anchor: (u16, u16),
     pub head: (u16, u16),
     pub active: bool,
+    pub dragged: bool,
 }
 
 impl TerminalSelection {
@@ -306,11 +317,36 @@ impl TerminalSelection {
             anchor: (row, col),
             head: (row, col),
             active: true,
+            dragged: false,
         }
     }
 
     pub fn is_non_empty(&self) -> bool {
         self.anchor != self.head
+    }
+
+    pub fn update_drag(&mut self, term_rect: Rect, mouse_col: u16, mouse_row: u16) -> bool {
+        if !self.active || term_rect.width == 0 || term_rect.height == 0 {
+            return false;
+        }
+        let anchor_col = term_rect.x.saturating_add(self.anchor.1);
+        let anchor_row = term_rect.y.saturating_add(self.anchor.0);
+        if mouse_col != anchor_col || mouse_row != anchor_row {
+            self.dragged = true;
+        }
+        let rel_col = mouse_col
+            .saturating_sub(term_rect.x)
+            .min(term_rect.width.saturating_sub(1));
+        let rel_row = mouse_row
+            .saturating_sub(term_rect.y)
+            .min(term_rect.height.saturating_sub(1));
+        let new_head = (rel_row, rel_col);
+        if self.head != new_head {
+            self.head = new_head;
+            true
+        } else {
+            false
+        }
     }
 
     pub fn normalized(&self) -> ((u16, u16), (u16, u16)) {
@@ -586,7 +622,23 @@ pub fn render_ui_with_pads_and_quota(
     let mut dpad_rect = None;
     let space_menu_open = matches!(modal, Modal::SpaceMenu);
 
-    render_top_tabbar(f, top_rect, world, space_menu_open, &mut hits);
+    let space_bounds = render_top_tabbar(f, top_rect, world, space_menu_open, &mut hits);
+    let space_slop_rect = if matches!(modal, Modal::None) && term_rect.height > 0 {
+        space_bounds.and_then(|(sx, send)| {
+            let slop_x = sx.max(term_rect.x);
+            let slop_end = send.min(term_rect.x.saturating_add(term_rect.width));
+            let slop_w = slop_end.saturating_sub(slop_x);
+            let slop_h = if term_rect.height >= 4 { 2 } else { 1 };
+            (slop_w > 0).then_some(Rect {
+                x: slop_x,
+                y: term_rect.y,
+                width: slop_w,
+                height: slop_h,
+            })
+        })
+    } else {
+        None
+    };
     render_bottom_status_bar(
         f,
         bottom_rect,
@@ -646,6 +698,7 @@ pub fn render_ui_with_pads_and_quota(
         hits,
         mod_rect,
         dpad_rect,
+        space_slop_rect,
     }
 }
 
@@ -981,9 +1034,9 @@ fn render_top_tabbar(
     world: &World,
     space_menu_open: bool,
     hits: &mut Vec<HitRegion>,
-) {
+) -> Option<(u16, u16)> {
     if rect.width == 0 || rect.height == 0 {
-        return;
+        return None;
     }
     let mut bg_bar = Style::default().bg(HERDR_PANEL_BG).fg(HERDR_TEXT);
     if rect.height == 1 {
@@ -1044,6 +1097,13 @@ fn render_top_tabbar(
             x += 1;
         }
     }
+    let space_hit_start = rect
+        .x
+        .saturating_add(if detach_w > 0 && rect.width >= detach_w {
+            detach_w
+        } else {
+            0
+        });
 
     // 1. Space selector button (`[ ▾ SpaceName ]`) — opens secondary Space popover menu
     let (sname, sstate) = world
@@ -1083,6 +1143,7 @@ fn render_top_tabbar(
         )
     };
     let space_w = space_lbl.width() as u16;
+    let mut drew_space = false;
     if space_w > 0 && x + space_w <= max_x {
         let style = Style::default()
             .bg(if space_menu_open {
@@ -1093,16 +1154,8 @@ fn render_top_tabbar(
             .fg(HERDR_MAUVE)
             .add_modifier(Modifier::BOLD);
         draw_touchbar_pill(buf, x, rect, &space_lbl, style, false);
-        hits.push(HitRegion {
-            rect: Rect {
-                x,
-                y: rect.y,
-                width: space_w,
-                height: rect.height,
-            },
-            target: HitTarget::ToggleSpaceMenu,
-        });
         x += space_w;
+        drew_space = true;
     }
 
     // Subtle slash divider between Space button and Tab pills
@@ -1116,6 +1169,25 @@ fn render_top_tabbar(
         }
         buf.set_string(x, div_y, "╱", div_style);
         x += 1;
+    }
+
+    // Invisibly extend Space's Row-0 hit box across adjacent gap + `╱` divider (zero visual change).
+    let mut space_drawn_bounds: Option<(u16, u16)> = None;
+    if drew_space {
+        let space_hit_end = x;
+        let space_hit_w = space_hit_end.saturating_sub(space_hit_start);
+        if space_hit_w > 0 {
+            hits.push(HitRegion {
+                rect: Rect {
+                    x: space_hit_start,
+                    y: rect.y,
+                    width: space_hit_w,
+                    height: rect.height,
+                },
+                target: HitTarget::ToggleSpaceMenu,
+            });
+            space_drawn_bounds = Some((space_hit_start, space_hit_end));
+        }
     }
 
     // 2. Horizontal Tab pills (`space / tab1 / tab2 ...`) + trailing `[ + ]` button
@@ -1238,6 +1310,8 @@ fn render_top_tabbar(
             target: HitTarget::ToggleHelp,
         });
     }
+
+    space_drawn_bounds
 }
 
 fn quota_remaining_color(remaining_percent: f64) -> Color {
@@ -2784,6 +2858,7 @@ mod tests {
         let mut hits = Vec::new();
         let mut mod_rect_out = None;
         let mut dpad_rect_out = None;
+        let mut space_slop_out = None;
 
         terminal
             .draw(|f| {
@@ -2805,6 +2880,7 @@ mod tests {
                 hits = geom.hits;
                 mod_rect_out = geom.mod_rect;
                 dpad_rect_out = geom.dpad_rect;
+                space_slop_out = geom.space_slop_rect;
                 assert_eq!(geom.term_rect.x, 0);
                 assert_eq!(geom.term_rect.width, 100);
                 assert_eq!(geom.term_rect.y, 1);
@@ -2817,12 +2893,41 @@ mod tests {
             find_hit_target(&hits, 1, 0),
             Some(HitTarget::TriggerAction(Action::Detach))
         );
+        assert_eq!(
+            find_hit_target(&hits, 4, 0),
+            Some(HitTarget::TriggerAction(Action::Detach))
+        );
 
-        // Top Bar Space selector right after `[ ⏏ ]` on row 0 should hit ToggleSpaceMenu
+        // Top Bar Space selector absorbs both the left gap (col 5) and `╱` divider (col 14)
+        // without changing visual rendering or overlapping Detach / first Tab pill
+        assert_eq!(
+            find_hit_target(&hits, 5, 0),
+            Some(HitTarget::ToggleSpaceMenu)
+        );
         assert_eq!(
             find_hit_target(&hits, 7, 0),
             Some(HitTarget::ToggleSpaceMenu)
         );
+        let buf_row0 = terminal.backend().buffer();
+        let slash_col = (0..100u16)
+            .find(|&x| buf_row0[(x, 0)].symbol() == "╱")
+            .expect("expected divider glyph on row 0");
+        assert_eq!(
+            find_hit_target(&hits, slash_col, 0),
+            Some(HitTarget::ToggleSpaceMenu)
+        );
+        assert!(matches!(
+            find_hit_target(&hits, slash_col + 1, 0),
+            Some(HitTarget::SelectTab { .. })
+        ));
+        let slop = space_slop_out.expect("expected invisible vertical Space hit-slop rect");
+        assert_eq!(slop.y, 1);
+        assert_eq!(slop.height, 2);
+        assert!(!is_in_rect(Some(slop), 4, 1));
+        assert!(is_in_rect(Some(slop), 5, 1));
+        assert!(is_in_rect(Some(slop), slash_col, 2));
+        assert!(!is_in_rect(Some(slop), slash_col + 1, 1));
+        assert!(!is_in_rect(Some(slop), 7, 3));
 
         // Top Bar exposes compact 1-row Tab pill, [ + ] (NewTab), and [ ? ] (ToggleHelp)
         assert!(hits
@@ -2950,6 +3055,7 @@ mod tests {
                 hits = geom.hits;
                 assert!(geom.mod_rect.is_none());
                 assert!(geom.dpad_rect.is_none());
+                assert!(geom.space_slop_rect.is_none());
             })
             .unwrap();
 
@@ -2988,6 +3094,7 @@ mod tests {
                     },
                 );
                 hits = geom.hits;
+                assert!(geom.space_slop_rect.is_none());
             })
             .unwrap();
 
@@ -3558,6 +3665,7 @@ mod tests {
                     &Modal::Help,
                 );
                 hits = geom.hits;
+                assert!(geom.space_slop_rect.is_none());
             })
             .unwrap();
 
@@ -3622,6 +3730,7 @@ mod tests {
             anchor: (0, 6),
             head: (1, 5),
             active: false,
+            dragged: true,
         };
         assert_eq!(sel.extract_text(parser.screen()), "world\nsecond");
 
@@ -3632,6 +3741,7 @@ mod tests {
             anchor: (0, 0),
             head: (1, 4),
             active: false,
+            dragged: true,
         };
         assert_eq!(
             wrap_sel.extract_text(wrap_parser.screen()),
