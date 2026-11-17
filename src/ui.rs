@@ -1613,7 +1613,12 @@ fn render_top_tabbar(
                 let prefix_w = format!(" {arrow} ").width() as u16;
                 let sym_w = sstate.symbol().width() as u16;
                 let label_y = if rect.height >= 3 { rect.y + 1 } else { rect.y };
-                if sym_w > 0 && prefix_w + sym_w <= space_w {
+                if sym_w > 0
+                    && prefix_w + sym_w <= space_w
+                    && buf
+                        .cell((x + prefix_w, label_y))
+                        .is_some_and(|c| c.symbol() == sstate.symbol())
+                {
                     for dx in 0..sym_w {
                         if let Some(cell) = buf.cell_mut((x + prefix_w + dx, label_y)) {
                             cell.set_fg(sym_fg);
@@ -1725,9 +1730,14 @@ fn render_top_tabbar(
                         };
                         if let Some(rel_x) = rel_x_opt {
                             let label_y = if rect.height >= 3 { rect.y + 1 } else { rect.y };
-                            for dx in 0..(prefix.width() as u16) {
-                                if let Some(cell) = buf.cell_mut((x + rel_x + dx, label_y)) {
-                                    cell.set_fg(badge_fg);
+                            if buf
+                                .cell((x + rel_x, label_y))
+                                .is_some_and(|c| c.symbol() == prefix)
+                            {
+                                for dx in 0..(prefix.width() as u16) {
+                                    if let Some(cell) = buf.cell_mut((x + rel_x + dx, label_y)) {
+                                        cell.set_fg(badge_fg);
+                                    }
                                 }
                             }
                         }
@@ -3806,16 +3816,14 @@ fn detect_eink_diff_rows(
     for r in 0..rows {
         if r > 0 && screen.row_wrapped(r - 1) {
             if let Some(prev) = out[usize::from(r - 1)] {
-                if matches!(prev.kind, EinkDiffRowKind::Add | EinkDiffRowKind::Remove) {
-                    out[usize::from(r)] = Some(EinkDiffRowHighlight {
-                        kind: prev.kind,
-                        marker_start_col: 0,
-                        marker_end_col_excl: 0,
-                        side_bar_col: None,
-                        force_paper_bg: true,
-                    });
-                    continue;
-                }
+                out[usize::from(r)] = Some(EinkDiffRowHighlight {
+                    kind: prev.kind,
+                    marker_start_col: 0,
+                    marker_end_col_excl: 0,
+                    side_bar_col: None,
+                    force_paper_bg: true,
+                });
+                continue;
             }
         }
 
@@ -3847,7 +3855,7 @@ fn detect_eink_diff_rows(
             }
         }
 
-        // Skip up to two optional line-number tokens (`123`, `123:`, `123 │`).
+        // Skip up to two optional line-number tokens (`123`, `123:`, `123 │`, `10  11 │`).
         for _ in 0..2 {
             let saved = c;
             let mut digits = 0u16;
@@ -3862,18 +3870,27 @@ fn detect_eink_diff_rows(
                 c = saved;
                 break;
             }
+            let mut after_num = c;
+            let mut had_sep = false;
             if c < cols {
-                let sep = screen.cell(r, c).map_or("", |cell| cell.contents());
-                if matches!(sep, ":" | "|" | "│") {
-                    c += 1;
+                let mut scan = c;
+                while scan < cols && vt_cell_ascii_byte(screen, r, scan) == Some(b' ') {
+                    scan += 1;
+                }
+                if scan < cols {
+                    let sep = screen.cell(r, scan).map_or("", |cell| cell.contents());
+                    if matches!(sep, ":" | "|" | "│") {
+                        c = scan + 1;
+                        after_num = c;
+                        had_sep = true;
+                    }
                 }
             }
-            let after_num = c;
             while c < cols && vt_cell_ascii_byte(screen, r, c) == Some(b' ') {
                 c += 1;
             }
             let next_b = vt_cell_ascii_byte(screen, r, c);
-            if c == after_num && !matches!(next_b, Some(b'+') | Some(b'-')) {
+            if !had_sep && c == after_num && !matches!(next_b, Some(b'+') | Some(b'-')) {
                 c = saved;
                 break;
             }
@@ -3937,11 +3954,21 @@ fn detect_eink_diff_rows(
         if trimmed_end_tail.starts_with("--- ") || trimmed_end_tail.starts_with("+++ ") {
             let is_add_hdr = trimmed_end_tail.starts_with("+++ ");
             let rest = trimmed_end_tail[4..].trim();
+            let paired_next_add = !is_add_hdr
+                && r + 1 < rows
+                && !rest.is_empty()
+                && vt_row_ascii_slice(screen, r + 1, c, (c + 8).min(cols)).starts_with("+++ ");
+            let paired_next_hunk = paired_next_add
+                && r + 2 < rows
+                && vt_row_ascii_slice(screen, r + 2, c, (c + 8).min(cols)).starts_with("@@ ");
             let has_path_shape = !rest.is_empty()
-                && (rest.starts_with("a/")
-                    || rest.starts_with("b/")
-                    || rest.starts_with("/dev/null")
-                    || in_diff_context);
+                && (!in_uncolored_hunk
+                    && (rest.starts_with("a/")
+                        || rest.starts_with("b/")
+                        || rest.starts_with("/dev/null")
+                        || paired_next_add
+                        || in_diff_context)
+                    || paired_next_hunk);
             let marker_hue = screen.cell(r, c).and_then(|cell| {
                 classify_vt_diff_hue(cell.fgcolor(), false)
                     .or_else(|| classify_vt_diff_hue(cell.bgcolor(), true))
@@ -3951,8 +3978,10 @@ fn detect_eink_diff_rows(
             } else {
                 marker_hue == Some(DiffHue::Red)
             };
-            if color_matches || has_path_shape {
+            if (!in_uncolored_hunk && color_matches) || has_path_shape {
                 in_diff_context = true;
+                in_uncolored_hunk = false;
+                hunk_base_col = None;
                 out[usize::from(r)] = Some(EinkDiffRowHighlight {
                     kind: if is_add_hdr {
                         EinkDiffRowKind::Add
@@ -3991,8 +4020,7 @@ fn detect_eink_diff_rows(
             let uncolored_ok = in_uncolored_hunk
                 && hunk_base_col == Some(c)
                 && fg_hue.is_none()
-                && bg_hue.is_none()
-                && !same_next;
+                && bg_hue.is_none();
             let prev_was_diff = r > 0
                 && matches!(
                     out[usize::from(r - 1)].map(|d| d.kind),
@@ -4000,13 +4028,21 @@ fn detect_eink_diff_rows(
                 );
 
             let confirmed = if same_next {
-                !all_marker_rule && color_matches && (in_diff_context || prev_was_diff)
+                let uncolored_double_in_hunk =
+                    uncolored_ok && (!all_marker_rule || trimmed_end_tail.len() >= 4);
+                let colored_double = color_matches
+                    && (in_diff_context || prev_was_diff)
+                    && (!all_marker_rule || in_uncolored_hunk);
+                uncolored_double_in_hunk || colored_double
             } else {
                 color_matches || uncolored_ok
             };
 
             if confirmed {
                 in_diff_context = true;
+                if hunk_base_col != Some(c) {
+                    in_uncolored_hunk = false;
+                }
                 out[usize::from(r)] = Some(EinkDiffRowHighlight {
                     kind: if is_add {
                         EinkDiffRowKind::Add
@@ -4025,6 +4061,7 @@ fn detect_eink_diff_rows(
         if let Some((bc, hue)) = colored_bar {
             if matches!(hue, DiffHue::Green | DiffHue::Red) {
                 in_diff_context = true;
+                in_uncolored_hunk = false;
                 out[usize::from(r)] = Some(EinkDiffRowHighlight {
                     kind: if hue == DiffHue::Green {
                         EinkDiffRowKind::Add
@@ -8164,5 +8201,132 @@ mod tests {
             full_text.contains("^b E"),
             "missing ^b E shortcut:\n{full_text}"
         );
+    }
+
+    #[test]
+    fn kaleido_diff_handles_uncolored_doubles_spaced_line_nums_and_wrapped_hunks() {
+        let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
+        let mut parser = vt100::Parser::new(nz(12), nz(44), 20);
+        parser.process(
+            b"--- old.txt\r\n\
+              +++ new.txt\r\n\
+              \x1b[36;48;2;20;40;65m@@ -1,4 +1,4 @@ fn very_long_hunk_signature_wraps_here()\x1b[0m\r\n\
+              ++counter;\r\n\
+              --sql_comment\r\n\
+              --- removed_sql\r\n\
+              +tail_add\r\n\
+              \x1b[32m  42 \xe2\x94\x82 + spaced_num_add();\x1b[0m\r\n\
+              \x1b[31m  10  11 \xe2\x94\x82 - dual_num_del();\x1b[0m\r\n\
+              \x1b[31m----\x1b[0m",
+        );
+
+        let backend = TestBackend::new(44, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            f.render_widget(
+                VtScreenWidget {
+                    screen: parser.screen(),
+                    selection: None,
+                    eink_mode: true,
+                    eink_color: true,
+                },
+                f.area(),
+            );
+        })
+        .unwrap();
+
+        let buf = term.backend().buffer();
+        for y in 0..12u16 {
+            for x in 0..44u16 {
+                assert_eq!(buf[(x, y)].bg, EINK_PAPER, "row {y} col {x} leaked bg");
+            }
+        }
+
+        // Row 0 & 1: uncolored `diff -u old.txt new.txt` headers
+        assert_eq!(buf[(0, 0)].fg, KALEIDO_RED);
+        assert_eq!(buf[(2, 0)].fg, KALEIDO_RED);
+        assert_eq!(buf[(4, 0)].fg, EINK_INK);
+        assert_eq!(buf[(0, 1)].fg, KALEIDO_GREEN);
+        assert_eq!(buf[(2, 1)].fg, KALEIDO_GREEN);
+
+        // Row 2 & wrapped Row 3: hunk header + wrapped continuation keeps white bg
+        assert_eq!(buf[(0, 2)].fg, KALEIDO_BLUE);
+        assert_eq!(buf[(0, 3)].bg, EINK_PAPER);
+        assert_eq!(buf[(0, 3)].fg, EINK_INK);
+
+        // Row 4: `++counter;` inside uncolored hunk -> col 0 '+' green, col 1 '+' black
+        assert_eq!(buf[(0, 4)].symbol(), "+");
+        assert_eq!(buf[(0, 4)].fg, KALEIDO_GREEN);
+        assert_eq!(buf[(1, 4)].symbol(), "+");
+        assert_eq!(buf[(1, 4)].fg, EINK_INK);
+
+        // Row 5: `--sql_comment` -> col 0 '-' red, col 1 '-' black
+        assert_eq!(buf[(0, 5)].symbol(), "-");
+        assert_eq!(buf[(0, 5)].fg, KALEIDO_RED);
+        assert_eq!(buf[(1, 5)].fg, EINK_INK);
+
+        // Row 6: `--- removed_sql` inside hunk -> ONLY col 0 '-' red (not "---" file header)
+        assert_eq!(buf[(0, 6)].symbol(), "-");
+        assert_eq!(buf[(0, 6)].fg, KALEIDO_RED);
+        assert_eq!(buf[(1, 6)].symbol(), "-");
+        assert_eq!(buf[(1, 6)].fg, EINK_INK);
+
+        // Row 7: `+tail_add` after `++`/`--` still inside uncolored hunk!
+        assert_eq!(buf[(0, 7)].symbol(), "+");
+        assert_eq!(buf[(0, 7)].fg, KALEIDO_GREEN);
+
+        // Row 8: `  42 │ + spaced_num_add();` -> '+' at col 7 is green
+        let plus_x = (0..44u16).find(|&x| buf[(x, 8)].symbol() == "+").unwrap();
+        assert_eq!(buf[(plus_x, 8)].fg, KALEIDO_GREEN);
+
+        // Row 9: `  10  11 │ - dual_num_del();` -> '-' at col 11 is red
+        let minus_x = (0..44u16).find(|&x| buf[(x, 9)].symbol() == "-").unwrap();
+        assert_eq!(buf[(minus_x, 9)].fg, KALEIDO_RED);
+    }
+
+    #[test]
+    fn kaleido_narrow_top_bar_never_tints_ellipsis_on_truncated_space() {
+        let mut world = kaleido_world_for_tabs();
+        world.doc.spaces[0].name = "extremely-long-space-name".to_string();
+        world
+            .active_tab_by_space
+            .insert("sp1".to_string(), "tb1".to_string());
+        let backend = TestBackend::new(36, 6);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            let _ = render_ui_full_with_eink_color(
+                f,
+                &world,
+                None,
+                false,
+                24,
+                false,
+                false,
+                false,
+                false,
+                0,
+                None,
+                false,
+                &Modal::None,
+                None,
+                false,
+                None,
+                false,
+                None,
+                true,
+                true,
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        for x in 0..36u16 {
+            if buf[(x, 0)].symbol() == "…" {
+                assert_eq!(
+                    buf[(x, 0)].fg,
+                    EINK_INK,
+                    "truncated ellipsis at col {x} must remain neutral ink"
+                );
+            }
+        }
     }
 }
