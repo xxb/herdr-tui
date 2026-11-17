@@ -1622,6 +1622,7 @@ fn sync_attached_terminals(
     scrollback_offset: &mut usize,
     warm_siblings: bool,
     resize_siblings: bool,
+    mark_seen: bool,
 ) -> SyncOutcome {
     let mut outcome = SyncOutcome::default();
     let cols = term_rect.width.max(1);
@@ -1654,13 +1655,17 @@ fn sync_attached_terminals(
             }
             if active_addr.as_ref() != Some(addr) {
                 core.set_focus(cur.channel, true);
-                world.mark_active_seen(core);
+                if mark_seen {
+                    world.mark_active_seen(core);
+                }
             }
             resolved_active = Some(addr.clone());
         } else if let Ok(ch) = core.attach_terminal(addr, cols, rows, ATTACH_HISTORY_LINES) {
             core.set_focus(ch, true);
             attached_map.insert(addr.clone(), AttachedTerminal::new(ch, cols, rows));
-            world.mark_active_seen(core);
+            if mark_seen {
+                world.mark_active_seen(core);
+            }
             outcome.newly_attached_active = true;
             resolved_active = Some(addr.clone());
         } else {
@@ -2591,6 +2596,7 @@ fn run_app_loop(
                 &mut scrollback_offset,
                 first_frame_drawn,
                 allow_sibling_resize,
+                !matches!(modal, Modal::TabOverview { .. }),
             );
             last_synced_doc_version = world.doc_version;
             newly_attached_active = sync_out.newly_attached_active;
@@ -3802,6 +3808,76 @@ fn run_app_loop(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn handle_shortcut_in_tab_overview(
+    action: Action,
+    core: &CoreClient,
+    world: &mut World,
+    attached: Option<&AttachedTerminal>,
+    prefix_spec: &str,
+    sidebar_open: &mut bool,
+    scrollback_offset: &mut usize,
+    modal: &mut Modal,
+) -> Result<KeyOutcome> {
+    match action {
+        Action::Detach => {
+            *modal = Modal::None;
+            Ok(KeyOutcome::Quit)
+        }
+        Action::SendPrefix | Action::PrevTab => {
+            exit_tab_overview_to_last_tab(core, world, modal);
+            Ok(KeyOutcome::UiChanged)
+        }
+        Action::NextTab => {
+            *modal = Modal::None;
+            if world.active_space().is_some_and(|s| !s.tabs.is_empty()) {
+                world.select_tab_index(0);
+                world.mark_active_seen(core);
+            }
+            Ok(KeyOutcome::UiChanged)
+        }
+        Action::SelectTab(idx) => {
+            if world.active_space().is_some_and(|s| idx < s.tabs.len()) {
+                *modal = Modal::None;
+                if execute_action(
+                    Action::SelectTab(idx),
+                    core,
+                    world,
+                    attached,
+                    prefix_spec,
+                    sidebar_open,
+                    scrollback_offset,
+                    modal,
+                )? {
+                    return Ok(KeyOutcome::Quit);
+                }
+            }
+            Ok(KeyOutcome::UiChanged)
+        }
+        other => {
+            if !matches!(other, Action::ToggleSidebar | Action::ToggleHelp) {
+                *modal = Modal::None;
+            }
+            if execute_action(
+                other,
+                core,
+                world,
+                attached,
+                prefix_spec,
+                sidebar_open,
+                scrollback_offset,
+                modal,
+            )? {
+                return Ok(KeyOutcome::Quit);
+            }
+            if matches!(modal, Modal::None) {
+                world.mark_active_seen(core);
+            }
+            Ok(KeyOutcome::UiChanged)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_key_event(
     mut kev: KeyEvent,
     core: &CoreClient,
@@ -3953,30 +4029,18 @@ fn handle_key_event(
         *prefix_active = false;
         if let Some(action) = match_prefix_action(&kev, prefix_spec) {
             if matches!(modal, Modal::TabOverview { .. }) {
-                match action {
-                    Action::SendPrefix => {
-                        *modal = Modal::None;
-                        return Ok(KeyOutcome::UiChanged);
-                    }
-                    Action::PrevTab => {
-                        exit_tab_overview_to_last_tab(core, world, modal);
-                        return Ok(KeyOutcome::UiChanged);
-                    }
-                    Action::NextTab => {
-                        *modal = Modal::None;
-                        if world.active_space().is_some_and(|s| !s.tabs.is_empty()) {
-                            world.select_tab_index(0);
-                            world.mark_active_seen(core);
-                        }
-                        return Ok(KeyOutcome::UiChanged);
-                    }
-                    _ => {
-                        if !matches!(action, Action::ToggleSidebar | Action::ToggleHelp) {
-                            *modal = Modal::None;
-                        }
-                    }
-                }
-            } else if matches!(modal, Modal::SpaceMenu | Modal::Help) {
+                return handle_shortcut_in_tab_overview(
+                    action,
+                    core,
+                    world,
+                    attached,
+                    prefix_spec,
+                    sidebar_open,
+                    scrollback_offset,
+                    modal,
+                );
+            }
+            if matches!(modal, Modal::SpaceMenu | Modal::Help) {
                 if action == Action::SendPrefix {
                     *modal = Modal::None;
                     return Ok(KeyOutcome::UiChanged);
@@ -4059,40 +4123,16 @@ fn handle_key_event(
         }
         Modal::TabOverview { .. } if match_direct_action(&kev).is_some() => {
             if let Some(action) = match_direct_action(&kev) {
-                match action {
-                    Action::Detach => {
-                        *modal = Modal::None;
-                        return Ok(KeyOutcome::Quit);
-                    }
-                    Action::PrevTab => {
-                        exit_tab_overview_to_last_tab(core, world, modal);
-                        return Ok(KeyOutcome::UiChanged);
-                    }
-                    Action::NextTab => {
-                        *modal = Modal::None;
-                        if world.active_space().is_some_and(|s| !s.tabs.is_empty()) {
-                            world.select_tab_index(0);
-                            world.mark_active_seen(core);
-                        }
-                        return Ok(KeyOutcome::UiChanged);
-                    }
-                    other => {
-                        *modal = Modal::None;
-                        if execute_action(
-                            other,
-                            core,
-                            world,
-                            attached,
-                            prefix_spec,
-                            sidebar_open,
-                            scrollback_offset,
-                            modal,
-                        )? {
-                            return Ok(KeyOutcome::Quit);
-                        }
-                        return Ok(KeyOutcome::UiChanged);
-                    }
-                }
+                return handle_shortcut_in_tab_overview(
+                    action,
+                    core,
+                    world,
+                    attached,
+                    prefix_spec,
+                    sidebar_open,
+                    scrollback_offset,
+                    modal,
+                );
             }
             return Ok(KeyOutcome::UiChanged);
         }
@@ -6191,5 +6231,43 @@ mod tests {
         .unwrap();
         assert_eq!(h.modal, Modal::None);
         assert_eq!(h.world.active_tab_index(), 0);
+
+        // Out-of-range Alt+9 on TabOverview keeps TabOverview open; valid Alt+2 exits and selects Tab 1
+        h.modal = Modal::default_tab_overview();
+        handle_key_event(
+            KeyEvent::new(KeyCode::Char('9'), KeyModifiers::ALT),
+            &h.core,
+            &mut h.world,
+            None,
+            "ctrl+b",
+            &mut sidebar_open,
+            &mut h.prefix_active,
+            &mut h.ctrl_active,
+            &mut h.alt_active,
+            &mut scrollback_offset,
+            &mut h.modal,
+            h.term_rect,
+        )
+        .unwrap();
+        assert!(matches!(h.modal, Modal::TabOverview { .. }));
+        assert_eq!(h.world.active_tab_index(), 0);
+
+        handle_key_event(
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT),
+            &h.core,
+            &mut h.world,
+            None,
+            "ctrl+b",
+            &mut sidebar_open,
+            &mut h.prefix_active,
+            &mut h.ctrl_active,
+            &mut h.alt_active,
+            &mut scrollback_offset,
+            &mut h.modal,
+            h.term_rect,
+        )
+        .unwrap();
+        assert_eq!(h.modal, Modal::None);
+        assert_eq!(h.world.active_tab_index(), 1);
     }
 }
