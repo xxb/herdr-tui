@@ -24,6 +24,7 @@ pub enum Action {
     ToggleHelp,
     ToggleEink,
     RedrawScreen,
+    OpenBookReader,
     PageUp,
     PageDown,
     Detach,
@@ -175,6 +176,7 @@ pub fn match_prefix_action(ev: &KeyEvent, prefix_spec: &str) -> Option<Action> {
         KeyCode::Char('?') => Some(Action::ToggleHelp),
         KeyCode::Char('e') => Some(Action::ToggleEink),
         KeyCode::Char('r') => Some(Action::RedrawScreen),
+        KeyCode::Char('v' | 'B') => Some(Action::OpenBookReader),
         KeyCode::PageUp => Some(Action::PageUp),
         KeyCode::PageDown => Some(Action::PageDown),
         KeyCode::Char('q' | 'd') => Some(Action::Detach),
@@ -374,6 +376,24 @@ mod tests {
         assert_eq!(
             match_prefix_action(&pg_dn, "ctrl+b"),
             Some(Action::PageDown)
+        );
+
+        let v_key = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE);
+        assert_eq!(
+            match_prefix_action(&v_key, "ctrl+b"),
+            Some(Action::OpenBookReader)
+        );
+
+        let b_upper = KeyEvent::new(KeyCode::Char('B'), KeyModifiers::SHIFT);
+        assert_eq!(
+            match_prefix_action(&b_upper, "ctrl+b"),
+            Some(Action::OpenBookReader)
+        );
+
+        let b_lower = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE);
+        assert_eq!(
+            match_prefix_action(&b_lower, "ctrl+b"),
+            Some(Action::ToggleSidebar)
         );
     }
 }
