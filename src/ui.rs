@@ -3389,6 +3389,33 @@ fn is_braille_char(s: &str) -> bool {
     matches!((chars.next(), chars.next()), (Some(ch), None) if ('\u{2800}'..='\u{28FF}').contains(&ch))
 }
 
+fn is_arc_or_box_drawing_char(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(
+        (chars.next(), chars.next()),
+        (Some(ch), None)
+            if ('\u{2500}'..='\u{257F}').contains(&ch)
+                || ('\u{25DC}'..='\u{25E1}').contains(&ch)
+    )
+}
+
+fn has_cardinal_neighbor<F>(
+    screen: &vt100::Screen,
+    r: u16,
+    c: u16,
+    rows: u16,
+    cols: u16,
+    pred: F,
+) -> bool
+where
+    F: Fn(&str) -> bool,
+{
+    (c > 0 && screen.cell(r, c - 1).is_some_and(|lc| pred(lc.contents())))
+        || (c + 1 < cols && screen.cell(r, c + 1).is_some_and(|rc| pred(rc.contents())))
+        || (r > 0 && screen.cell(r - 1, c).is_some_and(|uc| pred(uc.contents())))
+        || (r + 1 < rows && screen.cell(r + 1, c).is_some_and(|dc| pred(dc.contents())))
+}
+
 fn resolve_eink_cell_symbol<'a>(
     screen: &vt100::Screen,
     r: u16,
@@ -3400,23 +3427,11 @@ fn resolve_eink_cell_symbol<'a>(
     let mut chars = raw_sym.chars();
     if let (Some(ch), None) = (chars.next(), chars.next()) {
         if ('\u{2801}'..='\u{28FF}').contains(&ch) {
-            let left_braille = c > 0
-                && screen
-                    .cell(r, c - 1)
-                    .is_some_and(|lc| is_braille_char(lc.contents()));
-            let right_braille = c + 1 < cols
-                && screen
-                    .cell(r, c + 1)
-                    .is_some_and(|rc| is_braille_char(rc.contents()));
-            let up_braille = r > 0
-                && screen
-                    .cell(r - 1, c)
-                    .is_some_and(|uc| is_braille_char(uc.contents()));
-            let down_braille = r + 1 < rows
-                && screen
-                    .cell(r + 1, c)
-                    .is_some_and(|dc| is_braille_char(dc.contents()));
-            if !left_braille && !right_braille && !up_braille && !down_braille {
+            if !has_cardinal_neighbor(screen, r, c, rows, cols, is_braille_char) {
+                return "◈";
+            }
+        } else if ('\u{25DC}'..='\u{25E1}').contains(&ch) {
+            if !has_cardinal_neighbor(screen, r, c, rows, cols, is_arc_or_box_drawing_char) {
                 return "◈";
             }
         } else if matches!(ch, '◐' | '◓' | '◑' | '◒' | '◴' | '◷' | '◶' | '◵') {
@@ -4027,8 +4042,8 @@ fn render_help_modal(f: &mut Frame, area: Rect, eink_mode: bool, hits: &mut Vec<
                 .fg(if eink_mode { EINK_INK } else { Color::Cyan })
                 .add_modifier(Modifier::BOLD),
         )),
-        Line::from("  Top Bar [ ⏏ ]            Detach hct while keeping sessions running (^b q)"),
-        Line::from("  Top Bar [ ▾ Space ]      Open secondary Space popover menu / + New Space"),
+        Line::from("  Top Bar [ ⏏ ]            Detach hct (keep sessions running) (^b q)"),
+        Line::from("  Top Bar [ ▾ Space ]      Open Space popover menu / + New Space"),
         Line::from("  Top Bar [ Tab ] / [ + ]  Switch directly to Tab or add a new Tab"),
         Line::from("  Left Floating Cross (+)  Tap Esc / Ctl / ^B / Alt / Tab (drag to move)"),
         Line::from("  Right Floating Cross (+) Tap ↑ / ← / ⎘ (Paste) / → / ↓ (drag to move)"),
@@ -4043,7 +4058,7 @@ fn render_help_modal(f: &mut Frame, area: Rect, eink_mode: bool, hits: &mut Vec<
         Line::from("  Quick Fuzzy Switcher     ^b w          or  ^b f"),
         Line::from("  Jump Next Alert Agent    ^b a          (◉ blocked / ✓ done)"),
         Line::from("  Scrollback / History     ^b [          or  Tap [▼ BOT] on status bar"),
-        Line::from("  Page Up / Down           ^b PgUp / PgDn /  Tap Left [‹] / Right [›] (-e)"),
+        Line::from("  Page Up / Down           ^b PgUp / PgDn / Tap Left [‹] / Right [›]"),
         Line::from("  E-Ink / Clean Redraw     ^b e (E-Ink)  /   ^b r (clean redraw)"),
         Line::from("  Detach (keep running)    ^b q / ^b d   or  Ctrl+\\ / Tap [ ⏏ ]"),
         Line::from(""),
@@ -6055,7 +6070,7 @@ mod tests {
                 "\x1b[7mInv\x1b[0m\r\n",
                 "⣿ Vertical\r\n",
                 "⣤ Column\r\n",
-                "◜ CornerArc",
+                "◜ CornerArc\x1b[7;21H◜─Box\x1b[8;21H│",
                 "\x1b[9;1HSeeThrough",
                 "\x1b[11;1H中A\x1b[11;99H中",
             )
@@ -6187,7 +6202,10 @@ mod tests {
         assert_eq!(buf[(18, 4)].fg, EINK_PAPER);
         assert_eq!(buf[(0, 5)].symbol(), "⣿");
         assert_eq!(buf[(0, 6)].symbol(), "⣤");
-        assert_eq!(buf[(0, 7)].symbol(), "◜");
+        // Isolated arc spinner freezes to ◈ while decorative corner abutting box-drawing survives.
+        assert_eq!(buf[(0, 7)].symbol(), "◈");
+        assert_eq!(buf[(20, 7)].symbol(), "◜");
+        assert_eq!(buf[(20, 8)].symbol(), "│");
 
         // Verify left modifier cross corners are hollow (row 0, col 0 relative to disc keeps EINK_PAPER)
         // and active center `^B` sector is inverted (`EINK_INK` bg / `EINK_PAPER` fg).
@@ -6363,5 +6381,77 @@ mod tests {
 
         let snap6 = capture_eink_screen_snapshot(parser.screen(), area, 1);
         assert_ne!(snap5, snap6);
+
+        // Arc spinner sequence (`◜◠◝◞◡◟`) freezes to `◈` when isolated so snapshots match,
+        // while adjacent arc/box-drawing decorative corners preserve their original glyph.
+        let mut arc_parser = vt100::Parser::new(nz(4), nz(30), 0);
+        arc_parser.process("\x1b[?25l\x1b[H◜ Thinking...".as_bytes());
+        let arc_snap1 = capture_eink_screen_snapshot(arc_parser.screen(), area, 0);
+        for glyph in ["◠", "◝", "◞", "◡", "◟"] {
+            arc_parser.process(format!("\x1b[H{glyph} Thinking...").as_bytes());
+            let next_snap = capture_eink_screen_snapshot(arc_parser.screen(), area, 0);
+            assert_eq!(arc_snap1, next_snap);
+        }
+        arc_parser.process("\x1b[2;1H◜─Box".as_bytes());
+        let corner_snap = capture_eink_screen_snapshot(arc_parser.screen(), area, 0);
+        assert_ne!(arc_snap1, corner_snap);
+        assert_eq!(
+            resolve_eink_cell_symbol(arc_parser.screen(), 1, 0, 4, 30, "◜"),
+            "◜"
+        );
+        // Adjacent arc (`◜◠`) and vertical box-drawing neighbor (`◜` above `│`) also survive.
+        arc_parser.process("\x1b[3;1H◜◠\x1b[3;10H◜\x1b[4;10H│".as_bytes());
+        assert_eq!(
+            resolve_eink_cell_symbol(arc_parser.screen(), 2, 0, 4, 30, "◜"),
+            "◜"
+        );
+        assert_eq!(
+            resolve_eink_cell_symbol(arc_parser.screen(), 2, 1, 4, 30, "◠"),
+            "◠"
+        );
+        assert_eq!(
+            resolve_eink_cell_symbol(arc_parser.screen(), 2, 9, 4, 30, "◜"),
+            "◜"
+        );
+    }
+
+    #[test]
+    fn help_modal_shortcut_lines_fit_80_col_terminal_without_clipping() {
+        let world = World::default();
+        let mut terminal = Terminal::new(TestBackend::new(80, 36)).unwrap();
+        terminal
+            .draw(|f| {
+                let _ = render_ui_full(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::Help,
+                    None,
+                    false,
+                    None,
+                    false,
+                    None,
+                    true,
+                );
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let rows: Vec<String> = (0..36)
+            .map(|y| (0..80).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let joined = rows.join("\n");
+        assert!(joined.contains("Detach hct (keep sessions running) (^b q)"));
+        assert!(joined.contains("Open Space popover menu / + New Space"));
+        assert!(joined.contains("^b PgUp / PgDn / Tap Left [‹] / Right [›]"));
+        assert!(joined.contains("Tap outside, [ ✕ ], Esc, Enter, or ? to close"));
     }
 }
