@@ -189,7 +189,7 @@ struct Cli {
     #[arg(long, conflicts_with = "eink")]
     no_eink: bool,
 
-    /// Enable Kaleido color E-Ink accent overprint mode (implies --eink unless --no-eink is passed)
+    /// Enable Kaleido color E-Ink accent overprint mode (automatically activates --eink)
     #[arg(long, conflicts_with_all = ["no_eink", "no_eink_color"])]
     eink_color: bool,
 

@@ -3803,6 +3803,26 @@ fn looks_like_unified_hunk_header(s: &str) -> bool {
     range.starts_with('-') && range.contains('+')
 }
 
+fn is_diff_metadata_line(s: &str) -> bool {
+    const META_PREFIXES: &[&str] = &[
+        "index ",
+        "new file ",
+        "deleted file ",
+        "old mode ",
+        "new mode ",
+        "rename ",
+        "similarity ",
+        "copy from ",
+        "copy to ",
+        "Binary files ",
+    ];
+    META_PREFIXES.iter().any(|p| s.starts_with(p))
+}
+
+fn is_decorative_banner_tail(rest: &str) -> bool {
+    rest.ends_with("---") || rest.ends_with("+++") || rest.ends_with("===")
+}
+
 fn detect_eink_diff_rows(
     screen: &vt100::Screen,
     rows: u16,
@@ -3903,6 +3923,8 @@ fn detect_eink_diff_rows(
                     DiffHue::Red => EinkDiffRowKind::Remove,
                     DiffHue::BlueCyan => EinkDiffRowKind::Hunk,
                 };
+                in_diff_context = true;
+                in_uncolored_hunk = false;
                 out[usize::from(r)] = Some(EinkDiffRowHighlight {
                     kind,
                     marker_start_col: bc,
@@ -3910,6 +3932,8 @@ fn detect_eink_diff_rows(
                     side_bar_col: None,
                     force_paper_bg: true,
                 });
+            } else if !in_uncolored_hunk {
+                in_diff_context = false;
             }
             continue;
         }
@@ -3954,14 +3978,17 @@ fn detect_eink_diff_rows(
         if trimmed_end_tail.starts_with("--- ") || trimmed_end_tail.starts_with("+++ ") {
             let is_add_hdr = trimmed_end_tail.starts_with("+++ ");
             let rest = trimmed_end_tail[4..].trim();
+            let decorative_banner = is_decorative_banner_tail(rest);
             let paired_next_add = !is_add_hdr
                 && r + 1 < rows
                 && !rest.is_empty()
+                && !decorative_banner
                 && vt_row_ascii_slice(screen, r + 1, c, (c + 8).min(cols)).starts_with("+++ ");
             let paired_next_hunk = paired_next_add
                 && r + 2 < rows
                 && vt_row_ascii_slice(screen, r + 2, c, (c + 8).min(cols)).starts_with("@@ ");
             let has_path_shape = !rest.is_empty()
+                && !decorative_banner
                 && (!in_uncolored_hunk
                     && (rest.starts_with("a/")
                         || rest.starts_with("b/")
@@ -4011,6 +4038,9 @@ fn detect_eink_diff_rows(
                 && trimmed_end_tail
                     .chars()
                     .all(|ch| ch == if is_add { '+' } else { '-' } || ch.is_whitespace());
+            let decorative_banner = trimmed_end_tail
+                .get(4..)
+                .is_some_and(|s| is_decorative_banner_tail(s.trim()));
 
             let cell_opt = screen.cell(r, c);
             let fg_hue = cell_opt.and_then(|cell| classify_vt_diff_hue(cell.fgcolor(), false));
@@ -4028,8 +4058,9 @@ fn detect_eink_diff_rows(
                 );
 
             let confirmed = if same_next {
-                let uncolored_double_in_hunk =
-                    uncolored_ok && (!all_marker_rule || trimmed_end_tail.len() >= 4);
+                let uncolored_double_in_hunk = uncolored_ok
+                    && !decorative_banner
+                    && (!all_marker_rule || trimmed_end_tail.len() >= 4);
                 let colored_double = color_matches
                     && (in_diff_context || prev_was_diff)
                     && (!all_marker_rule || in_uncolored_hunk);
@@ -4081,7 +4112,13 @@ fn detect_eink_diff_rows(
             let base_byte = hunk_base_col.and_then(|bc| vt_cell_ascii_byte(screen, r, bc));
             if !matches!(base_byte, Some(b' ') | Some(b'\\')) {
                 in_uncolored_hunk = false;
+                hunk_base_col = None;
+                if !is_diff_metadata_line(trimmed_end_tail) {
+                    in_diff_context = false;
+                }
             }
+        } else if !is_diff_metadata_line(trimmed_end_tail) {
+            in_diff_context = false;
         }
     }
 
@@ -8282,6 +8319,38 @@ mod tests {
         // Row 9: `  10  11 │ - dual_num_del();` -> '-' at col 11 is red
         let minus_x = (0..44u16).find(|&x| buf[(x, 9)].symbol() == "-").unwrap();
         assert_eq!(buf[(minus_x, 9)].fg, KALEIDO_RED);
+    }
+
+    #[test]
+    fn kaleido_diff_context_resets_after_diff_so_banners_stay_monochrome() {
+        let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
+        let mut parser = vt100::Parser::new(nz(8), nz(50), 20);
+        parser.process(
+            b"\x1b[32m+added_code();\x1b[0m\r\n\
+              \r\n\
+              --- Results ---\r\n\
+              +++ Summary +++",
+        );
+
+        let backend = TestBackend::new(50, 8);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            f.render_widget(
+                VtScreenWidget {
+                    screen: parser.screen(),
+                    selection: None,
+                    eink_mode: true,
+                    eink_color: true,
+                },
+                f.area(),
+            );
+        })
+        .unwrap();
+
+        let buf = term.backend().buffer();
+        assert_eq!(buf[(0, 0)].fg, KALEIDO_GREEN);
+        assert_eq!(buf[(0, 2)].fg, EINK_INK);
+        assert_eq!(buf[(0, 3)].fg, EINK_INK);
     }
 
     #[test]
