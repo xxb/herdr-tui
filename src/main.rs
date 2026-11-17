@@ -15,13 +15,15 @@ use crate::keys::{
     Action, FileConfig,
 };
 use crate::model::{AgentState, EventDisposition, World};
+#[cfg(test)]
+use crate::ui::capture_eink_screen_snapshot;
 use crate::ui::{
-    capture_eink_screen_snapshot, collect_fuzzy_items, collect_overview_items,
+    capture_eink_screen_snapshot_with_color, collect_fuzzy_items, collect_overview_items,
     compute_terminal_rect, find_hit_target, is_in_rect, is_on_dpad_disc,
-    overview_selection_after_query_change, overview_selection_for_index, render_ui_full,
-    resolve_dpad_disc_rect, resolve_fuzzy_selection, resolve_mod_cross_rect,
-    resolve_overview_selection, EinkScreenSnapshot, HitRegion, HitTarget, Modal, OverviewItem,
-    OverviewSelection, PromptKind, TerminalSelection,
+    overview_selection_after_query_change, overview_selection_for_index,
+    render_ui_full_with_eink_color, resolve_dpad_disc_rect, resolve_fuzzy_selection,
+    resolve_mod_cross_rect, resolve_overview_selection, EinkScreenSnapshot, HitRegion, HitTarget,
+    Modal, OverviewItem, OverviewSelection, PromptKind, TerminalSelection,
 };
 use crate::usage::UsageTracker;
 use anyhow::Result;
@@ -187,30 +189,38 @@ struct Cli {
     #[arg(long, conflicts_with = "eink")]
     no_eink: bool,
 
+    /// Enable Kaleido color E-Ink accent overprint mode (automatically activates --eink)
+    #[arg(long, conflicts_with_all = ["no_eink", "no_eink_color"])]
+    eink_color: bool,
+
+    /// Disable Kaleido color E-Ink accent overprint mode (overrides ui.eink_color = true or environment detection)
+    #[arg(long, conflicts_with = "eink_color")]
+    no_eink_color: bool,
+
     /// Passive PTY output coalescing interval in milliseconds when --eink is enabled (default: 250, max: 2000)
     #[arg(long)]
     eink_interval_ms: Option<u64>,
 }
 
-fn resolve_eink_mode<F>(
-    cli_eink: bool,
-    cli_no_eink: bool,
-    cfg_eink: Option<bool>,
+fn resolve_eink_color_mode<F>(
+    cli_eink_color: bool,
+    cli_no_eink_color: bool,
+    cfg_eink_color: Option<bool>,
     mut get_env: F,
 ) -> bool
 where
     F: FnMut(&str) -> Option<String>,
 {
-    if cli_eink {
+    if cli_eink_color {
         return true;
     }
-    if cli_no_eink {
+    if cli_no_eink_color {
         return false;
     }
-    if let Some(v) = cfg_eink {
+    if let Some(v) = cfg_eink_color {
         return v;
     }
-    for var in ["HCT_EINK", "SHELLDECK_EINK"] {
+    for var in ["HCT_EINK_COLOR", "SHELLDECK_EINK_COLOR"] {
         if let Some(raw) = get_env(var) {
             let trimmed = raw.trim().to_ascii_lowercase();
             match trimmed.as_str() {
@@ -223,12 +233,84 @@ where
     for var in ["LC_TERMINAL_PROFILE", "HCT_THEME", "TERM"] {
         if let Some(raw) = get_env(var) {
             let lower = raw.trim().to_ascii_lowercase();
-            if lower.contains("eink") || lower.contains("e-ink") || lower.contains("monochrome") {
+            if lower.contains("kaleido")
+                || lower.contains("eink-color")
+                || lower.contains("eink_color")
+                || lower.contains("e-ink-color")
+            {
                 return true;
             }
         }
     }
     false
+}
+
+fn resolve_eink_and_color_modes<F>(
+    cli_eink: bool,
+    cli_no_eink: bool,
+    cli_eink_color: bool,
+    cli_no_eink_color: bool,
+    cfg_eink: Option<bool>,
+    cfg_eink_color: Option<bool>,
+    mut get_env: F,
+) -> (bool, bool)
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let eink_color = resolve_eink_color_mode(
+        cli_eink_color,
+        cli_no_eink_color,
+        cfg_eink_color,
+        &mut get_env,
+    );
+    if cli_no_eink {
+        return (false, eink_color);
+    }
+    if cli_eink || cli_eink_color {
+        return (true, eink_color);
+    }
+    if let Some(v) = cfg_eink {
+        return (v, eink_color);
+    }
+    if cfg_eink_color == Some(true) {
+        return (true, eink_color);
+    }
+    for var in ["HCT_EINK", "SHELLDECK_EINK"] {
+        if let Some(raw) = get_env(var) {
+            let trimmed = raw.trim().to_ascii_lowercase();
+            match trimmed.as_str() {
+                "1" | "true" | "yes" | "on" => return (true, eink_color),
+                "0" | "false" | "no" | "off" => return (false, eink_color),
+                _ => {}
+            }
+        }
+    }
+    for var in ["LC_TERMINAL_PROFILE", "HCT_THEME", "TERM"] {
+        if let Some(raw) = get_env(var) {
+            let lower = raw.trim().to_ascii_lowercase();
+            if lower.contains("eink")
+                || lower.contains("e-ink")
+                || lower.contains("monochrome")
+                || lower.contains("kaleido")
+            {
+                return (true, eink_color);
+            }
+        }
+    }
+    (eink_color, eink_color)
+}
+
+#[cfg(test)]
+fn resolve_eink_mode<F>(
+    cli_eink: bool,
+    cli_no_eink: bool,
+    cfg_eink: Option<bool>,
+    get_env: F,
+) -> bool
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    resolve_eink_and_color_modes(cli_eink, cli_no_eink, false, false, cfg_eink, None, get_env).0
 }
 
 fn resolve_eink_interval(cli_ms: Option<u64>, cfg_ms: Option<u64>) -> Duration {
@@ -1717,9 +1799,15 @@ fn main() -> Result<()> {
     } else {
         file_cfg.ui.touch_mode.unwrap_or(false)
     };
-    let eink_mode = resolve_eink_mode(cli.eink, cli.no_eink, file_cfg.ui.eink, |k| {
-        std::env::var_os(k).map(|v| v.to_string_lossy().into_owned())
-    });
+    let (eink_mode, eink_color) = resolve_eink_and_color_modes(
+        cli.eink,
+        cli.no_eink,
+        cli.eink_color,
+        cli.no_eink_color,
+        file_cfg.ui.eink,
+        file_cfg.ui.eink_color,
+        |k| std::env::var_os(k).map(|v| v.to_string_lossy().into_owned()),
+    );
     let eink_interval = resolve_eink_interval(cli.eink_interval_ms, file_cfg.ui.eink_interval_ms);
 
     let (app_tx, app_rx) = mpsc::channel::<AppEvent>();
@@ -1791,6 +1879,7 @@ fn main() -> Result<()> {
         mobile_threshold,
         touch_mode,
         eink_mode,
+        eink_color,
         eink_interval,
     );
 
@@ -1992,6 +2081,7 @@ fn execute_action_full(
     modal: &mut Modal,
     term_rect: Rect,
     eink_mode: &mut bool,
+    eink_color: &mut bool,
     force_clear: &mut bool,
     pending_eink_osc: &mut bool,
     pending_reader_osc: Option<&mut bool>,
@@ -2108,6 +2198,16 @@ fn execute_action_full(
             *eink_mode = !*eink_mode;
             *force_clear = true;
             *pending_eink_osc = *eink_mode;
+        }
+        Action::ToggleEinkColor => {
+            if !*eink_mode {
+                *eink_mode = true;
+                *eink_color = true;
+            } else {
+                *eink_color = !*eink_color;
+            }
+            *force_clear = true;
+            *pending_eink_osc = true;
         }
         Action::RedrawScreen => {
             *force_clear = true;
@@ -2836,9 +2936,47 @@ fn detect_eink_agent_settlement(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn promote_due_pty_dirty(
     eink_mode: bool,
+    eink_interval: Duration,
+    now: Instant,
+    pty_dirty: &mut bool,
+    eink_pacer: &mut EinkInputPacer,
+    dirty: &mut bool,
+    last_draw_at: &mut Option<Instant>,
+    last_eink_snap: &Option<(String, EinkScreenSnapshot)>,
+    active_addr: Option<&str>,
+    attached_map: &mut BTreeMap<String, AttachedTerminal>,
+    term_rect: Rect,
+    scrollback_offset: &mut usize,
+    modal: &Modal,
+    selection: &Option<TerminalSelection>,
+) {
+    promote_due_pty_dirty_with_color(
+        eink_mode,
+        false,
+        eink_interval,
+        now,
+        pty_dirty,
+        eink_pacer,
+        dirty,
+        last_draw_at,
+        last_eink_snap,
+        active_addr,
+        attached_map,
+        term_rect,
+        scrollback_offset,
+        modal,
+        selection,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn promote_due_pty_dirty_with_color(
+    eink_mode: bool,
+    eink_color: bool,
     eink_interval: Duration,
     now: Instant,
     pty_dirty: &mut bool,
@@ -2868,8 +3006,12 @@ fn promote_due_pty_dirty(
         if let Some(att) = active_addr.and_then(|a| attached_map.get_mut(a)) {
             att.parser.screen_mut().set_scrollback(*scrollback_offset);
             *scrollback_offset = att.parser.screen().scrollback();
-            let snap =
-                capture_eink_screen_snapshot(att.parser.screen(), term_rect, *scrollback_offset);
+            let snap = capture_eink_screen_snapshot_with_color(
+                att.parser.screen(),
+                term_rect,
+                *scrollback_offset,
+                eink_color,
+            );
             if last_eink_snap
                 .as_ref()
                 .is_some_and(|(a, prev)| Some(a.as_str()) == active_addr && prev == &snap)
@@ -2899,6 +3041,7 @@ fn run_app(
     mobile_threshold: u16,
     touch_mode: bool,
     eink_mode: bool,
+    eink_color: bool,
     eink_interval: Duration,
 ) -> Result<()> {
     let mut attached_map: BTreeMap<String, AttachedTerminal> = BTreeMap::new();
@@ -2915,6 +3058,7 @@ fn run_app(
         mobile_threshold,
         touch_mode,
         eink_mode,
+        eink_color,
         eink_interval,
         &mut attached_map,
         &mut active_addr,
@@ -2941,6 +3085,7 @@ fn run_app_loop(
     mobile_threshold: u16,
     touch_mode: bool,
     mut eink_mode: bool,
+    mut eink_color: bool,
     eink_interval: Duration,
     attached_map: &mut BTreeMap<String, AttachedTerminal>,
     active_addr: &mut Option<String>,
@@ -3077,8 +3222,9 @@ fn run_app_loop(
             .and_then(|a| attached_map.get(a))
             .map(|att| att.channel);
 
-        promote_due_pty_dirty(
+        promote_due_pty_dirty_with_color(
             eink_mode,
+            eink_color,
             eink_interval,
             Instant::now(),
             &mut pty_dirty,
@@ -3407,6 +3553,7 @@ fn run_app_loop(
                                                 &mut modal,
                                                 term_rect,
                                                 &mut eink_mode,
+                                                &mut eink_color,
                                                 &mut force_clear,
                                                 &mut pending_eink_osc,
                                                 Some(&mut pending_reader_osc),
@@ -3565,6 +3712,7 @@ fn run_app_loop(
                                                 &mut modal,
                                                 term_rect,
                                                 &mut eink_mode,
+                                                &mut eink_color,
                                                 &mut force_clear,
                                                 &mut pending_eink_osc,
                                                 Some(&mut pending_reader_osc),
@@ -3772,6 +3920,7 @@ fn run_app_loop(
                                                     &mut modal,
                                                     term_rect,
                                                     &mut eink_mode,
+                                                    &mut eink_color,
                                                     &mut force_clear,
                                                     &mut pending_eink_osc,
                                                     Some(&mut pending_reader_osc),
@@ -3809,6 +3958,7 @@ fn run_app_loop(
                                             &mut modal,
                                             term_rect,
                                             &mut eink_mode,
+                                            &mut eink_color,
                                             &mut force_clear,
                                             &mut pending_eink_osc,
                                             Some(&mut pending_reader_osc),
@@ -4204,6 +4354,7 @@ fn run_app_loop(
                                 &mut modal,
                                 term_rect,
                                 &mut eink_mode,
+                                &mut eink_color,
                                 &mut force_clear,
                                 &mut pending_eink_osc,
                                 Some(&mut pending_reader_osc),
@@ -4354,8 +4505,9 @@ fn run_app_loop(
             dirty = true;
         }
 
-        promote_due_pty_dirty(
+        promote_due_pty_dirty_with_color(
             eink_mode,
+            eink_color,
             eink_interval,
             Instant::now(),
             &mut pty_dirty,
@@ -4410,7 +4562,7 @@ fn run_app_loop(
                 force_clear = false;
             }
             terminal.draw(|f| {
-                let geom = render_ui_full(
+                let geom = render_ui_full_with_eink_color(
                     f,
                     world,
                     scr_ref,
@@ -4430,6 +4582,7 @@ fn run_app_loop(
                     dpad_dragging,
                     focused_quota.as_ref(),
                     eink_mode,
+                    eink_color,
                 );
                 last_hits = geom.hits;
                 last_mod_rect = geom.mod_rect;
@@ -4457,10 +4610,11 @@ fn run_app_loop(
                     attached_map.get(addr).map(|att| {
                         (
                             addr.clone(),
-                            capture_eink_screen_snapshot(
+                            capture_eink_screen_snapshot_with_color(
                                 att.parser.screen(),
                                 term_rect,
                                 scrollback_offset,
+                                eink_color,
                             ),
                         )
                     })
@@ -4495,6 +4649,7 @@ fn handle_shortcut_in_tab_overview(
     modal: &mut Modal,
     term_rect: Rect,
     eink_mode: &mut bool,
+    eink_color: &mut bool,
     force_clear: &mut bool,
     pending_eink_osc: &mut bool,
     mut pending_reader_osc: Option<&mut bool>,
@@ -4530,6 +4685,7 @@ fn handle_shortcut_in_tab_overview(
                     modal,
                     term_rect,
                     eink_mode,
+                    eink_color,
                     force_clear,
                     pending_eink_osc,
                     pending_reader_osc.as_deref_mut(),
@@ -4545,6 +4701,7 @@ fn handle_shortcut_in_tab_overview(
                 Action::ToggleSidebar
                     | Action::ToggleHelp
                     | Action::ToggleEink
+                    | Action::ToggleEinkColor
                     | Action::RedrawScreen
             ) {
                 *modal = Modal::None;
@@ -4560,6 +4717,7 @@ fn handle_shortcut_in_tab_overview(
                 modal,
                 term_rect,
                 eink_mode,
+                eink_color,
                 force_clear,
                 pending_eink_osc,
                 pending_reader_osc,
@@ -4631,6 +4789,7 @@ fn handle_key_event_with_eink(
     force_clear: &mut bool,
     pending_eink_osc: &mut bool,
 ) -> Result<KeyOutcome> {
+    let mut eink_color = false;
     handle_key_event_full(
         kev,
         core,
@@ -4645,6 +4804,7 @@ fn handle_key_event_with_eink(
         modal,
         term_rect,
         eink_mode,
+        &mut eink_color,
         force_clear,
         pending_eink_osc,
         None,
@@ -4666,6 +4826,7 @@ fn handle_key_event_full(
     modal: &mut Modal,
     term_rect: Rect,
     eink_mode: &mut bool,
+    eink_color: &mut bool,
     force_clear: &mut bool,
     pending_eink_osc: &mut bool,
     pending_reader_osc: Option<&mut bool>,
@@ -4818,6 +4979,7 @@ fn handle_key_event_full(
                     modal,
                     term_rect,
                     eink_mode,
+                    eink_color,
                     force_clear,
                     pending_eink_osc,
                     pending_reader_osc,
@@ -4833,6 +4995,7 @@ fn handle_key_event_full(
                     Action::ToggleSidebar
                         | Action::ToggleHelp
                         | Action::ToggleEink
+                        | Action::ToggleEinkColor
                         | Action::RedrawScreen
                 ) {
                     *modal = Modal::None;
@@ -4849,6 +5012,7 @@ fn handle_key_event_full(
                 modal,
                 term_rect,
                 eink_mode,
+                eink_color,
                 force_clear,
                 pending_eink_osc,
                 pending_reader_osc,
@@ -4928,6 +5092,7 @@ fn handle_key_event_full(
                     modal,
                     term_rect,
                     eink_mode,
+                    eink_color,
                     force_clear,
                     pending_eink_osc,
                     pending_reader_osc,
@@ -5052,6 +5217,7 @@ fn handle_key_event_full(
             modal,
             term_rect,
             eink_mode,
+            eink_color,
             force_clear,
             pending_eink_osc,
             pending_reader_osc,
@@ -7172,6 +7338,257 @@ mod tests {
     }
 
     #[test]
+    fn resolve_eink_color_mode_and_combined_precedence() {
+        let env_map = |pairs: &[(&str, &str)]| {
+            let pairs: Vec<(String, String)> = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect();
+            move |key: &str| pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+        };
+
+        // `--eink-color` activates both E-Ink mode and Kaleido color accent, overriding config & env
+        assert_eq!(
+            resolve_eink_and_color_modes(
+                false,
+                false,
+                true,
+                false,
+                Some(false),
+                Some(false),
+                env_map(&[("HCT_EINK", "0"), ("HCT_EINK_COLOR", "0")]),
+            ),
+            (true, true)
+        );
+
+        // `--no-eink-color` forces monochrome even when `-e` or `ui.eink_color = true` or env is set
+        assert_eq!(
+            resolve_eink_and_color_modes(
+                true,
+                false,
+                false,
+                true,
+                None,
+                Some(true),
+                env_map(&[("SHELLDECK_EINK_COLOR", "1")]),
+            ),
+            (true, false)
+        );
+
+        // Config `ui.eink_color = Some(true)` alone activates E-Ink + Kaleido unless `ui.eink = Some(false)`
+        assert_eq!(
+            resolve_eink_and_color_modes(
+                false,
+                false,
+                false,
+                false,
+                None,
+                Some(true),
+                env_map(&[])
+            ),
+            (true, true)
+        );
+        assert_eq!(
+            resolve_eink_and_color_modes(
+                false,
+                false,
+                false,
+                false,
+                Some(false),
+                Some(true),
+                env_map(&[]),
+            ),
+            (false, true)
+        );
+
+        // Environment detection (`SHELLDECK_EINK_COLOR`, `LC_TERMINAL_PROFILE`, `HCT_THEME`)
+        assert_eq!(
+            resolve_eink_and_color_modes(
+                false,
+                false,
+                false,
+                false,
+                None,
+                None,
+                env_map(&[("SHELLDECK_EINK_COLOR", "1")]),
+            ),
+            (true, true)
+        );
+        assert_eq!(
+            resolve_eink_and_color_modes(
+                false,
+                false,
+                false,
+                false,
+                None,
+                None,
+                env_map(&[("LC_TERMINAL_PROFILE", "shelldeck-eink-color")]),
+            ),
+            (true, true)
+        );
+        assert_eq!(
+            resolve_eink_and_color_modes(
+                false,
+                false,
+                false,
+                false,
+                None,
+                None,
+                env_map(&[("SHELLDECK_EINK", "0"), ("SHELLDECK_EINK_COLOR", "1")]),
+            ),
+            (false, true)
+        );
+        assert_eq!(
+            resolve_eink_and_color_modes(
+                false,
+                false,
+                false,
+                false,
+                None,
+                None,
+                env_map(&[("HCT_THEME", "kaleido")]),
+            ),
+            (true, true)
+        );
+
+        // CLI flag validation
+        let cli_color = Cli::try_parse_from(["hct", "--eink-color"]).unwrap();
+        assert!(cli_color.eink_color);
+        assert!(Cli::try_parse_from(["hct", "--eink-color", "--no-eink-color"]).is_err());
+        assert!(Cli::try_parse_from(["hct", "--eink-color", "--no-eink"]).is_err());
+    }
+
+    #[test]
+    fn toggle_eink_color_shortcut_switches_modes_cleanly() {
+        let core = CoreClient::dummy_for_tests();
+        let mut world = World::default();
+        let mut sidebar_open = false;
+        let mut prefix_active = false;
+        let mut ctrl_active = false;
+        let mut alt_active = false;
+        let mut scrollback_offset = 0;
+        let mut modal = Modal::Help;
+        let term_rect = Rect::new(0, 1, 80, 22);
+        let mut eink_mode = false;
+        let mut eink_color = false;
+        let mut force_clear = false;
+        let mut pending_eink_osc = false;
+
+        let mut send_prefix_key = |ch: char,
+                                   modal: &mut Modal,
+                                   eink_mode: &mut bool,
+                                   eink_color: &mut bool,
+                                   force_clear: &mut bool,
+                                   pending_eink_osc: &mut bool| {
+            let _ = handle_key_event_full(
+                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+                &core,
+                &mut world,
+                None,
+                "ctrl+b",
+                &mut sidebar_open,
+                &mut prefix_active,
+                &mut ctrl_active,
+                &mut alt_active,
+                &mut scrollback_offset,
+                modal,
+                term_rect,
+                eink_mode,
+                eink_color,
+                force_clear,
+                pending_eink_osc,
+                None,
+            )
+            .unwrap();
+            handle_key_event_full(
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                &core,
+                &mut world,
+                None,
+                "ctrl+b",
+                &mut sidebar_open,
+                &mut prefix_active,
+                &mut ctrl_active,
+                &mut alt_active,
+                &mut scrollback_offset,
+                modal,
+                term_rect,
+                eink_mode,
+                eink_color,
+                force_clear,
+                pending_eink_osc,
+                None,
+            )
+            .unwrap()
+        };
+
+        // 1. Dark -> `^b E` enters Kaleido E-Ink directly and keeps Help modal open
+        let out1 = send_prefix_key(
+            'E',
+            &mut modal,
+            &mut eink_mode,
+            &mut eink_color,
+            &mut force_clear,
+            &mut pending_eink_osc,
+        );
+        assert_eq!(out1, KeyOutcome::UiChanged);
+        assert!(eink_mode);
+        assert!(eink_color);
+        assert!(force_clear);
+        assert!(pending_eink_osc);
+        assert!(matches!(modal, Modal::Help));
+
+        // 2. Kaleido -> `^b E` returns to pure Monochrome E-Ink
+        force_clear = false;
+        pending_eink_osc = false;
+        let _ = send_prefix_key(
+            'E',
+            &mut modal,
+            &mut eink_mode,
+            &mut eink_color,
+            &mut force_clear,
+            &mut pending_eink_osc,
+        );
+        assert!(eink_mode);
+        assert!(!eink_color);
+        assert!(force_clear);
+
+        // 3. Monochrome -> `^b E` turns Kaleido back ON
+        let _ = send_prefix_key(
+            'E',
+            &mut modal,
+            &mut eink_mode,
+            &mut eink_color,
+            &mut force_clear,
+            &mut pending_eink_osc,
+        );
+        assert!(eink_mode);
+        assert!(eink_color);
+
+        // 4. `^b e` turns E-Ink OFF while remembering `eink_color`, then back ON restores Kaleido
+        let _ = send_prefix_key(
+            'e',
+            &mut modal,
+            &mut eink_mode,
+            &mut eink_color,
+            &mut force_clear,
+            &mut pending_eink_osc,
+        );
+        assert!(!eink_mode);
+        assert!(eink_color);
+        let _ = send_prefix_key(
+            'e',
+            &mut modal,
+            &mut eink_mode,
+            &mut eink_color,
+            &mut force_clear,
+            &mut pending_eink_osc,
+        );
+        assert!(eink_mode);
+        assert!(eink_color);
+    }
+
+    #[test]
     fn resolve_eink_interval_and_wheel_step_behave_accurately() {
         assert_eq!(
             resolve_eink_interval(None, None),
@@ -7910,6 +8327,7 @@ mod tests {
         let mut modal = Modal::Help;
         let term_rect = Rect::new(0, 1, 80, 22);
         let mut eink_mode = true;
+        let mut eink_color = false;
         let mut force_clear = false;
         let mut pending_eink_osc = false;
         let mut pending_reader_osc = false;
@@ -7929,6 +8347,7 @@ mod tests {
             &mut modal,
             term_rect,
             &mut eink_mode,
+            &mut eink_color,
             &mut force_clear,
             &mut pending_eink_osc,
             Some(&mut pending_reader_osc),
@@ -7948,6 +8367,7 @@ mod tests {
             &mut modal,
             term_rect,
             &mut eink_mode,
+            &mut eink_color,
             &mut force_clear,
             &mut pending_eink_osc,
             Some(&mut pending_reader_osc),

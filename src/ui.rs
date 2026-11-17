@@ -751,6 +751,7 @@ pub fn render_ui_with_pads_and_quota(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn render_ui_full(
     f: &mut Frame,
@@ -773,6 +774,54 @@ pub fn render_ui_full(
     focused_quota: Option<&AgentQuota>,
     eink_mode: bool,
 ) -> UiGeometry {
+    render_ui_full_with_eink_color(
+        f,
+        world,
+        screen,
+        sidebar_open,
+        sidebar_width,
+        touch_mode,
+        prefix_active,
+        ctrl_active,
+        alt_active,
+        scrollback_offset,
+        selection,
+        copied_flash,
+        modal,
+        mod_pos,
+        mod_dragging,
+        dpad_pos,
+        dpad_dragging,
+        focused_quota,
+        eink_mode,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_ui_full_with_eink_color(
+    f: &mut Frame,
+    world: &World,
+    screen: Option<&vt100::Screen>,
+    sidebar_open: bool,
+    sidebar_width: u16,
+    touch_mode: bool,
+    prefix_active: bool,
+    ctrl_active: bool,
+    alt_active: bool,
+    scrollback_offset: usize,
+    selection: Option<&TerminalSelection>,
+    copied_flash: bool,
+    modal: &Modal,
+    mod_pos: Option<(u16, u16)>,
+    mod_dragging: bool,
+    dpad_pos: Option<(u16, u16)>,
+    dpad_dragging: bool,
+    focused_quota: Option<&AgentQuota>,
+    eink_mode: bool,
+    eink_color: bool,
+) -> UiGeometry {
+    let effective_eink_color = eink_mode && eink_color;
     let area = f.area();
     let mut hits = Vec::new();
     let top_h = top_bar_height(area, touch_mode);
@@ -802,6 +851,7 @@ pub fn render_ui_full(
                 screen: scr,
                 selection,
                 eink_mode,
+                eink_color: effective_eink_color,
             },
             term_rect,
         );
@@ -844,6 +894,7 @@ pub fn render_ui_full(
         space_menu_open,
         tab_overview_open,
         eink_mode,
+        effective_eink_color,
         &mut hits,
     );
     let space_slop_rect = if matches!(modal, Modal::None) && term_rect.height > 0 {
@@ -877,6 +928,7 @@ pub fn render_ui_full(
         },
         copied_flash,
         eink_mode,
+        effective_eink_color,
         &mut hits,
     );
 
@@ -911,7 +963,15 @@ pub fn render_ui_full(
             }
         }
         Modal::SpaceMenu => {
-            render_space_menu_modal(f, area, top_h, world, eink_mode, &mut hits);
+            render_space_menu_modal(
+                f,
+                area,
+                top_h,
+                world,
+                eink_mode,
+                effective_eink_color,
+                &mut hits,
+            );
         }
         Modal::TabOverview {
             query,
@@ -926,11 +986,12 @@ pub fn render_ui_full(
                 *selected,
                 selected_target,
                 eink_mode,
+                effective_eink_color,
                 &mut hits,
             );
         }
         Modal::Help => {
-            render_help_modal(f, area, eink_mode, &mut hits);
+            render_help_modal(f, area, eink_mode, effective_eink_color, &mut hits);
         }
         Modal::ConfirmCloseTab { tab_id, tab_title } => {
             render_confirm_close_modal(f, area, tab_id, tab_title, eink_mode, &mut hits);
@@ -951,6 +1012,7 @@ pub fn render_ui_full(
                 *selected,
                 selected_tab_id.as_deref(),
                 eink_mode,
+                effective_eink_color,
                 &mut hits,
             );
         }
@@ -973,6 +1035,20 @@ pub const EINK_INK: Color = Color::Rgb(0, 0, 0); // #000000
 pub const EINK_INK_MUTED: Color = Color::Rgb(102, 102, 102); // #666666
 pub const EINK_SURFACE: Color = Color::Rgb(238, 238, 238); // #eeeeee
 pub const EINK_PILL_BG: Color = Color::Rgb(221, 221, 221); // #dddddd
+
+// Kaleido Color E-Ink high-contrast semantic overprint inks (>= 8.9:1 on #ffffff)
+pub const KALEIDO_RED: Color = Color::Rgb(153, 0, 0); // #990000 (Blocked / Diff Remove / Low Quota)
+pub const KALEIDO_GREEN: Color = Color::Rgb(0, 85, 34); // #005522 (Done / Diff Add)
+pub const KALEIDO_BLUE: Color = Color::Rgb(0, 51, 136); // #003388 (Working / Diff Hunk)
+
+fn kaleido_state_color(state: AgentState) -> Option<Color> {
+    match state {
+        AgentState::Blocked => Some(KALEIDO_RED),
+        AgentState::Done => Some(KALEIDO_GREEN),
+        AgentState::Working => Some(KALEIDO_BLUE),
+        AgentState::Idle | AgentState::None => None,
+    }
+}
 
 // Classic `herdr` Catppuccin Mocha palette tokens (`Palette::catppuccin()`)
 const HERDR_ACCENT: Color = Color::Rgb(137, 180, 250); // #89b4fa (Blue — focused tab bg)
@@ -1365,6 +1441,7 @@ fn render_top_tabbar(
     space_menu_open: bool,
     tab_overview_open: bool,
     eink_mode: bool,
+    eink_color: bool,
     hits: &mut Vec<HitRegion>,
 ) -> Option<(u16, u16)> {
     if rect.width == 0 || rect.height == 0 {
@@ -1527,6 +1604,29 @@ fn render_top_tabbar(
             eink_mode && space_menu_open,
             eink_mode,
         );
+        if eink_mode
+            && eink_color
+            && rect.width >= 36
+            && matches!(sstate, AgentState::Blocked | AgentState::Done)
+        {
+            if let Some(sym_fg) = kaleido_state_color(sstate) {
+                let prefix_w = format!(" {arrow} ").width() as u16;
+                let sym_w = sstate.symbol().width() as u16;
+                let label_y = if rect.height >= 3 { rect.y + 1 } else { rect.y };
+                if sym_w > 0
+                    && prefix_w + sym_w <= space_w
+                    && buf
+                        .cell((x + prefix_w, label_y))
+                        .is_some_and(|c| c.symbol() == sstate.symbol())
+                {
+                    for dx in 0..sym_w {
+                        if let Some(cell) = buf.cell_mut((x + prefix_w + dx, label_y)) {
+                            cell.set_fg(sym_fg);
+                        }
+                    }
+                }
+            }
+        }
         x += space_w;
         drew_space = true;
     }
@@ -1617,6 +1717,33 @@ fn render_top_tabbar(
             let pill_active = is_active && !tab_overview_open;
             let tstyle = tab_pill_style(st, pill_active, eink_mode);
             draw_touchbar_pill(buf, x, rect, &lbl, tstyle, pill_active, eink_mode);
+            if eink_mode && eink_color {
+                let prefix = eink_tab_prefix(st, is_active);
+                if !prefix.is_empty() {
+                    if let Some(badge_fg) = kaleido_state_color(st) {
+                        let rel_x_opt = if lbl.starts_with(' ') && lbl[1..].starts_with(prefix) {
+                            Some(1u16)
+                        } else if lbl.starts_with(prefix) {
+                            Some(0u16)
+                        } else {
+                            None
+                        };
+                        if let Some(rel_x) = rel_x_opt {
+                            let label_y = if rect.height >= 3 { rect.y + 1 } else { rect.y };
+                            if buf
+                                .cell((x + rel_x, label_y))
+                                .is_some_and(|c| c.symbol() == prefix)
+                            {
+                                for dx in 0..(prefix.width() as u16) {
+                                    if let Some(cell) = buf.cell_mut((x + rel_x + dx, label_y)) {
+                                        cell.set_fg(badge_fg);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             hits.push(HitRegion {
                 rect: Rect {
                     x,
@@ -1742,14 +1869,23 @@ fn agent_badge_colors(agent: AgentKind) -> (Color, Color) {
     }
 }
 
+fn is_eink_low_quota(remaining_percent: f64, eink_color: bool) -> bool {
+    if eink_color {
+        remaining_percent < 15.0
+    } else {
+        remaining_percent <= 15.0
+    }
+}
+
 fn metric_display_width(
     m: &QuotaMetric,
     bar_w: usize,
     show_detail: bool,
     eink_mode: bool,
+    eink_color: bool,
 ) -> usize {
     let pct = m.remaining_percent.clamp(0.0, 100.0).round() as u64;
-    let pct_str = if eink_mode && m.remaining_percent <= 15.0 {
+    let pct_str = if eink_mode && is_eink_low_quota(m.remaining_percent, eink_color) {
         format!("{pct}%!")
     } else {
         format!("{pct}%")
@@ -1776,6 +1912,7 @@ fn push_clamped_str(buf: &mut Buffer, x: &mut u16, y: u16, avail_end: u16, s: &s
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_bottom_status_bar(
     f: &mut Frame,
     rect: Rect,
@@ -1783,6 +1920,7 @@ fn render_bottom_status_bar(
     scrollback_offset: usize,
     copied_flash: bool,
     eink_mode: bool,
+    eink_color: bool,
     hits: &mut Vec<HitRegion>,
 ) {
     if rect.width == 0 || rect.height == 0 {
@@ -1892,7 +2030,7 @@ fn render_bottom_status_bar(
                     let metrics_total: usize = quota
                         .metrics
                         .iter()
-                        .map(|m| metric_display_width(m, *bw, *sd, eink_mode))
+                        .map(|m| metric_display_width(m, *bw, *sd, eink_mode, eink_color))
                         .sum();
                     metrics_total + sep_total <= avail_w
                 })
@@ -1931,22 +2069,33 @@ fn render_bottom_status_bar(
                 push_clamped_str(buf, &mut x, rect.y, avail_end, " ", base_style);
 
                 let (fill_style, pct_style, pct_suffix) = if eink_mode {
-                    let low = m.remaining_percent <= 15.0;
-                    (
-                        Style::default().bg(bar_bg).fg(EINK_INK),
-                        if low {
-                            Style::default()
-                                .bg(EINK_INK)
-                                .fg(EINK_PAPER)
-                                .add_modifier(Modifier::BOLD)
-                        } else {
+                    let low = is_eink_low_quota(m.remaining_percent, eink_color);
+                    if eink_color && low {
+                        (
+                            Style::default().bg(bar_bg).fg(KALEIDO_RED),
                             Style::default()
                                 .bg(bar_bg)
-                                .fg(EINK_INK)
-                                .add_modifier(Modifier::BOLD)
-                        },
-                        if low { "!" } else { "" },
-                    )
+                                .fg(KALEIDO_RED)
+                                .add_modifier(Modifier::BOLD),
+                            "!",
+                        )
+                    } else {
+                        (
+                            Style::default().bg(bar_bg).fg(EINK_INK),
+                            if low {
+                                Style::default()
+                                    .bg(EINK_INK)
+                                    .fg(EINK_PAPER)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default()
+                                    .bg(bar_bg)
+                                    .fg(EINK_INK)
+                                    .add_modifier(Modifier::BOLD)
+                            },
+                            if low { "!" } else { "" },
+                        )
+                    }
                 } else {
                     let u_col = quota_remaining_color(m.remaining_percent);
                     (
@@ -2775,12 +2924,14 @@ fn shorten_home_path(path: &str) -> String {
     path.to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_space_menu_modal(
     f: &mut Frame,
     area: Rect,
     top_h: u16,
     world: &World,
     eink_mode: bool,
+    eink_color: bool,
     hits: &mut Vec<HitRegion>,
 ) {
     hits.clear();
@@ -2914,6 +3065,8 @@ fn render_space_menu_modal(
             let sym_fg = if eink_mode {
                 if is_active {
                     EINK_PAPER
+                } else if eink_color {
+                    kaleido_state_color(sstate).unwrap_or(EINK_INK)
                 } else {
                     EINK_INK
                 }
@@ -2984,6 +3137,7 @@ fn render_tab_overview_page(
     selected: usize,
     selected_target: &OverviewSelection,
     eink_mode: bool,
+    eink_color: bool,
     hits: &mut Vec<HitRegion>,
 ) {
     if term_rect.width == 0 || term_rect.height == 0 {
@@ -3296,6 +3450,8 @@ fn render_tab_overview_page(
                 let st_fg = if eink_mode {
                     if is_sel {
                         EINK_PAPER
+                    } else if eink_color {
+                        kaleido_state_color(*state).unwrap_or(EINK_INK)
                     } else {
                         EINK_INK
                     }
@@ -3382,6 +3538,7 @@ struct VtScreenWidget<'a> {
     screen: &'a vt100::Screen,
     selection: Option<&'a TerminalSelection>,
     eink_mode: bool,
+    eink_color: bool,
 }
 
 fn is_braille_char(s: &str) -> bool {
@@ -3505,6 +3662,513 @@ fn is_eink_muted_cell(cell: &vt100::Cell) -> bool {
             None => false,
         },
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiffHue {
+    Red,
+    Green,
+    BlueCyan,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EinkDiffRowKind {
+    Add,
+    Remove,
+    Hunk,
+}
+
+impl EinkDiffRowKind {
+    fn kaleido_color(self) -> Color {
+        match self {
+            Self::Add => KALEIDO_GREEN,
+            Self::Remove => KALEIDO_RED,
+            Self::Hunk => KALEIDO_BLUE,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EinkDiffRowHighlight {
+    kind: EinkDiffRowKind,
+    marker_start_col: u16,
+    marker_end_col_excl: u16,
+    side_bar_col: Option<u16>,
+    force_paper_bg: bool,
+}
+
+impl EinkDiffRowHighlight {
+    fn is_marker_col(self, col: u16) -> bool {
+        (col >= self.marker_start_col && col < self.marker_end_col_excl)
+            || self.side_bar_col == Some(col)
+    }
+}
+
+fn classify_rgb_diff_hue(r: u8, g: u8, b: u8, is_bg: bool) -> Option<DiffHue> {
+    if is_bg {
+        let is_red_bg = r >= 32
+            && r >= g.saturating_add(14)
+            && r >= b.saturating_add(12)
+            && (u16::from(g) * 3 <= u16::from(r) * 2
+                || (r >= g.saturating_add(16) && b <= g.saturating_add(6)));
+        if is_red_bg {
+            return Some(DiffHue::Red);
+        }
+        if g >= 30 && g >= r.saturating_add(12) && g >= b.saturating_add(6) {
+            return Some(DiffHue::Green);
+        }
+        if b >= 36 && b >= r.saturating_add(14) && b >= g {
+            return Some(DiffHue::BlueCyan);
+        }
+        None
+    } else {
+        let is_red_fg = r >= 85
+            && r >= g.saturating_add(32)
+            && r >= b.saturating_add(24)
+            && u16::from(g) * 3 <= u16::from(r) * 2;
+        if is_red_fg {
+            return Some(DiffHue::Red);
+        }
+        if g >= 75 && g >= r.saturating_add(28) && g >= b.saturating_add(18) {
+            return Some(DiffHue::Green);
+        }
+        if b >= 85 && b >= r.saturating_add(25) {
+            return Some(DiffHue::BlueCyan);
+        }
+        None
+    }
+}
+
+fn classify_vt_diff_hue(c: vt100::Color, is_bg: bool) -> Option<DiffHue> {
+    match c {
+        vt100::Color::Default => None,
+        vt100::Color::Idx(1 | 9) => Some(DiffHue::Red),
+        vt100::Color::Idx(2 | 10) => Some(DiffHue::Green),
+        vt100::Color::Idx(4 | 6 | 12 | 14) => Some(DiffHue::BlueCyan),
+        vt100::Color::Idx(i) => {
+            let (r, g, b) = xterm256_rgb(i);
+            classify_rgb_diff_hue(r, g, b, is_bg)
+        }
+        vt100::Color::Rgb(r, g, b) => classify_rgb_diff_hue(r, g, b, is_bg),
+    }
+}
+
+fn is_diff_box_border_sym(s: &str) -> bool {
+    matches!(s, "│" | "┃" | "║" | "▎" | "▍" | "▌" | "▋" | "▊" | "▉")
+}
+
+fn is_diff_thick_bar_sym(s: &str) -> bool {
+    matches!(s, "┃" | "▎" | "▍" | "▌" | "▋" | "▊" | "▉")
+}
+
+fn vt_cell_ascii_byte(screen: &vt100::Screen, r: u16, c: u16) -> Option<u8> {
+    let cell = screen.cell(r, c)?;
+    if cell.is_wide() || cell.is_wide_continuation() {
+        return None;
+    }
+    let s = if cell.has_contents() {
+        cell.contents()
+    } else {
+        " "
+    };
+    let b = s.as_bytes();
+    (b.len() == 1).then_some(b[0])
+}
+
+fn vt_row_ascii_slice(screen: &vt100::Screen, r: u16, start_col: u16, end_col: u16) -> String {
+    let mut out = String::new();
+    for c in start_col..end_col {
+        if let Some(cell) = screen.cell(r, c) {
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            if cell.has_contents() {
+                out.push_str(cell.contents());
+            } else {
+                out.push(' ');
+            }
+        }
+    }
+    out
+}
+
+fn looks_like_unified_hunk_header(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("@@ ") else {
+        return false;
+    };
+    let Some(close_idx) = rest.find(" @@") else {
+        return false;
+    };
+    let range = rest[..close_idx].trim();
+    range.starts_with('-') && range.contains('+')
+}
+
+fn is_diff_metadata_line(s: &str) -> bool {
+    const META_PREFIXES: &[&str] = &[
+        "index ",
+        "new file ",
+        "deleted file ",
+        "old mode ",
+        "new mode ",
+        "rename ",
+        "similarity ",
+        "copy from ",
+        "copy to ",
+        "Binary files ",
+    ];
+    META_PREFIXES.iter().any(|p| s.starts_with(p))
+}
+
+fn is_decorative_banner_tail(rest: &str) -> bool {
+    rest.ends_with("---") || rest.ends_with("+++") || rest.ends_with("===")
+}
+
+fn detect_eink_diff_rows(
+    screen: &vt100::Screen,
+    rows: u16,
+    cols: u16,
+) -> Vec<Option<EinkDiffRowHighlight>> {
+    let mut out: Vec<Option<EinkDiffRowHighlight>> = vec![None; usize::from(rows)];
+    let mut in_diff_context = false;
+    let mut in_uncolored_hunk = false;
+    let mut hunk_base_col: Option<u16> = None;
+
+    for r in 0..rows {
+        if r > 0 && screen.row_wrapped(r - 1) {
+            if let Some(prev) = out[usize::from(r - 1)] {
+                out[usize::from(r)] = Some(EinkDiffRowHighlight {
+                    kind: prev.kind,
+                    marker_start_col: 0,
+                    marker_end_col_excl: 0,
+                    side_bar_col: None,
+                    force_paper_bg: true,
+                });
+                continue;
+            }
+        }
+
+        let mut c = 0u16;
+        let mut colored_bar: Option<(u16, DiffHue)> = None;
+        while c < cols && vt_cell_ascii_byte(screen, r, c) == Some(b' ') {
+            c += 1;
+        }
+        if c < cols {
+            if let Some(cell) = screen.cell(r, c) {
+                let sym = if cell.has_contents() {
+                    cell.contents()
+                } else {
+                    ""
+                };
+                if is_diff_box_border_sym(sym) {
+                    let hue = classify_vt_diff_hue(cell.fgcolor(), false)
+                        .or_else(|| classify_vt_diff_hue(cell.bgcolor(), true));
+                    if is_diff_thick_bar_sym(sym) {
+                        if let Some(h @ (DiffHue::Red | DiffHue::Green)) = hue {
+                            colored_bar = Some((c, h));
+                        }
+                    }
+                    c += 1;
+                    while c < cols && vt_cell_ascii_byte(screen, r, c) == Some(b' ') {
+                        c += 1;
+                    }
+                }
+            }
+        }
+
+        // Skip up to two optional line-number tokens (`123`, `123:`, `123 │`, `10  11 │`).
+        for _ in 0..2 {
+            let saved = c;
+            let mut digits = 0u16;
+            while c < cols
+                && digits < 6
+                && vt_cell_ascii_byte(screen, r, c).is_some_and(|b| b.is_ascii_digit())
+            {
+                digits += 1;
+                c += 1;
+            }
+            if digits == 0 {
+                c = saved;
+                break;
+            }
+            let mut after_num = c;
+            let mut had_sep = false;
+            if c < cols {
+                let mut scan = c;
+                while scan < cols && vt_cell_ascii_byte(screen, r, scan) == Some(b' ') {
+                    scan += 1;
+                }
+                if scan < cols {
+                    let sep = screen.cell(r, scan).map_or("", |cell| cell.contents());
+                    if matches!(sep, ":" | "|" | "│") {
+                        c = scan + 1;
+                        after_num = c;
+                        had_sep = true;
+                    }
+                }
+            }
+            while c < cols && vt_cell_ascii_byte(screen, r, c) == Some(b' ') {
+                c += 1;
+            }
+            let next_b = vt_cell_ascii_byte(screen, r, c);
+            if !had_sep && c == after_num && !matches!(next_b, Some(b'+') | Some(b'-')) {
+                c = saved;
+                break;
+            }
+        }
+
+        if c >= cols {
+            if let Some((bc, hue)) = colored_bar {
+                let kind = match hue {
+                    DiffHue::Green => EinkDiffRowKind::Add,
+                    DiffHue::Red => EinkDiffRowKind::Remove,
+                    DiffHue::BlueCyan => EinkDiffRowKind::Hunk,
+                };
+                in_diff_context = true;
+                in_uncolored_hunk = false;
+                out[usize::from(r)] = Some(EinkDiffRowHighlight {
+                    kind,
+                    marker_start_col: bc,
+                    marker_end_col_excl: bc + 1,
+                    side_bar_col: None,
+                    force_paper_bg: true,
+                });
+            } else if !in_uncolored_hunk {
+                in_diff_context = false;
+            }
+            continue;
+        }
+
+        let probe_end = (c + 64).min(cols);
+        let tail_ascii = vt_row_ascii_slice(screen, r, c, probe_end);
+        let trimmed_end_tail = tail_ascii.trim_end();
+
+        if trimmed_end_tail.starts_with("diff --git ") || trimmed_end_tail.starts_with("diff -u ") {
+            in_diff_context = true;
+            in_uncolored_hunk = false;
+            hunk_base_col = None;
+            continue;
+        }
+
+        if let Some(rest) = trimmed_end_tail.strip_prefix("@@ ") {
+            if let Some(close_rel) = rest.find(" @@") {
+                let marker_cell_hue = screen.cell(r, c).and_then(|cell| {
+                    classify_vt_diff_hue(cell.fgcolor(), false)
+                        .or_else(|| classify_vt_diff_hue(cell.bgcolor(), true))
+                });
+                if marker_cell_hue == Some(DiffHue::BlueCyan)
+                    || looks_like_unified_hunk_header(trimmed_end_tail)
+                {
+                    let inner_w = rest[..close_rel].width() as u16;
+                    let end_col = (c + 3 + inner_w + 3).min(cols);
+                    in_diff_context = true;
+                    in_uncolored_hunk = true;
+                    hunk_base_col = Some(c);
+                    out[usize::from(r)] = Some(EinkDiffRowHighlight {
+                        kind: EinkDiffRowKind::Hunk,
+                        marker_start_col: c,
+                        marker_end_col_excl: end_col,
+                        side_bar_col: None,
+                        force_paper_bg: true,
+                    });
+                    continue;
+                }
+            }
+        }
+
+        if trimmed_end_tail.starts_with("--- ") || trimmed_end_tail.starts_with("+++ ") {
+            let is_add_hdr = trimmed_end_tail.starts_with("+++ ");
+            let rest = trimmed_end_tail[4..].trim();
+            let decorative_banner = is_decorative_banner_tail(rest);
+            let paired_next_add = !is_add_hdr
+                && r + 1 < rows
+                && !rest.is_empty()
+                && !decorative_banner
+                && vt_row_ascii_slice(screen, r + 1, c, (c + 8).min(cols)).starts_with("+++ ");
+            let paired_next_hunk = paired_next_add
+                && r + 2 < rows
+                && vt_row_ascii_slice(screen, r + 2, c, (c + 8).min(cols)).starts_with("@@ ");
+            let has_path_shape = !rest.is_empty()
+                && !decorative_banner
+                && (!in_uncolored_hunk
+                    && (rest.starts_with("a/")
+                        || rest.starts_with("b/")
+                        || rest.starts_with("/dev/null")
+                        || paired_next_add
+                        || in_diff_context)
+                    || paired_next_hunk);
+            let marker_hue = screen.cell(r, c).and_then(|cell| {
+                classify_vt_diff_hue(cell.fgcolor(), false)
+                    .or_else(|| classify_vt_diff_hue(cell.bgcolor(), true))
+            });
+            let color_matches = if is_add_hdr {
+                marker_hue == Some(DiffHue::Green)
+            } else {
+                marker_hue == Some(DiffHue::Red)
+            };
+            if (!in_uncolored_hunk && color_matches) || has_path_shape {
+                in_diff_context = true;
+                in_uncolored_hunk = false;
+                hunk_base_col = None;
+                out[usize::from(r)] = Some(EinkDiffRowHighlight {
+                    kind: if is_add_hdr {
+                        EinkDiffRowKind::Add
+                    } else {
+                        EinkDiffRowKind::Remove
+                    },
+                    marker_start_col: c,
+                    marker_end_col_excl: (c + 3).min(cols),
+                    side_bar_col: colored_bar.map(|(bc, _)| bc),
+                    force_paper_bg: true,
+                });
+                continue;
+            }
+        }
+
+        let marker_byte = vt_cell_ascii_byte(screen, r, c);
+        if matches!(marker_byte, Some(b'+') | Some(b'-')) {
+            let is_add = marker_byte == Some(b'+');
+            let want_hue = if is_add { DiffHue::Green } else { DiffHue::Red };
+            let next_byte = if c + 1 < cols {
+                vt_cell_ascii_byte(screen, r, c + 1)
+            } else {
+                None
+            };
+            let same_next = next_byte == marker_byte;
+            let all_marker_rule = same_next
+                && trimmed_end_tail
+                    .chars()
+                    .all(|ch| ch == if is_add { '+' } else { '-' } || ch.is_whitespace());
+            let decorative_banner = trimmed_end_tail
+                .get(4..)
+                .is_some_and(|s| is_decorative_banner_tail(s.trim()));
+
+            let cell_opt = screen.cell(r, c);
+            let fg_hue = cell_opt.and_then(|cell| classify_vt_diff_hue(cell.fgcolor(), false));
+            let bg_hue = cell_opt.and_then(|cell| classify_vt_diff_hue(cell.bgcolor(), true));
+            let bar_matches = colored_bar.is_some_and(|(_, h)| h == want_hue);
+            let color_matches = fg_hue == Some(want_hue) || bg_hue == Some(want_hue) || bar_matches;
+            let uncolored_ok = in_uncolored_hunk
+                && hunk_base_col == Some(c)
+                && fg_hue.is_none()
+                && bg_hue.is_none();
+            let prev_was_diff = r > 0
+                && matches!(
+                    out[usize::from(r - 1)].map(|d| d.kind),
+                    Some(EinkDiffRowKind::Add | EinkDiffRowKind::Remove)
+                );
+
+            let confirmed = if same_next {
+                let uncolored_double_in_hunk = uncolored_ok
+                    && !decorative_banner
+                    && (!all_marker_rule || trimmed_end_tail.len() >= 4);
+                let colored_double = color_matches
+                    && (in_diff_context || prev_was_diff)
+                    && (!all_marker_rule || in_uncolored_hunk);
+                uncolored_double_in_hunk || colored_double
+            } else {
+                color_matches || uncolored_ok
+            };
+
+            if confirmed {
+                in_diff_context = true;
+                if hunk_base_col != Some(c) {
+                    in_uncolored_hunk = false;
+                }
+                out[usize::from(r)] = Some(EinkDiffRowHighlight {
+                    kind: if is_add {
+                        EinkDiffRowKind::Add
+                    } else {
+                        EinkDiffRowKind::Remove
+                    },
+                    marker_start_col: c,
+                    marker_end_col_excl: c + 1,
+                    side_bar_col: colored_bar.map(|(bc, _)| bc),
+                    force_paper_bg: true,
+                });
+                continue;
+            }
+        }
+
+        if let Some((bc, hue)) = colored_bar {
+            if matches!(hue, DiffHue::Green | DiffHue::Red) {
+                in_diff_context = true;
+                in_uncolored_hunk = false;
+                out[usize::from(r)] = Some(EinkDiffRowHighlight {
+                    kind: if hue == DiffHue::Green {
+                        EinkDiffRowKind::Add
+                    } else {
+                        EinkDiffRowKind::Remove
+                    },
+                    marker_start_col: bc,
+                    marker_end_col_excl: bc + 1,
+                    side_bar_col: None,
+                    force_paper_bg: true,
+                });
+                continue;
+            }
+        }
+
+        if in_uncolored_hunk {
+            let base_byte = hunk_base_col.and_then(|bc| vt_cell_ascii_byte(screen, r, bc));
+            if !matches!(base_byte, Some(b' ') | Some(b'\\')) {
+                in_uncolored_hunk = false;
+                hunk_base_col = None;
+                if !is_diff_metadata_line(trimmed_end_tail) {
+                    in_diff_context = false;
+                }
+            }
+        } else if !is_diff_metadata_line(trimmed_end_tail) {
+            in_diff_context = false;
+        }
+    }
+
+    out
+}
+
+fn resolve_eink_vt_colors_and_mods_with_diff(
+    cell: &vt100::Cell,
+    selected: bool,
+    col: u16,
+    row_diff: Option<EinkDiffRowHighlight>,
+) -> (Color, Color, Modifier) {
+    if selected || cell.inverse() {
+        return (EINK_PAPER, EINK_INK, Modifier::BOLD);
+    }
+    if let Some(diff) = row_diff {
+        let bg_col = if diff.force_paper_bg {
+            EINK_PAPER
+        } else {
+            resolve_eink_vt_colors_and_mods(cell, false).1
+        };
+        if diff.is_marker_col(col) {
+            let mut mods = Modifier::BOLD;
+            if cell.italic() {
+                mods |= Modifier::ITALIC;
+            }
+            if cell.underline() {
+                mods |= Modifier::UNDERLINED;
+            }
+            return (diff.kind.kaleido_color(), EINK_PAPER, mods);
+        }
+        let is_muted = is_eink_muted_cell(cell);
+        let fg_col = if is_muted && bg_col != EINK_PILL_BG {
+            EINK_INK_MUTED
+        } else {
+            EINK_INK
+        };
+        let mut mods = Modifier::empty();
+        if cell.bold() && !is_muted {
+            mods |= Modifier::BOLD;
+        }
+        if cell.italic() {
+            mods |= Modifier::ITALIC;
+        }
+        if cell.underline() {
+            mods |= Modifier::UNDERLINED;
+        }
+        return (fg_col, bg_col, mods);
+    }
+    resolve_eink_vt_colors_and_mods(cell, false)
 }
 
 fn resolve_eink_vt_colors_and_mods(cell: &vt100::Cell, selected: bool) -> (Color, Color, Modifier) {
@@ -3943,18 +4607,36 @@ fn normalized_narrow_vt_symbol<'a>(
     }
 }
 
+#[cfg(test)]
 pub fn capture_eink_screen_snapshot(
     screen: &vt100::Screen,
     area: Rect,
     scrollback_offset: usize,
+) -> EinkScreenSnapshot {
+    capture_eink_screen_snapshot_with_color(screen, area, scrollback_offset, false)
+}
+
+pub fn capture_eink_screen_snapshot_with_color(
+    screen: &vt100::Screen,
+    area: Rect,
+    scrollback_offset: usize,
+    eink_color: bool,
 ) -> EinkScreenSnapshot {
     let (scr_cols, scr_rows) = {
         let (r, c) = screen.size();
         (c.get(), r.get())
     };
     let (rows, cols) = vt_render_dims((scr_cols, scr_rows), area);
+    let diff_rows = if eink_color {
+        Some(detect_eink_diff_rows(screen, rows, cols))
+    } else {
+        None
+    };
     let mut cells = Vec::with_capacity(usize::from(rows) * usize::from(cols));
     for r in 0..rows {
+        let row_diff = diff_rows
+            .as_ref()
+            .and_then(|rows_vec| rows_vec[usize::from(r)]);
         let mut c = 0;
         while c < cols {
             let Some(cell) = screen.cell(r, c) else {
@@ -3965,7 +4647,11 @@ pub fn capture_eink_screen_snapshot(
                 c += 1;
                 continue;
             }
-            let (fg, bg, mods) = resolve_eink_vt_colors_and_mods(cell, false);
+            let (fg, bg, mods) = if eink_color {
+                resolve_eink_vt_colors_and_mods_with_diff(cell, false, c, row_diff)
+            } else {
+                resolve_eink_vt_colors_and_mods(cell, false)
+            };
             let raw_sym = if cell.has_contents() {
                 cell.contents()
             } else {
@@ -4060,10 +4746,18 @@ impl Widget for VtScreenWidget<'_> {
             (c.get(), r.get())
         };
         let (rows, cols) = vt_render_dims((scr_cols, scr_rows), area);
+        let diff_rows = if self.eink_mode && self.eink_color {
+            Some(detect_eink_diff_rows(self.screen, rows, cols))
+        } else {
+            None
+        };
         let active_sel = self.selection.filter(|s| s.is_non_empty());
         let sel_bounds = active_sel.map(|s| s.normalized());
 
         for r in 0..rows {
+            let row_diff = diff_rows
+                .as_ref()
+                .and_then(|rows_vec| rows_vec[usize::from(r)]);
             let row_in_sel = sel_bounds.is_some_and(|((sr, _), (er, _))| r >= sr && r <= er);
             let mut c = 0;
             while c < cols {
@@ -4084,7 +4778,11 @@ impl Widget for VtScreenWidget<'_> {
                     });
 
                 let style = if self.eink_mode {
-                    let (fg_col, bg_col, mods) = resolve_eink_vt_colors_and_mods(cell, selected);
+                    let (fg_col, bg_col, mods) = if self.eink_color {
+                        resolve_eink_vt_colors_and_mods_with_diff(cell, selected, c, row_diff)
+                    } else {
+                        resolve_eink_vt_colors_and_mods(cell, selected)
+                    };
                     Style::default().fg(fg_col).bg(bg_col).add_modifier(mods)
                 } else if selected {
                     Style::default()
@@ -4220,7 +4918,13 @@ fn draw_modal_close_button(
     }
 }
 
-fn render_help_modal(f: &mut Frame, area: Rect, eink_mode: bool, hits: &mut Vec<HitRegion>) {
+fn render_help_modal(
+    f: &mut Frame,
+    area: Rect,
+    eink_mode: bool,
+    eink_color: bool,
+    hits: &mut Vec<HitRegion>,
+) {
     hits.clear();
     let popup = centered_rect(74, 34, area);
     f.render_widget(Clear, popup);
@@ -4259,7 +4963,7 @@ fn render_help_modal(f: &mut Frame, area: Rect, eink_mode: bool, hits: &mut Vec<
     }
     let inner = block.inner(popup);
 
-    // Reflow the 17 touch quick-action buttons across available inner width so narrow mobile
+    // Reflow the 18 touch quick-action buttons across available inner width so narrow mobile
     // viewports wrap buttons onto additional rows instead of dropping right-hand columns.
     let compact_btns = inner.width < 58;
     let (eink_wide, eink_short) = if eink_mode {
@@ -4267,7 +4971,12 @@ fn render_help_modal(f: &mut Frame, area: Rect, eink_mode: bool, hits: &mut Vec<
     } else {
         ("  ◐ E-Ink: OFF  ", " ◐E:OF ")
     };
-    let quick_actions: [(&str, &str, HitTarget); 17] = [
+    let (kaleido_wide, kaleido_short) = if eink_mode && eink_color {
+        ("  ◈ Kaleido: ON ", " ◈K:ON ")
+    } else {
+        ("  ◈ Kaleido: OFF", " ◈K:OF ")
+    };
+    let quick_actions: [(&str, &str, HitTarget); 18] = [
         (
             "  + New Tab     ",
             " +Tab ",
@@ -4332,6 +5041,11 @@ fn render_help_modal(f: &mut Frame, area: Rect, eink_mode: bool, hits: &mut Vec<
             eink_wide,
             eink_short,
             HitTarget::TriggerAction(Action::ToggleEink),
+        ),
+        (
+            kaleido_wide,
+            kaleido_short,
+            HitTarget::TriggerAction(Action::ToggleEinkColor),
         ),
         (
             "  📖 Book View  ",
@@ -4406,6 +5120,7 @@ fn render_help_modal(f: &mut Frame, area: Rect, eink_mode: bool, hits: &mut Vec<
         Line::from("  Scrollback / History     ^b [          or  Tap [▼ BOT] on status bar"),
         Line::from("  Page Up / Down           ^b PgUp / PgDn / Tap Left [‹] / Right [›]"),
         Line::from("  E-Ink / Clean Redraw     ^b e (E-Ink)  /   ^b r (clean redraw)"),
+        Line::from("  Kaleido Color Accent     ^b E (95% mono + 5% overprint accents)"),
         Line::from("  Book Reader (ShellDeck)  ^b v / ^b B   or  Tap [ 📖 Book View ]"),
         Line::from("  Detach (keep running)    ^b q / ^b d   or  Ctrl+\\ / Tap [ ⏏ ]"),
         Line::from(""),
@@ -4434,7 +5149,10 @@ fn render_help_modal(f: &mut Frame, area: Rect, eink_mode: bool, hits: &mut Vec<
             continue;
         }
         let bstyle = if eink_mode {
-            if matches!(target, HitTarget::TriggerAction(Action::ToggleEink)) {
+            let active_toggle = matches!(target, HitTarget::TriggerAction(Action::ToggleEink))
+                || (eink_color
+                    && matches!(target, HitTarget::TriggerAction(Action::ToggleEinkColor)));
+            if active_toggle {
                 Style::default()
                     .bg(EINK_INK)
                     .fg(EINK_PAPER)
@@ -4685,6 +5403,7 @@ fn render_fuzzy_modal(
     selected: usize,
     selected_tab_id: Option<&str>,
     eink_mode: bool,
+    eink_color: bool,
     hits: &mut Vec<HitRegion>,
 ) {
     hits.clear();
@@ -4750,12 +5469,16 @@ fn render_fuzzy_modal(
                 } else {
                     row_style.fg(EINK_INK_MUTED)
                 };
+                let sym_style = if !is_sel && eink_color {
+                    row_style
+                        .fg(kaleido_state_color(it.state).unwrap_or(EINK_INK))
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    row_style.add_modifier(Modifier::BOLD)
+                };
                 let line = Line::from(vec![
                     Span::styled(if is_sel { " ▸ " } else { "   " }, row_style),
-                    Span::styled(
-                        format!("{} ", it.state.symbol()),
-                        row_style.add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled(format!("{} ", it.state.symbol()), sym_style),
                     Span::styled(
                         format!("[{}] ", it.space_name),
                         row_style.add_modifier(Modifier::BOLD),
@@ -5773,6 +6496,7 @@ mod tests {
                     screen: parser.screen(),
                     selection: None,
                     eink_mode: false,
+                    eink_color: false,
                 },
                 f.area(),
             );
@@ -5834,6 +6558,7 @@ mod tests {
                     screen: parser.screen(),
                     selection: None,
                     eink_mode: false,
+                    eink_color: false,
                 },
                 f.area(),
             );
@@ -5869,6 +6594,7 @@ mod tests {
                     screen: parser.screen(),
                     selection: None,
                     eink_mode: false,
+                    eink_color: false,
                 },
                 f.area(),
             );
@@ -5899,6 +6625,7 @@ mod tests {
                     screen: parser.screen(),
                     selection: None,
                     eink_mode: false,
+                    eink_color: false,
                 },
                 f.area(),
             );
@@ -6834,6 +7561,7 @@ mod tests {
                     screen: parser.screen(),
                     selection: None,
                     eink_mode: true,
+                    eink_color: false,
                 },
                 f.area(),
             );
@@ -7058,6 +7786,7 @@ mod tests {
                     screen: parser.screen(),
                     selection: None,
                     eink_mode: true,
+                    eink_color: false,
                 },
                 f.area(),
             );
@@ -7097,5 +7826,576 @@ mod tests {
         assert_eq!(lines[2]["r"][0][1], 2);
         assert_eq!(lines[3]["r"][0][0], "# Gray244Bold");
         assert_eq!(lines[3]["r"][0][1], 1);
+    }
+
+    fn kaleido_world_for_tabs() -> World {
+        use crate::model::{make_single_terminal_tab, SharedSpace, TerminalInfo};
+        let mut world = World::default();
+        world.doc.spaces = vec![SharedSpace {
+            id: "sp1".to_string(),
+            name: "work".to_string(),
+            folder: String::new(),
+            tabs: vec![
+                make_single_terminal_tab("tb1", "blocked-tab", "term-blocked"),
+                make_single_terminal_tab("tb2", "working-tab", "term-working"),
+                make_single_terminal_tab("tb3", "done-tab", "term-done"),
+                make_single_terminal_tab("tb4", "idle-tab", "term-idle"),
+            ],
+            rest: serde_json::Map::new(),
+        }];
+        world
+            .active_tab_by_space
+            .insert("sp1".to_string(), "tb4".to_string());
+        let mk_term = |addr: &str, status: &str, turn: u64, seen: Option<u64>| TerminalInfo {
+            address: addr.to_string(),
+            name: Some(addr.to_string()),
+            state: "live".to_string(),
+            cwd: "/tmp".to_string(),
+            fg_cwd: None,
+            fg_name: None,
+            title: addr.to_string(),
+            status_word: Some(status.to_string()),
+            status_app: Some("codex".to_string()),
+            status_msg: None,
+            turn,
+            seen_turn: seen,
+            pinned: false,
+            parent: None,
+        };
+        world.terminals.insert(
+            "term-blocked".to_string(),
+            mk_term("term-blocked", "blocked", 3, Some(2)),
+        );
+        world.terminals.insert(
+            "term-working".to_string(),
+            mk_term("term-working", "working", 3, Some(2)),
+        );
+        world.terminals.insert(
+            "term-done".to_string(),
+            mk_term("term-done", "done", 4, Some(3)),
+        );
+        world.terminals.insert(
+            "term-idle".to_string(),
+            mk_term("term-idle", "done", 2, Some(2)),
+        );
+        world
+    }
+
+    #[test]
+    fn kaleido_top_bar_colors_agent_markers_and_keeps_titles_on_white_paper() {
+        let world = kaleido_world_for_tabs();
+        let backend = TestBackend::new(120, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            let _ = render_ui_full_with_eink_color(
+                f,
+                &world,
+                None,
+                false,
+                24,
+                false,
+                false,
+                false,
+                false,
+                0,
+                None,
+                false,
+                &Modal::None,
+                None,
+                false,
+                None,
+                false,
+                None,
+                true,
+                true,
+            );
+        })
+        .unwrap();
+
+        let buf = term.backend().buffer();
+        let mut row0 = String::new();
+        for x in 0..120u16 {
+            let cell = &buf[(x, 0)];
+            row0.push_str(cell.symbol());
+            // Never tint backgrounds in Kaleido mode
+            assert!(
+                matches!(cell.bg, EINK_PAPER | EINK_SURFACE | EINK_INK),
+                "unexpected bg {:?} at col {x}",
+                cell.bg
+            );
+        }
+
+        let find_char_fg = |needle: &str| -> Color {
+            for x in 0..120u16 {
+                if buf[(x, 0)].symbol() == needle {
+                    return buf[(x, 0)].fg;
+                }
+            }
+            panic!("missing '{needle}' in top row: {row0}");
+        };
+        assert_eq!(find_char_fg("!"), KALEIDO_RED);
+        assert_eq!(find_char_fg("*"), KALEIDO_BLUE);
+        assert_eq!(find_char_fg("✓"), KALEIDO_GREEN);
+
+        // Tab title text stays strict neutral black ink on white paper
+        let b_pos = row0.find("blocked-tab").expect("blocked-tab title");
+        let title_col = row0[..b_pos].chars().count() as u16;
+        assert_eq!(buf[(title_col, 0)].fg, EINK_INK);
+        assert_eq!(buf[(title_col, 0)].bg, EINK_PAPER);
+
+        // Monochrome mode (`eink_color = false`) keeps state symbols neutral
+        term.draw(|f| {
+            let _ = render_ui_full_with_eink_color(
+                f,
+                &world,
+                None,
+                false,
+                24,
+                false,
+                false,
+                false,
+                false,
+                0,
+                None,
+                false,
+                &Modal::None,
+                None,
+                false,
+                None,
+                false,
+                None,
+                true,
+                false,
+            );
+        })
+        .unwrap();
+        let buf_mono = term.backend().buffer();
+        for x in 0..120u16 {
+            assert_eq!(
+                color_rgb(buf_mono[(x, 0)].fg).0,
+                color_rgb(buf_mono[(x, 0)].fg).1
+            );
+            assert_eq!(
+                color_rgb(buf_mono[(x, 0)].fg).1,
+                color_rgb(buf_mono[(x, 0)].fg).2
+            );
+        }
+    }
+
+    fn color_rgb(c: Color) -> (u8, u8, u8) {
+        match c {
+            Color::Rgb(r, g, b) => (r, g, b),
+            Color::White => (255, 255, 255),
+            Color::Black => (0, 0, 0),
+            other => panic!("expected RGB/neutral color, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kaleido_bottom_quota_bar_highlights_below_15_percent_and_keeps_15_and_above_monochrome() {
+        use crate::usage::{AgentKind, AgentQuota, QuotaMetric};
+        let world = kaleido_world_for_tabs();
+        let backend = TestBackend::new(100, 8);
+        let mut term = Terminal::new(backend).unwrap();
+
+        let render_with_pct = |term: &mut Terminal<TestBackend>, pct: f64, eink_color: bool| {
+            let quota = AgentQuota {
+                agent: AgentKind::Codex,
+                metrics: vec![QuotaMetric {
+                    window_label: "5h".to_string(),
+                    remaining_percent: pct,
+                    detail: Some("2h10m".to_string()),
+                }],
+            };
+            term.draw(|f| {
+                let _ = render_ui_full_with_eink_color(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::None,
+                    None,
+                    false,
+                    None,
+                    false,
+                    Some(&quota),
+                    true,
+                    eink_color,
+                );
+            })
+            .unwrap();
+        };
+
+        // Below 15% (14.9% -> rounds to 15%? Use 14.0% and 14.4% too, and check < 15.0 threshold)
+        render_with_pct(&mut term, 14.2, true);
+        let buf = term.backend().buffer();
+        let row_y = 7u16;
+        let row_text: String = (0..100u16).map(|x| buf[(x, row_y)].symbol()).collect();
+        assert!(row_text.contains("14%!"), "expected '14%!' in {row_text}");
+        let mut saw_red_bar = false;
+        let mut saw_red_pct = false;
+        for x in 0..100u16 {
+            let cell = &buf[(x, row_y)];
+            // Bottom bar backgrounds stay pure neutral Carta monochrome (no red/tinted bg)
+            assert!(
+                matches!(cell.bg, EINK_PAPER | EINK_INK),
+                "unexpected bg {:?} at col {x}",
+                cell.bg
+            );
+            if cell.symbol() == "█" || cell.symbol() == "▌" {
+                assert_eq!(cell.fg, KALEIDO_RED);
+                assert_eq!(cell.bg, EINK_PAPER);
+                saw_red_bar = true;
+            }
+            if cell.symbol() == "─" {
+                assert_eq!(cell.fg, EINK_INK_MUTED);
+                assert_eq!(cell.bg, EINK_PAPER);
+            }
+            if cell.symbol() == "!" && cell.fg == KALEIDO_RED {
+                assert_eq!(cell.bg, EINK_PAPER);
+                saw_red_pct = true;
+            }
+        }
+        assert!(saw_red_bar && saw_red_pct);
+
+        // Exactly 15.0% stays strictly monochrome (threshold is < 15.0)
+        render_with_pct(&mut term, 15.0, true);
+        let buf_15 = term.backend().buffer();
+        for x in 0..100u16 {
+            let (r, g, b) = color_rgb(buf_15[(x, row_y)].fg);
+            assert!(
+                r == g && g == b,
+                "expected neutral gray at 15.0%, got {:?}",
+                buf_15[(x, row_y)].fg
+            );
+            assert!(matches!(buf_15[(x, row_y)].bg, EINK_PAPER | EINK_INK));
+        }
+
+        // 85.0% stays strictly monochrome
+        render_with_pct(&mut term, 85.0, true);
+        let buf_85 = term.backend().buffer();
+        for x in 0..100u16 {
+            let (r, g, b) = color_rgb(buf_85[(x, row_y)].fg);
+            assert!(r == g && g == b);
+        }
+    }
+
+    #[test]
+    fn kaleido_diff_markers_highlight_only_markers_and_sidebars_on_white_paper() {
+        let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
+        let mut parser = vt100::Parser::new(nz(12), nz(60), 20);
+        parser.process(
+            b"\x1b[38;5;208;48;2;20;60;20m--- a/lib.rs\x1b[0m\r\n\
+              \x1b[32;48;2;20;70;20m+++ b/lib.rs\x1b[0m\r\n\
+              \x1b[36m@@ -1,3 +1,4 @@ fn demo()\x1b[0m\r\n\
+              \x1b[31;48;2;70;20;20m-let old_val = 1;\x1b[0m\r\n\
+              \x1b[32;48;2;20;70;20m+let new_val = 2;\x1b[0m\r\n\
+              \x1b[38;2;220;220;220m unchanged_ctx();\x1b[0m\r\n\
+              \x1b[32m  42 + boxed_add();\x1b[0m\r\n\
+              \x1b[31m  41 - boxed_del();\x1b[0m\r\n\
+              \x1b[38;2;40;160;80m\xe2\x96\x8e\x1b[0m bar_add();\r\n\
+              ++i;\r\n\
+              - plain markdown bullet",
+        );
+
+        let backend = TestBackend::new(60, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            f.render_widget(
+                VtScreenWidget {
+                    screen: parser.screen(),
+                    selection: None,
+                    eink_mode: true,
+                    eink_color: true,
+                },
+                f.area(),
+            );
+        })
+        .unwrap();
+
+        let buf = term.backend().buffer();
+        // Every background cell stays crisp pure white paper (no red/green bg wash!)
+        for y in 0..12u16 {
+            for x in 0..60u16 {
+                assert_eq!(buf[(x, y)].bg, EINK_PAPER, "row {y} col {x} leaked bg");
+            }
+        }
+
+        // Row 0: "---" red, file path neutral
+        assert_eq!(buf[(0, 0)].fg, KALEIDO_RED);
+        assert_eq!(buf[(2, 0)].fg, KALEIDO_RED);
+        assert_eq!(buf[(4, 0)].fg, EINK_INK); // 'a' stays sharp black
+
+        // Row 1: "+++" green, file path neutral
+        assert_eq!(buf[(0, 1)].fg, KALEIDO_GREEN);
+        assert_eq!(buf[(2, 1)].fg, KALEIDO_GREEN);
+        assert_eq!(buf[(4, 1)].fg, EINK_INK);
+
+        // Row 2: "@@ -1,3 +1,4 @@" blue hunk marker, trailing "fn demo()" neutral
+        assert_eq!(buf[(0, 2)].fg, KALEIDO_BLUE);
+        assert_eq!(buf[(14, 2)].fg, KALEIDO_BLUE);
+        let fn_pos = (0..60u16).find(|&x| buf[(x, 2)].symbol() == "f").unwrap();
+        assert_eq!(buf[(fn_pos, 2)].fg, EINK_INK);
+
+        // Row 3: '-' marker KALEIDO_RED + BOLD, code "let old_val = 1;" strictly monochrome
+        assert_eq!(buf[(0, 3)].fg, KALEIDO_RED);
+        assert!(buf[(0, 3)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buf[(1, 3)].symbol(), "l");
+        assert_eq!(buf[(1, 3)].fg, EINK_INK);
+
+        // Row 4: '+' marker KALEIDO_GREEN + BOLD, code "let new_val = 2;" strictly monochrome
+        assert_eq!(buf[(0, 4)].fg, KALEIDO_GREEN);
+        assert!(buf[(0, 4)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buf[(1, 4)].symbol(), "l");
+        assert_eq!(buf[(1, 4)].fg, EINK_INK);
+
+        // Row 6/7: numbered agent diff markers (`42 +`, `41 -`)
+        assert_eq!(buf[(5, 6)].symbol(), "+");
+        assert_eq!(buf[(5, 6)].fg, KALEIDO_GREEN);
+        assert_eq!(buf[(7, 6)].fg, EINK_INK);
+        assert_eq!(buf[(5, 7)].symbol(), "-");
+        assert_eq!(buf[(5, 7)].fg, KALEIDO_RED);
+        assert_eq!(buf[(7, 7)].fg, EINK_INK);
+
+        // Row 8: colored side bar '▎' -> KALEIDO_GREEN, body text stays black
+        assert_eq!(buf[(0, 8)].symbol(), "▎");
+        assert_eq!(buf[(0, 8)].fg, KALEIDO_GREEN);
+        assert_eq!(buf[(2, 8)].symbol(), "b");
+        assert_eq!(buf[(2, 8)].fg, EINK_INK);
+
+        // Row 9 ("++i;") and Row 10 ("- plain markdown bullet"): outside hunk/uncolored -> neutral
+        assert_eq!(buf[(0, 9)].fg, EINK_INK);
+        assert_eq!(buf[(0, 10)].fg, EINK_INK);
+
+        // Monochrome snapshot vs Kaleido snapshot differ when diff rows are present
+        let snap_mono = capture_eink_screen_snapshot_with_color(
+            parser.screen(),
+            Rect::new(0, 0, 60, 12),
+            0,
+            false,
+        );
+        let snap_kaleido = capture_eink_screen_snapshot_with_color(
+            parser.screen(),
+            Rect::new(0, 0, 60, 12),
+            0,
+            true,
+        );
+        assert_ne!(snap_mono, snap_kaleido);
+    }
+
+    #[test]
+    fn kaleido_help_modal_renders_toggle_and_shortcut_within_80_cols() {
+        let world = kaleido_world_for_tabs();
+        let backend = TestBackend::new(80, 36);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            let _ = render_ui_full_with_eink_color(
+                f,
+                &world,
+                None,
+                false,
+                24,
+                false,
+                false,
+                false,
+                false,
+                0,
+                None,
+                false,
+                &Modal::Help,
+                None,
+                false,
+                None,
+                false,
+                None,
+                true,
+                true,
+            );
+        })
+        .unwrap();
+
+        let buf = term.backend().buffer();
+        let mut full_text = String::new();
+        for y in 0..36u16 {
+            for x in 0..80u16 {
+                full_text.push_str(buf[(x, y)].symbol());
+            }
+            full_text.push('\n');
+        }
+        assert!(
+            full_text.contains("Kaleido: ON"),
+            "missing Kaleido button:\n{full_text}"
+        );
+        assert!(
+            full_text.contains("^b E"),
+            "missing ^b E shortcut:\n{full_text}"
+        );
+    }
+
+    #[test]
+    fn kaleido_diff_handles_uncolored_doubles_spaced_line_nums_and_wrapped_hunks() {
+        let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
+        let mut parser = vt100::Parser::new(nz(12), nz(44), 20);
+        parser.process(
+            b"--- old.txt\r\n\
+              +++ new.txt\r\n\
+              \x1b[36;48;2;20;40;65m@@ -1,4 +1,4 @@ fn very_long_hunk_signature_wraps_here()\x1b[0m\r\n\
+              ++counter;\r\n\
+              --sql_comment\r\n\
+              --- removed_sql\r\n\
+              +tail_add\r\n\
+              \x1b[32m  42 \xe2\x94\x82 + spaced_num_add();\x1b[0m\r\n\
+              \x1b[31m  10  11 \xe2\x94\x82 - dual_num_del();\x1b[0m\r\n\
+              \x1b[31m----\x1b[0m",
+        );
+
+        let backend = TestBackend::new(44, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            f.render_widget(
+                VtScreenWidget {
+                    screen: parser.screen(),
+                    selection: None,
+                    eink_mode: true,
+                    eink_color: true,
+                },
+                f.area(),
+            );
+        })
+        .unwrap();
+
+        let buf = term.backend().buffer();
+        for y in 0..12u16 {
+            for x in 0..44u16 {
+                assert_eq!(buf[(x, y)].bg, EINK_PAPER, "row {y} col {x} leaked bg");
+            }
+        }
+
+        // Row 0 & 1: uncolored `diff -u old.txt new.txt` headers
+        assert_eq!(buf[(0, 0)].fg, KALEIDO_RED);
+        assert_eq!(buf[(2, 0)].fg, KALEIDO_RED);
+        assert_eq!(buf[(4, 0)].fg, EINK_INK);
+        assert_eq!(buf[(0, 1)].fg, KALEIDO_GREEN);
+        assert_eq!(buf[(2, 1)].fg, KALEIDO_GREEN);
+
+        // Row 2 & wrapped Row 3: hunk header + wrapped continuation keeps white bg
+        assert_eq!(buf[(0, 2)].fg, KALEIDO_BLUE);
+        assert_eq!(buf[(0, 3)].bg, EINK_PAPER);
+        assert_eq!(buf[(0, 3)].fg, EINK_INK);
+
+        // Row 4: `++counter;` inside uncolored hunk -> col 0 '+' green, col 1 '+' black
+        assert_eq!(buf[(0, 4)].symbol(), "+");
+        assert_eq!(buf[(0, 4)].fg, KALEIDO_GREEN);
+        assert_eq!(buf[(1, 4)].symbol(), "+");
+        assert_eq!(buf[(1, 4)].fg, EINK_INK);
+
+        // Row 5: `--sql_comment` -> col 0 '-' red, col 1 '-' black
+        assert_eq!(buf[(0, 5)].symbol(), "-");
+        assert_eq!(buf[(0, 5)].fg, KALEIDO_RED);
+        assert_eq!(buf[(1, 5)].fg, EINK_INK);
+
+        // Row 6: `--- removed_sql` inside hunk -> ONLY col 0 '-' red (not "---" file header)
+        assert_eq!(buf[(0, 6)].symbol(), "-");
+        assert_eq!(buf[(0, 6)].fg, KALEIDO_RED);
+        assert_eq!(buf[(1, 6)].symbol(), "-");
+        assert_eq!(buf[(1, 6)].fg, EINK_INK);
+
+        // Row 7: `+tail_add` after `++`/`--` still inside uncolored hunk!
+        assert_eq!(buf[(0, 7)].symbol(), "+");
+        assert_eq!(buf[(0, 7)].fg, KALEIDO_GREEN);
+
+        // Row 8: `  42 │ + spaced_num_add();` -> '+' at col 7 is green
+        let plus_x = (0..44u16).find(|&x| buf[(x, 8)].symbol() == "+").unwrap();
+        assert_eq!(buf[(plus_x, 8)].fg, KALEIDO_GREEN);
+
+        // Row 9: `  10  11 │ - dual_num_del();` -> '-' at col 11 is red
+        let minus_x = (0..44u16).find(|&x| buf[(x, 9)].symbol() == "-").unwrap();
+        assert_eq!(buf[(minus_x, 9)].fg, KALEIDO_RED);
+    }
+
+    #[test]
+    fn kaleido_diff_context_resets_after_diff_so_banners_stay_monochrome() {
+        let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
+        let mut parser = vt100::Parser::new(nz(8), nz(50), 20);
+        parser.process(
+            b"\x1b[32m+added_code();\x1b[0m\r\n\
+              \r\n\
+              --- Results ---\r\n\
+              +++ Summary +++",
+        );
+
+        let backend = TestBackend::new(50, 8);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            f.render_widget(
+                VtScreenWidget {
+                    screen: parser.screen(),
+                    selection: None,
+                    eink_mode: true,
+                    eink_color: true,
+                },
+                f.area(),
+            );
+        })
+        .unwrap();
+
+        let buf = term.backend().buffer();
+        assert_eq!(buf[(0, 0)].fg, KALEIDO_GREEN);
+        assert_eq!(buf[(0, 2)].fg, EINK_INK);
+        assert_eq!(buf[(0, 3)].fg, EINK_INK);
+    }
+
+    #[test]
+    fn kaleido_narrow_top_bar_never_tints_ellipsis_on_truncated_space() {
+        let mut world = kaleido_world_for_tabs();
+        world.doc.spaces[0].name = "extremely-long-space-name".to_string();
+        world
+            .active_tab_by_space
+            .insert("sp1".to_string(), "tb1".to_string());
+        let backend = TestBackend::new(36, 6);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            let _ = render_ui_full_with_eink_color(
+                f,
+                &world,
+                None,
+                false,
+                24,
+                false,
+                false,
+                false,
+                false,
+                0,
+                None,
+                false,
+                &Modal::None,
+                None,
+                false,
+                None,
+                false,
+                None,
+                true,
+                true,
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        for x in 0..36u16 {
+            if buf[(x, 0)].symbol() == "…" {
+                assert_eq!(
+                    buf[(x, 0)].fg,
+                    EINK_INK,
+                    "truncated ellipsis at col {x} must remain neutral ink"
+                );
+            }
+        }
     }
 }

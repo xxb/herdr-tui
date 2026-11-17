@@ -23,6 +23,7 @@ pub enum Action {
     EnterScrollback,
     ToggleHelp,
     ToggleEink,
+    ToggleEinkColor,
     RedrawScreen,
     OpenBookReader,
     PageUp,
@@ -61,6 +62,7 @@ pub struct UiFileConfig {
     pub touch_mode: Option<bool>,
     pub allow_nested: Option<bool>,
     pub eink: Option<bool>,
+    pub eink_color: Option<bool>,
     pub eink_interval_ms: Option<u64>,
 }
 
@@ -175,6 +177,7 @@ pub fn match_prefix_action(ev: &KeyEvent, prefix_spec: &str) -> Option<Action> {
         KeyCode::Char('[') => Some(Action::EnterScrollback),
         KeyCode::Char('?') => Some(Action::ToggleHelp),
         KeyCode::Char('e') => Some(Action::ToggleEink),
+        KeyCode::Char('E') => Some(Action::ToggleEinkColor),
         KeyCode::Char('r') => Some(Action::RedrawScreen),
         KeyCode::Char('v' | 'B') => Some(Action::OpenBookReader),
         KeyCode::PageUp => Some(Action::PageUp),
@@ -338,14 +341,17 @@ mod tests {
         let default_cfg: FileConfig = toml::from_str("").unwrap();
         assert_eq!(default_cfg.ui.allow_nested, None);
         assert_eq!(default_cfg.ui.eink, None);
+        assert_eq!(default_cfg.ui.eink_color, None);
         assert_eq!(default_cfg.ui.eink_interval_ms, None);
 
         let nested_cfg: FileConfig = toml::from_str("[ui]\nallow_nested = true\n").unwrap();
         assert_eq!(nested_cfg.ui.allow_nested, Some(true));
 
         let eink_cfg: FileConfig =
-            toml::from_str("[ui]\neink = true\neink_interval_ms = 300\n").unwrap();
+            toml::from_str("[ui]\neink = true\neink_color = true\neink_interval_ms = 300\n")
+                .unwrap();
         assert_eq!(eink_cfg.ui.eink, Some(true));
+        assert_eq!(eink_cfg.ui.eink_color, Some(true));
         assert_eq!(eink_cfg.ui.eink_interval_ms, Some(300));
     }
 
@@ -355,6 +361,12 @@ mod tests {
         assert_eq!(
             match_prefix_action(&e_key, "ctrl+b"),
             Some(Action::ToggleEink)
+        );
+
+        let e_upper = KeyEvent::new(KeyCode::Char('E'), KeyModifiers::SHIFT);
+        assert_eq!(
+            match_prefix_action(&e_upper, "ctrl+b"),
+            Some(Action::ToggleEinkColor)
         );
 
         let r_lower = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE);
