@@ -16,9 +16,11 @@ use crate::keys::{
 };
 use crate::model::{EventDisposition, World};
 use crate::ui::{
-    collect_fuzzy_items, compute_terminal_rect, find_hit_target, is_in_rect, is_on_dpad_disc,
-    render_ui_with_pads_and_quota, resolve_dpad_disc_rect, resolve_fuzzy_selection,
-    resolve_mod_cross_rect, HitRegion, HitTarget, Modal, PromptKind, TerminalSelection,
+    collect_fuzzy_items, collect_overview_items, compute_terminal_rect, find_hit_target,
+    is_in_rect, is_on_dpad_disc, overview_selection_after_query_change,
+    overview_selection_for_index, render_ui_with_pads_and_quota, resolve_dpad_disc_rect,
+    resolve_fuzzy_selection, resolve_mod_cross_rect, resolve_overview_selection, HitRegion,
+    HitTarget, Modal, OverviewItem, OverviewSelection, PromptKind, TerminalSelection,
 };
 use crate::usage::UsageTracker;
 use anyhow::Result;
@@ -1454,6 +1456,18 @@ fn paste_text_into_app(
         *selected = 0;
         let items = collect_fuzzy_items(world, query);
         *selected_tab_id = items.first().map(|it| it.tab_id.clone());
+    } else if let Modal::TabOverview {
+        query,
+        selected,
+        selected_target,
+    } = modal
+    {
+        let sanitized: String = text.chars().filter(|&c| c != '\r' && c != '\n').collect();
+        if !sanitized.is_empty() {
+            query.push_str(&sanitized);
+            let items = collect_overview_items(world, query);
+            (*selected, *selected_target) = overview_selection_after_query_change(&items, query);
+        }
     }
 }
 
@@ -1608,6 +1622,7 @@ fn sync_attached_terminals(
     scrollback_offset: &mut usize,
     warm_siblings: bool,
     resize_siblings: bool,
+    mark_seen: bool,
 ) -> SyncOutcome {
     let mut outcome = SyncOutcome::default();
     let cols = term_rect.width.max(1);
@@ -1640,13 +1655,17 @@ fn sync_attached_terminals(
             }
             if active_addr.as_ref() != Some(addr) {
                 core.set_focus(cur.channel, true);
-                world.mark_active_seen(core);
+                if mark_seen {
+                    world.mark_active_seen(core);
+                }
             }
             resolved_active = Some(addr.clone());
         } else if let Ok(ch) = core.attach_terminal(addr, cols, rows, ATTACH_HISTORY_LINES) {
             core.set_focus(ch, true);
             attached_map.insert(addr.clone(), AttachedTerminal::new(ch, cols, rows));
-            world.mark_active_seen(core);
+            if mark_seen {
+                world.mark_active_seen(core);
+            }
             outcome.newly_attached_active = true;
             resolved_active = Some(addr.clone());
         } else {
@@ -2207,6 +2226,85 @@ fn try_activate_space_slop_tap(
     true
 }
 
+fn exit_tab_overview_to_last_tab(core: &CoreClient, world: &mut World, modal: &mut Modal) {
+    *modal = Modal::None;
+    if let Some(len) = world
+        .active_space()
+        .map(|s| s.tabs.len())
+        .filter(|&n| n > 0)
+    {
+        world.select_tab_index(len - 1);
+        world.mark_active_seen(core);
+    }
+}
+
+fn step_linear_tab_or_overview(
+    dir: HorizontalSwipeDir,
+    core: &CoreClient,
+    world: &mut World,
+    modal: &mut Modal,
+) -> bool {
+    if matches!(modal, Modal::TabOverview { .. }) {
+        return match dir {
+            HorizontalSwipeDir::Prev => {
+                exit_tab_overview_to_last_tab(core, world, modal);
+                true
+            }
+            HorizontalSwipeDir::Next => false,
+        };
+    }
+    let tab_len = world.active_space().map_or(0, |s| s.tabs.len());
+    match dir {
+        HorizontalSwipeDir::Prev => {
+            let cur = world.active_tab_index();
+            if tab_len == 0 || cur == 0 {
+                false
+            } else {
+                world.select_tab_index(cur - 1);
+                world.mark_active_seen(core);
+                true
+            }
+        }
+        HorizontalSwipeDir::Next => {
+            if tab_len == 0 {
+                *modal = Modal::default_tab_overview();
+                return true;
+            }
+            let cur = world.active_tab_index();
+            if cur + 1 < tab_len {
+                world.select_tab_index(cur + 1);
+                world.mark_active_seen(core);
+            } else {
+                *modal = Modal::default_tab_overview();
+            }
+            true
+        }
+    }
+}
+
+fn scroll_tab_overview_selection(world: &World, modal: &mut Modal, scroll_up: bool) -> bool {
+    let Modal::TabOverview {
+        ref query,
+        ref mut selected,
+        ref mut selected_target,
+    } = *modal
+    else {
+        return false;
+    };
+    let items = collect_overview_items(world, query);
+    let cur_sel = resolve_overview_selection(&items, *selected, selected_target);
+    let next_idx = if scroll_up {
+        cur_sel.saturating_sub(1)
+    } else {
+        (cur_sel + 1).min(items.len().saturating_sub(1))
+    };
+    let next_sel = overview_selection_for_index(&items, next_idx);
+    let changed = (*selected, selected_target.clone()) != next_sel;
+    *selected = next_sel.0;
+    *selected_target = next_sel.1;
+    changed
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_top_bar_or_space_vertical_wheel(
     scroll_up: bool,
@@ -2214,7 +2312,7 @@ fn handle_top_bar_or_space_vertical_wheel(
     horiz_wheel: &mut HorizontalWheelGestureState,
     core: &CoreClient,
     world: &mut World,
-    modal: &Modal,
+    modal: &mut Modal,
     dpad_drag_active: bool,
     prefix_active: &mut bool,
     ctrl_active: &mut bool,
@@ -2258,17 +2356,13 @@ fn handle_top_bar_or_space_vertical_wheel(
         }
         return space_changed || had_sticky || had_vis_sel;
     }
-    let prev_ti = world.active_tab_index();
-    if scroll_up {
-        world.prev_tab();
+    let dir = if scroll_up {
+        HorizontalSwipeDir::Prev
     } else {
-        world.next_tab();
-    }
-    let tab_changed = world.active_tab_index() != prev_ti;
-    if tab_changed {
-        world.mark_active_seen(core);
-    }
-    tab_changed || had_sticky || had_vis_sel
+        HorizontalSwipeDir::Next
+    };
+    let changed = step_linear_tab_or_overview(dir, core, world, modal);
+    changed || had_sticky || had_vis_sel
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2280,7 +2374,7 @@ fn handle_horizontal_wheel_event(
     horiz_wheel: &mut HorizontalWheelGestureState,
     core: &CoreClient,
     world: &mut World,
-    modal: &Modal,
+    modal: &mut Modal,
     dpad_drag_active: bool,
     prefix_active: &mut bool,
     ctrl_active: &mut bool,
@@ -2291,7 +2385,10 @@ fn handle_horizontal_wheel_event(
 ) -> bool {
     if dpad_drag_active
         || selection.as_ref().is_some_and(|s| s.active)
-        || !matches!(modal, Modal::None | Modal::SpaceMenu)
+        || !matches!(
+            modal,
+            Modal::None | Modal::TabOverview { .. } | Modal::SpaceMenu
+        )
     {
         horiz_wheel.record_suppressed_horizontal_wheel(dir, now);
         return false;
@@ -2328,16 +2425,8 @@ fn handle_horizontal_wheel_event(
         }
         return space_changed || had_sticky || had_vis_sel;
     }
-    let prev_ti = world.active_tab_index();
-    match dir {
-        HorizontalSwipeDir::Prev => world.prev_tab(),
-        HorizontalSwipeDir::Next => world.next_tab(),
-    }
-    let tab_changed = world.active_tab_index() != prev_ti;
-    if tab_changed {
-        world.mark_active_seen(core);
-    }
-    tab_changed || had_sticky || had_vis_sel
+    let changed = step_linear_tab_or_overview(dir, core, world, modal);
+    changed || had_sticky || had_vis_sel
 }
 
 fn record_credit(pending: &mut Vec<(u32, u32)>, channel: u32, bytes: u32) {
@@ -2507,6 +2596,7 @@ fn run_app_loop(
                 &mut scrollback_offset,
                 first_frame_drawn,
                 allow_sibling_resize,
+                !matches!(modal, Modal::TabOverview { .. }),
             );
             last_synced_doc_version = world.doc_version;
             newly_attached_active = sync_out.newly_attached_active;
@@ -2630,7 +2720,7 @@ fn run_app_loop(
                             flush_credits(core, &mut pending_credits, &mut pending_credit_bytes);
                         }
                         let is_active = active_channel == Some(channel);
-                        if is_active {
+                        if is_active && !matches!(modal, Modal::TabOverview { .. }) {
                             dirty = true;
                         }
                         if let Some(att) = attached_map.values_mut().find(|a| a.channel == channel)
@@ -2982,6 +3072,8 @@ fn run_app_loop(
                                             KeyOutcome::ForwardedToPty => {}
                                         },
                                     }
+                                } else if matches!(modal, Modal::TabOverview { .. }) {
+                                    dpad_drag = None;
                                 } else if !matches!(modal, Modal::None) {
                                     dpad_drag = None;
                                     modal = Modal::None;
@@ -3213,7 +3305,7 @@ fn run_app_loop(
                                         &mut horiz_wheel,
                                         core,
                                         world,
-                                        &modal,
+                                        &mut modal,
                                         dpad_drag.is_some(),
                                         &mut prefix_active,
                                         &mut ctrl_active,
@@ -3249,14 +3341,16 @@ fn run_app_loop(
                                     *selected_tab_id =
                                         items.get(*selected).map(|it| it.tab_id.clone());
                                     dirty = true;
-                                } else if matches!(modal, Modal::None) && mev.row < term_rect.y {
+                                } else if matches!(modal, Modal::None | Modal::TabOverview { .. })
+                                    && mev.row < term_rect.y
+                                {
                                     if handle_top_bar_or_space_vertical_wheel(
                                         true,
                                         wheel_now,
                                         &mut horiz_wheel,
                                         core,
                                         world,
-                                        &modal,
+                                        &mut modal,
                                         dpad_drag.is_some(),
                                         &mut prefix_active,
                                         &mut ctrl_active,
@@ -3265,6 +3359,16 @@ fn run_app_loop(
                                         &mut selection_screen,
                                         &mut selection_vt_seq,
                                     ) {
+                                        dirty = true;
+                                    }
+                                } else if matches!(modal, Modal::TabOverview { .. })
+                                    && dpad_drag.is_none()
+                                    && !selection.as_ref().is_some_and(|s| s.active)
+                                    && mev.row >= term_rect.y
+                                    && mev.row < term_rect.y.saturating_add(term_rect.height)
+                                {
+                                    horiz_wheel.record_viewport_vertical_wheel(wheel_now);
+                                    if scroll_tab_overview_selection(world, &mut modal, true) {
                                         dirty = true;
                                     }
                                 } else if matches!(modal, Modal::None)
@@ -3329,7 +3433,7 @@ fn run_app_loop(
                                         &mut horiz_wheel,
                                         core,
                                         world,
-                                        &modal,
+                                        &mut modal,
                                         dpad_drag.is_some(),
                                         &mut prefix_active,
                                         &mut ctrl_active,
@@ -3367,14 +3471,16 @@ fn run_app_loop(
                                             items.get(*selected).map(|it| it.tab_id.clone());
                                         dirty = true;
                                     }
-                                } else if matches!(modal, Modal::None) && mev.row < term_rect.y {
+                                } else if matches!(modal, Modal::None | Modal::TabOverview { .. })
+                                    && mev.row < term_rect.y
+                                {
                                     if handle_top_bar_or_space_vertical_wheel(
                                         false,
                                         wheel_now,
                                         &mut horiz_wheel,
                                         core,
                                         world,
-                                        &modal,
+                                        &mut modal,
                                         dpad_drag.is_some(),
                                         &mut prefix_active,
                                         &mut ctrl_active,
@@ -3383,6 +3489,16 @@ fn run_app_loop(
                                         &mut selection_screen,
                                         &mut selection_vt_seq,
                                     ) {
+                                        dirty = true;
+                                    }
+                                } else if matches!(modal, Modal::TabOverview { .. })
+                                    && dpad_drag.is_none()
+                                    && !selection.as_ref().is_some_and(|s| s.active)
+                                    && mev.row >= term_rect.y
+                                    && mev.row < term_rect.y.saturating_add(term_rect.height)
+                                {
+                                    horiz_wheel.record_viewport_vertical_wheel(wheel_now);
+                                    if scroll_tab_overview_selection(world, &mut modal, false) {
                                         dirty = true;
                                     }
                                 } else if matches!(modal, Modal::None)
@@ -3452,7 +3568,7 @@ fn run_app_loop(
                                     &mut horiz_wheel,
                                     core,
                                     world,
-                                    &modal,
+                                    &mut modal,
                                     dpad_drag.is_some(),
                                     &mut prefix_active,
                                     &mut ctrl_active,
@@ -3541,21 +3657,27 @@ fn run_app_loop(
             if world.fetch_doc(core).is_ok() && world.refresh_terminals(core).is_ok() {
                 let _ = world.reconcile_and_sync(core);
             }
-            world.mark_active_seen(core);
+            if !matches!(modal, Modal::TabOverview { .. }) {
+                world.mark_active_seen(core);
+            }
             need_sync_terminals = true;
             dirty = true;
         } else if pending_lifecycle_sync {
             if world.refresh_terminals(core).is_ok() {
                 let _ = world.reconcile_and_sync(core);
             }
-            world.mark_active_seen(core);
+            if !matches!(modal, Modal::TabOverview { .. }) {
+                world.mark_active_seen(core);
+            }
             need_sync_terminals = true;
             dirty = true;
         } else if pending_term_refresh {
             let _ = world.refresh_terminals(core);
-            world.mark_active_seen(core);
+            if !matches!(modal, Modal::TabOverview { .. }) {
+                world.mark_active_seen(core);
+            }
             dirty = true;
-        } else if check_active_seen {
+        } else if check_active_seen && !matches!(modal, Modal::TabOverview { .. }) {
             world.mark_active_seen(core);
         }
 
@@ -3600,6 +3722,22 @@ fn run_app_loop(
             {
                 *selected_tab_id = None;
                 dirty = true;
+            }
+        } else if let Modal::TabOverview {
+            ref query,
+            ref mut selected,
+            ref mut selected_target,
+        } = modal
+        {
+            if let OverviewSelection::Tab(ref tid) = *selected_target {
+                let in_active_space = world
+                    .active_space()
+                    .is_some_and(|s| s.tabs.iter().any(|t| &t.id == tid));
+                if !in_active_space {
+                    let items = collect_overview_items(world, query);
+                    (*selected, *selected_target) = overview_selection_for_index(&items, *selected);
+                    dirty = true;
+                }
             }
         }
 
@@ -3665,6 +3803,76 @@ fn run_app_loop(
                 first_frame_drawn = true;
                 need_sync_terminals = true;
             }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_shortcut_in_tab_overview(
+    action: Action,
+    core: &CoreClient,
+    world: &mut World,
+    attached: Option<&AttachedTerminal>,
+    prefix_spec: &str,
+    sidebar_open: &mut bool,
+    scrollback_offset: &mut usize,
+    modal: &mut Modal,
+) -> Result<KeyOutcome> {
+    match action {
+        Action::Detach => {
+            *modal = Modal::None;
+            Ok(KeyOutcome::Quit)
+        }
+        Action::SendPrefix | Action::PrevTab => {
+            exit_tab_overview_to_last_tab(core, world, modal);
+            Ok(KeyOutcome::UiChanged)
+        }
+        Action::NextTab => {
+            *modal = Modal::None;
+            if world.active_space().is_some_and(|s| !s.tabs.is_empty()) {
+                world.select_tab_index(0);
+                world.mark_active_seen(core);
+            }
+            Ok(KeyOutcome::UiChanged)
+        }
+        Action::SelectTab(idx) => {
+            if world.active_space().is_some_and(|s| idx < s.tabs.len()) {
+                *modal = Modal::None;
+                if execute_action(
+                    Action::SelectTab(idx),
+                    core,
+                    world,
+                    attached,
+                    prefix_spec,
+                    sidebar_open,
+                    scrollback_offset,
+                    modal,
+                )? {
+                    return Ok(KeyOutcome::Quit);
+                }
+            }
+            Ok(KeyOutcome::UiChanged)
+        }
+        other => {
+            if !matches!(other, Action::ToggleSidebar | Action::ToggleHelp) {
+                *modal = Modal::None;
+            }
+            if execute_action(
+                other,
+                core,
+                world,
+                attached,
+                prefix_spec,
+                sidebar_open,
+                scrollback_offset,
+                modal,
+            )? {
+                return Ok(KeyOutcome::Quit);
+            }
+            if matches!(modal, Modal::None) {
+                world.mark_active_seen(core);
+            }
+            Ok(KeyOutcome::UiChanged)
         }
     }
 }
@@ -3812,14 +4020,26 @@ fn handle_key_event(
             }
             return Ok(KeyOutcome::UiChanged);
         }
-        Modal::SpaceMenu | Modal::Help | Modal::None => {}
+        Modal::SpaceMenu | Modal::TabOverview { .. } | Modal::Help | Modal::None => {}
     }
 
     // 2. Prefix mode active (`Ctrl+b` pressed previously or `[^B]` tapped)
-    // Checked before `SpaceMenu`/`Help` so `^b b` and `^b ?` toggle those popovers closed cleanly.
+    // Checked before `SpaceMenu`/`Help`/`TabOverview` so `^b b`, `^b ?`, and `^b p/n` behave cleanly.
     if *prefix_active {
         *prefix_active = false;
         if let Some(action) = match_prefix_action(&kev, prefix_spec) {
+            if matches!(modal, Modal::TabOverview { .. }) {
+                return handle_shortcut_in_tab_overview(
+                    action,
+                    core,
+                    world,
+                    attached,
+                    prefix_spec,
+                    sidebar_open,
+                    scrollback_offset,
+                    modal,
+                );
+            }
             if matches!(modal, Modal::SpaceMenu | Modal::Help) {
                 if action == Action::SendPrefix {
                     *modal = Modal::None;
@@ -3843,6 +4063,8 @@ fn handle_key_event(
             }
         } else if matches!(modal, Modal::SpaceMenu | Modal::Help) && kev.code == KeyCode::Esc {
             *modal = Modal::None;
+        } else if matches!(modal, Modal::TabOverview { .. }) && kev.code == KeyCode::Esc {
+            exit_tab_overview_to_last_tab(core, world, modal);
         }
         return Ok(KeyOutcome::UiChanged);
     }
@@ -3853,7 +4075,7 @@ fn handle_key_event(
         return Ok(KeyOutcome::UiChanged);
     }
 
-    // 4. Handle non-prefix keys inside `SpaceMenu` and `Help` popovers
+    // 4. Handle non-prefix keys inside `SpaceMenu`, `TabOverview`, and `Help` overlays
     match modal {
         Modal::SpaceMenu => {
             if match_direct_action(&kev) == Some(Action::Detach) {
@@ -3894,6 +4116,114 @@ fn handle_key_event(
                         kind: PromptKind::NewSpace,
                         input: String::new(),
                     };
+                }
+                _ => {}
+            }
+            return Ok(KeyOutcome::UiChanged);
+        }
+        Modal::TabOverview { .. } if match_direct_action(&kev).is_some() => {
+            if let Some(action) = match_direct_action(&kev) {
+                return handle_shortcut_in_tab_overview(
+                    action,
+                    core,
+                    world,
+                    attached,
+                    prefix_spec,
+                    sidebar_open,
+                    scrollback_offset,
+                    modal,
+                );
+            }
+            return Ok(KeyOutcome::UiChanged);
+        }
+        Modal::TabOverview {
+            query,
+            selected,
+            selected_target,
+        } => {
+            let no_ctrl_alt = !kev
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+            match kev.code {
+                KeyCode::Esc => {
+                    exit_tab_overview_to_last_tab(core, world, modal);
+                }
+                KeyCode::Left if no_ctrl_alt && query.is_empty() => {
+                    exit_tab_overview_to_last_tab(core, world, modal);
+                }
+                KeyCode::Up | KeyCode::BackTab => {
+                    let items = collect_overview_items(world, query);
+                    let cur_sel = resolve_overview_selection(&items, *selected, selected_target);
+                    (*selected, *selected_target) =
+                        overview_selection_for_index(&items, cur_sel.saturating_sub(1));
+                }
+                KeyCode::Char('p') if kev.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let items = collect_overview_items(world, query);
+                    let cur_sel = resolve_overview_selection(&items, *selected, selected_target);
+                    (*selected, *selected_target) =
+                        overview_selection_for_index(&items, cur_sel.saturating_sub(1));
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    let items = collect_overview_items(world, query);
+                    let cur_sel = resolve_overview_selection(&items, *selected, selected_target);
+                    (*selected, *selected_target) = overview_selection_for_index(
+                        &items,
+                        (cur_sel + 1).min(items.len().saturating_sub(1)),
+                    );
+                }
+                KeyCode::Char('n') if kev.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let items = collect_overview_items(world, query);
+                    let cur_sel = resolve_overview_selection(&items, *selected, selected_target);
+                    (*selected, *selected_target) = overview_selection_for_index(
+                        &items,
+                        (cur_sel + 1).min(items.len().saturating_sub(1)),
+                    );
+                }
+                KeyCode::Home => {
+                    let items = collect_overview_items(world, query);
+                    (*selected, *selected_target) = overview_selection_for_index(&items, 0);
+                }
+                KeyCode::End => {
+                    let items = collect_overview_items(world, query);
+                    (*selected, *selected_target) =
+                        overview_selection_for_index(&items, items.len().saturating_sub(1));
+                }
+                KeyCode::Enter => {
+                    let items = collect_overview_items(world, query);
+                    let cur_sel = resolve_overview_selection(&items, *selected, selected_target);
+                    match items.get(cur_sel) {
+                        Some(OverviewItem::NewTab { .. }) | None => {
+                            *modal = Modal::None;
+                            let _ = world.create_new_tab(core);
+                        }
+                        Some(OverviewItem::Tab {
+                            space_id, tab_id, ..
+                        }) => {
+                            let sid = space_id.clone();
+                            let tid = tab_id.clone();
+                            *modal = Modal::None;
+                            if world.select_tab_by_id(&sid, &tid) {
+                                world.mark_active_seen(core);
+                            }
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                    let items = collect_overview_items(world, query);
+                    (*selected, *selected_target) =
+                        overview_selection_after_query_change(&items, query);
+                }
+                KeyCode::Char('u') if kev.modifiers.contains(KeyModifiers::CONTROL) => {
+                    query.clear();
+                    *selected = 0;
+                    *selected_target = OverviewSelection::NewTab;
+                }
+                KeyCode::Char(c) if no_ctrl_alt => {
+                    query.push(c);
+                    let items = collect_overview_items(world, query);
+                    (*selected, *selected_target) =
+                        overview_selection_after_query_change(&items, query);
                 }
                 _ => {}
             }
@@ -4618,7 +4948,7 @@ mod tests {
                 &mut self.horiz_wheel,
                 &self.core,
                 &mut self.world,
-                &self.modal,
+                &mut self.modal,
                 dpad_drag,
                 &mut self.prefix_active,
                 &mut self.ctrl_active,
@@ -4660,7 +4990,7 @@ mod tests {
                 &mut self.horiz_wheel,
                 &self.core,
                 &mut self.world,
-                &self.modal,
+                &mut self.modal,
                 dpad_drag,
                 &mut self.prefix_active,
                 &mut self.ctrl_active,
@@ -4723,20 +5053,40 @@ mod tests {
         assert_eq!(h.world.active_tab_index(), 0);
         let t_rev_end = t_rev + Duration::from_millis(32);
 
-        // 4. After HORIZ_WHEEL_QUIET_GAP elapses, a second deliberate swipe in the same direction steps cleanly -> Tab 2 (wrap)
-        let t_next = t_rev_end + HORIZ_WHEEL_QUIET_GAP;
-        assert!(h.swipe_horiz(
+        // 4. After HORIZ_WHEEL_QUIET_GAP elapses, a Prev swipe at Tab 0 clamps hard (no wrap!),
+        //    then two deliberate Next swipes step Tab 0 -> Tab 1 -> Tab 2.
+        let t_left_clamp = t_rev_end + HORIZ_WHEEL_QUIET_GAP;
+        assert!(!h.swipe_horiz(
             HorizontalSwipeDir::Prev,
             10,
             VIEWPORT_HORIZ_SWIPE_THRESHOLD,
-            t_next
+            t_left_clamp
+        ));
+        assert_eq!(h.world.active_tab_index(), 0);
+        assert_eq!(h.modal, Modal::None);
+
+        let t_to_1 = t_left_clamp + Duration::from_millis(32) + HORIZ_WHEEL_QUIET_GAP;
+        assert!(h.swipe_horiz(
+            HorizontalSwipeDir::Next,
+            10,
+            VIEWPORT_HORIZ_SWIPE_THRESHOLD,
+            t_to_1
+        ));
+        assert_eq!(h.world.active_tab_index(), 1);
+
+        let t_to_2 = t_to_1 + Duration::from_millis(32) + HORIZ_WHEEL_QUIET_GAP;
+        assert!(h.swipe_horiz(
+            HorizontalSwipeDir::Next,
+            10,
+            VIEWPORT_HORIZ_SWIPE_THRESHOLD,
+            t_to_2
         ));
         assert_eq!(h.world.active_tab_index(), 2);
-        let t_next_end = t_next + Duration::from_millis(32);
+        let t_next_end = t_to_2 + Duration::from_millis(32);
 
         // 5. Diagonal trackpad bleed during viewport vertical scroll is suppressed within VERT_SCROLL_LOCK_WINDOW
         //    across both Viewport and TopBar (row 0), then explicit TopBar swipes work after the lock expires
-        //    AND suppress trailing vertical top-bar packets after a horizontal switch (both packet orderings!).
+        //    AND suppress trailing vertical top-bar packets after entering TabOverview (both packet orderings!).
         let t_vert = t_next_end + Duration::from_secs(1);
         h.horiz_wheel.record_viewport_vertical_wheel(t_vert);
         assert!(!h.horiz_tick(
@@ -4752,8 +5102,10 @@ mod tests {
             t_vert + Duration::from_millis(50),
         ));
         assert_eq!(h.world.active_tab_index(), 2);
+        assert_eq!(h.modal, Modal::None);
 
-        // Once VERT_SCROLL_LOCK_WINDOW + HORIZ_WHEEL_QUIET_GAP elapses, pure TopBar horizontal swipe switches cleanly
+        // Once VERT_SCROLL_LOCK_WINDOW + HORIZ_WHEEL_QUIET_GAP elapses, pure TopBar horizontal swipe
+        // past the last tab (Tab 2) enters the trailing `TabOverview` page cleanly!
         let t_top_ok = t_vert + VERT_SCROLL_LOCK_WINDOW + HORIZ_WHEEL_QUIET_GAP;
         assert!(h.swipe_horiz(
             HorizontalSwipeDir::Next,
@@ -4761,18 +5113,57 @@ mod tests {
             TOP_BAR_HORIZ_SWIPE_THRESHOLD,
             t_top_ok
         ));
-        assert_eq!(h.world.active_tab_index(), 0);
+        assert!(matches!(h.modal, Modal::TabOverview { .. }));
         let t_top_end = t_top_ok + Duration::from_millis(16);
         // Ordering B (`ScrollRight` -> continuous `ScrollDown` stream on row 0):
         // trailing vertical packets stay suppressed even after 180ms until a quiet gap
         for ms in [40_u64, 100, 150, 200, 250] {
             assert!(!h.vert_switch(false, t_top_end + Duration::from_millis(ms), false));
         }
+        assert!(matches!(h.modal, Modal::TabOverview { .. }));
+
+        // Swiping Next while already on `TabOverview` clamps hard; swiping Prev exits back to Tab 2,
+        // and trailing Prev inertia never overshoots from Tab 2 to Tab 1!
+        let t_clamp_overview = t_top_end + Duration::from_millis(400);
+        assert!(!h.swipe_horiz(
+            HorizontalSwipeDir::Next,
+            10,
+            VIEWPORT_HORIZ_SWIPE_THRESHOLD,
+            t_clamp_overview
+        ));
+        assert!(matches!(h.modal, Modal::TabOverview { .. }));
+
+        let t_exit_overview = t_clamp_overview + Duration::from_millis(100);
+        assert!(h.swipe_horiz(
+            HorizontalSwipeDir::Prev,
+            10,
+            VIEWPORT_HORIZ_SWIPE_THRESHOLD,
+            t_exit_overview
+        ));
+        assert_eq!(h.modal, Modal::None);
+        assert_eq!(h.world.active_tab_index(), 2);
+        let t_exit_end = t_exit_overview + Duration::from_millis(32);
+        for ms in [16_u64, 50, 110, 180] {
+            assert!(!h.horiz_tick(
+                HorizontalSwipeDir::Prev,
+                10,
+                t_exit_end + Duration::from_millis(ms),
+                false,
+            ));
+        }
+        assert_eq!(h.world.active_tab_index(), 2);
+
+        // Step to Tab 0 first so Ordering A tests `Tab 0 -> Tab 1` with `ScrollDown` -> `ScrollRight` stream
+        let t_back1 = t_exit_end + Duration::from_millis(400);
+        assert!(h.vert_switch(true, t_back1, false));
+        assert_eq!(h.world.active_tab_index(), 1);
+        let t_back0 = t_back1 + Duration::from_millis(400);
+        assert!(h.vert_switch(true, t_back0, false));
         assert_eq!(h.world.active_tab_index(), 0);
 
         // Ordering A (`ScrollDown` -> continuous `ScrollRight` stream on row 0):
         // vertical switches Tab 0 -> Tab 1, and rejected horizontal burst stays coalesced past VERT_SCROLL_LOCK_WINDOW
-        let t_order_a = t_top_end + Duration::from_millis(500);
+        let t_order_a = t_back0 + Duration::from_millis(500);
         assert!(h.vert_switch(false, t_order_a, false));
         assert_eq!(h.world.active_tab_index(), 1);
         for ms in [40_u64, 100, 150, 250, 350, 450] {
@@ -5537,5 +5928,346 @@ mod tests {
             &mut alt_active,
         ));
         assert_eq!(help_modal, Modal::Help);
+    }
+
+    #[test]
+    fn tab_overview_supports_linear_topbar_wheel_filter_navigation_and_cyclic_shortcuts() {
+        let mut h = WheelTestHarness::new();
+        let mut t = Instant::now();
+        let step = Duration::from_millis(500);
+
+        // 1. TopBar vertical wheel walks linearly: Tab 0 clamps Up, Down steps 0 -> 1 -> 2 -> TabOverview -> clamp
+        assert!(!h.vert_switch(true, t, false));
+        assert_eq!(h.world.active_tab_index(), 0);
+        assert_eq!(h.modal, Modal::None);
+
+        t += step;
+        assert!(h.vert_switch(false, t, false));
+        assert_eq!(h.world.active_tab_index(), 1);
+
+        t += step;
+        assert!(h.vert_switch(false, t, false));
+        assert_eq!(h.world.active_tab_index(), 2);
+
+        t += step;
+        assert!(h.vert_switch(false, t, false));
+        assert!(matches!(h.modal, Modal::TabOverview { .. }));
+
+        t += step;
+        assert!(!h.vert_switch(false, t, false));
+        assert!(matches!(h.modal, Modal::TabOverview { .. }));
+
+        // TopBar Up from TabOverview exits back to last tab (2), then walks 2 -> 1 -> 0 -> clamp
+        t += step;
+        assert!(h.vert_switch(true, t, false));
+        assert_eq!(h.modal, Modal::None);
+        assert_eq!(h.world.active_tab_index(), 2);
+
+        t += step;
+        assert!(h.vert_switch(true, t, false));
+        assert_eq!(h.world.active_tab_index(), 1);
+        t += step;
+        assert!(h.vert_switch(true, t, false));
+        assert_eq!(h.world.active_tab_index(), 0);
+        t += step;
+        assert!(!h.vert_switch(true, t, false));
+        assert_eq!(h.world.active_tab_index(), 0);
+
+        // 2. Single-tab Space (`sp2`): Prev clamps at 0, Next enters TabOverview, Prev returns to 0
+        h.world.next_space();
+        assert_eq!(h.world.active_space().map(|s| s.id.as_str()), Some("sp2"));
+        assert_eq!(h.world.active_tab_index(), 0);
+        t += step;
+        assert!(!h.vert_switch(true, t, false));
+        assert_eq!(h.modal, Modal::None);
+        t += step;
+        assert!(h.vert_switch(false, t, false));
+        assert!(matches!(h.modal, Modal::TabOverview { .. }));
+        t += step;
+        assert!(h.vert_switch(true, t, false));
+        assert_eq!(h.modal, Modal::None);
+        assert_eq!(h.world.active_tab_index(), 0);
+
+        // Return to 3-tab Space (`sp1`) and verify keyboard shortcuts stay cyclic while in Modal::None
+        h.world.prev_space();
+        h.world.select_tab_index(0);
+        let mut sidebar_open = false;
+        let mut scrollback_offset = 0;
+
+        // Alt+Left at Tab 0 wraps to Tab 2 (`^b p` also wraps)
+        handle_key_event(
+            KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+            &h.core,
+            &mut h.world,
+            None,
+            "ctrl+b",
+            &mut sidebar_open,
+            &mut h.prefix_active,
+            &mut h.ctrl_active,
+            &mut h.alt_active,
+            &mut scrollback_offset,
+            &mut h.modal,
+            h.term_rect,
+        )
+        .unwrap();
+        assert_eq!(h.world.active_tab_index(), 2);
+        assert_eq!(h.modal, Modal::None);
+
+        // `^b n` at Tab 2 wraps to Tab 0
+        for kev in [
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        ] {
+            handle_key_event(
+                kev,
+                &h.core,
+                &mut h.world,
+                None,
+                "ctrl+b",
+                &mut sidebar_open,
+                &mut h.prefix_active,
+                &mut h.ctrl_active,
+                &mut h.alt_active,
+                &mut scrollback_offset,
+                &mut h.modal,
+                h.term_rect,
+            )
+            .unwrap();
+        }
+        assert_eq!(h.world.active_tab_index(), 0);
+        assert_eq!(h.modal, Modal::None);
+
+        // 3. Enter TabOverview from Tab 2, test filter typing, paste, selection navigation, Left guard, Esc & Enter
+        h.world.select_tab_index(2);
+        t += step;
+        assert!(h.vert_switch(false, t, false));
+        assert!(matches!(
+            h.modal,
+            Modal::TabOverview {
+                selected: 0,
+                selected_target: OverviewSelection::NewTab,
+                ..
+            }
+        ));
+
+        // Typing "tw" filters and auto-selects tab `tb2`
+        for ch in ['t', 'w'] {
+            handle_key_event(
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                &h.core,
+                &mut h.world,
+                None,
+                "ctrl+b",
+                &mut sidebar_open,
+                &mut h.prefix_active,
+                &mut h.ctrl_active,
+                &mut h.alt_active,
+                &mut scrollback_offset,
+                &mut h.modal,
+                h.term_rect,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            h.modal,
+            Modal::TabOverview {
+                query: "tw".to_string(),
+                selected: 1,
+                selected_target: OverviewSelection::Tab("tb2".to_string()),
+            }
+        );
+
+        // Left key does NOT exit while query is non-empty
+        handle_key_event(
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            &h.core,
+            &mut h.world,
+            None,
+            "ctrl+b",
+            &mut sidebar_open,
+            &mut h.prefix_active,
+            &mut h.ctrl_active,
+            &mut h.alt_active,
+            &mut scrollback_offset,
+            &mut h.modal,
+            h.term_rect,
+        )
+        .unwrap();
+        assert!(matches!(h.modal, Modal::TabOverview { .. }));
+
+        // `paste_text_into_app` appends stripped text to filter query
+        paste_text_into_app(
+            "o\n",
+            &h.core,
+            &h.world,
+            None,
+            &mut scrollback_offset,
+            &mut h.modal,
+        );
+        assert_eq!(
+            h.modal,
+            Modal::TabOverview {
+                query: "two".to_string(),
+                selected: 1,
+                selected_target: OverviewSelection::Tab("tb2".to_string()),
+            }
+        );
+
+        // Enter opens the selected tab (`tb2`, index 1) and closes TabOverview
+        handle_key_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &h.core,
+            &mut h.world,
+            None,
+            "ctrl+b",
+            &mut sidebar_open,
+            &mut h.prefix_active,
+            &mut h.ctrl_active,
+            &mut h.alt_active,
+            &mut scrollback_offset,
+            &mut h.modal,
+            h.term_rect,
+        )
+        .unwrap();
+        assert_eq!(h.modal, Modal::None);
+        assert_eq!(h.world.active_tab_index(), 1);
+
+        // Re-enter TabOverview from Tab 2, test Backspace reset + Left exit with empty query
+        h.world.select_tab_index(2);
+        h.modal = Modal::TabOverview {
+            query: "o".to_string(),
+            selected: 1,
+            selected_target: OverviewSelection::Tab("tb1".to_string()),
+        };
+        handle_key_event(
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            &h.core,
+            &mut h.world,
+            None,
+            "ctrl+b",
+            &mut sidebar_open,
+            &mut h.prefix_active,
+            &mut h.ctrl_active,
+            &mut h.alt_active,
+            &mut scrollback_offset,
+            &mut h.modal,
+            h.term_rect,
+        )
+        .unwrap();
+        assert_eq!(
+            h.modal,
+            Modal::TabOverview {
+                query: String::new(),
+                selected: 0,
+                selected_target: OverviewSelection::NewTab,
+            }
+        );
+
+        // Down / wheel navigation steps into tab list, and Left (with empty query) exits to last tab (2)
+        assert!(scroll_tab_overview_selection(&h.world, &mut h.modal, false));
+        assert_eq!(
+            h.modal,
+            Modal::TabOverview {
+                query: String::new(),
+                selected: 1,
+                selected_target: OverviewSelection::Tab("tb1".to_string()),
+            }
+        );
+        handle_key_event(
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            &h.core,
+            &mut h.world,
+            None,
+            "ctrl+b",
+            &mut sidebar_open,
+            &mut h.prefix_active,
+            &mut h.ctrl_active,
+            &mut h.alt_active,
+            &mut scrollback_offset,
+            &mut h.modal,
+            h.term_rect,
+        )
+        .unwrap();
+        assert_eq!(h.modal, Modal::None);
+        assert_eq!(h.world.active_tab_index(), 2);
+
+        // Esc from TabOverview when on an earlier tab also exits cleanly back to the last tab (2)
+        h.world.select_tab_index(0);
+        h.modal = Modal::default_tab_overview();
+        handle_key_event(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &h.core,
+            &mut h.world,
+            None,
+            "ctrl+b",
+            &mut sidebar_open,
+            &mut h.prefix_active,
+            &mut h.ctrl_active,
+            &mut h.alt_active,
+            &mut scrollback_offset,
+            &mut h.modal,
+            h.term_rect,
+        )
+        .unwrap();
+        assert_eq!(h.modal, Modal::None);
+        assert_eq!(h.world.active_tab_index(), 2);
+
+        // Alt+Right while on TabOverview wraps forward to Tab 0
+        h.modal = Modal::default_tab_overview();
+        handle_key_event(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+            &h.core,
+            &mut h.world,
+            None,
+            "ctrl+b",
+            &mut sidebar_open,
+            &mut h.prefix_active,
+            &mut h.ctrl_active,
+            &mut h.alt_active,
+            &mut scrollback_offset,
+            &mut h.modal,
+            h.term_rect,
+        )
+        .unwrap();
+        assert_eq!(h.modal, Modal::None);
+        assert_eq!(h.world.active_tab_index(), 0);
+
+        // Out-of-range Alt+9 on TabOverview keeps TabOverview open; valid Alt+2 exits and selects Tab 1
+        h.modal = Modal::default_tab_overview();
+        handle_key_event(
+            KeyEvent::new(KeyCode::Char('9'), KeyModifiers::ALT),
+            &h.core,
+            &mut h.world,
+            None,
+            "ctrl+b",
+            &mut sidebar_open,
+            &mut h.prefix_active,
+            &mut h.ctrl_active,
+            &mut h.alt_active,
+            &mut scrollback_offset,
+            &mut h.modal,
+            h.term_rect,
+        )
+        .unwrap();
+        assert!(matches!(h.modal, Modal::TabOverview { .. }));
+        assert_eq!(h.world.active_tab_index(), 0);
+
+        handle_key_event(
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT),
+            &h.core,
+            &mut h.world,
+            None,
+            "ctrl+b",
+            &mut sidebar_open,
+            &mut h.prefix_active,
+            &mut h.ctrl_active,
+            &mut h.alt_active,
+            &mut scrollback_offset,
+            &mut h.modal,
+            h.term_rect,
+        )
+        .unwrap();
+        assert_eq!(h.modal, Modal::None);
+        assert_eq!(h.world.active_tab_index(), 1);
     }
 }
