@@ -59,9 +59,20 @@ pub fn find_hit_target(hits: &[HitRegion], col: u16, row: u16) -> Option<HitTarg
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OverviewSelection {
+    NewTab,
+    Tab(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Modal {
     None,
     SpaceMenu,
+    TabOverview {
+        query: String,
+        selected: usize,
+        selected_target: OverviewSelection,
+    },
     Help,
     ConfirmCloseTab {
         tab_id: String,
@@ -76,6 +87,143 @@ pub enum Modal {
         selected: usize,
         selected_tab_id: Option<String>,
     },
+}
+
+impl Modal {
+    pub fn default_tab_overview() -> Self {
+        Self::TabOverview {
+            query: String::new(),
+            selected: 0,
+            selected_target: OverviewSelection::NewTab,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OverviewItem {
+    NewTab {
+        cwd: String,
+    },
+    Tab {
+        space_id: String,
+        tab_id: String,
+        tab_number: usize,
+        tab_name: String,
+        term_addr: String,
+        state: AgentState,
+        cwd: String,
+        detail: String,
+    },
+}
+
+pub fn collect_overview_items(world: &World, query: &str) -> Vec<OverviewItem> {
+    let q = query.trim().to_lowercase();
+    let new_tab_cwd = world
+        .active_terminal_address()
+        .and_then(|addr| world.terminals.get(&addr))
+        .map(|info| info.effective_cwd().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            world
+                .active_space()
+                .map(|s| s.folder.clone())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_default();
+
+    let mut out = vec![OverviewItem::NewTab { cwd: new_tab_cwd }];
+    let Some(space) = world.active_space() else {
+        return out;
+    };
+    for (ti, tab) in space.tabs.iter().enumerate() {
+        let tab_number = ti + 1;
+        let tab_name = world.tab_display_name(space, ti);
+        let term_addr = world.active_terminal_for_tab(tab).unwrap_or_default();
+        let info = world.terminals.get(&term_addr);
+        let cwd = info
+            .map(|i| i.effective_cwd().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| space.folder.clone());
+        let state = world.tab_state(tab);
+        let detail = info
+            .and_then(|i| {
+                i.status_msg
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| {
+                        (!i.title.is_empty() && i.title != tab_name).then_some(i.title.as_str())
+                    })
+            })
+            .unwrap_or("")
+            .to_string();
+        let hay = format!(
+            "{} {} {} {} {} {}",
+            tab_number,
+            tab_name.to_lowercase(),
+            term_addr.to_lowercase(),
+            state.label(),
+            cwd.to_lowercase(),
+            detail.to_lowercase()
+        );
+        if q.is_empty() || fuzzy_subsequence(&hay, &q) {
+            out.push(OverviewItem::Tab {
+                space_id: space.id.clone(),
+                tab_id: tab.id.clone(),
+                tab_number,
+                tab_name,
+                term_addr,
+                state,
+                cwd,
+                detail,
+            });
+        }
+    }
+    out
+}
+
+pub fn resolve_overview_selection(
+    items: &[OverviewItem],
+    selected: usize,
+    target: &OverviewSelection,
+) -> usize {
+    if items.is_empty() {
+        return 0;
+    }
+    match target {
+        OverviewSelection::NewTab => 0,
+        OverviewSelection::Tab(tid) => items
+            .iter()
+            .position(|it| matches!(it, OverviewItem::Tab { tab_id, .. } if tab_id == tid))
+            .unwrap_or_else(|| selected.min(items.len() - 1)),
+    }
+}
+
+pub fn overview_selection_for_index(
+    items: &[OverviewItem],
+    idx: usize,
+) -> (usize, OverviewSelection) {
+    if items.is_empty() {
+        return (0, OverviewSelection::NewTab);
+    }
+    let clamped = idx.min(items.len() - 1);
+    let target = match &items[clamped] {
+        OverviewItem::NewTab { .. } => OverviewSelection::NewTab,
+        OverviewItem::Tab { tab_id, .. } => OverviewSelection::Tab(tab_id.clone()),
+    };
+    (clamped, target)
+}
+
+pub fn overview_selection_after_query_change(
+    items: &[OverviewItem],
+    query: &str,
+) -> (usize, OverviewSelection) {
+    if query.trim().is_empty() {
+        (0, OverviewSelection::NewTab)
+    } else if items.len() > 1 {
+        overview_selection_for_index(items, 1)
+    } else {
+        (0, OverviewSelection::NewTab)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -594,7 +742,11 @@ pub fn render_ui_with_pads_and_quota(
         height: bot_h,
     };
 
-    if let Some(scr) = screen {
+    let tab_overview_open = matches!(modal, Modal::TabOverview { .. });
+
+    if tab_overview_open {
+        // TabOverview owns the full terminal viewport; avoid painting stale background VT cells.
+    } else if let Some(scr) = screen {
         f.render_widget(
             VtScreenWidget {
                 screen: scr,
@@ -622,7 +774,14 @@ pub fn render_ui_with_pads_and_quota(
     let mut dpad_rect = None;
     let space_menu_open = matches!(modal, Modal::SpaceMenu);
 
-    let space_bounds = render_top_tabbar(f, top_rect, world, space_menu_open, &mut hits);
+    let space_bounds = render_top_tabbar(
+        f,
+        top_rect,
+        world,
+        space_menu_open,
+        tab_overview_open,
+        &mut hits,
+    );
     let space_slop_rect = if matches!(modal, Modal::None) && term_rect.height > 0 {
         space_bounds.and_then(|(sx, send)| {
             let slop_x = sx.max(term_rect.x);
@@ -642,8 +801,16 @@ pub fn render_ui_with_pads_and_quota(
     render_bottom_status_bar(
         f,
         bottom_rect,
-        focused_quota,
-        scrollback_offset,
+        if tab_overview_open {
+            None
+        } else {
+            focused_quota
+        },
+        if tab_overview_open {
+            0
+        } else {
+            scrollback_offset
+        },
         copied_flash,
         &mut hits,
     );
@@ -666,6 +833,21 @@ pub fn render_ui_with_pads_and_quota(
         }
         Modal::SpaceMenu => {
             render_space_menu_modal(f, area, top_h, world, &mut hits);
+        }
+        Modal::TabOverview {
+            query,
+            selected,
+            selected_target,
+        } => {
+            render_tab_overview_page(
+                f,
+                term_rect,
+                world,
+                query,
+                *selected,
+                selected_target,
+                &mut hits,
+            );
         }
         Modal::Help => {
             render_help_modal(f, area, &mut hits);
@@ -1033,6 +1215,7 @@ fn render_top_tabbar(
     rect: Rect,
     world: &World,
     space_menu_open: bool,
+    tab_overview_open: bool,
     hits: &mut Vec<HitRegion>,
 ) -> Option<(u16, u16)> {
     if rect.width == 0 || rect.height == 0 {
@@ -1230,8 +1413,9 @@ fn render_top_tabbar(
                 break;
             }
             x = next_x;
-            let tstyle = tab_pill_style(st, is_active);
-            draw_touchbar_pill(buf, x, rect, &lbl, tstyle, is_active);
+            let pill_active = is_active && !tab_overview_open;
+            let tstyle = tab_pill_style(st, pill_active);
+            draw_touchbar_pill(buf, x, rect, &lbl, tstyle, pill_active);
             hits.push(HitRegion {
                 rect: Rect {
                     x,
@@ -1275,11 +1459,18 @@ fn render_top_tabbar(
 
     // 3. `[ + ]` button immediately after the tabs to add a new Tab
     if x + plus_w <= avail_end {
-        let pstyle = Style::default()
-            .bg(Color::Rgb(32, 46, 42))
-            .fg(HERDR_GREEN)
-            .add_modifier(Modifier::BOLD);
-        draw_touchbar_pill(buf, x, rect, plus_lbl, pstyle, false);
+        let pstyle = if tab_overview_open {
+            Style::default()
+                .bg(HERDR_ACCENT)
+                .fg(HERDR_PANEL_BG)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .bg(Color::Rgb(32, 46, 42))
+                .fg(HERDR_GREEN)
+                .add_modifier(Modifier::BOLD)
+        };
+        draw_touchbar_pill(buf, x, rect, plus_lbl, pstyle, tab_overview_open);
         hits.push(HitRegion {
             rect: Rect {
                 x,
@@ -2196,6 +2387,328 @@ fn render_space_menu_modal(
         },
         target: HitTarget::NewSpacePrompt,
     });
+}
+
+fn render_tab_overview_page(
+    f: &mut Frame,
+    term_rect: Rect,
+    world: &World,
+    query: &str,
+    selected: usize,
+    selected_target: &OverviewSelection,
+    hits: &mut Vec<HitRegion>,
+) {
+    if term_rect.width == 0 || term_rect.height == 0 {
+        return;
+    }
+
+    // Do NOT clear `hits`: Top Bar (`[ ⏏ ]`, `[ ▾ Space ]`, tab pills, `[ + ]`, `[ ? ]`)
+    // remains live above `term_rect`. Push `ModalNoop` on `term_rect` first so item rows pushed
+    // afterward take priority in `find_hit_target`.
+    f.render_widget(
+        Block::default().style(Style::default().bg(HERDR_SURFACE_DIM).fg(HERDR_TEXT)),
+        term_rect,
+    );
+    hits.push(HitRegion {
+        rect: term_rect,
+        target: HitTarget::ModalNoop,
+    });
+
+    let col_w = if term_rect.width >= 80 {
+        term_rect.width.saturating_sub(8).min(78)
+    } else if term_rect.width >= 24 {
+        term_rect.width.saturating_sub(2)
+    } else {
+        term_rect.width
+    };
+    let col_x = term_rect.x + (term_rect.width.saturating_sub(col_w)) / 2;
+    let pad_v = u16::from(term_rect.height >= 12);
+    let content_y = term_rect.y + pad_v;
+    let content_end_y = (term_rect.y + term_rect.height).saturating_sub(pad_v);
+    let avail_h = content_end_y.saturating_sub(content_y);
+    let cw = col_w as usize;
+    if cw == 0 || avail_h == 0 {
+        return;
+    }
+
+    let items = collect_overview_items(world, query);
+    let sel = resolve_overview_selection(&items, selected, selected_target);
+    let (space_name, total_tabs) = world
+        .active_space()
+        .map(|s| (world.space_display_name(s), s.tabs.len()))
+        .unwrap_or_else(|| ("space".to_string(), 0));
+    let buf = f.buffer_mut();
+
+    let (list_y, list_end_y) = if avail_h >= 8 {
+        let tab_word = if total_tabs == 1 { "tab" } else { "tabs" };
+        let left_hdr = format!(" ❖ {space_name} ({total_tabs} {tab_word})");
+        let right_hdr = "← swipe / Esc back ";
+        buf.set_string(
+            col_x,
+            content_y,
+            pad_to_width(&left_hdr, cw),
+            Style::default()
+                .bg(HERDR_SURFACE_DIM)
+                .fg(HERDR_MAUVE)
+                .add_modifier(Modifier::BOLD),
+        );
+        if left_hdr.width() + 2 + right_hdr.width() <= cw {
+            let rx = col_x + col_w - right_hdr.width() as u16;
+            buf.set_string(
+                rx,
+                content_y,
+                right_hdr,
+                Style::default().bg(HERDR_SURFACE_DIM).fg(HERDR_OVERLAY0),
+            );
+        }
+
+        let filter_y = content_y + 1;
+        buf.set_string(
+            col_x,
+            filter_y,
+            " ".repeat(cw),
+            Style::default().bg(HERDR_PANEL_BG).fg(HERDR_TEXT),
+        );
+        let prompt_prefix = truncate_to_width(" › ", cw);
+        let pw = prompt_prefix.width() as u16;
+        if pw > 0 {
+            buf.set_string(
+                col_x,
+                filter_y,
+                &prompt_prefix,
+                Style::default()
+                    .bg(HERDR_PANEL_BG)
+                    .fg(HERDR_ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            );
+        }
+        let rem_w = cw.saturating_sub(pw as usize);
+        if rem_w > 0 {
+            let (input_txt, input_fg) = if query.is_empty() {
+                (
+                    "Filter tabs, or Enter for + New Tab…".to_string(),
+                    HERDR_OVERLAY1,
+                )
+            } else {
+                (format!("{query}▏"), HERDR_TEXT)
+            };
+            buf.set_string(
+                col_x + pw,
+                filter_y,
+                truncate_to_width(&input_txt, rem_w),
+                Style::default().bg(HERDR_PANEL_BG).fg(input_fg),
+            );
+        }
+
+        let hint_y = content_end_y - 1;
+        let hint_txt = truncate_to_width(
+            " ↑/↓ select · Enter open · Type filter · ← swipe / Esc exit",
+            cw,
+        );
+        buf.set_string(
+            col_x,
+            hint_y,
+            &hint_txt,
+            Style::default().bg(HERDR_SURFACE_DIM).fg(HERDR_OVERLAY0),
+        );
+        (content_y + 3, hint_y)
+    } else if avail_h >= 4 {
+        let bar_txt = if query.is_empty() {
+            format!(" ❖ {space_name} · › type to filter…")
+        } else {
+            format!(" ❖ {space_name} · › {query}▏")
+        };
+        let fg = if query.is_empty() {
+            HERDR_SUBTEXT0
+        } else {
+            HERDR_TEXT
+        };
+        buf.set_string(
+            col_x,
+            content_y,
+            pad_to_width(&bar_txt, cw),
+            Style::default().bg(HERDR_PANEL_BG).fg(fg),
+        );
+        (content_y + 1, content_end_y)
+    } else {
+        (content_y, content_end_y)
+    };
+
+    let list_h = list_end_y.saturating_sub(list_y);
+    if list_h == 0 {
+        return;
+    }
+
+    let use_two_row = list_h >= 6;
+    let row_step: usize = if use_two_row { 2 } else { 1 };
+    let visible_items = ((list_h as usize) / row_step).max(1);
+    let lookahead_idx = if visible_items >= 2 {
+        (sel + 1).min(items.len().saturating_sub(1))
+    } else {
+        sel
+    };
+    let start_idx = if lookahead_idx < visible_items {
+        0
+    } else {
+        lookahead_idx + 1 - visible_items
+    };
+
+    let mut y = list_y;
+    for (idx, item) in items.iter().enumerate().skip(start_idx) {
+        if y + (row_step as u16) > list_end_y {
+            break;
+        }
+        let is_sel = idx == sel;
+        let row_bg = if is_sel {
+            HERDR_SURFACE0
+        } else {
+            HERDR_SURFACE_DIM
+        };
+        let marker = if is_sel { "▸" } else { " " };
+
+        match item {
+            OverviewItem::NewTab { cwd } => {
+                let r1_title = format!(" {marker} + New Tab");
+                let r1_style = Style::default()
+                    .bg(row_bg)
+                    .fg(HERDR_GREEN)
+                    .add_modifier(Modifier::BOLD);
+                let r2_style = Style::default().bg(row_bg).fg(if is_sel {
+                    HERDR_SUBTEXT0
+                } else {
+                    HERDR_OVERLAY1
+                });
+                buf.set_string(col_x, y, pad_to_width(&r1_title, cw), r1_style);
+                let hint = "Enter / ^b c ";
+                if cw >= 32 && r1_title.width() + 2 + hint.width() <= cw {
+                    let hx = col_x + col_w - hint.width() as u16;
+                    buf.set_string(hx, y, hint, Style::default().bg(row_bg).fg(HERDR_OVERLAY1));
+                }
+                if is_sel {
+                    buf.set_string(col_x, y, "▍", r1_style.fg(HERDR_GREEN));
+                }
+                if use_two_row {
+                    let short_cwd = shorten_home_path(cwd);
+                    let r2_text = format!("     new…  {short_cwd}");
+                    buf.set_string(col_x, y + 1, pad_to_width(&r2_text, cw), r2_style);
+                    if is_sel {
+                        buf.set_string(col_x, y + 1, "▍", r2_style.fg(HERDR_GREEN));
+                    }
+                }
+                hits.push(HitRegion {
+                    rect: Rect {
+                        x: col_x,
+                        y,
+                        width: col_w,
+                        height: row_step as u16,
+                    },
+                    target: HitTarget::NewTab,
+                });
+            }
+            OverviewItem::Tab {
+                space_id,
+                tab_id,
+                tab_number,
+                tab_name,
+                term_addr,
+                state,
+                cwd,
+                detail,
+            } => {
+                let prefix = format!(" {marker} ");
+                let sym_x = prefix.width() as u16;
+                let sym = state.symbol();
+                let addr_part = if term_addr.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({term_addr})")
+                };
+                let r1_text = format!("{prefix}{sym} {tab_number}:{tab_name}{addr_part}");
+                let (r1_style, r2_style) = if is_sel {
+                    (
+                        Style::default()
+                            .bg(HERDR_SURFACE0)
+                            .fg(HERDR_TEXT)
+                            .add_modifier(Modifier::BOLD),
+                        Style::default().bg(HERDR_SURFACE0).fg(HERDR_SUBTEXT0),
+                    )
+                } else {
+                    (
+                        Style::default().bg(HERDR_SURFACE_DIM).fg(HERDR_SUBTEXT0),
+                        Style::default().bg(HERDR_SURFACE_DIM).fg(HERDR_OVERLAY1),
+                    )
+                };
+                buf.set_string(col_x, y, pad_to_width(&r1_text, cw), r1_style);
+                if sym_x + (sym.width() as u16) <= col_w {
+                    buf.set_string(
+                        col_x + sym_x,
+                        y,
+                        sym,
+                        r1_style
+                            .fg(state_color(*state))
+                            .add_modifier(Modifier::BOLD),
+                    );
+                }
+                if cw >= 40
+                    && matches!(
+                        state,
+                        AgentState::Blocked | AgentState::Done | AgentState::Working
+                    )
+                {
+                    let badge = format!(" {} ", state.label());
+                    if r1_text.width() + 2 + badge.width() <= cw {
+                        let bx = col_x + col_w - badge.width() as u16;
+                        buf.set_string(
+                            bx,
+                            y,
+                            &badge,
+                            Style::default()
+                                .bg(row_bg)
+                                .fg(state_color(*state))
+                                .add_modifier(Modifier::BOLD),
+                        );
+                    }
+                }
+                if is_sel {
+                    buf.set_string(col_x, y, "▍", r1_style.fg(HERDR_ACCENT));
+                }
+                if use_two_row {
+                    let short_cwd = shorten_home_path(cwd);
+                    let r2_text = if detail.is_empty() {
+                        format!("     {short_cwd}")
+                    } else {
+                        format!("     {short_cwd} · {detail}")
+                    };
+                    buf.set_string(col_x, y + 1, pad_to_width(&r2_text, cw), r2_style);
+                    if is_sel {
+                        buf.set_string(col_x, y + 1, "▍", r2_style.fg(HERDR_ACCENT));
+                    }
+                }
+                hits.push(HitRegion {
+                    rect: Rect {
+                        x: col_x,
+                        y,
+                        width: col_w,
+                        height: row_step as u16,
+                    },
+                    target: HitTarget::SelectTab {
+                        space_id: space_id.clone(),
+                        tab_id: tab_id.clone(),
+                    },
+                });
+            }
+        }
+        y += row_step as u16;
+    }
+
+    if !query.trim().is_empty() && items.len() == 1 && y < list_end_y {
+        buf.set_string(
+            col_x,
+            y,
+            pad_to_width("   No matching tabs in this Space", cw),
+            Style::default().bg(HERDR_SURFACE_DIM).fg(HERDR_OVERLAY1),
+        );
+    }
 }
 
 struct VtScreenWidget<'a> {
@@ -4024,5 +4537,267 @@ mod tests {
         let sbuf = shell_term.backend().buffer();
         let sline: String = (0..80).map(|x| sbuf[(x, 11)].symbol()).collect();
         assert_eq!(sline.trim(), "");
+    }
+
+    #[test]
+    fn tab_overview_renders_full_viewport_highlights_plus_pill_and_preserves_topbar_hits() {
+        use crate::model::{make_single_terminal_tab, TerminalInfo};
+        use crate::usage::{AgentKind, AgentQuota, QuotaMetric};
+
+        let mut world = World::default();
+        world.doc.spaces.push(SharedSpace {
+            id: "space-1".to_string(),
+            name: "main".to_string(),
+            folder: "/tmp/work".to_string(),
+            tabs: vec![
+                make_single_terminal_tab("tab-1", "agent", "t1"),
+                make_single_terminal_tab("tab-2", "shell", "t2"),
+            ],
+            ..Default::default()
+        });
+        world.doc.spaces.push(SharedSpace {
+            id: "space-2".to_string(),
+            name: "other".to_string(),
+            folder: "/tmp/other".to_string(),
+            tabs: vec![make_single_terminal_tab("tab-other", "hidden-tab", "t3")],
+            ..Default::default()
+        });
+        world.terminals.insert(
+            "t1".to_string(),
+            TerminalInfo {
+                address: "t1".to_string(),
+                cwd: "/tmp/work".to_string(),
+                status_word: Some("blocked".to_string()),
+                status_msg: Some("Approve tool call".to_string()),
+                ..Default::default()
+            },
+        );
+        world.terminals.insert(
+            "t2".to_string(),
+            TerminalInfo {
+                address: "t2".to_string(),
+                cwd: "/tmp/work/sub".to_string(),
+                ..Default::default()
+            },
+        );
+        world.terminals.insert(
+            "t3".to_string(),
+            TerminalInfo {
+                address: "t3".to_string(),
+                cwd: "/tmp/other".to_string(),
+                ..Default::default()
+            },
+        );
+        world.select_tab_index(1);
+
+        let quota = AgentQuota {
+            agent: AgentKind::Codex,
+            metrics: vec![QuotaMetric {
+                window_label: "5h".to_string(),
+                remaining_percent: 80.0,
+                detail: None,
+            }],
+        };
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut hits = Vec::new();
+        terminal
+            .draw(|f| {
+                let geom = render_ui_with_pads_and_quota(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    true,
+                    false,
+                    false,
+                    false,
+                    15,
+                    None,
+                    false,
+                    &Modal::default_tab_overview(),
+                    None,
+                    false,
+                    None,
+                    false,
+                    Some(&quota),
+                );
+                assert!(geom.mod_rect.is_none());
+                assert!(geom.dpad_rect.is_none());
+                assert!(geom.space_slop_rect.is_none());
+                hits = geom.hits;
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let row0: String = (0..100).map(|x| buf[(x, 0)].symbol()).collect();
+        let plus_byte = row0.find(" + ").expect("expected trailing [ + ] pill");
+        let plus_x = row0[..plus_byte].chars().count() as u16;
+        assert_eq!(buf[(plus_x, 0)].bg, HERDR_ACCENT);
+        assert_eq!(buf[(plus_x, 0)].fg, HERDR_PANEL_BG);
+        assert_eq!(buf[(plus_x, 0)].underline_color, TOPBAR_UNDERLINE_ACTIVE);
+
+        let tab2_byte = row0.find("2:shell").expect("expected 2:shell pill");
+        let tab2_x = row0[..tab2_byte].chars().count() as u16;
+        assert_ne!(buf[(tab2_x, 0)].bg, HERDR_ACCENT);
+        assert_eq!(buf[(tab2_x, 0)].underline_color, TOPBAR_UNDERLINE_DIM);
+
+        // TopBar hits remain active alongside viewport overview hits
+        assert_eq!(
+            find_hit_target(&hits, 1, 0),
+            Some(HitTarget::TriggerAction(Action::Detach))
+        );
+        assert!(hits
+            .iter()
+            .any(|h| h.target == HitTarget::ToggleSpaceMenu && h.rect.y == 0));
+        assert!(hits
+            .iter()
+            .any(|h| h.target == HitTarget::NewTab && h.rect.y == 0));
+        assert!(hits
+            .iter()
+            .any(|h| h.target == HitTarget::ToggleHelp && h.rect.y == 0));
+        assert!(hits
+            .iter()
+            .any(|h| h.target == HitTarget::NewTab && h.rect.y >= 1 && h.rect.y < 23));
+        assert!(hits.iter().any(|h| {
+            h.target
+                == HitTarget::SelectTab {
+                    space_id: "space-1".to_string(),
+                    tab_id: "tab-1".to_string(),
+                }
+                && h.rect.y >= 1
+        }));
+        assert!(hits.iter().any(|h| {
+            h.target
+                == HitTarget::SelectTab {
+                    space_id: "space-1".to_string(),
+                    tab_id: "tab-2".to_string(),
+                }
+                && h.rect.y >= 1
+        }));
+        assert!(!hits.iter().any(|h| {
+            matches!(
+                h.target,
+                HitTarget::SelectTab { ref tab_id, .. } if tab_id == "tab-other"
+            )
+        }));
+        assert_eq!(find_hit_target(&hits, 0, 12), Some(HitTarget::ModalNoop));
+
+        // Bottom bar suppresses background quota and scrollback badge while overview is open
+        let bot_line: String = (0..100).map(|x| buf[(x, 23)].symbol()).collect();
+        assert!(!bot_line.contains("Codex"));
+        assert!(!bot_line.contains("BOT"));
+        assert!(!hits.iter().any(|h| h.target == HitTarget::ExitScrollback));
+
+        let rendered: String = (0..24)
+            .map(|y| (0..100).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("+ New Tab"));
+        assert!(rendered.contains("1:agent"));
+        assert!(rendered.contains("2:shell"));
+        assert!(rendered.contains("Approve tool call"));
+        assert!(!rendered.contains("hidden-tab"));
+
+        // Filtered query preserves real tab numbers and shows empty state when nothing matches
+        terminal
+            .draw(|f| {
+                render_ui(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::TabOverview {
+                        query: "sh".to_string(),
+                        selected: 1,
+                        selected_target: OverviewSelection::Tab("tab-2".to_string()),
+                    },
+                );
+            })
+            .unwrap();
+        let filt_buf = terminal.backend().buffer();
+        let filt_vp: String = (1..23)
+            .map(|y| {
+                (0..100)
+                    .map(|x| filt_buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(filt_vp.contains("2:shell"));
+        assert!(!filt_vp.contains("1:agent"));
+
+        terminal
+            .draw(|f| {
+                render_ui(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::TabOverview {
+                        query: "zzz".to_string(),
+                        selected: 0,
+                        selected_target: OverviewSelection::NewTab,
+                    },
+                );
+            })
+            .unwrap();
+        let empty_buf = terminal.backend().buffer();
+        let empty_vp: String = (1..23)
+            .map(|y| {
+                (0..100)
+                    .map(|x| empty_buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(empty_vp.contains("No matching tabs in this Space"));
+
+        // Compact / ultra-short viewports never panic and keep + New Tab clickable
+        for (w, h) in [(20u16, 5u16), (16u16, 4u16)] {
+            let mut small_term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            let mut small_hits = Vec::new();
+            small_term
+                .draw(|f| {
+                    small_hits = render_ui(
+                        f,
+                        &world,
+                        None,
+                        false,
+                        24,
+                        false,
+                        false,
+                        false,
+                        false,
+                        0,
+                        None,
+                        false,
+                        &Modal::default_tab_overview(),
+                    )
+                    .hits;
+                })
+                .unwrap();
+            assert!(small_hits
+                .iter()
+                .any(|hit| hit.target == HitTarget::NewTab && hit.rect.y >= 1));
+        }
     }
 }
