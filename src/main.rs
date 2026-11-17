@@ -2572,12 +2572,84 @@ enum KeyOutcome {
     Quit,
 }
 
+const EINK_INPUT_BYPASS_WINDOW: Duration = Duration::from_millis(200);
+const EINK_INPUT_FOLLOWUP_INTERVAL: Duration = Duration::from_millis(16);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct EinkInputPacer {
+    last_drawn_input_seq: u64,
+    pty_dirty_interactive: bool,
+    pending_echo_seq: Option<u64>,
+}
+
+impl EinkInputPacer {
+    fn record_active_pty_data(
+        &mut self,
+        channel: u32,
+        now: Instant,
+        last_input: Option<crate::core::LastPtyInput>,
+    ) {
+        if let Some(inp) = last_input {
+            if inp.channel == channel
+                && now.saturating_duration_since(inp.at) <= EINK_INPUT_BYPASS_WINDOW
+            {
+                self.pty_dirty_interactive = true;
+                if inp.seq != self.last_drawn_input_seq {
+                    self.pending_echo_seq = Some(inp.seq);
+                }
+            }
+        }
+    }
+
+    fn next_deadline(
+        &self,
+        pty_dirty: bool,
+        eink_mode: bool,
+        eink_interval: Duration,
+        now: Instant,
+        last_draw_at: Option<Instant>,
+    ) -> Option<Instant> {
+        if !pty_dirty {
+            return None;
+        }
+        if !eink_mode || eink_interval.is_zero() || self.pending_echo_seq.is_some() {
+            return Some(now);
+        }
+        let interval = if self.pty_dirty_interactive {
+            EINK_INPUT_FOLLOWUP_INTERVAL.min(eink_interval)
+        } else {
+            eink_interval
+        };
+        Some(last_draw_at.map_or(now, |t| t + interval))
+    }
+
+    fn clear_zero_diff(&mut self) -> bool {
+        let was_interactive = self.pty_dirty_interactive;
+        self.pty_dirty_interactive = false;
+        self.pending_echo_seq = None;
+        was_interactive
+    }
+
+    fn on_promoted_or_drawn(&mut self) {
+        if let Some(seq) = self.pending_echo_seq.take() {
+            self.last_drawn_input_seq = seq;
+        }
+        self.pty_dirty_interactive = false;
+    }
+
+    fn reset_on_channel_switch(&mut self) {
+        self.pty_dirty_interactive = false;
+        self.pending_echo_seq = None;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn promote_due_pty_dirty(
     eink_mode: bool,
     eink_interval: Duration,
     now: Instant,
     pty_dirty: &mut bool,
+    eink_pacer: &mut EinkInputPacer,
     dirty: &mut bool,
     last_draw_at: &mut Option<Instant>,
     last_eink_snap: &Option<(String, EinkScreenSnapshot)>,
@@ -2588,13 +2660,15 @@ fn promote_due_pty_dirty(
     modal: &Modal,
     selection: &Option<TerminalSelection>,
 ) {
-    if !*pty_dirty || *dirty {
+    if *dirty {
         return;
     }
-    let due = !eink_mode
-        || eink_interval.is_zero()
-        || last_draw_at.is_none_or(|t| now.saturating_duration_since(t) >= eink_interval);
-    if !due {
+    let Some(deadline) =
+        eink_pacer.next_deadline(*pty_dirty, eink_mode, eink_interval, now, *last_draw_at)
+    else {
+        return;
+    };
+    if now < deadline {
         return;
     }
     if eink_mode && matches!(modal, Modal::None) && selection.is_none() {
@@ -2608,12 +2682,15 @@ fn promote_due_pty_dirty(
                 .is_some_and(|(a, prev)| Some(a.as_str()) == active_addr && prev == &snap)
             {
                 *pty_dirty = false;
-                *last_draw_at = Some(now);
+                if !eink_pacer.clear_zero_diff() {
+                    *last_draw_at = Some(now);
+                }
                 return;
             }
         }
     }
     *dirty = true;
+    eink_pacer.on_promoted_or_drawn();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2701,6 +2778,7 @@ fn run_app_loop(
     let mut has_focused_agent = false;
     let mut dirty = true;
     let mut pty_dirty = false;
+    let mut eink_pacer = EinkInputPacer::default();
     let mut last_draw_at: Option<Instant> = None;
     let mut last_eink_snap: Option<(String, EinkScreenSnapshot)> = None;
     let mut pending_eink_osc = eink_mode;
@@ -2789,6 +2867,8 @@ fn run_app_loop(
                 selection = None;
                 selection_screen = None;
                 selection_vt_seq = None;
+                pty_dirty = false;
+                eink_pacer.reset_on_channel_switch();
                 dirty = true;
             }
         }
@@ -2801,8 +2881,9 @@ fn run_app_loop(
         promote_due_pty_dirty(
             eink_mode,
             eink_interval,
-            now,
+            Instant::now(),
             &mut pty_dirty,
+            &mut eink_pacer,
             &mut dirty,
             &mut last_draw_at,
             &last_eink_snap,
@@ -2824,8 +2905,8 @@ fn run_app_loop(
                 None
             };
             let retry_deadline = pending_attach_retry.as_ref().map(|(_, t)| *t);
-            let pty_deadline = if pty_dirty && eink_mode && !eink_interval.is_zero() {
-                Some(last_draw_at.map_or(now, |t| t + eink_interval))
+            let pty_deadline = if eink_mode && !eink_interval.is_zero() {
+                eink_pacer.next_deadline(pty_dirty, eink_mode, eink_interval, now, last_draw_at)
             } else {
                 None
             };
@@ -2942,6 +3023,11 @@ fn run_app_loop(
                                 dirty = true;
                             } else {
                                 pty_dirty = true;
+                                eink_pacer.record_active_pty_data(
+                                    channel,
+                                    Instant::now(),
+                                    core.last_pty_input(),
+                                );
                             }
                         }
                     }
@@ -3990,6 +4076,7 @@ fn run_app_loop(
             eink_interval,
             Instant::now(),
             &mut pty_dirty,
+            &mut eink_pacer,
             &mut dirty,
             &mut last_draw_at,
             &last_eink_snap,
@@ -4079,6 +4166,7 @@ fn run_app_loop(
             execute!(terminal.backend_mut(), EndSynchronizedUpdate)?;
             dirty = false;
             pty_dirty = false;
+            eink_pacer.on_promoted_or_drawn();
             last_draw_at = Some(Instant::now());
             prev_drawn_addr = active_addr.clone();
             prev_modal_open = !matches!(modal, Modal::None);
@@ -6977,6 +7065,7 @@ mod tests {
         let t0 = Instant::now();
         let mut last_draw_at = Some(t0);
         let mut pty_dirty = true;
+        let mut eink_pacer = EinkInputPacer::default();
         let mut dirty = false;
         let interval = Duration::from_millis(250);
         promote_due_pty_dirty(
@@ -6984,6 +7073,7 @@ mod tests {
             interval,
             t0 + Duration::from_millis(50),
             &mut pty_dirty,
+            &mut eink_pacer,
             &mut dirty,
             &mut last_draw_at,
             &last_snap,
@@ -7004,6 +7094,7 @@ mod tests {
             interval,
             t1,
             &mut pty_dirty,
+            &mut eink_pacer,
             &mut dirty,
             &mut last_draw_at,
             &last_snap,
@@ -7029,6 +7120,7 @@ mod tests {
             interval,
             t1 + Duration::from_millis(300),
             &mut pty_dirty,
+            &mut eink_pacer,
             &mut dirty,
             &mut last_draw_at,
             &last_snap,
@@ -7040,5 +7132,283 @@ mod tests {
             &None,
         );
         assert!(dirty);
+    }
+
+    #[test]
+    fn eink_forwarded_pty_input_bypasses_passive_frame_pacing() {
+        let core = CoreClient::dummy_for_tests();
+        let mut world = World::default();
+        let mut sidebar_open = false;
+        let mut prefix_active = false;
+        let mut ctrl_active = false;
+        let mut alt_active = false;
+        let mut scrollback_offset = 0usize;
+        let mut modal = Modal::None;
+        let term_rect = Rect::new(0, 1, 80, 22);
+        let mut eink_mode = true;
+        let mut force_clear = false;
+        let mut pending_eink_osc = false;
+        let interval = Duration::from_millis(2000);
+
+        let mut attached_map: BTreeMap<String, AttachedTerminal> = BTreeMap::new();
+        let att = AttachedTerminal::new(9, term_rect.width, term_rect.height);
+        let baseline_snap = capture_eink_screen_snapshot(att.parser.screen(), term_rect, 0);
+        attached_map.insert("term-1".to_string(), att);
+        let mut last_snap = Some(("term-1".to_string(), baseline_snap));
+
+        // 1. Regular key forwarded to PTY records last_pty_input on that channel
+        let outcome = {
+            let att_ref = attached_map.get("term-1");
+            handle_key_event_with_eink(
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+                &core,
+                &mut world,
+                att_ref,
+                "ctrl+b",
+                &mut sidebar_open,
+                &mut prefix_active,
+                &mut ctrl_active,
+                &mut alt_active,
+                &mut scrollback_offset,
+                &mut modal,
+                term_rect,
+                &mut eink_mode,
+                &mut force_clear,
+                &mut pending_eink_osc,
+            )
+            .unwrap()
+        };
+        assert_eq!(outcome, KeyOutcome::ForwardedToPty);
+        let inp1 = core
+            .last_pty_input()
+            .expect("send_input must record LastPtyInput");
+        assert_eq!(inp1.channel, 9);
+
+        // Even if last draw was 10ms before keypress and interval is 2000ms, echo promotes immediately
+        let draw0 = inp1
+            .at
+            .checked_sub(Duration::from_millis(10))
+            .unwrap_or(inp1.at);
+        let t_echo1 = draw0 + Duration::from_millis(12);
+        let mut last_draw_at = Some(draw0);
+        let mut pty_dirty = true;
+        let mut dirty = false;
+        let mut eink_pacer = EinkInputPacer::default();
+        attached_map
+            .get_mut("term-1")
+            .unwrap()
+            .process_vt_bytes(b"a");
+        eink_pacer.record_active_pty_data(9, t_echo1, core.last_pty_input());
+        assert_eq!(
+            eink_pacer.next_deadline(pty_dirty, true, interval, t_echo1, last_draw_at),
+            Some(t_echo1)
+        );
+        promote_due_pty_dirty(
+            true,
+            interval,
+            t_echo1,
+            &mut pty_dirty,
+            &mut eink_pacer,
+            &mut dirty,
+            &mut last_draw_at,
+            &last_snap,
+            Some("term-1"),
+            &mut attached_map,
+            term_rect,
+            &mut scrollback_offset,
+            &Modal::None,
+            &None,
+        );
+        assert!(dirty);
+
+        // Simulate completing draw after first echo
+        dirty = false;
+        eink_pacer.on_promoted_or_drawn();
+        last_draw_at = Some(t_echo1);
+        last_snap = Some((
+            "term-1".to_string(),
+            capture_eink_screen_snapshot(
+                attached_map.get("term-1").unwrap().parser.screen(),
+                term_rect,
+                0,
+            ),
+        ));
+
+        // 2. Rapid follow-up highlight/autosuggestion chunk within 200ms schedules at 16ms, not 2000ms
+        let t_follow = t_echo1 + Duration::from_millis(5);
+        attached_map
+            .get_mut("term-1")
+            .unwrap()
+            .process_vt_bytes(b"bc");
+        pty_dirty = true;
+        eink_pacer.record_active_pty_data(9, t_follow, core.last_pty_input());
+        assert_eq!(
+            eink_pacer.next_deadline(pty_dirty, true, interval, t_follow, last_draw_at),
+            Some(t_echo1 + EINK_INPUT_FOLLOWUP_INTERVAL)
+        );
+        promote_due_pty_dirty(
+            true,
+            interval,
+            t_follow,
+            &mut pty_dirty,
+            &mut eink_pacer,
+            &mut dirty,
+            &mut last_draw_at,
+            &last_snap,
+            Some("term-1"),
+            &mut attached_map,
+            term_rect,
+            &mut scrollback_offset,
+            &Modal::None,
+            &None,
+        );
+        assert!(!dirty);
+        let t_follow_due = t_echo1 + EINK_INPUT_FOLLOWUP_INTERVAL;
+        promote_due_pty_dirty(
+            true,
+            interval,
+            t_follow_due,
+            &mut pty_dirty,
+            &mut eink_pacer,
+            &mut dirty,
+            &mut last_draw_at,
+            &last_snap,
+            Some("term-1"),
+            &mut attached_map,
+            term_rect,
+            &mut scrollback_offset,
+            &Modal::None,
+            &None,
+        );
+        assert!(dirty);
+
+        // Complete follow-up draw and capture updated snapshot
+        dirty = false;
+        eink_pacer.on_promoted_or_drawn();
+        last_draw_at = Some(t_follow_due);
+        last_snap = Some((
+            "term-1".to_string(),
+            capture_eink_screen_snapshot(
+                attached_map.get("term-1").unwrap().parser.screen(),
+                term_rect,
+                0,
+            ),
+        ));
+
+        // 3. Invisible zero-diff chunk after next keypress must NOT consume last_drawn_input_seq
+        let outcome2 = {
+            let att_ref = attached_map.get("term-1");
+            handle_key_event_with_eink(
+                KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+                &core,
+                &mut world,
+                att_ref,
+                "ctrl+b",
+                &mut sidebar_open,
+                &mut prefix_active,
+                &mut ctrl_active,
+                &mut alt_active,
+                &mut scrollback_offset,
+                &mut modal,
+                term_rect,
+                &mut eink_mode,
+                &mut force_clear,
+                &mut pending_eink_osc,
+            )
+            .unwrap()
+        };
+        assert_eq!(outcome2, KeyOutcome::ForwardedToPty);
+        let inp2 = core.last_pty_input().unwrap();
+        assert_ne!(inp2.seq, inp1.seq);
+
+        let t_noop = inp2.at + Duration::from_millis(1);
+        attached_map
+            .get_mut("term-1")
+            .unwrap()
+            .process_vt_bytes(b"\x1b[?25l\x1b[?25h");
+        pty_dirty = true;
+        eink_pacer.record_active_pty_data(9, t_noop, core.last_pty_input());
+        promote_due_pty_dirty(
+            true,
+            interval,
+            t_noop,
+            &mut pty_dirty,
+            &mut eink_pacer,
+            &mut dirty,
+            &mut last_draw_at,
+            &last_snap,
+            Some("term-1"),
+            &mut attached_map,
+            term_rect,
+            &mut scrollback_offset,
+            &Modal::None,
+            &None,
+        );
+        assert!(!pty_dirty);
+        assert!(!dirty);
+
+        // Real cursor movement 3ms later still gets 0ms immediate promotion
+        let t_cursor = inp2.at + Duration::from_millis(4);
+        attached_map
+            .get_mut("term-1")
+            .unwrap()
+            .process_vt_bytes(b"\x1b[D");
+        pty_dirty = true;
+        eink_pacer.record_active_pty_data(9, t_cursor, core.last_pty_input());
+        assert_eq!(
+            eink_pacer.next_deadline(pty_dirty, true, interval, t_cursor, last_draw_at),
+            Some(t_cursor)
+        );
+        promote_due_pty_dirty(
+            true,
+            interval,
+            t_cursor,
+            &mut pty_dirty,
+            &mut eink_pacer,
+            &mut dirty,
+            &mut last_draw_at,
+            &last_snap,
+            Some("term-1"),
+            &mut attached_map,
+            term_rect,
+            &mut scrollback_offset,
+            &Modal::None,
+            &None,
+        );
+        assert!(dirty);
+
+        // 4. Passive output 300ms after input (> 200ms window) is throttled by full eink_interval
+        dirty = false;
+        pty_dirty = true;
+        eink_pacer.on_promoted_or_drawn();
+        last_draw_at = Some(t_cursor);
+        let t_passive = inp2.at + Duration::from_millis(300);
+        attached_map
+            .get_mut("term-1")
+            .unwrap()
+            .process_vt_bytes(b"\r\npassive");
+        eink_pacer.record_active_pty_data(9, t_passive, core.last_pty_input());
+        assert_eq!(
+            eink_pacer.next_deadline(pty_dirty, true, interval, t_passive, last_draw_at),
+            Some(t_cursor + interval)
+        );
+        promote_due_pty_dirty(
+            true,
+            interval,
+            t_passive,
+            &mut pty_dirty,
+            &mut eink_pacer,
+            &mut dirty,
+            &mut last_draw_at,
+            &last_snap,
+            Some("term-1"),
+            &mut attached_map,
+            term_rect,
+            &mut scrollback_offset,
+            &Modal::None,
+            &None,
+        );
+        assert!(pty_dirty);
+        assert!(!dirty);
     }
 }
