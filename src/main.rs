@@ -2006,6 +2006,35 @@ struct FloatingDPadDrag {
     tap_target: Option<HitTarget>,
 }
 
+const PAGE_TAP_SLOP_CELLS: u16 = 1;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingPageTurnTap {
+    action: Action,
+    start_col: u16,
+    start_row: u16,
+}
+
+fn match_eink_page_touch_zone(
+    left_zone: Option<Rect>,
+    right_zone: Option<Rect>,
+    col: u16,
+    row: u16,
+) -> Option<Action> {
+    if is_in_rect(left_zone, col, row) {
+        Some(Action::PageUp)
+    } else if is_in_rect(right_zone, col, row) {
+        Some(Action::PageDown)
+    } else {
+        None
+    }
+}
+
+fn page_tap_within_slop(tap: &PendingPageTurnTap, col: u16, row: u16) -> bool {
+    col.abs_diff(tap.start_col) <= PAGE_TAP_SLOP_CELLS
+        && row.abs_diff(tap.start_row) <= PAGE_TAP_SLOP_CELLS
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HorizontalSwipeDir {
     Prev,
@@ -2778,7 +2807,10 @@ fn run_app_loop(
     let mut dpad_pos: Option<(u16, u16)> = None;
     let mut last_dpad_rect: Option<Rect> = None;
     let mut last_space_slop_rect: Option<Rect> = None;
+    let mut last_page_up_rect: Option<Rect> = None;
+    let mut last_page_down_rect: Option<Rect> = None;
     let mut dpad_drag: Option<FloatingDPadDrag> = None;
+    let mut page_tap: Option<PendingPageTurnTap> = None;
     let mut horiz_wheel = HorizontalWheelGestureState::default();
     let mut selection: Option<TerminalSelection> = None;
     let mut selection_screen: Option<vt100::Screen> = None;
@@ -2877,6 +2909,8 @@ fn run_app_loop(
                 pending_sibling_resize_at = Some(Instant::now() + SIBLING_RESIZE_DEBOUNCE);
             }
             if *active_addr != prev_addr {
+                dpad_drag = None;
+                page_tap = None;
                 selection = None;
                 selection_screen = None;
                 selection_vt_seq = None;
@@ -3085,6 +3119,7 @@ fn run_app_loop(
                             if w < mobile_threshold {
                                 *sidebar_open = false;
                             }
+                            page_tap = None;
                             cur_size = (w, h);
                             pending_sibling_resize_at =
                                 Some(Instant::now() + SIBLING_RESIZE_DEBOUNCE);
@@ -3113,6 +3148,7 @@ fn run_app_loop(
                         Event::Mouse(mev) => match mev.kind {
                             MouseEventKind::Down(MouseButton::Left) => {
                                 horiz_wheel.clear_pending_horiz();
+                                page_tap = None;
                                 let mx = mev.column;
                                 let my = mev.row;
                                 let had_vis_sel = selection
@@ -3401,6 +3437,24 @@ fn run_app_loop(
                                     ctrl_active = false;
                                     alt_active = false;
                                     dirty = true;
+                                } else if let Some(action) = match_eink_page_touch_zone(
+                                    last_page_up_rect,
+                                    last_page_down_rect,
+                                    mx,
+                                    my,
+                                ) {
+                                    dpad_drag = None;
+                                    page_tap = Some(PendingPageTurnTap {
+                                        action,
+                                        start_col: mx,
+                                        start_row: my,
+                                    });
+                                    selection = None;
+                                    selection_screen = None;
+                                    selection_vt_seq = None;
+                                    if had_vis_sel {
+                                        dirty = true;
+                                    }
                                 } else if mx >= term_rect.x
                                     && mx < term_rect.x.saturating_add(term_rect.width)
                                     && my >= term_rect.y
@@ -3452,6 +3506,31 @@ fn run_app_loop(
                                                 dpad_pos = next_pos;
                                                 dirty = true;
                                             }
+                                        }
+                                    }
+                                } else if let Some(ref tap) = page_tap {
+                                    if !page_tap_within_slop(tap, mev.column, mev.row) {
+                                        let start_col = tap.start_col;
+                                        let start_row = tap.start_row;
+                                        page_tap = None;
+                                        if term_rect.width > 0 && term_rect.height > 0 {
+                                            let rel_col = start_col
+                                                .saturating_sub(term_rect.x)
+                                                .min(term_rect.width.saturating_sub(1));
+                                            let rel_row = start_row
+                                                .saturating_sub(term_rect.y)
+                                                .min(term_rect.height.saturating_sub(1));
+                                            let mut sel = TerminalSelection::new(rel_row, rel_col);
+                                            if sel.update_drag(term_rect, mev.column, mev.row) {
+                                                if sel.is_non_empty() && selection_screen.is_none()
+                                                {
+                                                    selection_screen = active_att
+                                                        .map(|a| a.parser.screen().clone());
+                                                    selection_vt_seq = active_att.map(|a| a.vt_seq);
+                                                }
+                                                dirty = true;
+                                            }
+                                            selection = Some(sel);
                                         }
                                     }
                                 } else if let Some(ref mut sel) = selection {
@@ -3557,6 +3636,36 @@ fn run_app_loop(
                                             _ => {}
                                         }
                                     }
+                                } else if let Some(tap) = page_tap.take() {
+                                    if matches!(modal, Modal::None)
+                                        && page_tap_within_slop(&tap, mev.column, mev.row)
+                                    {
+                                        prefix_active = false;
+                                        ctrl_active = false;
+                                        alt_active = false;
+                                        if execute_action(
+                                            tap.action,
+                                            core,
+                                            world,
+                                            active_att,
+                                            prefix_spec,
+                                            sidebar_open,
+                                            &mut scrollback_offset,
+                                            &mut modal,
+                                            term_rect,
+                                            &mut eink_mode,
+                                            &mut force_clear,
+                                            &mut pending_eink_osc,
+                                        )? {
+                                            flush_credits(
+                                                core,
+                                                &mut pending_credits,
+                                                &mut pending_credit_bytes,
+                                            );
+                                            return Ok(());
+                                        }
+                                        dirty = true;
+                                    }
                                 } else if let Some(ref mut sel) = selection {
                                     if sel.active {
                                         if term_rect.width > 0 && term_rect.height > 0 {
@@ -3620,6 +3729,7 @@ fn run_app_loop(
                                 }
                             }
                             MouseEventKind::ScrollUp => {
+                                page_tap = None;
                                 let wheel_now = Instant::now();
                                 if matches!(modal, Modal::SpaceMenu) {
                                     if handle_top_bar_or_space_vertical_wheel(
@@ -3750,6 +3860,7 @@ fn run_app_loop(
                                 }
                             }
                             MouseEventKind::ScrollDown => {
+                                page_tap = None;
                                 let wheel_now = Instant::now();
                                 if matches!(modal, Modal::SpaceMenu) {
                                     if handle_top_bar_or_space_vertical_wheel(
@@ -3882,6 +3993,7 @@ fn run_app_loop(
                                 }
                             }
                             MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => {
+                                page_tap = None;
                                 let dir = if matches!(mev.kind, MouseEventKind::ScrollLeft) {
                                     HorizontalSwipeDir::Prev
                                 } else {
@@ -3915,6 +4027,7 @@ fn run_app_loop(
                                     .as_ref()
                                     .is_some_and(TerminalSelection::is_non_empty);
                             dpad_drag = None;
+                            page_tap = None;
                             selection = None;
                             selection_screen = None;
                             selection_vt_seq = None;
@@ -4165,6 +4278,8 @@ fn run_app_loop(
                 last_mod_rect = geom.mod_rect;
                 last_dpad_rect = geom.dpad_rect;
                 last_space_slop_rect = geom.space_slop_rect;
+                last_page_up_rect = geom.page_up_rect;
+                last_page_down_rect = geom.page_down_rect;
             })?;
             if pending_eink_osc {
                 if eink_mode {
@@ -7513,5 +7628,61 @@ mod tests {
             Some(&("t2".to_string(), AgentState::Idle))
         ));
         assert!(!detect_eink_agent_settlement(prev_working.as_ref(), None));
+    }
+
+    #[test]
+    fn eink_page_turn_touch_tap_tolerates_thumb_jitter_and_preserves_drag_selection() {
+        let left_zone = Some(Rect::new(0, 7, 8, 8));
+        let right_zone = Some(Rect::new(92, 7, 8, 8));
+
+        // Expanded touch zones hit across 8 cols x 8 rows while leaving middle viewport clear
+        assert_eq!(
+            match_eink_page_touch_zone(left_zone, right_zone, 0, 10),
+            Some(Action::PageUp)
+        );
+        assert_eq!(
+            match_eink_page_touch_zone(left_zone, right_zone, 7, 14),
+            Some(Action::PageUp)
+        );
+        assert_eq!(
+            match_eink_page_touch_zone(left_zone, right_zone, 92, 7),
+            Some(Action::PageDown)
+        );
+        assert_eq!(
+            match_eink_page_touch_zone(left_zone, right_zone, 99, 14),
+            Some(Action::PageDown)
+        );
+        assert_eq!(
+            match_eink_page_touch_zone(left_zone, right_zone, 20, 10),
+            None
+        );
+
+        // Tap slop absorbs ±1 col / ±1 row thumb jitter and promotes >= 2 cell drags
+        let tap = PendingPageTurnTap {
+            action: Action::PageUp,
+            start_col: 4,
+            start_row: 10,
+        };
+        assert!(page_tap_within_slop(&tap, 4, 10));
+        assert!(page_tap_within_slop(&tap, 5, 11));
+        assert!(page_tap_within_slop(&tap, 3, 9));
+        assert!(!page_tap_within_slop(&tap, 6, 10));
+        assert!(!page_tap_within_slop(&tap, 4, 12));
+
+        // Dragging out from col 0 inside the page zone hands off to TerminalSelection at col 0
+        let term_rect = Rect::new(0, 1, 100, 22);
+        let mut att = AttachedTerminal::new(1, term_rect.width, term_rect.height);
+        att.process_vt_bytes(b"\x1b[10;1HSeeThrough line");
+        let start_tap = PendingPageTurnTap {
+            action: Action::PageUp,
+            start_col: 0,
+            start_row: 10,
+        };
+        assert!(!page_tap_within_slop(&start_tap, 9, 10));
+        let rel_col = start_tap.start_col.saturating_sub(term_rect.x);
+        let rel_row = start_tap.start_row.saturating_sub(term_rect.y);
+        let mut sel = TerminalSelection::new(rel_row, rel_col);
+        assert!(sel.update_drag(term_rect, 9, 10));
+        assert_eq!(sel.extract_text(att.parser.screen()), "SeeThrough");
     }
 }

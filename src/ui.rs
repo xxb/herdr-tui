@@ -370,6 +370,8 @@ pub struct UiGeometry {
     pub mod_rect: Option<Rect>,
     pub dpad_rect: Option<Rect>,
     pub space_slop_rect: Option<Rect>,
+    pub page_up_rect: Option<Rect>,
+    pub page_down_rect: Option<Rect>,
 }
 
 pub fn is_in_rect(rect: Option<Rect>, col: u16, row: u16) -> bool {
@@ -831,6 +833,8 @@ pub fn render_ui_full(
 
     let mut mod_rect = None;
     let mut dpad_rect = None;
+    let mut page_up_rect = None;
+    let mut page_down_rect = None;
     let space_menu_open = matches!(modal, Modal::SpaceMenu);
 
     let space_bounds = render_top_tabbar(
@@ -900,7 +904,10 @@ pub fn render_ui_full(
                 );
             }
             if eink_mode {
-                render_eink_page_turn_tabs(f, term_rect, mod_rect, dpad_rect, &mut hits);
+                let (pg_up, pg_dn) =
+                    render_eink_page_turn_tabs(f, term_rect, mod_rect, dpad_rect, space_slop_rect);
+                page_up_rect = pg_up;
+                page_down_rect = pg_dn;
             }
         }
         Modal::SpaceMenu => {
@@ -955,6 +962,8 @@ pub fn render_ui_full(
         mod_rect,
         dpad_rect,
         space_slop_rect,
+        page_up_rect,
+        page_down_rect,
     }
 }
 
@@ -2562,7 +2571,7 @@ fn resolve_eink_page_tab_rect(
     if term_rect.width < 12 || term_rect.height < 3 {
         return None;
     }
-    let tab_w: u16 = 3;
+    let tab_w: u16 = if term_rect.width < 48 { 2 } else { 3 };
     let tab_h: u16 = if term_rect.height >= 9 {
         5
     } else if term_rect.height >= 5 {
@@ -2662,28 +2671,91 @@ fn paint_eink_page_tab(buf: &mut Buffer, rect: Rect, is_left: bool) {
     }
 }
 
+fn expand_eink_page_touch_rect(
+    term_rect: Rect,
+    visual: Rect,
+    is_left: bool,
+    obstacle: Option<Rect>,
+    top_obstacle: Option<Rect>,
+) -> Rect {
+    let max_side_w = (term_rect.width / 5).max(visual.width);
+    let desired_w = (term_rect.width / 12).clamp(6, 8);
+    let mut touch_w = desired_w.min(max_side_w).max(visual.width);
+
+    let desired_h: u16 = if term_rect.height >= 26 {
+        11
+    } else if term_rect.height >= 15 {
+        9
+    } else if term_rect.height >= 9 {
+        7
+    } else if term_rect.height >= 5 {
+        5
+    } else {
+        visual.height
+    };
+    let max_h = (term_rect.height * 2 / 5).max(visual.height);
+    let target_h = desired_h.min(max_h).max(visual.height);
+    let extra_y = target_h - visual.height;
+    let mut top = visual.y.saturating_sub(extra_y / 2).max(term_rect.y);
+    let mut bot =
+        (visual.y + visual.height + (extra_y - extra_y / 2)).min(term_rect.y + term_rect.height);
+
+    let cand_x = |w: u16| {
+        if is_left {
+            term_rect.x
+        } else {
+            term_rect.x + term_rect.width - w
+        }
+    };
+
+    if let Some(slop) = top_obstacle {
+        let cand = Rect::new(cand_x(touch_w), top, touch_w, bot.saturating_sub(top));
+        if rects_intersect(cand, slop) && slop.y + slop.height <= visual.y {
+            top = top.max(slop.y + slop.height);
+        }
+    }
+
+    if let Some(obs) = obstacle {
+        let cand = Rect::new(cand_x(touch_w), top, touch_w, bot.saturating_sub(top));
+        if rects_intersect(cand, obs) {
+            if obs.y + obs.height <= visual.y {
+                top = top.max(obs.y + obs.height);
+            } else if obs.y >= visual.y + visual.height {
+                bot = bot.min(obs.y);
+            } else if is_left && obs.x >= visual.x + visual.width {
+                touch_w = obs.x - term_rect.x;
+            } else if !is_left && obs.x + obs.width <= visual.x {
+                let new_x = obs.x + obs.width;
+                touch_w = (term_rect.x + term_rect.width).saturating_sub(new_x);
+            }
+        }
+    }
+
+    Rect::new(
+        cand_x(touch_w),
+        top,
+        touch_w,
+        bot.saturating_sub(top).max(visual.height),
+    )
+}
+
 fn render_eink_page_turn_tabs(
     f: &mut Frame,
     term_rect: Rect,
     mod_rect: Option<Rect>,
     dpad_rect: Option<Rect>,
-    hits: &mut Vec<HitRegion>,
-) {
+    space_slop_rect: Option<Rect>,
+) -> (Option<Rect>, Option<Rect>) {
     let buf = f.buffer_mut();
-    if let Some(left_rect) = resolve_eink_page_tab_rect(term_rect, true, mod_rect) {
-        paint_eink_page_tab(buf, left_rect, true);
-        hits.push(HitRegion {
-            rect: left_rect,
-            target: HitTarget::TriggerAction(Action::PageUp),
-        });
-    }
-    if let Some(right_rect) = resolve_eink_page_tab_rect(term_rect, false, dpad_rect) {
-        paint_eink_page_tab(buf, right_rect, false);
-        hits.push(HitRegion {
-            rect: right_rect,
-            target: HitTarget::TriggerAction(Action::PageDown),
-        });
-    }
+    let left_touch = resolve_eink_page_tab_rect(term_rect, true, mod_rect).map(|vis| {
+        paint_eink_page_tab(buf, vis, true);
+        expand_eink_page_touch_rect(term_rect, vis, true, mod_rect, space_slop_rect)
+    });
+    let right_touch = resolve_eink_page_tab_rect(term_rect, false, dpad_rect).map(|vis| {
+        paint_eink_page_tab(buf, vis, false);
+        expand_eink_page_touch_rect(term_rect, vis, false, dpad_rect, None)
+    });
+    (left_touch, right_touch)
 }
 
 fn shorten_home_path(path: &str) -> String {
@@ -6009,6 +6081,8 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         let mut geom_hits = Vec::new();
         let mut mod_rect_out = None;
+        let mut page_up_out = None;
+        let mut page_down_out = None;
         terminal
             .draw(|f| {
                 let geom = render_ui_full(
@@ -6034,6 +6108,8 @@ mod tests {
                 );
                 geom_hits = geom.hits;
                 mod_rect_out = geom.mod_rect;
+                page_up_out = geom.page_up_rect;
+                page_down_out = geom.page_down_rect;
             })
             .unwrap();
 
@@ -6065,20 +6141,24 @@ mod tests {
         assert!(!bot_row.contains('░'));
         assert!(!bot_row.contains("▲Pg"));
         assert!(!bot_row.contains("▼Pg"));
-        assert!(geom_hits.iter().any(|h| h.rect == Rect::new(0, 9, 3, 5)
-            && h.target == HitTarget::TriggerAction(Action::PageUp)));
-        assert!(geom_hits.iter().any(|h| h.rect == Rect::new(97, 9, 3, 5)
-            && h.target == HitTarget::TriggerAction(Action::PageDown)));
+        assert!(!geom_hits.iter().any(|h| matches!(
+            h.target,
+            HitTarget::TriggerAction(Action::PageUp | Action::PageDown)
+        )));
+        assert_eq!(page_up_out, Some(Rect::new(0, 8, 8, 7)));
+        assert_eq!(page_down_out, Some(Rect::new(92, 8, 8, 7)));
         assert!(geom_hits
             .iter()
             .any(|h| h.target == HitTarget::ExitScrollback));
 
         // Left & right vertically-centered see-through book page-turn tabs preserve text
-        // outside the centered chevron and sanitize half-wide CJK glyphs under the chevron.
+        // outside the centered chevron and sanitize half-wide CJK glyphs under the chevron,
+        // while keeping visual width at 3 cols even with the 8-col expanded touch hit zone.
         assert_eq!(buf[(0, 9)].symbol(), "S");
         assert_eq!(buf[(0, 9)].bg, EINK_SURFACE);
         assert_eq!(buf[(1, 9)].symbol(), "e");
         assert_eq!(buf[(1, 9)].bg, EINK_SURFACE);
+        assert_eq!(buf[(3, 9)].bg, EINK_PAPER);
         assert_eq!(buf[(0, 11)].symbol(), "‹");
         assert_eq!(buf[(0, 11)].bg, EINK_SURFACE);
         assert_eq!(buf[(0, 11)].fg, EINK_INK);
@@ -6211,6 +6291,48 @@ mod tests {
                     .any(|h| h.target == HitTarget::TriggerAction(Action::PageDown)));
             }
         }
+
+        // Small narrow mobile viewport (40x24): slimmer 2-col visual bookmark with 6-col
+        // expanded touch zones leaving the central 70% of the viewport untouched.
+        let mut narrow_term = Terminal::new(TestBackend::new(40, 24)).unwrap();
+        let mut narrow_up = None;
+        let mut narrow_dn = None;
+        narrow_term
+            .draw(|f| {
+                let geom = render_ui_full(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::None,
+                    None,
+                    false,
+                    None,
+                    false,
+                    None,
+                    true,
+                );
+                narrow_up = geom.page_up_rect;
+                narrow_dn = geom.page_down_rect;
+            })
+            .unwrap();
+        let nbuf = narrow_term.backend().buffer();
+        assert_eq!(nbuf[(0, 9)].bg, EINK_SURFACE);
+        assert_eq!(nbuf[(1, 9)].bg, EINK_SURFACE);
+        assert_eq!(nbuf[(2, 9)].bg, EINK_PAPER);
+        assert_eq!(nbuf[(38, 11)].bg, EINK_SURFACE);
+        assert_eq!(nbuf[(39, 11)].symbol(), "›");
+        assert_eq!(nbuf[(37, 11)].bg, EINK_PAPER);
+        assert_eq!(narrow_up, Some(Rect::new(0, 8, 6, 8)));
+        assert_eq!(narrow_dn, Some(Rect::new(34, 8, 6, 8)));
     }
 
     #[test]
