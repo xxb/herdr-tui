@@ -1794,7 +1794,7 @@ fn render_bottom_status_bar(
     let max_x = rect.x + rect.width;
     let mut x = rect.x;
 
-    // Reserve right-side space for optional `✓ Copied`, E-Ink page-turn pills, and `▼ BOT (+N)`
+    // Reserve right-side space for optional `✓ Copied` and `▼ BOT (+N)` indicators
     let copied_lbl = if copied_flash {
         Some(if rect.width < 60 {
             " ✓ "
@@ -1815,16 +1815,7 @@ fn render_bottom_status_bar(
     };
     let copied_w = copied_lbl.map_or(0, |s| s.width() as u16);
     let scroll_w = scroll_lbl.as_ref().map_or(0, |s| s.width() as u16);
-    let pg_up_lbl = " ▲Pg ";
-    let pg_dn_lbl = " ▼Pg ";
-    let pg_up_w = pg_up_lbl.width() as u16;
-    let pg_dn_w = pg_dn_lbl.width() as u16;
-    let pg_gap_before_scroll = u16::from(scroll_lbl.is_some());
-    let pg_pair_w = pg_up_w + 1 + pg_dn_w + pg_gap_before_scroll;
-    let show_pg_btns =
-        eink_mode && rect.width >= 32 && copied_w + scroll_w + pg_pair_w <= rect.width;
-    let pg_w = if show_pg_btns { pg_pair_w } else { 0 };
-    let right_reserved = copied_w + pg_w + scroll_w;
+    let right_reserved = copied_w + scroll_w;
     let avail_end = max_x.saturating_sub(right_reserved);
 
     // Strictly render ONLY the currently focused agent's quota usage on this single row.
@@ -2011,46 +2002,6 @@ fn render_bottom_status_bar(
                 },
             );
             rx += cw;
-        }
-    }
-    if show_pg_btns {
-        let pg_style = Style::default()
-            .bg(EINK_SURFACE)
-            .fg(EINK_INK)
-            .add_modifier(Modifier::BOLD);
-        if rx + pg_up_w <= max_x {
-            buf.set_string(rx, rect.y, pg_up_lbl, pg_style);
-            hits.push(HitRegion {
-                rect: Rect {
-                    x: rx,
-                    y: rect.y,
-                    width: pg_up_w,
-                    height: rect.height,
-                },
-                target: HitTarget::TriggerAction(Action::PageUp),
-            });
-            rx += pg_up_w;
-        }
-        if rx < max_x {
-            buf.set_string(rx, rect.y, " ", base_style);
-            rx += 1;
-        }
-        if rx + pg_dn_w <= max_x {
-            buf.set_string(rx, rect.y, pg_dn_lbl, pg_style);
-            hits.push(HitRegion {
-                rect: Rect {
-                    x: rx,
-                    y: rect.y,
-                    width: pg_dn_w,
-                    height: rect.height,
-                },
-                target: HitTarget::TriggerAction(Action::PageDown),
-            });
-            rx += pg_dn_w;
-        }
-        if scroll_lbl.is_some() && rx < max_x {
-            buf.set_string(rx, rect.y, " ", base_style);
-            rx += 1;
         }
     }
     if let Some(slbl) = scroll_lbl {
@@ -3231,6 +3182,7 @@ fn resolve_eink_cell_symbol<'a>(
     screen: &vt100::Screen,
     r: u16,
     c: u16,
+    rows: u16,
     cols: u16,
     raw_sym: &'a str,
 ) -> &'a str {
@@ -3245,13 +3197,18 @@ fn resolve_eink_cell_symbol<'a>(
                 && screen
                     .cell(r, c + 1)
                     .is_some_and(|rc| is_braille_char(rc.contents()));
-            if !left_braille && !right_braille {
+            let up_braille = r > 0
+                && screen
+                    .cell(r - 1, c)
+                    .is_some_and(|uc| is_braille_char(uc.contents()));
+            let down_braille = r + 1 < rows
+                && screen
+                    .cell(r + 1, c)
+                    .is_some_and(|dc| is_braille_char(dc.contents()));
+            if !left_braille && !right_braille && !up_braille && !down_braille {
                 return "◈";
             }
-        } else if matches!(
-            ch,
-            '◐' | '◓' | '◑' | '◒' | '◴' | '◷' | '◶' | '◵' | '◜' | '◝' | '◞' | '◟'
-        ) {
+        } else if matches!(ch, '◐' | '◓' | '◑' | '◒' | '◴' | '◷' | '◶' | '◵') {
             return "◈";
         }
     }
@@ -3350,9 +3307,36 @@ fn resolve_eink_vt_colors_and_mods(cell: &vt100::Cell, selected: bool) -> (Color
     (fg_col, bg_col, mods)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EinkSnapSym {
+    Inline { bytes: [u8; 15], len: u8 },
+    Hashed(u64),
+}
+
+impl EinkSnapSym {
+    fn from_str(s: &str) -> Self {
+        let b = s.as_bytes();
+        if b.len() <= 15 {
+            let mut bytes = [0u8; 15];
+            bytes[..b.len()].copy_from_slice(b);
+            Self::Inline {
+                bytes,
+                len: b.len() as u8,
+            }
+        } else {
+            let mut h: u64 = 0xcbf29ce484222325;
+            for &byte in b {
+                h ^= u64::from(byte);
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            Self::Hashed(h)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct EinkSnapCell {
-    sym: String,
+    sym: EinkSnapSym,
     fg: Color,
     bg: Color,
     mods: Modifier,
@@ -3371,12 +3355,13 @@ fn normalized_narrow_vt_symbol<'a>(
     screen: &vt100::Screen,
     r: u16,
     c: u16,
+    rows: u16,
     cols: u16,
     raw_sym: &'a str,
     eink_mode: bool,
 ) -> &'a str {
     let effective = if eink_mode {
-        resolve_eink_cell_symbol(screen, r, c, cols, raw_sym)
+        resolve_eink_cell_symbol(screen, r, c, rows, cols, raw_sym)
     } else {
         raw_sym
     };
@@ -3422,7 +3407,7 @@ pub fn capture_eink_screen_snapshot(
             if cell.is_wide() {
                 if c + 1 >= cols {
                     cells.push(EinkSnapCell {
-                        sym: " ".to_string(),
+                        sym: EinkSnapSym::from_str(" "),
                         fg,
                         bg,
                         mods,
@@ -3431,13 +3416,13 @@ pub fn capture_eink_screen_snapshot(
                 } else {
                     let sym = if raw_sym.width() == 2 { raw_sym } else { " " };
                     cells.push(EinkSnapCell {
-                        sym: sym.to_string(),
+                        sym: EinkSnapSym::from_str(sym),
                         fg,
                         bg,
                         mods,
                     });
                     cells.push(EinkSnapCell {
-                        sym: String::new(),
+                        sym: EinkSnapSym::from_str(""),
                         fg,
                         bg,
                         mods,
@@ -3445,9 +3430,9 @@ pub fn capture_eink_screen_snapshot(
                     c += 2;
                 }
             } else {
-                let sym = normalized_narrow_vt_symbol(screen, r, c, cols, raw_sym, true);
+                let sym = normalized_narrow_vt_symbol(screen, r, c, rows, cols, raw_sym, true);
                 cells.push(EinkSnapCell {
-                    sym: sym.to_string(),
+                    sym: EinkSnapSym::from_str(sym),
                     fg,
                     bg,
                     mods,
@@ -3593,6 +3578,7 @@ impl Widget for VtScreenWidget<'_> {
                         self.screen,
                         r,
                         c,
+                        rows,
                         cols,
                         raw_sym,
                         self.eink_mode,
@@ -3669,7 +3655,7 @@ fn draw_modal_close_button(
 
 fn render_help_modal(f: &mut Frame, area: Rect, eink_mode: bool, hits: &mut Vec<HitRegion>) {
     hits.clear();
-    let popup = centered_rect(68, 32, area);
+    let popup = centered_rect(74, 32, area);
     f.render_widget(Clear, popup);
     hits.push(HitRegion {
         rect: popup,
@@ -3706,7 +3692,7 @@ fn render_help_modal(f: &mut Frame, area: Rect, eink_mode: bool, hits: &mut Vec<
     }
     let inner = block.inner(popup);
 
-    // Reflow the 14 touch quick-action buttons across available inner width so narrow mobile
+    // Reflow the 16 touch quick-action buttons across available inner width so narrow mobile
     // viewports wrap buttons onto additional rows instead of dropping right-hand columns.
     let compact_btns = inner.width < 58;
     let (eink_wide, eink_short) = if eink_mode {
@@ -3714,7 +3700,7 @@ fn render_help_modal(f: &mut Frame, area: Rect, eink_mode: bool, hits: &mut Vec<
     } else {
         ("  ◐ E-Ink: OFF  ", " ◐E:OF ")
     };
-    let quick_actions: [(&str, &str, HitTarget); 14] = [
+    let quick_actions: [(&str, &str, HitTarget); 16] = [
         (
             "  + New Tab     ",
             " +Tab ",
@@ -3744,6 +3730,16 @@ fn render_help_modal(f: &mut Frame, area: Rect, eink_mode: bool, hits: &mut Vec<
             "  ⇕ Scrollback  ",
             " ⇕Scrl ",
             HitTarget::TriggerAction(Action::EnterScrollback),
+        ),
+        (
+            "  ▲ Page Up     ",
+            " ▲PgUp ",
+            HitTarget::TriggerAction(Action::PageUp),
+        ),
+        (
+            "  ▼ Page Down   ",
+            " ▼PgDn ",
+            HitTarget::TriggerAction(Action::PageDown),
         ),
         (
             "  + New Space   ",
@@ -3836,7 +3832,7 @@ fn render_help_modal(f: &mut Frame, area: Rect, eink_mode: bool, hits: &mut Vec<
         Line::from("  Quick Fuzzy Switcher     ^b w          or  ^b f"),
         Line::from("  Jump Next Alert Agent    ^b a          (◉ blocked / ✓ done)"),
         Line::from("  Scrollback / History     ^b [          or  Tap [▼ BOT] on status bar"),
-        Line::from("  Page Up / Down           ^b PgUp / PgDn /  Tap [▲Pg] / [▼Pg] on status bar"),
+        Line::from("  Page Up / Down           ^b PgUp / PgDn /  Quick Actions [▲ Page Up / Down]"),
         Line::from("  E-Ink / Clean Redraw     ^b e (E-Ink)  /   ^b r (clean redraw)"),
         Line::from("  Detach (keep running)    ^b q / ^b d   or  Ctrl+\\ / Tap [ ⏏ ]"),
         Line::from(""),
@@ -5112,6 +5108,15 @@ mod tests {
             .any(|h| h.target == HitTarget::TriggerAction(Action::RenameSpace)));
         assert!(hits
             .iter()
+            .any(|h| h.target == HitTarget::TriggerAction(Action::EnterScrollback)));
+        assert!(hits
+            .iter()
+            .any(|h| h.target == HitTarget::TriggerAction(Action::PageUp)));
+        assert!(hits
+            .iter()
+            .any(|h| h.target == HitTarget::TriggerAction(Action::PageDown)));
+        assert!(hits
+            .iter()
             .any(|h| h.target == HitTarget::TriggerAction(Action::Detach)));
     }
 
@@ -5836,7 +5841,10 @@ mod tests {
                 "⣀⣤ Spark\r\n",
                 "\x1b[2mDimComment\x1b[0m ",
                 "\x1b[38;2;255;220;120;48;2;20;24;36mDarkBg\x1b[0m ",
-                "\x1b[7mInv\x1b[0m",
+                "\x1b[7mInv\x1b[0m\r\n",
+                "⣿ Vertical\r\n",
+                "⣤ Column\r\n",
+                "◜ CornerArc",
             )
             .as_bytes(),
         );
@@ -5901,19 +5909,18 @@ mod tests {
         assert!(bot_row.contains('█'));
         assert!(bot_row.contains('─'));
         assert!(!bot_row.contains('░'));
-        assert!(bot_row.contains("▲Pg"));
-        assert!(bot_row.contains("▼Pg"));
-        assert!(geom_hits
-            .iter()
-            .any(|h| h.target == HitTarget::TriggerAction(Action::PageUp)));
-        assert!(geom_hits
-            .iter()
-            .any(|h| h.target == HitTarget::TriggerAction(Action::PageDown)));
+        assert!(!bot_row.contains("▲Pg"));
+        assert!(!bot_row.contains("▼Pg"));
+        assert!(!geom_hits.iter().any(|h| matches!(
+            h.target,
+            HitTarget::TriggerAction(Action::PageUp | Action::PageDown)
+        )));
         assert!(geom_hits
             .iter()
             .any(|h| h.target == HitTarget::ExitScrollback));
 
-        // Verify VtScreenWidget spinner freezing, sparkline preservation, DIM removal, and RGB de-fog
+        // Verify VtScreenWidget spinner freezing, vertical/horizontal sparkline & corner-arc
+        // preservation, DIM removal, and RGB de-fog
         assert_eq!(buf[(0, 1)].symbol(), "◈");
         assert_eq!(buf[(0, 2)].symbol(), "◈");
         assert_eq!(buf[(0, 3)].symbol(), "⣀");
@@ -5926,6 +5933,9 @@ mod tests {
         assert_eq!(buf[(18, 4)].symbol(), "I");
         assert_eq!(buf[(18, 4)].bg, EINK_INK);
         assert_eq!(buf[(18, 4)].fg, EINK_PAPER);
+        assert_eq!(buf[(0, 5)].symbol(), "⣿");
+        assert_eq!(buf[(0, 6)].symbol(), "⣤");
+        assert_eq!(buf[(0, 7)].symbol(), "◜");
 
         // Verify left modifier cross corners are hollow (row 0, col 0 relative to disc keeps EINK_PAPER)
         // and active center `^B` sector is inverted (`EINK_INK` bg / `EINK_PAPER` fg).
@@ -6021,6 +6031,12 @@ mod tests {
                 assert!(modal_hits
                     .iter()
                     .any(|h| h.target == HitTarget::TriggerAction(Action::RedrawScreen)));
+                assert!(modal_hits
+                    .iter()
+                    .any(|h| h.target == HitTarget::TriggerAction(Action::PageUp)));
+                assert!(modal_hits
+                    .iter()
+                    .any(|h| h.target == HitTarget::TriggerAction(Action::PageDown)));
             }
         }
     }

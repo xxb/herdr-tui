@@ -187,7 +187,7 @@ struct Cli {
     #[arg(long, conflicts_with = "eink")]
     no_eink: bool,
 
-    /// Passive PTY output coalescing interval in milliseconds when --eink is enabled (default: 250)
+    /// Passive PTY output coalescing interval in milliseconds when --eink is enabled (default: 250, max: 2000)
     #[arg(long)]
     eink_interval_ms: Option<u64>,
 }
