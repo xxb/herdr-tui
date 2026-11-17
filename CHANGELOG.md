@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.0](https://github.com/xxb/herdr-tui/compare/v0.4.0...v0.5.0) (2026-11-17)
+
+
+### Features
+
+* **eink:** add 3-tier process/body/bold LUT and OSC 777 Book Reader export ([#62](https://github.com/xxb/herdr-tui/issues/62)) ([8739296](https://github.com/xxb/herdr-tui/commit/873929666e8168c3f02002f5b549a970d5e62ff5))
+* **eink:** add 300 PPI monochrome mode, agent frame pacing, and page controls ([#60](https://github.com/xxb/herdr-tui/issues/60)) ([5c6bcec](https://github.com/xxb/herdr-tui/commit/5c6bcecfb276fbc6b78077e9e4de72ea691c64b1))
+
 ## [0.4.0](https://github.com/xxb/herdr-tui/compare/v0.3.3...v0.4.0) (2026-11-17)
 
 
