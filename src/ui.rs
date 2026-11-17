@@ -1794,7 +1794,7 @@ fn render_bottom_status_bar(
     let max_x = rect.x + rect.width;
     let mut x = rect.x;
 
-    // Reserve right-side space for optional `✓ Copied` and `▼ BOT (+N)` indicators
+    // Reserve right-side space for optional `✓ Copied`, E-Ink `[ ▲Pg ]` / `[ ▼Pg ]` pills, and `▼ BOT (+N)`
     let copied_lbl = if copied_flash {
         Some(if rect.width < 60 {
             " ✓ "
@@ -1815,7 +1815,17 @@ fn render_bottom_status_bar(
     };
     let copied_w = copied_lbl.map_or(0, |s| s.width() as u16);
     let scroll_w = scroll_lbl.as_ref().map_or(0, |s| s.width() as u16);
-    let right_reserved = copied_w + scroll_w;
+    let pg_up_lbl = " ▲Pg ";
+    let pg_dn_lbl = " ▼Pg ";
+    let pg_up_w = pg_up_lbl.width() as u16;
+    let pg_dn_w = pg_dn_lbl.width() as u16;
+    let pg_gap_before = u16::from(copied_lbl.is_some());
+    let pg_gap_after = u16::from(scroll_lbl.is_some());
+    let pg_pair_w = pg_gap_before + pg_up_w + 1 + pg_dn_w + pg_gap_after;
+    let show_pg_btns =
+        eink_mode && rect.width >= 32 && copied_w + scroll_w + pg_pair_w <= rect.width;
+    let pg_w = if show_pg_btns { pg_pair_w } else { 0 };
+    let right_reserved = copied_w + pg_w + scroll_w;
     let avail_end = max_x.saturating_sub(right_reserved);
 
     // Strictly render ONLY the currently focused agent's quota usage on this single row.
@@ -2002,6 +2012,50 @@ fn render_bottom_status_bar(
                 },
             );
             rx += cw;
+        }
+    }
+    if show_pg_btns {
+        if copied_lbl.is_some() && rx < max_x {
+            buf.set_string(rx, rect.y, " ", base_style);
+            rx += 1;
+        }
+        let pg_style = Style::default()
+            .bg(EINK_SURFACE)
+            .fg(EINK_INK)
+            .add_modifier(Modifier::BOLD);
+        if rx + pg_up_w <= max_x {
+            buf.set_string(rx, rect.y, pg_up_lbl, pg_style);
+            hits.push(HitRegion {
+                rect: Rect {
+                    x: rx,
+                    y: rect.y,
+                    width: pg_up_w,
+                    height: rect.height,
+                },
+                target: HitTarget::TriggerAction(Action::PageUp),
+            });
+            rx += pg_up_w;
+        }
+        if rx < max_x {
+            buf.set_string(rx, rect.y, " ", base_style);
+            rx += 1;
+        }
+        if rx + pg_dn_w <= max_x {
+            buf.set_string(rx, rect.y, pg_dn_lbl, pg_style);
+            hits.push(HitRegion {
+                rect: Rect {
+                    x: rx,
+                    y: rect.y,
+                    width: pg_dn_w,
+                    height: rect.height,
+                },
+                target: HitTarget::TriggerAction(Action::PageDown),
+            });
+            rx += pg_dn_w;
+        }
+        if scroll_lbl.is_some() && rx < max_x {
+            buf.set_string(rx, rect.y, " ", base_style);
+            rx += 1;
         }
     }
     if let Some(slbl) = scroll_lbl {
@@ -3832,7 +3886,7 @@ fn render_help_modal(f: &mut Frame, area: Rect, eink_mode: bool, hits: &mut Vec<
         Line::from("  Quick Fuzzy Switcher     ^b w          or  ^b f"),
         Line::from("  Jump Next Alert Agent    ^b a          (◉ blocked / ✓ done)"),
         Line::from("  Scrollback / History     ^b [          or  Tap [▼ BOT] on status bar"),
-        Line::from("  Page Up / Down           ^b PgUp / PgDn /  Quick Actions [▲ Page Up / Down]"),
+        Line::from("  Page Up / Down           ^b PgUp / PgDn /  Tap [▲Pg] / [▼Pg] (--eink / ?)"),
         Line::from("  E-Ink / Clean Redraw     ^b e (E-Ink)  /   ^b r (clean redraw)"),
         Line::from("  Detach (keep running)    ^b q / ^b d   or  Ctrl+\\ / Tap [ ⏏ ]"),
         Line::from(""),
@@ -5909,12 +5963,14 @@ mod tests {
         assert!(bot_row.contains('█'));
         assert!(bot_row.contains('─'));
         assert!(!bot_row.contains('░'));
-        assert!(!bot_row.contains("▲Pg"));
-        assert!(!bot_row.contains("▼Pg"));
-        assert!(!geom_hits.iter().any(|h| matches!(
-            h.target,
-            HitTarget::TriggerAction(Action::PageUp | Action::PageDown)
-        )));
+        assert!(bot_row.contains("▲Pg"));
+        assert!(bot_row.contains("▼Pg"));
+        assert!(geom_hits
+            .iter()
+            .any(|h| h.target == HitTarget::TriggerAction(Action::PageUp)));
+        assert!(geom_hits
+            .iter()
+            .any(|h| h.target == HitTarget::TriggerAction(Action::PageDown)));
         assert!(geom_hits
             .iter()
             .any(|h| h.target == HitTarget::ExitScrollback));
