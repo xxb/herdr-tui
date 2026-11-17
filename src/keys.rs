@@ -22,6 +22,10 @@ pub enum Action {
     CyclePaneInTab,
     EnterScrollback,
     ToggleHelp,
+    ToggleEink,
+    RedrawScreen,
+    PageUp,
+    PageDown,
     Detach,
     SendPrefix,
 }
@@ -55,6 +59,8 @@ pub struct UiFileConfig {
     pub mobile_width_threshold: Option<u16>,
     pub touch_mode: Option<bool>,
     pub allow_nested: Option<bool>,
+    pub eink: Option<bool>,
+    pub eink_interval_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Default)]
@@ -167,6 +173,10 @@ pub fn match_prefix_action(ev: &KeyEvent, prefix_spec: &str) -> Option<Action> {
         KeyCode::Char('o') => Some(Action::CyclePaneInTab),
         KeyCode::Char('[') => Some(Action::EnterScrollback),
         KeyCode::Char('?') => Some(Action::ToggleHelp),
+        KeyCode::Char('e') => Some(Action::ToggleEink),
+        KeyCode::Char('r') => Some(Action::RedrawScreen),
+        KeyCode::PageUp => Some(Action::PageUp),
+        KeyCode::PageDown => Some(Action::PageDown),
         KeyCode::Char('q' | 'd') => Some(Action::Detach),
         _ => None,
     }
@@ -325,8 +335,45 @@ mod tests {
     fn file_config_parses_allow_nested_flag() {
         let default_cfg: FileConfig = toml::from_str("").unwrap();
         assert_eq!(default_cfg.ui.allow_nested, None);
+        assert_eq!(default_cfg.ui.eink, None);
+        assert_eq!(default_cfg.ui.eink_interval_ms, None);
 
         let nested_cfg: FileConfig = toml::from_str("[ui]\nallow_nested = true\n").unwrap();
         assert_eq!(nested_cfg.ui.allow_nested, Some(true));
+
+        let eink_cfg: FileConfig =
+            toml::from_str("[ui]\neink = true\neink_interval_ms = 300\n").unwrap();
+        assert_eq!(eink_cfg.ui.eink, Some(true));
+        assert_eq!(eink_cfg.ui.eink_interval_ms, Some(300));
+    }
+
+    #[test]
+    fn eink_and_page_prefix_shortcuts_match_without_breaking_rename_space() {
+        let e_key = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE);
+        assert_eq!(
+            match_prefix_action(&e_key, "ctrl+b"),
+            Some(Action::ToggleEink)
+        );
+
+        let r_lower = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE);
+        assert_eq!(
+            match_prefix_action(&r_lower, "ctrl+b"),
+            Some(Action::RedrawScreen)
+        );
+
+        let r_upper = KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT);
+        assert_eq!(
+            match_prefix_action(&r_upper, "ctrl+b"),
+            Some(Action::RenameSpace)
+        );
+
+        let pg_up = KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE);
+        assert_eq!(match_prefix_action(&pg_up, "ctrl+b"), Some(Action::PageUp));
+
+        let pg_dn = KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE);
+        assert_eq!(
+            match_prefix_action(&pg_dn, "ctrl+b"),
+            Some(Action::PageDown)
+        );
     }
 }

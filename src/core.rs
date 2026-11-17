@@ -10,7 +10,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug)]
 pub enum CoreMessage {
@@ -30,12 +30,20 @@ pub enum CoreMessage {
 
 type PendingRpcMap = HashMap<u64, (String, Sender<Value>)>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LastPtyInput {
+    pub seq: u64,
+    pub channel: u32,
+    pub at: Instant,
+}
+
 pub struct CoreClient {
     _child: Child,
     writer: Arc<Mutex<BufWriter<ChildStdin>>>,
     next_id: AtomicU64,
     pending: Arc<Mutex<PendingRpcMap>>,
     events_channel: Arc<Mutex<Option<u32>>>,
+    last_pty_input: Mutex<Option<LastPtyInput>>,
 }
 
 fn find_core_binary() -> PathBuf {
@@ -206,6 +214,7 @@ impl CoreClient {
             next_id: AtomicU64::new(1),
             pending,
             events_channel,
+            last_pty_input: Mutex::new(None),
         })
     }
 
@@ -357,7 +366,29 @@ impl CoreClient {
 
     /// Send input bytes to an attached terminal channel.
     pub fn send_input(&self, channel: u32, bytes: &[u8]) {
-        let _ = self.send_frame(channel, wire::DATA, bytes);
+        if bytes.is_empty() {
+            return;
+        }
+        if self.send_frame(channel, wire::DATA, bytes).is_ok() {
+            let mut guard = self
+                .last_pty_input
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let next_seq = guard.map_or(1, |prev| prev.seq.wrapping_add(1));
+            *guard = Some(LastPtyInput {
+                seq: next_seq,
+                channel,
+                at: Instant::now(),
+            });
+        }
+    }
+
+    /// Snapshot of the most recent user-forwarded PTY input chunk.
+    pub fn last_pty_input(&self) -> Option<LastPtyInput> {
+        *self
+            .last_pty_input
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Resize an attached terminal channel.
@@ -384,6 +415,7 @@ impl CoreClient {
             next_id: AtomicU64::new(1),
             pending: Arc::new(Mutex::new(HashMap::new())),
             events_channel: Arc::new(Mutex::new(None)),
+            last_pty_input: Mutex::new(None),
         })
     }
 }
