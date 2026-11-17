@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/xxb/herdr-tui/compare/v0.5.0...v0.6.0) (2026-11-17)
+
+
+### Features
+
+* **eink:** add Kaleido color E-Ink accent overprint mode (--eink-color) ([#65](https://github.com/xxb/herdr-tui/issues/65)) ([9db83fe](https://github.com/xxb/herdr-tui/commit/9db83fec17bbb35c811f3a190e3deed1084186a6))
+
 ## [0.5.0](https://github.com/xxb/herdr-tui/compare/v0.4.0...v0.5.0) (2026-11-17)
 
 
