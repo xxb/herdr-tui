@@ -3842,7 +3842,10 @@ pub fn extract_clean_reader_json(screen: &mut vt100::Screen, title: &str) -> Str
             }
         }
         let slice = &cleaned[start_idx..];
-        let mut anchor = slice.iter().position(|l| l.in_live).unwrap_or(0);
+        let mut anchor = slice
+            .iter()
+            .position(|l| l.in_live)
+            .unwrap_or_else(|| slice.len().saturating_sub(1));
         let mut lines_out = Vec::with_capacity(slice.len() + usize::from(inside_dropped_fence));
         if inside_dropped_fence {
             lines_out.push(CleanReaderLine {
@@ -6996,5 +6999,17 @@ mod tests {
         assert!(style_line
             .iter()
             .any(|r| r[0].as_str().unwrap().contains("blue_bold") && r[1] == 1));
+
+        // When live screen is blank after scrollback, anchor points to the tail of scrollback rather than line 0.
+        let mut blank_live = vt100::Parser::new(nz(3), nz(40), 20);
+        blank_live.process("older turn 1\r\nolder turn 2\r\n\r\n\r\n\r\n".as_bytes());
+        let blank_json: serde_json::Value = serde_json::from_str(&extract_clean_reader_json(
+            blank_live.screen_mut(),
+            "blank-live",
+        ))
+        .unwrap();
+        let blank_lines = blank_json["lines"].as_array().unwrap();
+        assert_eq!(blank_lines.len(), 2);
+        assert_eq!(blank_json["anchor"], 1);
     }
 }
