@@ -3490,6 +3490,9 @@ fn is_eink_muted_cell(cell: &vt100::Cell) -> bool {
     if cell.dim() {
         return true;
     }
+    if cell.bold() {
+        return false;
+    }
     match cell.fgcolor() {
         vt100::Color::Default => false,
         c => match vt_color_rgb(c) {
@@ -3744,10 +3747,12 @@ pub fn extract_clean_reader_json(screen: &mut vt100::Screen, title: &str) -> Str
             };
             prev_was_wide = cell.is_wide();
             if cell.has_contents() {
-                let style = if is_eink_muted_cell(cell) {
+                let style = if cell.dim() {
                     2
                 } else if cell.bold() {
                     1
+                } else if is_eink_muted_cell(cell) {
+                    2
                 } else {
                     0
                 };
@@ -6814,10 +6819,11 @@ mod tests {
     fn eink_vt_screen_enforces_three_tier_hierarchy_for_process_body_and_bold() {
         let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
         let mut parser = vt100::Parser::new(nz(4), nz(50), 0);
-        // Line 0: Bold + dim process (stays muted #666666 without BOLD), plain body, and pure bold heading.
+        // Line 0: Bold + dim process (stays muted #666666 without BOLD), plain body, pure bold heading,
+        //         bold mid-gray #94a3b8 heading (promoted to EINK_INK + BOLD), and non-bold #94a3b8 (muted).
         // Line 1: Dim inside mid-light pill bg (~#d4d4d4 -> EINK_PILL_BG) promotes to EINK_INK for contrast.
         parser.process(
-            b"\x1b[1;2mstep\x1b[0m body \x1b[1mTitle\x1b[0m\r\n\x1b[2;48;2;210;210;210mpill\x1b[0m",
+            b"\x1b[1;2mstep\x1b[0m body \x1b[1mTitle\x1b[0m \x1b[1;38;2;148;163;184mSlateH\x1b[0m \x1b[38;2;148;163;184mslate\x1b[0m\r\n\x1b[2;48;2;210;210;210mpill\x1b[0m",
         );
 
         let backend = TestBackend::new(50, 4);
@@ -6850,6 +6856,16 @@ mod tests {
         assert_eq!(buf[(10, 0)].symbol(), "T");
         assert_eq!(buf[(10, 0)].fg, EINK_INK);
         assert!(buf[(10, 0)].modifier.contains(Modifier::BOLD));
+
+        // Bold mid-gray (#94a3b8 without DIM) keeps EINK_INK + BOLD heading hierarchy
+        assert_eq!(buf[(16, 0)].symbol(), "S");
+        assert_eq!(buf[(16, 0)].fg, EINK_INK);
+        assert!(buf[(16, 0)].modifier.contains(Modifier::BOLD));
+
+        // Non-bold mid-gray (#94a3b8) stays muted #666666 without BOLD
+        assert_eq!(buf[(23, 0)].symbol(), "s");
+        assert_eq!(buf[(23, 0)].fg, EINK_INK_MUTED);
+        assert!(!buf[(23, 0)].modifier.contains(Modifier::BOLD));
 
         // Muted on EINK_PILL_BG promotes to EINK_INK
         assert_eq!(buf[(0, 1)].symbol(), "p");
@@ -6964,14 +6980,14 @@ mod tests {
         );
         assert!(joined_lines.iter().any(|s| s == "# Final After Long Code"));
 
-        // Verify indented colored box border + titled box rule + slate vs bright white/blue styles on small screen
-        let mut small = vt100::Parser::new(nz(6), nz(60), 20);
+        // Verify indented colored box border + titled box rule + slate vs bright white/blue/bold-slate styles on small screen
+        let mut small = vt100::Parser::new(nz(6), nz(80), 20);
         small.process("╭─── Summary ───╮\r\n".as_bytes());
         small.process(
             "\x1b[2C\x1b[90m│\x1b[0m \x1b[1m# 结论\x1b[0m \x1b[90m│\x1b[0m\r\n".as_bytes(),
         );
         small.process(
-            "\x1b[38;2;148;163;184mslate_step\x1b[0m \x1b[38;2;255;255;255mwhite_body\x1b[0m \x1b[1;38;2;88;166;255mblue_bold\x1b[0m"
+            "\x1b[38;2;148;163;184mslate_step\x1b[0m \x1b[38;2;255;255;255mwhite_body\x1b[0m \x1b[1;38;2;88;166;255mblue_bold\x1b[0m \x1b[1;38;2;148;163;184mbold_slate\x1b[0m \x1b[1;2;38;2;148;163;184mdim_slate\x1b[0m"
                 .as_bytes(),
         );
         let small_json: serde_json::Value =
@@ -6999,6 +7015,12 @@ mod tests {
         assert!(style_line
             .iter()
             .any(|r| r[0].as_str().unwrap().contains("blue_bold") && r[1] == 1));
+        assert!(style_line
+            .iter()
+            .any(|r| r[0].as_str().unwrap().contains("bold_slate") && r[1] == 1));
+        assert!(style_line
+            .iter()
+            .any(|r| r[0].as_str().unwrap().contains("dim_slate") && r[1] == 2));
 
         // When live screen is blank after scrollback, anchor points to the tail of scrollback rather than line 0.
         let mut blank_live = vt100::Parser::new(nz(3), nz(40), 20);
@@ -7011,5 +7033,69 @@ mod tests {
         let blank_lines = blank_json["lines"].as_array().unwrap();
         assert_eq!(blank_lines.len(), 2);
         assert_eq!(blank_json["anchor"], 1);
+    }
+
+    #[test]
+    fn bold_slate_gray_heading_stays_bold_and_ink_in_live_eink_and_reader_export() {
+        let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
+        let mut parser = vt100::Parser::new(nz(5), nz(64), 20);
+        // 1. Non-DIM bold slate gray (#94a3b8: chroma 36 <= 42, luma 160 in 70..=180)
+        // 2. Non-bold slate gray (#94a3b8) -> muted
+        // 3. DIM + bold slate gray (#94a3b8) -> muted (DIM wins)
+        // 4. Non-DIM bold xterm gray 244 -> bold
+        parser.process(
+            b"\x1b[1;38;2;148;163;184m# SlateHeading\x1b[0m\r\n\
+              \x1b[38;2;148;163;184mslate_muted\x1b[0m\r\n\
+              \x1b[1;2;38;2;148;163;184mdim_bold_slate\x1b[0m\r\n\
+              \x1b[1;38;5;244m# Gray244Bold\x1b[0m",
+        );
+
+        let backend = TestBackend::new(64, 5);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            f.render_widget(
+                VtScreenWidget {
+                    screen: parser.screen(),
+                    selection: None,
+                    eink_mode: true,
+                },
+                f.area(),
+            );
+        })
+        .unwrap();
+
+        let buf = term.backend().buffer();
+        // Bold #94a3b8 -> EINK_INK + Modifier::BOLD
+        assert_eq!(buf[(0, 0)].symbol(), "#");
+        assert_eq!(buf[(0, 0)].fg, EINK_INK);
+        assert!(buf[(0, 0)].modifier.contains(Modifier::BOLD));
+
+        // Non-bold #94a3b8 -> EINK_INK_MUTED without BOLD
+        assert_eq!(buf[(0, 1)].symbol(), "s");
+        assert_eq!(buf[(0, 1)].fg, EINK_INK_MUTED);
+        assert!(!buf[(0, 1)].modifier.contains(Modifier::BOLD));
+
+        // DIM + bold #94a3b8 -> EINK_INK_MUTED without BOLD
+        assert_eq!(buf[(0, 2)].symbol(), "d");
+        assert_eq!(buf[(0, 2)].fg, EINK_INK_MUTED);
+        assert!(!buf[(0, 2)].modifier.contains(Modifier::BOLD));
+
+        // Non-DIM bold xterm 244 -> EINK_INK + Modifier::BOLD
+        assert_eq!(buf[(0, 3)].symbol(), "#");
+        assert_eq!(buf[(0, 3)].fg, EINK_INK);
+        assert!(buf[(0, 3)].modifier.contains(Modifier::BOLD));
+
+        // Clean Reader JSON export matches exact same 3-tier classification
+        let parsed: serde_json::Value =
+            serde_json::from_str(&extract_clean_reader_json(parser.screen_mut(), "slate")).unwrap();
+        let lines = parsed["lines"].as_array().unwrap();
+        assert_eq!(lines[0]["r"][0][0], "# SlateHeading");
+        assert_eq!(lines[0]["r"][0][1], 1);
+        assert_eq!(lines[1]["r"][0][0], "slate_muted");
+        assert_eq!(lines[1]["r"][0][1], 2);
+        assert_eq!(lines[2]["r"][0][0], "dim_bold_slate");
+        assert_eq!(lines[2]["r"][0][1], 2);
+        assert_eq!(lines[3]["r"][0][0], "# Gray244Bold");
+        assert_eq!(lines[3]["r"][0][1], 1);
     }
 }

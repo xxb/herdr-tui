@@ -1358,17 +1358,54 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
+fn chunk_str_max_bytes(s: &str, max_bytes: usize) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < s.len() {
+        let mut end = (start + max_bytes).min(s.len());
+        while end > start && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            end = s[start..]
+                .char_indices()
+                .nth(1)
+                .map_or(s.len(), |(idx, _)| start + idx);
+        }
+        chunks.push(&s[start..end]);
+        start = end;
+    }
+    chunks
+}
+
 fn format_single_osc_sequence(osc_body: &str, in_tmux: bool, in_screen: bool) -> String {
+    const DCS_CHUNK_BYTES: usize = 76;
     let osc = format!("\x1b]{osc_body}\x07");
     if in_tmux {
-        format!("\x1bPtmux;\x1b{osc}\x1b\\{osc}")
+        // Chunk tmux DCS passthrough into <=76-byte (pre-escape) frames and escape every ESC
+        // inside each chunk so large OSC 777 payloads never overflow tmux passthrough buffers.
+        let chunks = chunk_str_max_bytes(&osc, DCS_CHUNK_BYTES);
+        let mut out = String::with_capacity(osc.len() + chunks.len() * 12);
+        for chunk in chunks {
+            out.push_str("\x1bPtmux;");
+            for ch in chunk.chars() {
+                if ch == '\x1b' {
+                    out.push_str("\x1b\x1b");
+                } else {
+                    out.push(ch);
+                }
+            }
+            out.push_str("\x1b\\");
+        }
+        out
     } else if in_screen {
         // GNU screen caps individual DCS passthrough blocks (historically 256 bytes);
         // chunking into <=76-byte DCS frames forwards arbitrarily long OSC payloads intact.
-        let mut out = String::with_capacity(osc.len() + (osc.len() / 76 + 1) * 4);
-        for chunk in osc.as_bytes().chunks(76) {
+        let chunks = chunk_str_max_bytes(&osc, DCS_CHUNK_BYTES);
+        let mut out = String::with_capacity(osc.len() + chunks.len() * 4);
+        for chunk in chunks {
             out.push_str("\x1bP");
-            out.push_str(std::str::from_utf8(chunk).unwrap_or(""));
+            out.push_str(chunk);
             out.push_str("\x1b\\");
         }
         out
@@ -1378,8 +1415,16 @@ fn format_single_osc_sequence(osc_body: &str, in_tmux: bool, in_screen: bool) ->
 }
 
 fn format_osc52_sequence(b64: &str, in_tmux: bool, in_screen: bool) -> String {
-    if in_tmux || in_screen {
-        format_single_osc_sequence(&format!("52;c;{b64}"), in_tmux, in_screen)
+    if in_tmux {
+        let osc = format!("\x1b]52;c;{b64}\x07");
+        let dcs = format_single_osc_sequence(&format!("52;c;{b64}"), true, in_screen);
+        if osc.len() <= 76 {
+            format!("{dcs}{osc}")
+        } else {
+            dcs
+        }
+    } else if in_screen {
+        format_single_osc_sequence(&format!("52;c;{b64}"), false, true)
     } else {
         format!("\x1b]52;c;{b64}\x07\x1b]52;;{b64}\x07")
     }
@@ -1398,12 +1443,6 @@ fn format_shelldeck_reader_open_osc_with_env(
     )
 }
 
-fn format_shelldeck_reader_open_osc(json_payload: &str) -> String {
-    let in_tmux = std::env::var_os("TMUX").is_some_and(|v| !v.is_empty());
-    let in_screen = std::env::var_os("STY").is_some_and(|v| !v.is_empty());
-    format_shelldeck_reader_open_osc_with_env(json_payload, in_tmux, in_screen)
-}
-
 fn format_shelldeck_eink_refresh_osc_with_env(in_tmux: bool, in_screen: bool) -> String {
     format_single_osc_sequence(EINK_REFRESH_OSC_BODY, in_tmux, in_screen)
 }
@@ -1414,12 +1453,13 @@ fn format_shelldeck_eink_refresh_osc() -> String {
     format_shelldeck_eink_refresh_osc_with_env(in_tmux, in_screen)
 }
 
-fn emit_shelldeck_reader_osc(
-    terminal: &mut Terminal<CrosstermBackend<BufWriter<io::Stdout>>>,
+fn emit_shelldeck_reader_osc_with_env<W: Write>(
+    out: &mut W,
     world: &World,
     active_addr: Option<&String>,
     attached_map: &mut BTreeMap<String, AttachedTerminal>,
-    flush_after: bool,
+    in_tmux: bool,
+    in_screen: bool,
 ) -> Result<()> {
     if let Some(addr) = active_addr {
         if let Some(att) = attached_map.get_mut(addr) {
@@ -1428,12 +1468,56 @@ fn emit_shelldeck_reader_osc(
                 .map(|s| world.tab_display_name(s, world.active_tab_index()))
                 .unwrap_or_else(|| addr.clone());
             let json = crate::ui::extract_clean_reader_json(att.parser.screen_mut(), &tab_title);
-            let seq = format_shelldeck_reader_open_osc(&json);
-            terminal.backend_mut().write_all(seq.as_bytes())?;
-            if flush_after {
-                terminal.backend_mut().flush()?;
-            }
+            let seq = format_shelldeck_reader_open_osc_with_env(&json, in_tmux, in_screen);
+            out.write_all(seq.as_bytes())?;
+            out.flush()?;
         }
+    }
+    Ok(())
+}
+
+fn flush_pending_reader_osc_with_env<W: Write>(
+    out: &mut W,
+    pending_reader_osc: &mut bool,
+    world: &World,
+    active_addr: Option<&String>,
+    attached_map: &mut BTreeMap<String, AttachedTerminal>,
+    in_tmux: bool,
+    in_screen: bool,
+) -> Result<()> {
+    if *pending_reader_osc {
+        emit_shelldeck_reader_osc_with_env(
+            out,
+            world,
+            active_addr,
+            attached_map,
+            in_tmux,
+            in_screen,
+        )?;
+        *pending_reader_osc = false;
+    }
+    Ok(())
+}
+
+fn flush_pending_reader_osc<W: Write>(
+    out: &mut W,
+    pending_reader_osc: &mut bool,
+    world: &World,
+    active_addr: Option<&String>,
+    attached_map: &mut BTreeMap<String, AttachedTerminal>,
+) -> Result<()> {
+    if *pending_reader_osc {
+        let in_tmux = std::env::var_os("TMUX").is_some_and(|v| !v.is_empty());
+        let in_screen = std::env::var_os("STY").is_some_and(|v| !v.is_empty());
+        flush_pending_reader_osc_with_env(
+            out,
+            pending_reader_osc,
+            world,
+            active_addr,
+            attached_map,
+            in_tmux,
+            in_screen,
+        )?;
     }
     Ok(())
 }
@@ -4361,16 +4445,6 @@ fn run_app_loop(
                 }
                 pending_eink_osc = false;
             }
-            if pending_reader_osc {
-                emit_shelldeck_reader_osc(
-                    terminal,
-                    world,
-                    active_addr.as_ref(),
-                    attached_map,
-                    false,
-                )?;
-                pending_reader_osc = false;
-            }
             execute!(terminal.backend_mut(), EndSynchronizedUpdate)?;
             dirty = false;
             pty_dirty = false;
@@ -4399,10 +4473,13 @@ fn run_app_loop(
                 need_sync_terminals = true;
             }
         }
-        if pending_reader_osc {
-            emit_shelldeck_reader_osc(terminal, world, active_addr.as_ref(), attached_map, true)?;
-            pending_reader_osc = false;
-        }
+        flush_pending_reader_osc(
+            terminal.backend_mut(),
+            &mut pending_reader_osc,
+            world,
+            active_addr.as_ref(),
+            attached_map,
+        )?;
     }
 }
 
@@ -7899,11 +7976,142 @@ mod tests {
         );
         assert_eq!(
             format_shelldeck_eink_refresh_osc_with_env(true, false),
-            "\x1bPtmux;\x1b\x1b]777;shelldeck;eink-refresh\x07\x1b\\\x1b]777;shelldeck;eink-refresh\x07"
+            "\x1bPtmux;\x1b\x1b]777;shelldeck;eink-refresh\x07\x1b\\"
         );
         assert_eq!(
             format_shelldeck_eink_refresh_osc_with_env(false, true),
             "\x1bP\x1b]777;shelldeck;eink-refresh\x07\x1b\\"
+        );
+    }
+
+    #[test]
+    fn large_reader_open_osc_chunks_tmux_and_screen_dcs_cleanly_without_duplication() {
+        let large_text = "x".repeat(47_500);
+        let large_json =
+            format!(r#"{{"v":1,"title":"big","anchor":0,"lines":[{{"r":[["{large_text}",0]]}}]}}"#);
+        assert!(large_json.len() > 47_500);
+        let expected_b64 = base64_encode(large_json.as_bytes());
+        assert!(expected_b64.len() > 63_000);
+        let expected_osc = format!("\x1b]777;shelldeck;reader-open;{expected_b64}\x07");
+
+        // 1. tmux: chunked into <=77-byte DCS frames with doubled ESC and no trailing raw OSC
+        let tmux_seq = format_shelldeck_reader_open_osc_with_env(&large_json, true, false);
+        assert!(tmux_seq.starts_with("\x1bPtmux;\x1b\x1b]777;shelldeck;reader-open;"));
+        assert!(tmux_seq.ends_with("\x1b\\"));
+        let mut tmux_frames = 0usize;
+        let mut tmux_unwrapped = String::with_capacity(expected_osc.len());
+        let mut rest = tmux_seq.as_str();
+        while !rest.is_empty() {
+            let body_plus = rest
+                .strip_prefix("\x1bPtmux;")
+                .expect("every segment in tmux passthrough must start with ESC P tmux;");
+            let end_idx = body_plus
+                .find("\x1b\\")
+                .expect("every tmux DCS chunk must end with ST");
+            let frame_inner = &body_plus[..end_idx];
+            assert!(
+                frame_inner.len() <= 78,
+                "tmux DCS chunk unexpectedly large: {}",
+                frame_inner.len()
+            );
+            tmux_unwrapped.push_str(&frame_inner.replace("\x1b\x1b", "\x1b"));
+            tmux_frames += 1;
+            rest = &body_plus[end_idx + 2..];
+        }
+        assert!(tmux_frames > 800, "expected >800 chunks, got {tmux_frames}");
+        assert_eq!(tmux_unwrapped, expected_osc);
+
+        // 2. screen: chunked into <=76-byte DCS frames and reconstructs exact OSC
+        let screen_seq = format_shelldeck_reader_open_osc_with_env(&large_json, false, true);
+        assert!(screen_seq.starts_with("\x1bP\x1b]777;shelldeck;reader-open;"));
+        assert!(screen_seq.ends_with("\x1b\\"));
+        let mut screen_frames = 0usize;
+        let mut screen_unwrapped = String::with_capacity(expected_osc.len());
+        let mut rest_scr = screen_seq.as_str();
+        while !rest_scr.is_empty() {
+            let body_plus = rest_scr
+                .strip_prefix("\x1bP")
+                .expect("every segment in screen passthrough must start with ESC P");
+            let end_idx = body_plus
+                .find("\x1b\\")
+                .expect("every screen DCS chunk must end with ST");
+            let frame_inner = &body_plus[..end_idx];
+            assert!(frame_inner.len() <= 76);
+            screen_unwrapped.push_str(frame_inner);
+            screen_frames += 1;
+            rest_scr = &body_plus[end_idx + 2..];
+        }
+        assert!(
+            screen_frames > 800,
+            "expected >800 chunks, got {screen_frames}"
+        );
+        assert_eq!(screen_unwrapped, expected_osc);
+
+        // Inner ESC anywhere inside an OSC body is also doubled per tmux DCS chunk.
+        let inner_esc_tmux = format_single_osc_sequence("777;a\x1bb", true, false);
+        assert_eq!(
+            inner_esc_tmux,
+            "\x1bPtmux;\x1b\x1b]777;a\x1b\x1bb\x07\x1b\\"
+        );
+    }
+
+    #[test]
+    fn emit_shelldeck_reader_osc_runs_after_end_synchronized_update() {
+        use crate::model::{SharedSpace, SharedTab, TerminalInfo};
+
+        let mut world = World::default();
+        world.terminals.insert(
+            "t1".to_string(),
+            TerminalInfo {
+                address: "t1".to_string(),
+                title: "demo".to_string(),
+                ..Default::default()
+            },
+        );
+        world.doc.spaces.push(SharedSpace {
+            id: "s1".to_string(),
+            name: "main".to_string(),
+            folder: String::new(),
+            tabs: vec![SharedTab {
+                id: "tab1".to_string(),
+                name: "agy".to_string(),
+                root: serde_json::json!({ "type": "block", "content": { "terminal": "t1" } }),
+                rest: Default::default(),
+            }],
+            rest: Default::default(),
+        });
+        let mut attached_map = BTreeMap::new();
+        let mut att = AttachedTerminal::new(1, 40, 4);
+        att.process_vt_bytes(b"Reader output line");
+        attached_map.insert("t1".to_string(), att);
+
+        let mut buf: Vec<u8> = Vec::new();
+        queue!(buf, BeginSynchronizedUpdate).unwrap();
+        execute!(buf, EndSynchronizedUpdate).unwrap();
+        let active_addr = "t1".to_string();
+        let mut pending_reader_osc = true;
+        flush_pending_reader_osc_with_env(
+            &mut buf,
+            &mut pending_reader_osc,
+            &world,
+            Some(&active_addr),
+            &mut attached_map,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(!pending_reader_osc);
+
+        let emitted = String::from_utf8(buf).unwrap();
+        let end_sync_pos = emitted
+            .find("\x1b[?2026l")
+            .expect("EndSynchronizedUpdate must be emitted");
+        let reader_pos = emitted
+            .find("\x1b]777;shelldeck;reader-open;")
+            .expect("reader-open OSC must be emitted");
+        assert!(
+            reader_pos > end_sync_pos,
+            "reader-open OSC must be emitted strictly after EndSynchronizedUpdate"
         );
     }
 }
