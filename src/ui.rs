@@ -970,7 +970,7 @@ pub fn render_ui_full(
 // 300 PPI Carta 4-bit neutral LUT tokens (R == G == B, multiples of 0x11)
 pub const EINK_PAPER: Color = Color::Rgb(255, 255, 255); // #ffffff
 pub const EINK_INK: Color = Color::Rgb(0, 0, 0); // #000000
-pub const EINK_INK_MUTED: Color = Color::Rgb(51, 51, 51); // #333333
+pub const EINK_INK_MUTED: Color = Color::Rgb(102, 102, 102); // #666666
 pub const EINK_SURFACE: Color = Color::Rgb(238, 238, 238); // #eeeeee
 pub const EINK_PILL_BG: Color = Color::Rgb(221, 221, 221); // #dddddd
 
@@ -3486,6 +3486,27 @@ fn rgb_luma(r: u8, g: u8, b: u8) -> u8 {
     ((299u32 * u32::from(r) + 587u32 * u32::from(g) + 114u32 * u32::from(b)) / 1000) as u8
 }
 
+fn is_eink_muted_cell(cell: &vt100::Cell) -> bool {
+    if cell.dim() {
+        return true;
+    }
+    if cell.bold() {
+        return false;
+    }
+    match cell.fgcolor() {
+        vt100::Color::Default => false,
+        c => match vt_color_rgb(c) {
+            Some((r, g, b)) => {
+                let luma = rgb_luma(r, g, b);
+                let chroma = r.max(g).max(b) - r.min(g).min(b);
+                matches!(c, vt100::Color::Idx(8 | 238..=249))
+                    || (chroma <= 42 && (70..=180).contains(&luma))
+            }
+            None => false,
+        },
+    }
+}
+
 fn resolve_eink_vt_colors_and_mods(cell: &vt100::Cell, selected: bool) -> (Color, Color, Modifier) {
     if selected || cell.inverse() {
         return (EINK_PAPER, EINK_INK, Modifier::BOLD);
@@ -3499,29 +3520,16 @@ fn resolve_eink_vt_colors_and_mods(cell: &vt100::Cell, selected: bool) -> (Color
             _ => EINK_PAPER,
         },
     };
-    let fg_col = if cell.dim() {
+    let is_muted = is_eink_muted_cell(cell);
+    // Keep at least >= 4.5:1 contrast when text sits inside a mid-light pill background (#dddddd).
+    let fg_col = if is_muted && bg_col != EINK_PILL_BG {
         EINK_INK_MUTED
     } else {
-        match cell.fgcolor() {
-            vt100::Color::Default => EINK_INK,
-            c => match vt_color_rgb(c) {
-                Some((r, g, b)) => {
-                    let luma = rgb_luma(r, g, b);
-                    let chroma = r.max(g).max(b) - r.min(g).min(b);
-                    if matches!(c, vt100::Color::Idx(8 | 238..=249))
-                        || (chroma <= 18 && (70..=180).contains(&luma))
-                    {
-                        EINK_INK_MUTED
-                    } else {
-                        EINK_INK
-                    }
-                }
-                None => EINK_INK,
-            },
-        }
+        EINK_INK
     };
     let mut mods = Modifier::empty();
-    if cell.bold() {
+    // Preserve BOLD only on foreground ink/headings so muted process text (#666666) stays light.
+    if cell.bold() && !is_muted {
         mods |= Modifier::BOLD;
     }
     if cell.italic() {
@@ -3531,6 +3539,339 @@ fn resolve_eink_vt_colors_and_mods(cell: &vt100::Cell, selected: bool) -> (Color
         mods |= Modifier::UNDERLINED;
     }
     (fg_col, bg_col, mods)
+}
+
+#[derive(serde::Serialize)]
+struct CleanReaderLine {
+    r: Vec<(String, u8)>,
+}
+
+#[derive(serde::Serialize)]
+struct CleanReaderPayload<'a> {
+    v: u8,
+    title: &'a str,
+    anchor: usize,
+    lines: Vec<CleanReaderLine>,
+}
+
+fn push_reader_run(runs: &mut Vec<(String, u8)>, text: &str, style: u8) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some((last_txt, last_style)) = runs.last_mut() {
+        if *last_style == style {
+            last_txt.push_str(text);
+            return;
+        }
+    }
+    runs.push((text.to_string(), style));
+}
+
+fn trim_trailing_reader_runs(runs: &mut Vec<(String, u8)>) {
+    while let Some((last_text, _)) = runs.last_mut() {
+        let trimmed_len = last_text.trim_end().len();
+        last_text.truncate(trimmed_len);
+        if last_text.is_empty() {
+            runs.pop();
+        } else {
+            break;
+        }
+    }
+}
+
+fn strip_leading_char(runs: &mut Vec<(String, u8)>, ch: char) -> bool {
+    let Some((first, _)) = runs.first_mut() else {
+        return false;
+    };
+    if let Some(rest) = first.strip_prefix(ch) {
+        *first = rest.to_string();
+        if first.is_empty() {
+            runs.remove(0);
+        }
+        return true;
+    }
+    false
+}
+
+fn strip_trailing_box_edge(runs: &mut Vec<(String, u8)>) {
+    trim_trailing_reader_runs(runs);
+    let Some((last, _)) = runs.last_mut() else {
+        return;
+    };
+    if let Some(rest) = last.strip_suffix(['│', '┃', '║']) {
+        *last = rest.to_string();
+        if last.is_empty() {
+            runs.pop();
+        }
+        trim_trailing_reader_runs(runs);
+    }
+}
+
+fn trim_leading_whitespace_runs(runs: &mut Vec<(String, u8)>) {
+    while runs
+        .first()
+        .is_some_and(|(t, _)| t.starts_with(char::is_whitespace))
+    {
+        let first_ref = &mut runs[0].0;
+        let rest = first_ref.trim_start().to_string();
+        *first_ref = rest;
+        if first_ref.is_empty() {
+            runs.remove(0);
+        }
+    }
+}
+
+fn strip_leading_box_rule_chars(runs: &mut Vec<(String, u8)>) {
+    while let Some((first, _)) = runs.first_mut() {
+        let trimmed = first.trim_start_matches(|c: char| {
+            c.is_whitespace() || ('\u{2500}'..='\u{257F}').contains(&c)
+        });
+        if trimmed.len() == first.len() {
+            break;
+        }
+        *first = trimmed.to_string();
+        if first.is_empty() {
+            runs.remove(0);
+        } else {
+            break;
+        }
+    }
+}
+
+fn strip_trailing_box_rule_chars(runs: &mut Vec<(String, u8)>) {
+    while let Some((last, _)) = runs.last_mut() {
+        let trimmed = last.trim_end_matches(|c: char| {
+            c.is_whitespace() || ('\u{2500}'..='\u{257F}').contains(&c)
+        });
+        if trimmed.len() == last.len() {
+            break;
+        }
+        *last = trimmed.to_string();
+        if last.is_empty() {
+            runs.pop();
+        } else {
+            break;
+        }
+    }
+}
+
+fn clean_reader_logical_line(runs: &mut Vec<(String, u8)>) -> Option<Vec<(String, u8)>> {
+    trim_trailing_reader_runs(runs);
+    if runs.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let joined: String = runs.iter().map(|(t, _)| t.as_str()).collect();
+    let trimmed = joined.trim();
+    if trimmed.is_empty() {
+        return Some(Vec::new());
+    }
+    if trimmed
+        .chars()
+        .all(|c| c.is_whitespace() || ('\u{2500}'..='\u{257F}').contains(&c))
+    {
+        return None;
+    }
+
+    // Strip Unicode vertical card frames (`│ text │`, `┃ text ┃`, `║ text ║`) without touching ASCII `|`,
+    // and unwrap titled box top headers like `╭─── Summary ───╮`.
+    if trimmed.starts_with(['│', '┃', '║']) {
+        trim_leading_whitespace_runs(runs);
+        for edge in ['│', '┃', '║'] {
+            if strip_leading_char(runs, edge) {
+                let _ = strip_leading_char(runs, ' ');
+                break;
+            }
+        }
+        strip_trailing_box_edge(runs);
+    } else if trimmed.starts_with(['╭', '┌', '┏', '╔']) && trimmed.ends_with(['╮', '┐', '┓', '╗'])
+    {
+        strip_leading_box_rule_chars(runs);
+        strip_trailing_box_rule_chars(runs);
+    }
+
+    let remaining_blank = runs.iter().all(|(t, _)| t.trim().is_empty());
+    if remaining_blank {
+        Some(Vec::new())
+    } else {
+        Some(std::mem::take(runs))
+    }
+}
+
+fn is_reader_fence_line(runs: &[(String, u8)]) -> bool {
+    let joined: String = runs.iter().map(|(t, _)| t.as_str()).collect();
+    joined.trim_start().starts_with("```")
+}
+
+/// Extract clean logical lines (joining soft-wrapped rows across scrollback + live screen)
+/// with 3-tier E-Ink style codes (`0` = body `#000000`, `1` = bold heading/emphasis,
+/// `2` = muted process `#666666`), stripped of Unicode TUI box frames and bounded for OSC 777.
+pub fn extract_clean_reader_json(screen: &mut vt100::Screen, title: &str) -> String {
+    const MAX_SCAN_ROWS: usize = 420;
+    const MAX_JSON_BYTES: usize = 48_000;
+
+    let (rows_nz, cols_nz) = screen.size();
+    let rows = usize::from(rows_nz.get());
+    let cols = cols_nz.get();
+    let total_sb = screen.scrollback_len();
+    let hist_rows = total_sb.min(MAX_SCAN_ROWS.saturating_sub(rows));
+    let orig_sb = screen.scrollback();
+
+    struct RawLogical {
+        in_live: bool,
+        runs: Vec<(String, u8)>,
+    }
+
+    let mut logical_lines: Vec<RawLogical> = Vec::new();
+    let mut cur_runs: Vec<(String, u8)> = Vec::new();
+    let mut cur_in_live = false;
+
+    let append_visible_row = |scr: &vt100::Screen,
+                              r: u16,
+                              in_live: bool,
+                              cur_runs: &mut Vec<(String, u8)>,
+                              cur_in_live: &mut bool,
+                              out: &mut Vec<RawLogical>| {
+        if cur_runs.is_empty() && in_live {
+            *cur_in_live = true;
+        }
+        let mut prev_was_wide = false;
+        let mut prev_col: u16 = 0;
+        for col in 0..cols {
+            if prev_was_wide {
+                prev_was_wide = false;
+                continue;
+            }
+            let Some(cell) = scr.cell(r, col) else {
+                continue;
+            };
+            prev_was_wide = cell.is_wide();
+            if cell.has_contents() {
+                let style = if cell.dim() {
+                    2
+                } else if cell.bold() {
+                    1
+                } else if is_eink_muted_cell(cell) {
+                    2
+                } else {
+                    0
+                };
+                if col > prev_col {
+                    let gap_style = cur_runs.last().map_or(style, |r| r.1);
+                    push_reader_run(
+                        cur_runs,
+                        &" ".repeat(usize::from(col - prev_col)),
+                        gap_style,
+                    );
+                }
+                prev_col = col + if cell.is_wide() { 2 } else { 1 };
+                push_reader_run(cur_runs, cell.contents(), style);
+            }
+        }
+        if !scr.row_wrapped(r) {
+            out.push(RawLogical {
+                in_live: *cur_in_live || in_live,
+                runs: std::mem::take(cur_runs),
+            });
+            *cur_in_live = false;
+        }
+    };
+
+    let mut cur_abs = total_sb.saturating_sub(hist_rows);
+    while cur_abs < total_sb {
+        let sb = total_sb - cur_abs;
+        screen.set_scrollback(sb);
+        let take = (total_sb - cur_abs).min(rows);
+        for r in 0..take {
+            append_visible_row(
+                screen,
+                r as u16,
+                false,
+                &mut cur_runs,
+                &mut cur_in_live,
+                &mut logical_lines,
+            );
+        }
+        cur_abs += take;
+    }
+
+    screen.set_scrollback(0);
+    for r in 0..rows {
+        append_visible_row(
+            screen,
+            r as u16,
+            true,
+            &mut cur_runs,
+            &mut cur_in_live,
+            &mut logical_lines,
+        );
+    }
+    if !cur_runs.is_empty() {
+        logical_lines.push(RawLogical {
+            in_live: cur_in_live,
+            runs: cur_runs,
+        });
+    }
+    screen.set_scrollback(orig_sb);
+
+    struct CleanLine {
+        in_live: bool,
+        runs: Vec<(String, u8)>,
+    }
+    let mut cleaned: Vec<CleanLine> = Vec::with_capacity(logical_lines.len());
+    let mut prev_blank = true;
+    for mut raw in logical_lines {
+        let Some(runs) = clean_reader_logical_line(&mut raw.runs) else {
+            continue;
+        };
+        let is_blank = runs.is_empty();
+        if is_blank && prev_blank {
+            continue;
+        }
+        prev_blank = is_blank;
+        cleaned.push(CleanLine {
+            in_live: raw.in_live,
+            runs,
+        });
+    }
+    while cleaned.last().is_some_and(|l| l.runs.is_empty()) {
+        cleaned.pop();
+    }
+
+    let mut start_idx = 0usize;
+    loop {
+        let mut inside_dropped_fence = false;
+        for dropped in &cleaned[..start_idx] {
+            if is_reader_fence_line(&dropped.runs) {
+                inside_dropped_fence = !inside_dropped_fence;
+            }
+        }
+        let slice = &cleaned[start_idx..];
+        let mut anchor = slice
+            .iter()
+            .position(|l| l.in_live)
+            .unwrap_or_else(|| slice.len().saturating_sub(1));
+        let mut lines_out = Vec::with_capacity(slice.len() + usize::from(inside_dropped_fence));
+        if inside_dropped_fence {
+            lines_out.push(CleanReaderLine {
+                r: vec![("```".to_string(), 0)],
+            });
+            anchor += 1;
+        }
+        lines_out.extend(slice.iter().map(|l| CleanReaderLine { r: l.runs.clone() }));
+        let payload = CleanReaderPayload {
+            v: 1,
+            title,
+            anchor,
+            lines: lines_out,
+        };
+        let json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
+        if json.len() <= MAX_JSON_BYTES || start_idx + 1 >= cleaned.len() {
+            return json;
+        }
+        let step = ((cleaned.len() - start_idx) / 8).max(1);
+        start_idx = (start_idx + step).min(cleaned.len() - 1);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3881,7 +4222,7 @@ fn draw_modal_close_button(
 
 fn render_help_modal(f: &mut Frame, area: Rect, eink_mode: bool, hits: &mut Vec<HitRegion>) {
     hits.clear();
-    let popup = centered_rect(74, 32, area);
+    let popup = centered_rect(74, 34, area);
     f.render_widget(Clear, popup);
     hits.push(HitRegion {
         rect: popup,
@@ -3918,7 +4259,7 @@ fn render_help_modal(f: &mut Frame, area: Rect, eink_mode: bool, hits: &mut Vec<
     }
     let inner = block.inner(popup);
 
-    // Reflow the 16 touch quick-action buttons across available inner width so narrow mobile
+    // Reflow the 17 touch quick-action buttons across available inner width so narrow mobile
     // viewports wrap buttons onto additional rows instead of dropping right-hand columns.
     let compact_btns = inner.width < 58;
     let (eink_wide, eink_short) = if eink_mode {
@@ -3926,7 +4267,7 @@ fn render_help_modal(f: &mut Frame, area: Rect, eink_mode: bool, hits: &mut Vec<
     } else {
         ("  ◐ E-Ink: OFF  ", " ◐E:OF ")
     };
-    let quick_actions: [(&str, &str, HitTarget); 16] = [
+    let quick_actions: [(&str, &str, HitTarget); 17] = [
         (
             "  + New Tab     ",
             " +Tab ",
@@ -3991,6 +4332,11 @@ fn render_help_modal(f: &mut Frame, area: Rect, eink_mode: bool, hits: &mut Vec<
             eink_wide,
             eink_short,
             HitTarget::TriggerAction(Action::ToggleEink),
+        ),
+        (
+            "  📖 Book View  ",
+            " 📖Book ",
+            HitTarget::TriggerAction(Action::OpenBookReader),
         ),
         (
             "  ↻ Redraw      ",
@@ -4060,6 +4406,7 @@ fn render_help_modal(f: &mut Frame, area: Rect, eink_mode: bool, hits: &mut Vec<
         Line::from("  Scrollback / History     ^b [          or  Tap [▼ BOT] on status bar"),
         Line::from("  Page Up / Down           ^b PgUp / PgDn / Tap Left [‹] / Right [›]"),
         Line::from("  E-Ink / Clean Redraw     ^b e (E-Ink)  /   ^b r (clean redraw)"),
+        Line::from("  Book Reader (ShellDeck)  ^b v / ^b B   or  Tap [ 📖 Book View ]"),
         Line::from("  Detach (keep running)    ^b q / ^b d   or  Ctrl+\\ / Tap [ ⏏ ]"),
         Line::from(""),
         Line::from(Span::styled(
@@ -5957,7 +6304,7 @@ mod tests {
 
     fn assert_strict_eink_buffer(buf: &Buffer) {
         let is_neutral_carta_color = |c: Color| match c {
-            Color::Rgb(r, g, b) => r == g && g == b && matches!(r, 0 | 51 | 221 | 238 | 255),
+            Color::Rgb(r, g, b) => r == g && g == b && matches!(r, 0 | 102 | 221 | 238 | 255),
             _ => false,
         };
         for y in buf.area.y..buf.area.y + buf.area.height {
@@ -6300,6 +6647,9 @@ mod tests {
                     .any(|h| h.target == HitTarget::TriggerAction(Action::ToggleEink)));
                 assert!(modal_hits
                     .iter()
+                    .any(|h| h.target == HitTarget::TriggerAction(Action::OpenBookReader)));
+                assert!(modal_hits
+                    .iter()
                     .any(|h| h.target == HitTarget::TriggerAction(Action::RedrawScreen)));
                 assert!(modal_hits
                     .iter()
@@ -6446,12 +6796,306 @@ mod tests {
             .unwrap();
         let buf = terminal.backend().buffer();
         let rows: Vec<String> = (0..36)
-            .map(|y| (0..80).map(|x| buf[(x, y)].symbol()).collect())
+            .map(|y| {
+                let mut line = String::new();
+                let mut x = 0u16;
+                while x < 80 {
+                    let sym = buf[(x, y)].symbol();
+                    line.push_str(sym);
+                    x += sym.width().max(1) as u16;
+                }
+                line
+            })
             .collect();
         let joined = rows.join("\n");
         assert!(joined.contains("Detach hct (keep sessions running) (^b q)"));
         assert!(joined.contains("Open Space popover menu / + New Space"));
         assert!(joined.contains("^b PgUp / PgDn / Tap Left [‹] / Right [›]"));
+        assert!(joined.contains("Tap [ 📖 Book View ]"));
         assert!(joined.contains("Tap outside, [ ✕ ], Esc, Enter, or ? to close"));
+    }
+
+    #[test]
+    fn eink_vt_screen_enforces_three_tier_hierarchy_for_process_body_and_bold() {
+        let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
+        let mut parser = vt100::Parser::new(nz(4), nz(50), 0);
+        // Line 0: Bold + dim process (stays muted #666666 without BOLD), plain body, pure bold heading,
+        //         bold mid-gray #94a3b8 heading (promoted to EINK_INK + BOLD), and non-bold #94a3b8 (muted).
+        // Line 1: Dim inside mid-light pill bg (~#d4d4d4 -> EINK_PILL_BG) promotes to EINK_INK for contrast.
+        parser.process(
+            b"\x1b[1;2mstep\x1b[0m body \x1b[1mTitle\x1b[0m \x1b[1;38;2;148;163;184mSlateH\x1b[0m \x1b[38;2;148;163;184mslate\x1b[0m\r\n\x1b[2;48;2;210;210;210mpill\x1b[0m",
+        );
+
+        let backend = TestBackend::new(50, 4);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            f.render_widget(
+                VtScreenWidget {
+                    screen: parser.screen(),
+                    selection: None,
+                    eink_mode: true,
+                },
+                f.area(),
+            );
+        })
+        .unwrap();
+
+        let buf = term.backend().buffer();
+        // Process text (#666666, non-bold, non-DIM)
+        assert_eq!(buf[(0, 0)].symbol(), "s");
+        assert_eq!(buf[(0, 0)].fg, Color::Rgb(102, 102, 102));
+        assert!(!buf[(0, 0)].modifier.contains(Modifier::BOLD));
+        assert!(!buf[(0, 0)].modifier.contains(Modifier::DIM));
+
+        // Plain body (#000000, non-bold)
+        assert_eq!(buf[(5, 0)].symbol(), "b");
+        assert_eq!(buf[(5, 0)].fg, EINK_INK);
+        assert!(!buf[(5, 0)].modifier.contains(Modifier::BOLD));
+
+        // Heading / emphasis (#000000 + BOLD)
+        assert_eq!(buf[(10, 0)].symbol(), "T");
+        assert_eq!(buf[(10, 0)].fg, EINK_INK);
+        assert!(buf[(10, 0)].modifier.contains(Modifier::BOLD));
+
+        // Bold mid-gray (#94a3b8 without DIM) keeps EINK_INK + BOLD heading hierarchy
+        assert_eq!(buf[(16, 0)].symbol(), "S");
+        assert_eq!(buf[(16, 0)].fg, EINK_INK);
+        assert!(buf[(16, 0)].modifier.contains(Modifier::BOLD));
+
+        // Non-bold mid-gray (#94a3b8) stays muted #666666 without BOLD
+        assert_eq!(buf[(23, 0)].symbol(), "s");
+        assert_eq!(buf[(23, 0)].fg, EINK_INK_MUTED);
+        assert!(!buf[(23, 0)].modifier.contains(Modifier::BOLD));
+
+        // Muted on EINK_PILL_BG promotes to EINK_INK
+        assert_eq!(buf[(0, 1)].symbol(), "p");
+        assert_eq!(buf[(0, 1)].bg, EINK_PILL_BG);
+        assert_eq!(buf[(0, 1)].fg, EINK_INK);
+    }
+
+    #[test]
+    fn extract_clean_reader_json_joins_cjk_wraps_strips_boxes_and_restores_scrollback() {
+        let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
+        let mut parser = vt100::Parser::new(nz(4), nz(10), 40);
+        // Emit scrollback rows (with box frame and wrapped CJK text), then live screen rows.
+        parser.process("┌────────┐\r\n".as_bytes());
+        parser.process("\x1b[2m思考过程\x1b[0m\r\n".as_bytes());
+        parser.process("└────────┘\r\n".as_bytes());
+        parser.process("中文连续文本测试换行\r\n".as_bytes());
+        parser.process("│ \x1b[1m# 结论\x1b[0m │\r\n".as_bytes());
+        parser.process("正文已完成".as_bytes());
+
+        parser.screen_mut().set_scrollback(2);
+        let json_str = extract_clean_reader_json(parser.screen_mut(), "agy-1");
+        // Caller's scrollback offset is preserved.
+        assert_eq!(parser.screen().scrollback(), 2);
+
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed["v"], 1);
+        assert_eq!(parsed["title"], "agy-1");
+
+        let lines = parsed["lines"].as_array().unwrap();
+        let joined_lines: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l["r"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|run| run[0].as_str().unwrap())
+                    .collect::<String>()
+            })
+            .collect();
+
+        // Box horizontal rules removed; CJK soft wrap rejoined without bogus space; │ # 结论 │ stripped cleanly.
+        assert!(joined_lines.iter().any(|s| s == "思考过程"));
+        assert!(joined_lines.iter().any(|s| s == "中文连续文本测试换行"));
+        assert!(joined_lines.iter().any(|s| s == "# 结论"));
+        assert!(joined_lines.iter().any(|s| s == "正文已完成"));
+        assert!(!joined_lines
+            .iter()
+            .any(|s| s.contains('┌') || s.contains('└')));
+
+        // Anchor points inside bounds to the start of the live screen slice.
+        let anchor = parsed["anchor"].as_u64().unwrap() as usize;
+        assert!(anchor < lines.len());
+
+        // Style codes: 2 = muted for "思考过程", 1 = bold for "# 结论".
+        let proc_line = lines.iter().find(|l| l["r"][0][0] == "思考过程").unwrap();
+        assert_eq!(proc_line["r"][0][1], 2);
+
+        let bold_line = lines.iter().find(|l| l["r"][0][0] == "# 结论").unwrap();
+        assert_eq!(bold_line["r"][0][1], 1);
+    }
+
+    #[test]
+    fn extract_clean_reader_json_handles_indented_colored_box_borders_slate_muted_and_fence_parity()
+    {
+        let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
+        let mut parser = vt100::Parser::new(nz(8), nz(60), 420);
+        parser.process("╭─── Summary ───╮\r\n".as_bytes());
+        // Leading spaces in default style followed by colored `│` border + bold content
+        parser.process(
+            "\x1b[2C\x1b[90m│\x1b[0m \x1b[1m# 结论\x1b[0m \x1b[90m│\x1b[0m\r\n".as_bytes(),
+        );
+        // Slate cool-gray muted (#94a3b8) vs bright white (#ffffff) and blue (#58a6ff)
+        parser.process(
+            "\x1b[38;2;148;163;184mslate_step\x1b[0m \x1b[38;2;255;255;255mwhite_body\x1b[0m \x1b[1;38;2;88;166;255mblue_bold\x1b[0m\r\n"
+                .as_bytes(),
+        );
+        // Very long history (> 48KB) containing a code fence whose opening is trimmed while closing stays
+        parser.process("```rust\r\n".as_bytes());
+        let filler = "let value_xyz_0123456789_abcdef_0123456789 = 42;\r\n";
+        for i in 0..360 {
+            parser.process(format!("// line {i:03} {filler}").as_bytes());
+        }
+        parser.process("```\r\n".as_bytes());
+        parser.process("# Final After Long Code\r\n".as_bytes());
+
+        let json_str = extract_clean_reader_json(parser.screen_mut(), "fence-check");
+        assert!(json_str.len() <= 48_000);
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let lines = parsed["lines"].as_array().unwrap();
+        let joined_lines: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l["r"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|run| run[0].as_str().unwrap())
+                    .collect::<String>()
+            })
+            .collect();
+
+        // Count ``` fence toggles — parity must be even (synthetic opening fence added if trimmed mid-block)
+        let fence_count = joined_lines
+            .iter()
+            .filter(|s| s.trim_start().starts_with("```"))
+            .count();
+        assert_eq!(
+            fence_count % 2,
+            0,
+            "fence parity must remain balanced: {joined_lines:?}"
+        );
+        assert!(joined_lines.iter().any(|s| s == "# Final After Long Code"));
+
+        // Verify indented colored box border + titled box rule + slate vs bright white/blue/bold-slate styles on small screen
+        let mut small = vt100::Parser::new(nz(6), nz(80), 20);
+        small.process("╭─── Summary ───╮\r\n".as_bytes());
+        small.process(
+            "\x1b[2C\x1b[90m│\x1b[0m \x1b[1m# 结论\x1b[0m \x1b[90m│\x1b[0m\r\n".as_bytes(),
+        );
+        small.process(
+            "\x1b[38;2;148;163;184mslate_step\x1b[0m \x1b[38;2;255;255;255mwhite_body\x1b[0m \x1b[1;38;2;88;166;255mblue_bold\x1b[0m \x1b[1;38;2;148;163;184mbold_slate\x1b[0m \x1b[1;2;38;2;148;163;184mdim_slate\x1b[0m"
+                .as_bytes(),
+        );
+        let small_json: serde_json::Value =
+            serde_json::from_str(&extract_clean_reader_json(small.screen_mut(), "small")).unwrap();
+        let small_lines = small_json["lines"].as_array().unwrap();
+        let small_text: Vec<String> = small_lines
+            .iter()
+            .map(|l| {
+                l["r"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|run| run[0].as_str().unwrap())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(small_text[0], "Summary");
+        assert_eq!(small_text[1], "# 结论");
+        let style_line = small_lines[2]["r"].as_array().unwrap();
+        assert_eq!(style_line[0][0], "slate_step");
+        assert_eq!(style_line[0][1], 2);
+        assert!(style_line
+            .iter()
+            .any(|r| r[0].as_str().unwrap().contains("white_body") && r[1] == 0));
+        assert!(style_line
+            .iter()
+            .any(|r| r[0].as_str().unwrap().contains("blue_bold") && r[1] == 1));
+        assert!(style_line
+            .iter()
+            .any(|r| r[0].as_str().unwrap().contains("bold_slate") && r[1] == 1));
+        assert!(style_line
+            .iter()
+            .any(|r| r[0].as_str().unwrap().contains("dim_slate") && r[1] == 2));
+
+        // When live screen is blank after scrollback, anchor points to the tail of scrollback rather than line 0.
+        let mut blank_live = vt100::Parser::new(nz(3), nz(40), 20);
+        blank_live.process("older turn 1\r\nolder turn 2\r\n\r\n\r\n\r\n".as_bytes());
+        let blank_json: serde_json::Value = serde_json::from_str(&extract_clean_reader_json(
+            blank_live.screen_mut(),
+            "blank-live",
+        ))
+        .unwrap();
+        let blank_lines = blank_json["lines"].as_array().unwrap();
+        assert_eq!(blank_lines.len(), 2);
+        assert_eq!(blank_json["anchor"], 1);
+    }
+
+    #[test]
+    fn bold_slate_gray_heading_stays_bold_and_ink_in_live_eink_and_reader_export() {
+        let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
+        let mut parser = vt100::Parser::new(nz(5), nz(64), 20);
+        // 1. Non-DIM bold slate gray (#94a3b8: chroma 36 <= 42, luma 160 in 70..=180)
+        // 2. Non-bold slate gray (#94a3b8) -> muted
+        // 3. DIM + bold slate gray (#94a3b8) -> muted (DIM wins)
+        // 4. Non-DIM bold xterm gray 244 -> bold
+        parser.process(
+            b"\x1b[1;38;2;148;163;184m# SlateHeading\x1b[0m\r\n\
+              \x1b[38;2;148;163;184mslate_muted\x1b[0m\r\n\
+              \x1b[1;2;38;2;148;163;184mdim_bold_slate\x1b[0m\r\n\
+              \x1b[1;38;5;244m# Gray244Bold\x1b[0m",
+        );
+
+        let backend = TestBackend::new(64, 5);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            f.render_widget(
+                VtScreenWidget {
+                    screen: parser.screen(),
+                    selection: None,
+                    eink_mode: true,
+                },
+                f.area(),
+            );
+        })
+        .unwrap();
+
+        let buf = term.backend().buffer();
+        // Bold #94a3b8 -> EINK_INK + Modifier::BOLD
+        assert_eq!(buf[(0, 0)].symbol(), "#");
+        assert_eq!(buf[(0, 0)].fg, EINK_INK);
+        assert!(buf[(0, 0)].modifier.contains(Modifier::BOLD));
+
+        // Non-bold #94a3b8 -> EINK_INK_MUTED without BOLD
+        assert_eq!(buf[(0, 1)].symbol(), "s");
+        assert_eq!(buf[(0, 1)].fg, EINK_INK_MUTED);
+        assert!(!buf[(0, 1)].modifier.contains(Modifier::BOLD));
+
+        // DIM + bold #94a3b8 -> EINK_INK_MUTED without BOLD
+        assert_eq!(buf[(0, 2)].symbol(), "d");
+        assert_eq!(buf[(0, 2)].fg, EINK_INK_MUTED);
+        assert!(!buf[(0, 2)].modifier.contains(Modifier::BOLD));
+
+        // Non-DIM bold xterm 244 -> EINK_INK + Modifier::BOLD
+        assert_eq!(buf[(0, 3)].symbol(), "#");
+        assert_eq!(buf[(0, 3)].fg, EINK_INK);
+        assert!(buf[(0, 3)].modifier.contains(Modifier::BOLD));
+
+        // Clean Reader JSON export matches exact same 3-tier classification
+        let parsed: serde_json::Value =
+            serde_json::from_str(&extract_clean_reader_json(parser.screen_mut(), "slate")).unwrap();
+        let lines = parsed["lines"].as_array().unwrap();
+        assert_eq!(lines[0]["r"][0][0], "# SlateHeading");
+        assert_eq!(lines[0]["r"][0][1], 1);
+        assert_eq!(lines[1]["r"][0][0], "slate_muted");
+        assert_eq!(lines[1]["r"][0][1], 2);
+        assert_eq!(lines[2]["r"][0][0], "dim_bold_slate");
+        assert_eq!(lines[2]["r"][0][1], 2);
+        assert_eq!(lines[3]["r"][0][0], "# Gray244Bold");
+        assert_eq!(lines[3]["r"][0][1], 1);
     }
 }

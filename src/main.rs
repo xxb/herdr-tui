@@ -67,7 +67,7 @@ const TOP_BAR_HORIZ_SWIPE_THRESHOLD: u8 = 1;
 const SPACE_MENU_HORIZ_SWIPE_THRESHOLD: u8 = 1;
 const DEFAULT_EINK_INTERVAL_MS: u64 = 250;
 const MAX_EINK_INTERVAL_MS: u64 = 2000;
-const EINK_REFRESH_OSC: &[u8] = b"\x1b]777;shelldeck;eink-refresh\x07";
+const EINK_REFRESH_OSC_BODY: &str = "777;shelldeck;eink-refresh";
 
 enum AppEvent {
     Core(CoreMessage),
@@ -1358,23 +1358,168 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
-fn format_osc52_sequence(b64: &str, in_tmux: bool, in_screen: bool) -> String {
+fn chunk_str_max_bytes(s: &str, max_bytes: usize) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < s.len() {
+        let mut end = (start + max_bytes).min(s.len());
+        while end > start && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            end = s[start..]
+                .char_indices()
+                .nth(1)
+                .map_or(s.len(), |(idx, _)| start + idx);
+        }
+        chunks.push(&s[start..end]);
+        start = end;
+    }
+    chunks
+}
+
+fn format_single_osc_sequence(osc_body: &str, in_tmux: bool, in_screen: bool) -> String {
+    const DCS_CHUNK_BYTES: usize = 76;
+    let osc = format!("\x1b]{osc_body}\x07");
     if in_tmux {
-        format!("\x1bPtmux;\x1b\x1b]52;c;{b64}\x07\x1b\\\x1b]52;c;{b64}\x07")
+        // Chunk tmux DCS passthrough into <=76-byte (pre-escape) frames and escape every ESC
+        // inside each chunk so large OSC 777 payloads never overflow tmux passthrough buffers.
+        let chunks = chunk_str_max_bytes(&osc, DCS_CHUNK_BYTES);
+        let mut out = String::with_capacity(osc.len() + chunks.len() * 12);
+        for chunk in chunks {
+            out.push_str("\x1bPtmux;");
+            for ch in chunk.chars() {
+                if ch == '\x1b' {
+                    out.push_str("\x1b\x1b");
+                } else {
+                    out.push(ch);
+                }
+            }
+            out.push_str("\x1b\\");
+        }
+        out
     } else if in_screen {
         // GNU screen caps individual DCS passthrough blocks (historically 256 bytes);
-        // chunking into <=76-byte DCS frames forwards arbitrarily long OSC 52 payloads intact.
-        let osc = format!("\x1b]52;c;{b64}\x07");
-        let mut out = String::with_capacity(osc.len() + (osc.len() / 76 + 1) * 4);
-        for chunk in osc.as_bytes().chunks(76) {
+        // chunking into <=76-byte DCS frames forwards arbitrarily long OSC payloads intact.
+        let chunks = chunk_str_max_bytes(&osc, DCS_CHUNK_BYTES);
+        let mut out = String::with_capacity(osc.len() + chunks.len() * 4);
+        for chunk in chunks {
             out.push_str("\x1bP");
-            out.push_str(std::str::from_utf8(chunk).unwrap_or(""));
+            out.push_str(chunk);
             out.push_str("\x1b\\");
         }
         out
     } else {
+        osc
+    }
+}
+
+fn format_osc52_sequence(b64: &str, in_tmux: bool, in_screen: bool) -> String {
+    if in_tmux {
+        let osc = format!("\x1b]52;c;{b64}\x07");
+        let dcs = format_single_osc_sequence(&format!("52;c;{b64}"), true, in_screen);
+        if osc.len() <= 76 {
+            format!("{dcs}{osc}")
+        } else {
+            dcs
+        }
+    } else if in_screen {
+        format_single_osc_sequence(&format!("52;c;{b64}"), false, true)
+    } else {
         format!("\x1b]52;c;{b64}\x07\x1b]52;;{b64}\x07")
     }
+}
+
+fn format_shelldeck_reader_open_osc_with_env(
+    json_payload: &str,
+    in_tmux: bool,
+    in_screen: bool,
+) -> String {
+    let b64 = base64_encode(json_payload.as_bytes());
+    format_single_osc_sequence(
+        &format!("777;shelldeck;reader-open;{b64}"),
+        in_tmux,
+        in_screen,
+    )
+}
+
+fn format_shelldeck_eink_refresh_osc_with_env(in_tmux: bool, in_screen: bool) -> String {
+    format_single_osc_sequence(EINK_REFRESH_OSC_BODY, in_tmux, in_screen)
+}
+
+fn format_shelldeck_eink_refresh_osc() -> String {
+    let in_tmux = std::env::var_os("TMUX").is_some_and(|v| !v.is_empty());
+    let in_screen = std::env::var_os("STY").is_some_and(|v| !v.is_empty());
+    format_shelldeck_eink_refresh_osc_with_env(in_tmux, in_screen)
+}
+
+fn emit_shelldeck_reader_osc_with_env<W: Write>(
+    out: &mut W,
+    world: &World,
+    active_addr: Option<&String>,
+    attached_map: &mut BTreeMap<String, AttachedTerminal>,
+    in_tmux: bool,
+    in_screen: bool,
+) -> Result<()> {
+    if let Some(addr) = active_addr {
+        if let Some(att) = attached_map.get_mut(addr) {
+            let tab_title = world
+                .active_space()
+                .map(|s| world.tab_display_name(s, world.active_tab_index()))
+                .unwrap_or_else(|| addr.clone());
+            let json = crate::ui::extract_clean_reader_json(att.parser.screen_mut(), &tab_title);
+            let seq = format_shelldeck_reader_open_osc_with_env(&json, in_tmux, in_screen);
+            out.write_all(seq.as_bytes())?;
+            out.flush()?;
+        }
+    }
+    Ok(())
+}
+
+fn flush_pending_reader_osc_with_env<W: Write>(
+    out: &mut W,
+    pending_reader_osc: &mut bool,
+    world: &World,
+    active_addr: Option<&String>,
+    attached_map: &mut BTreeMap<String, AttachedTerminal>,
+    in_tmux: bool,
+    in_screen: bool,
+) -> Result<()> {
+    if *pending_reader_osc {
+        emit_shelldeck_reader_osc_with_env(
+            out,
+            world,
+            active_addr,
+            attached_map,
+            in_tmux,
+            in_screen,
+        )?;
+        *pending_reader_osc = false;
+    }
+    Ok(())
+}
+
+fn flush_pending_reader_osc<W: Write>(
+    out: &mut W,
+    pending_reader_osc: &mut bool,
+    world: &World,
+    active_addr: Option<&String>,
+    attached_map: &mut BTreeMap<String, AttachedTerminal>,
+) -> Result<()> {
+    if *pending_reader_osc {
+        let in_tmux = std::env::var_os("TMUX").is_some_and(|v| !v.is_empty());
+        let in_screen = std::env::var_os("STY").is_some_and(|v| !v.is_empty());
+        flush_pending_reader_osc_with_env(
+            out,
+            pending_reader_osc,
+            world,
+            active_addr,
+            attached_map,
+            in_tmux,
+            in_screen,
+        )?;
+    }
+    Ok(())
 }
 
 fn copy_to_clipboard(text: &str) {
@@ -1836,7 +1981,7 @@ fn encode_wheel_for_terminal(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_action(
+fn execute_action_full(
     action: Action,
     core: &CoreClient,
     world: &mut World,
@@ -1849,6 +1994,7 @@ fn execute_action(
     eink_mode: &mut bool,
     force_clear: &mut bool,
     pending_eink_osc: &mut bool,
+    pending_reader_osc: Option<&mut bool>,
 ) -> Result<bool> {
     match action {
         Action::Detach => return Ok(true),
@@ -1967,6 +2113,11 @@ fn execute_action(
             *force_clear = true;
             if *eink_mode {
                 *pending_eink_osc = true;
+            }
+        }
+        Action::OpenBookReader => {
+            if let Some(flag) = pending_reader_osc {
+                *flag = true;
             }
         }
         Action::PageUp => {
@@ -2827,6 +2978,7 @@ fn run_app_loop(
     let mut last_draw_at: Option<Instant> = None;
     let mut last_eink_snap: Option<(String, EinkScreenSnapshot)> = None;
     let mut pending_eink_osc = eink_mode;
+    let mut pending_reader_osc = false;
     let mut prev_drawn_addr: Option<String> = None;
     let mut prev_modal_open = false;
     let mut prev_active_agent_state: Option<(String, AgentState)> = None;
@@ -3244,7 +3396,7 @@ fn run_app_loop(
                                             prefix_active = false;
                                             ctrl_active = false;
                                             alt_active = false;
-                                            if execute_action(
+                                            if execute_action_full(
                                                 act,
                                                 core,
                                                 world,
@@ -3257,6 +3409,7 @@ fn run_app_loop(
                                                 &mut eink_mode,
                                                 &mut force_clear,
                                                 &mut pending_eink_osc,
+                                                Some(&mut pending_reader_osc),
                                             )? {
                                                 flush_credits(
                                                     core,
@@ -3398,7 +3551,7 @@ fn run_app_loop(
                                             dirty = true;
                                         }
                                         HitTarget::SendKey(kev) => {
-                                            match handle_key_event_with_eink(
+                                            match handle_key_event_full(
                                                 kev,
                                                 core,
                                                 world,
@@ -3414,6 +3567,7 @@ fn run_app_loop(
                                                 &mut eink_mode,
                                                 &mut force_clear,
                                                 &mut pending_eink_osc,
+                                                Some(&mut pending_reader_osc),
                                             )? {
                                                 KeyOutcome::Quit => {
                                                     flush_credits(
@@ -3604,7 +3758,7 @@ fn run_app_loop(
                                                 }
                                             }
                                             Some(HitTarget::SendKey(kev)) => {
-                                                match handle_key_event_with_eink(
+                                                match handle_key_event_full(
                                                     kev,
                                                     core,
                                                     world,
@@ -3620,6 +3774,7 @@ fn run_app_loop(
                                                     &mut eink_mode,
                                                     &mut force_clear,
                                                     &mut pending_eink_osc,
+                                                    Some(&mut pending_reader_osc),
                                                 )? {
                                                     KeyOutcome::Quit => {
                                                         flush_credits(
@@ -3643,7 +3798,7 @@ fn run_app_loop(
                                         prefix_active = false;
                                         ctrl_active = false;
                                         alt_active = false;
-                                        if execute_action(
+                                        if execute_action_full(
                                             tap.action,
                                             core,
                                             world,
@@ -3656,6 +3811,7 @@ fn run_app_loop(
                                             &mut eink_mode,
                                             &mut force_clear,
                                             &mut pending_eink_osc,
+                                            Some(&mut pending_reader_osc),
                                         )? {
                                             flush_credits(
                                                 core,
@@ -4034,7 +4190,7 @@ fn run_app_loop(
                             if had_drag_or_sel {
                                 dirty = true;
                             }
-                            match handle_key_event_with_eink(
+                            match handle_key_event_full(
                                 kev,
                                 core,
                                 world,
@@ -4050,6 +4206,7 @@ fn run_app_loop(
                                 &mut eink_mode,
                                 &mut force_clear,
                                 &mut pending_eink_osc,
+                                Some(&mut pending_reader_osc),
                             )? {
                                 KeyOutcome::Quit => {
                                     flush_credits(
@@ -4283,7 +4440,8 @@ fn run_app_loop(
             })?;
             if pending_eink_osc {
                 if eink_mode {
-                    terminal.backend_mut().write_all(EINK_REFRESH_OSC)?;
+                    let seq = format_shelldeck_eink_refresh_osc();
+                    terminal.backend_mut().write_all(seq.as_bytes())?;
                 }
                 pending_eink_osc = false;
             }
@@ -4315,6 +4473,13 @@ fn run_app_loop(
                 need_sync_terminals = true;
             }
         }
+        flush_pending_reader_osc(
+            terminal.backend_mut(),
+            &mut pending_reader_osc,
+            world,
+            active_addr.as_ref(),
+            attached_map,
+        )?;
     }
 }
 
@@ -4332,6 +4497,7 @@ fn handle_shortcut_in_tab_overview(
     eink_mode: &mut bool,
     force_clear: &mut bool,
     pending_eink_osc: &mut bool,
+    mut pending_reader_osc: Option<&mut bool>,
 ) -> Result<KeyOutcome> {
     match action {
         Action::Detach => {
@@ -4353,7 +4519,7 @@ fn handle_shortcut_in_tab_overview(
         Action::SelectTab(idx) => {
             if world.active_space().is_some_and(|s| idx < s.tabs.len()) {
                 *modal = Modal::None;
-                if execute_action(
+                if execute_action_full(
                     Action::SelectTab(idx),
                     core,
                     world,
@@ -4366,6 +4532,7 @@ fn handle_shortcut_in_tab_overview(
                     eink_mode,
                     force_clear,
                     pending_eink_osc,
+                    pending_reader_osc.as_deref_mut(),
                 )? {
                     return Ok(KeyOutcome::Quit);
                 }
@@ -4382,7 +4549,7 @@ fn handle_shortcut_in_tab_overview(
             ) {
                 *modal = Modal::None;
             }
-            if execute_action(
+            if execute_action_full(
                 other,
                 core,
                 world,
@@ -4395,6 +4562,7 @@ fn handle_shortcut_in_tab_overview(
                 eink_mode,
                 force_clear,
                 pending_eink_osc,
+                pending_reader_osc,
             )? {
                 return Ok(KeyOutcome::Quit);
             }
@@ -4444,8 +4612,47 @@ fn handle_key_event(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn handle_key_event_with_eink(
+    kev: KeyEvent,
+    core: &CoreClient,
+    world: &mut World,
+    attached: Option<&AttachedTerminal>,
+    prefix_spec: &str,
+    sidebar_open: &mut bool,
+    prefix_active: &mut bool,
+    ctrl_active: &mut bool,
+    alt_active: &mut bool,
+    scrollback_offset: &mut usize,
+    modal: &mut Modal,
+    term_rect: Rect,
+    eink_mode: &mut bool,
+    force_clear: &mut bool,
+    pending_eink_osc: &mut bool,
+) -> Result<KeyOutcome> {
+    handle_key_event_full(
+        kev,
+        core,
+        world,
+        attached,
+        prefix_spec,
+        sidebar_open,
+        prefix_active,
+        ctrl_active,
+        alt_active,
+        scrollback_offset,
+        modal,
+        term_rect,
+        eink_mode,
+        force_clear,
+        pending_eink_osc,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_key_event_full(
     mut kev: KeyEvent,
     core: &CoreClient,
     world: &mut World,
@@ -4461,6 +4668,7 @@ fn handle_key_event_with_eink(
     eink_mode: &mut bool,
     force_clear: &mut bool,
     pending_eink_osc: &mut bool,
+    pending_reader_osc: Option<&mut bool>,
 ) -> Result<KeyOutcome> {
     let mut ui_changed = false;
     if *ctrl_active {
@@ -4612,6 +4820,7 @@ fn handle_key_event_with_eink(
                     eink_mode,
                     force_clear,
                     pending_eink_osc,
+                    pending_reader_osc,
                 );
             }
             if matches!(modal, Modal::SpaceMenu | Modal::Help) {
@@ -4629,7 +4838,7 @@ fn handle_key_event_with_eink(
                     *modal = Modal::None;
                 }
             }
-            if execute_action(
+            if execute_action_full(
                 action,
                 core,
                 world,
@@ -4642,6 +4851,7 @@ fn handle_key_event_with_eink(
                 eink_mode,
                 force_clear,
                 pending_eink_osc,
+                pending_reader_osc,
             )? {
                 return Ok(KeyOutcome::Quit);
             }
@@ -4720,6 +4930,7 @@ fn handle_key_event_with_eink(
                     eink_mode,
                     force_clear,
                     pending_eink_osc,
+                    pending_reader_osc,
                 );
             }
             return Ok(KeyOutcome::UiChanged);
@@ -4830,7 +5041,7 @@ fn handle_key_event_with_eink(
 
     // 5. Direct global shortcuts (`Alt+Left/Right/Up/Down/1..9`, `Ctrl+\`)
     if let Some(action) = match_direct_action(&kev) {
-        if execute_action(
+        if execute_action_full(
             action,
             core,
             world,
@@ -4843,6 +5054,7 @@ fn handle_key_event_with_eink(
             eink_mode,
             force_clear,
             pending_eink_osc,
+            pending_reader_osc,
         )? {
             return Ok(KeyOutcome::Quit);
         }
@@ -7684,5 +7896,222 @@ mod tests {
         let mut sel = TerminalSelection::new(rel_row, rel_col);
         assert!(sel.update_drag(term_rect, 9, 10));
         assert_eq!(sel.extract_text(att.parser.screen()), "SeeThrough");
+    }
+
+    #[test]
+    fn book_reader_shortcut_sets_pending_osc_and_formats_osc_777_sequence() {
+        let core = CoreClient::dummy_for_tests();
+        let mut world = World::default();
+        let mut sidebar_open = false;
+        let mut prefix_active = false;
+        let mut ctrl_active = false;
+        let mut alt_active = false;
+        let mut scrollback_offset = 0;
+        let mut modal = Modal::Help;
+        let term_rect = Rect::new(0, 1, 80, 22);
+        let mut eink_mode = true;
+        let mut force_clear = false;
+        let mut pending_eink_osc = false;
+        let mut pending_reader_osc = false;
+
+        let ctrl_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        let _ = handle_key_event_full(
+            ctrl_b,
+            &core,
+            &mut world,
+            None,
+            "ctrl+b",
+            &mut sidebar_open,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut scrollback_offset,
+            &mut modal,
+            term_rect,
+            &mut eink_mode,
+            &mut force_clear,
+            &mut pending_eink_osc,
+            Some(&mut pending_reader_osc),
+        )
+        .unwrap();
+        let out = handle_key_event_full(
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+            &core,
+            &mut world,
+            None,
+            "ctrl+b",
+            &mut sidebar_open,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut scrollback_offset,
+            &mut modal,
+            term_rect,
+            &mut eink_mode,
+            &mut force_clear,
+            &mut pending_eink_osc,
+            Some(&mut pending_reader_osc),
+        )
+        .unwrap();
+        assert_eq!(out, KeyOutcome::UiChanged);
+        assert!(matches!(modal, Modal::None));
+        assert!(pending_reader_osc);
+
+        let raw_json = r#"{"v":1,"title":"tab","anchor":0,"lines":[]}"#;
+        let plain_seq = format_shelldeck_reader_open_osc_with_env(raw_json, false, false);
+        assert!(plain_seq.starts_with("\x1b]777;shelldeck;reader-open;"));
+        assert!(plain_seq.ends_with("\x07"));
+
+        let tmux_seq = format_shelldeck_reader_open_osc_with_env(raw_json, true, false);
+        assert!(tmux_seq.starts_with("\x1bPtmux;\x1b\x1b]777;shelldeck;reader-open;"));
+        assert!(tmux_seq.contains("\x1b\\"));
+
+        let screen_seq = format_shelldeck_reader_open_osc_with_env(raw_json, false, true);
+        assert!(screen_seq.starts_with("\x1bP\x1b]777;shelldeck;reader-open;"));
+        assert!(screen_seq.contains("\x1b\\\x1bP"));
+
+        assert_eq!(
+            format_shelldeck_eink_refresh_osc_with_env(false, false),
+            "\x1b]777;shelldeck;eink-refresh\x07"
+        );
+        assert_eq!(
+            format_shelldeck_eink_refresh_osc_with_env(true, false),
+            "\x1bPtmux;\x1b\x1b]777;shelldeck;eink-refresh\x07\x1b\\"
+        );
+        assert_eq!(
+            format_shelldeck_eink_refresh_osc_with_env(false, true),
+            "\x1bP\x1b]777;shelldeck;eink-refresh\x07\x1b\\"
+        );
+    }
+
+    #[test]
+    fn large_reader_open_osc_chunks_tmux_and_screen_dcs_cleanly_without_duplication() {
+        let large_text = "x".repeat(47_500);
+        let large_json =
+            format!(r#"{{"v":1,"title":"big","anchor":0,"lines":[{{"r":[["{large_text}",0]]}}]}}"#);
+        assert!(large_json.len() > 47_500);
+        let expected_b64 = base64_encode(large_json.as_bytes());
+        assert!(expected_b64.len() > 63_000);
+        let expected_osc = format!("\x1b]777;shelldeck;reader-open;{expected_b64}\x07");
+
+        // 1. tmux: chunked into <=77-byte DCS frames with doubled ESC and no trailing raw OSC
+        let tmux_seq = format_shelldeck_reader_open_osc_with_env(&large_json, true, false);
+        assert!(tmux_seq.starts_with("\x1bPtmux;\x1b\x1b]777;shelldeck;reader-open;"));
+        assert!(tmux_seq.ends_with("\x1b\\"));
+        let mut tmux_frames = 0usize;
+        let mut tmux_unwrapped = String::with_capacity(expected_osc.len());
+        let mut rest = tmux_seq.as_str();
+        while !rest.is_empty() {
+            let body_plus = rest
+                .strip_prefix("\x1bPtmux;")
+                .expect("every segment in tmux passthrough must start with ESC P tmux;");
+            let end_idx = body_plus
+                .find("\x1b\\")
+                .expect("every tmux DCS chunk must end with ST");
+            let frame_inner = &body_plus[..end_idx];
+            assert!(
+                frame_inner.len() <= 78,
+                "tmux DCS chunk unexpectedly large: {}",
+                frame_inner.len()
+            );
+            tmux_unwrapped.push_str(&frame_inner.replace("\x1b\x1b", "\x1b"));
+            tmux_frames += 1;
+            rest = &body_plus[end_idx + 2..];
+        }
+        assert!(tmux_frames > 800, "expected >800 chunks, got {tmux_frames}");
+        assert_eq!(tmux_unwrapped, expected_osc);
+
+        // 2. screen: chunked into <=76-byte DCS frames and reconstructs exact OSC
+        let screen_seq = format_shelldeck_reader_open_osc_with_env(&large_json, false, true);
+        assert!(screen_seq.starts_with("\x1bP\x1b]777;shelldeck;reader-open;"));
+        assert!(screen_seq.ends_with("\x1b\\"));
+        let mut screen_frames = 0usize;
+        let mut screen_unwrapped = String::with_capacity(expected_osc.len());
+        let mut rest_scr = screen_seq.as_str();
+        while !rest_scr.is_empty() {
+            let body_plus = rest_scr
+                .strip_prefix("\x1bP")
+                .expect("every segment in screen passthrough must start with ESC P");
+            let end_idx = body_plus
+                .find("\x1b\\")
+                .expect("every screen DCS chunk must end with ST");
+            let frame_inner = &body_plus[..end_idx];
+            assert!(frame_inner.len() <= 76);
+            screen_unwrapped.push_str(frame_inner);
+            screen_frames += 1;
+            rest_scr = &body_plus[end_idx + 2..];
+        }
+        assert!(
+            screen_frames > 800,
+            "expected >800 chunks, got {screen_frames}"
+        );
+        assert_eq!(screen_unwrapped, expected_osc);
+
+        // Inner ESC anywhere inside an OSC body is also doubled per tmux DCS chunk.
+        let inner_esc_tmux = format_single_osc_sequence("777;a\x1bb", true, false);
+        assert_eq!(
+            inner_esc_tmux,
+            "\x1bPtmux;\x1b\x1b]777;a\x1b\x1bb\x07\x1b\\"
+        );
+    }
+
+    #[test]
+    fn emit_shelldeck_reader_osc_runs_after_end_synchronized_update() {
+        use crate::model::{SharedSpace, SharedTab, TerminalInfo};
+
+        let mut world = World::default();
+        world.terminals.insert(
+            "t1".to_string(),
+            TerminalInfo {
+                address: "t1".to_string(),
+                title: "demo".to_string(),
+                ..Default::default()
+            },
+        );
+        world.doc.spaces.push(SharedSpace {
+            id: "s1".to_string(),
+            name: "main".to_string(),
+            folder: String::new(),
+            tabs: vec![SharedTab {
+                id: "tab1".to_string(),
+                name: "agy".to_string(),
+                root: serde_json::json!({ "type": "block", "content": { "terminal": "t1" } }),
+                rest: Default::default(),
+            }],
+            rest: Default::default(),
+        });
+        let mut attached_map = BTreeMap::new();
+        let mut att = AttachedTerminal::new(1, 40, 4);
+        att.process_vt_bytes(b"Reader output line");
+        attached_map.insert("t1".to_string(), att);
+
+        let mut buf: Vec<u8> = Vec::new();
+        queue!(buf, BeginSynchronizedUpdate).unwrap();
+        execute!(buf, EndSynchronizedUpdate).unwrap();
+        let active_addr = "t1".to_string();
+        let mut pending_reader_osc = true;
+        flush_pending_reader_osc_with_env(
+            &mut buf,
+            &mut pending_reader_osc,
+            &world,
+            Some(&active_addr),
+            &mut attached_map,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(!pending_reader_osc);
+
+        let emitted = String::from_utf8(buf).unwrap();
+        let end_sync_pos = emitted
+            .find("\x1b[?2026l")
+            .expect("EndSynchronizedUpdate must be emitted");
+        let reader_pos = emitted
+            .find("\x1b]777;shelldeck;reader-open;")
+            .expect("reader-open OSC must be emitted");
+        assert!(
+            reader_pos > end_sync_pos,
+            "reader-open OSC must be emitted strictly after EndSynchronizedUpdate"
+        );
     }
 }
