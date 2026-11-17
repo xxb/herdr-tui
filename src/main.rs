@@ -180,7 +180,7 @@ struct Cli {
     no_allow_nested: bool,
 
     /// Optimize UI and frame pacing for 300 PPI monochrome E-Ink displays
-    #[arg(long)]
+    #[arg(short = 'e', long)]
     eink: bool,
 
     /// Disable E-Ink mode (overrides ui.eink = true or environment detection)
@@ -6837,6 +6837,11 @@ mod tests {
             None,
             env_map(&[("TERM", "xterm-256color")])
         ));
+
+        // `-e` short flag activates `--eink` and conflicts with `--no-eink`
+        let cli_short = Cli::try_parse_from(["hct", "-e"]).unwrap();
+        assert!(cli_short.eink);
+        assert!(Cli::try_parse_from(["hct", "-e", "--no-eink"]).is_err());
     }
 
     #[test]

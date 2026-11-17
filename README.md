@@ -24,15 +24,15 @@ A fast, lightweight **multi-tab TUI client** for [`herdr-core` (`hc`)](https://g
   - **Right Directional & Paste Cross (`↑` / `←` / `⎘` / `→` / `↓`)**: `15 × 7` hollow-corner `+` cross with 4 directional keys (`↑`, `↓`, `←`, `→`) and centered Paste (`⎘`).
   - Both `+` crosses can be tapped or dragged independently anywhere over the terminal viewport, with 4 completely hollow corners so underlying terminal text remains visible and clickable.
 - **Bottom 1-Row Read-Only Focused-Agent Quota Bar (底部单行聚焦 Agent 配额剩余百分比进度条)**
-  - Displays **only** the currently focused Agent's quota remaining percentage (`剩余百分比`) with an 8-step Unicode fractional block progress bar (e.g. `Codex  5h ██████▋░ 83% (3h12m)  ·  7d █▎░░░░░░ 16% (5d04h)`, `Antigravity  5h ███████▋ 95% (3h51m)  ·  7d ███▌░░░░ 44% (2d17h)`, `OpenCode  今日 ██████▉░ 86% (28/200 · 142k)`), never exceeding 1 line, without repeating status/CWD/turn info that the agent TUI already shows, plus `[ ✓ Copied ]`, clickable `[ ▲Pg ]` / `[ ▼Pg ]` in `--eink` mode, and clickable `[ ▼ BOT (+N) ]` when viewing scrollback.
+  - Displays **only** the currently focused Agent's quota remaining percentage (`剩余百分比`) with an 8-step Unicode fractional block progress bar (e.g. `Codex  5h ██████▋░ 83% (3h12m)  ·  7d █▎░░░░░░ 16% (5d04h)`, `Antigravity  5h ███████▋ 95% (3h51m)  ·  7d ███▌░░░░ 44% (2d17h)`, `OpenCode  今日 ██████▉░ 86% (28/200 · 142k)`), never exceeding 1 line, without repeating status/CWD/turn info that the agent TUI already shows, plus `[ ✓ Copied ]` and clickable `[ ▼ BOT (+N) ]` when viewing scrollback.
 - **Touch & Mouse Friendly for iPad / Mobile SSH (触控与鼠标丝滑切换)**
   - **Touch Drag Text Selection + Auto Copy over SSH (手指拖动选字自动复制)**: Drag across terminal text with your finger (or mouse) to highlight text in real time; releasing automatically copies the selected text to the remote SSH client's system clipboard via OSC 52 (and local clipboard when available) and flashes `[✓ Copied]`.
   - **1-Row Compact Touch Top Bar**: Uses a crisp 1-row pill bar (with bottom highlight underline on the active tab) so terminal sessions immediately start on Row 1 without wasting vertical screen space.
   - **Touch-Interactive Modals**: Directly tap items in the Space Popover (`^b b`) or Fuzzy Switcher (`^b w`), tap Confirm/Cancel buttons in dialogs, or tap any of the 16 quick-action buttons in the `[ ? ]` panel.
-- **E-Ink Monochrome & Agent Pacing Mode (`hct --eink` / `^b e` 墨水屏高对比低刷模式)**
-  - **Strict 300 PPI Monochrome Chrome & Viewport Filter**: Quantizes UI chrome, tabs, floating crosses, and modals to Carta 4-bit neutral grays (`#FFFFFF`, `#EEEEEE`, `#DDDDDD`, `#333333`, `#000000`), adds monochrome non-color Agent prefixes (`!` / `*` / `✓`) and dither-free progress bars (`█` / `─` with `!` low-quota warning), strips `Modifier::DIM`, and remaps dark-mode RGB/TrueColor agent output onto crisp white paper without restarting running sessions.
+- **E-Ink Monochrome & Agent Pacing Mode (`hct -e` / `hct --eink` / `^b e` 墨水屏高对比低刷模式)**
+  - **Strict 300 PPI Monochrome Chrome & Viewport Filter**: Quantizes UI chrome, tabs, floating crosses, and modals to Carta 4-bit neutral grays (`#FFFFFF`, `#EEEEEE`, `#DDDDDD`, `#333333`, `#000000`), keeps the top bar on white paper (`#FFFFFF`) with an active-tab highlight underline to minimize block ghosting and redraws, adds monochrome non-color Agent prefixes (`!` / `*` / `✓`) and dither-free progress bars (`█` / `─` with `!` low-quota warning), strips `Modifier::DIM`, and remaps dark-mode RGB/TrueColor agent output onto crisp white paper without restarting running sessions.
   - **Spinner Freezing & Frame Pacing**: Freezes isolated Braille/quarter-circle agent spinners to static `◈` while preserving multi-cell Braille charts, keeps user input at 0 ms responsiveness, coalesces passive PTY bursts over `--eink-interval-ms` (default `250`, max `2000`, configurable via `ui.eink_interval_ms`), and skips redundant draws when the snapped screen is unchanged.
-  - **Page-Turn Controls & Semantic Clean Refresh**: Adds direct `[ ▲Pg ]` / `[ ▼Pg ]` bottom-bar buttons (plus `[ ? ]` quick actions) and `^b PgUp` / `^b PgDn` shortcuts (with half-page main-screen wheel steps), `^b r` clean redraw, environment auto-detection (`HCT_EINK`, `SHELLDECK_EINK`, `LC_TERMINAL_PROFILE`, `HCT_THEME`, `TERM`), and `OSC 777;shelldeck;eink-refresh` signals on agent completion (`Working` → `Done`/`Idle`/`Blocked`) and tab/modal settlement.
+  - **Page-Turn Controls & Semantic Clean Refresh**: Adds left/right vertically-centered see-through book page-turn tabs (`[ ‹ ]` `PageUp` / `[ › ]` `PageDown`, plus `[ ? ]` quick actions) and `^b PgUp` / `^b PgDn` shortcuts (with half-page main-screen wheel steps), `^b r` clean redraw, environment auto-detection (`HCT_EINK`, `SHELLDECK_EINK`, `LC_TERMINAL_PROFILE`, `HCT_THEME`, `TERM`), and `OSC 777;shelldeck;eink-refresh` signals on agent completion (`Working` → `Done`/`Idle`/`Blocked`) and tab/modal settlement.
 - **Classic `herdr` Keybindings (兼容旧版 `herdr` 快捷键)**
   Compatible with `~/.config/herdr/config.toml` and `~/.config/herdr-tui/config.toml`.
 - **Shared Attention (`herdr.seen`)**
@@ -59,8 +59,8 @@ A fast, lightweight **multi-tab TUI client** for [`herdr-core` (`hc`)](https://g
 | **Jump to Alert Agent** (跳转待处理 Agent) | `^b a` | — |
 | **Cycle Pane in Split Tab** (多窗格轮换) | `^b o` | — |
 | **Scrollback Mode** (历史回滚查看) | `^b [` | Mouse Wheel Up / Down |
-| **Page Up / Page Down** (整页翻页) | `^b PgUp` / `^b PgDn` | Tap `[ ▲Pg ]` / `[ ▼Pg ]` on `--eink` status bar (or in `[ ? ]`) |
-| **Toggle E-Ink Mode** (切换墨水屏模式) | `^b e` | `hct --eink` / `--no-eink`, or Tap `[ ◐ E-Ink ]` in `[ ? ]` |
+| **Page Up / Page Down** (整页翻页) | `^b PgUp` / `^b PgDn` | Tap Left `[ ‹ ]` / Right `[ › ]` edge tab in `-e` / `--eink` (or in `[ ? ]`) |
+| **Toggle E-Ink Mode** (切换墨水屏模式) | `^b e` | `hct -e` / `--eink` / `--no-eink`, or Tap `[ ◐ E-Ink ]` in `[ ? ]` |
 | **Clean Redraw** (手动清残影重绘) | `^b r` | Tap `[ ↻ Redraw ]` in `[ ? ]` |
 | **Help Overlay** (快捷键帮助) | `^b ?` | Tap `[ ? ]` on top tab bar |
 | **Detach `hct`** (脱离并保持后台运行) | `^b q` (or `^b d`) | `Ctrl+\` or Tap `[ ⏏ ]` on top tab bar |

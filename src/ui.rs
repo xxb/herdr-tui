@@ -899,6 +899,9 @@ pub fn render_ui_full(
                     &mut hits,
                 );
             }
+            if eink_mode {
+                render_eink_page_turn_tabs(f, term_rect, mod_rect, dpad_rect, &mut hits);
+            }
         }
         Modal::SpaceMenu => {
             render_space_menu_modal(f, area, top_h, world, eink_mode, &mut hits);
@@ -1027,21 +1030,17 @@ fn tab_pill_style(st: AgentState, is_active: bool, eink_mode: bool) -> Style {
     if eink_mode {
         return if is_active {
             Style::default()
-                .bg(EINK_INK)
-                .fg(EINK_PAPER)
+                .bg(EINK_PAPER)
+                .fg(EINK_INK)
                 .add_modifier(Modifier::BOLD)
         } else {
             match st {
-                AgentState::Blocked | AgentState::Done => Style::default()
-                    .bg(EINK_PILL_BG)
-                    .fg(EINK_INK)
-                    .add_modifier(Modifier::BOLD),
-                AgentState::Working => Style::default()
-                    .bg(EINK_SURFACE)
+                AgentState::Blocked | AgentState::Done | AgentState::Working => Style::default()
+                    .bg(EINK_PAPER)
                     .fg(EINK_INK)
                     .add_modifier(Modifier::BOLD),
                 AgentState::Idle | AgentState::None => {
-                    Style::default().bg(EINK_SURFACE).fg(EINK_INK_MUTED)
+                    Style::default().bg(EINK_PAPER).fg(EINK_INK_MUTED)
                 }
             }
         };
@@ -1327,10 +1326,17 @@ fn draw_touchbar_pill(
             &bot_line,
             Style::default().bg(gloss_bg).fg(bot_gloss_fg),
         );
+    } else if eink_mode {
+        let pill_style = if emphasized {
+            style
+                .add_modifier(Modifier::UNDERLINED)
+                .underline_color(EINK_INK)
+        } else {
+            style
+        };
+        buf.set_string(x, rect.y, label, pill_style);
     } else {
-        let ul_color = if eink_mode {
-            EINK_INK
-        } else if emphasized {
+        let ul_color = if emphasized {
             TOPBAR_UNDERLINE_ACTIVE
         } else {
             TOPBAR_UNDERLINE_DIM
@@ -1367,7 +1373,7 @@ fn render_top_tabbar(
         TOPBAR_UNDERLINE_DIM
     };
     let mut bg_bar = Style::default().bg(bar_bg).fg(bar_fg);
-    if rect.height == 1 {
+    if rect.height == 1 && !eink_mode {
         bg_bar = bg_bar
             .add_modifier(Modifier::UNDERLINED)
             .underline_color(bar_ul);
@@ -1485,17 +1491,14 @@ fn render_top_tabbar(
     let mut drew_space = false;
     if space_w > 0 && x + space_w <= max_x {
         let style = if eink_mode {
-            if space_menu_open {
-                Style::default()
-                    .bg(EINK_INK)
-                    .fg(EINK_PAPER)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-                    .bg(EINK_SURFACE)
-                    .fg(EINK_INK)
-                    .add_modifier(Modifier::BOLD)
-            }
+            Style::default()
+                .bg(if space_menu_open {
+                    EINK_PAPER
+                } else {
+                    EINK_SURFACE
+                })
+                .fg(EINK_INK)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
                 .bg(if space_menu_open {
@@ -1527,7 +1530,7 @@ fn render_top_tabbar(
         } else {
             HERDR_OVERLAY0
         });
-        if rect.height == 1 {
+        if rect.height == 1 && !eink_mode {
             div_style = div_style
                 .add_modifier(Modifier::UNDERLINED)
                 .underline_color(bar_ul);
@@ -1649,17 +1652,14 @@ fn render_top_tabbar(
     // 3. `[ + ]` button immediately after the tabs to add a new Tab
     if x + plus_w <= avail_end {
         let pstyle = if eink_mode {
-            if tab_overview_open {
-                Style::default()
-                    .bg(EINK_INK)
-                    .fg(EINK_PAPER)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-                    .bg(EINK_SURFACE)
-                    .fg(EINK_INK)
-                    .add_modifier(Modifier::BOLD)
-            }
+            Style::default()
+                .bg(if tab_overview_open {
+                    EINK_PAPER
+                } else {
+                    EINK_SURFACE
+                })
+                .fg(EINK_INK)
+                .add_modifier(Modifier::BOLD)
         } else if tab_overview_open {
             Style::default()
                 .bg(HERDR_ACCENT)
@@ -1794,7 +1794,7 @@ fn render_bottom_status_bar(
     let max_x = rect.x + rect.width;
     let mut x = rect.x;
 
-    // Reserve right-side space for optional `✓ Copied`, E-Ink `[ ▲Pg ]` / `[ ▼Pg ]` pills, and `▼ BOT (+N)`
+    // Reserve right-side space for optional `✓ Copied` and `▼ BOT (+N)` indicators
     let copied_lbl = if copied_flash {
         Some(if rect.width < 60 {
             " ✓ "
@@ -1815,17 +1815,7 @@ fn render_bottom_status_bar(
     };
     let copied_w = copied_lbl.map_or(0, |s| s.width() as u16);
     let scroll_w = scroll_lbl.as_ref().map_or(0, |s| s.width() as u16);
-    let pg_up_lbl = " ▲Pg ";
-    let pg_dn_lbl = " ▼Pg ";
-    let pg_up_w = pg_up_lbl.width() as u16;
-    let pg_dn_w = pg_dn_lbl.width() as u16;
-    let pg_gap_before = u16::from(copied_lbl.is_some());
-    let pg_gap_after = u16::from(scroll_lbl.is_some());
-    let pg_pair_w = pg_gap_before + pg_up_w + 1 + pg_dn_w + pg_gap_after;
-    let show_pg_btns =
-        eink_mode && rect.width >= 32 && copied_w + scroll_w + pg_pair_w <= rect.width;
-    let pg_w = if show_pg_btns { pg_pair_w } else { 0 };
-    let right_reserved = copied_w + pg_w + scroll_w;
+    let right_reserved = copied_w + scroll_w;
     let avail_end = max_x.saturating_sub(right_reserved);
 
     // Strictly render ONLY the currently focused agent's quota usage on this single row.
@@ -2012,50 +2002,6 @@ fn render_bottom_status_bar(
                 },
             );
             rx += cw;
-        }
-    }
-    if show_pg_btns {
-        if copied_lbl.is_some() && rx < max_x {
-            buf.set_string(rx, rect.y, " ", base_style);
-            rx += 1;
-        }
-        let pg_style = Style::default()
-            .bg(EINK_SURFACE)
-            .fg(EINK_INK)
-            .add_modifier(Modifier::BOLD);
-        if rx + pg_up_w <= max_x {
-            buf.set_string(rx, rect.y, pg_up_lbl, pg_style);
-            hits.push(HitRegion {
-                rect: Rect {
-                    x: rx,
-                    y: rect.y,
-                    width: pg_up_w,
-                    height: rect.height,
-                },
-                target: HitTarget::TriggerAction(Action::PageUp),
-            });
-            rx += pg_up_w;
-        }
-        if rx < max_x {
-            buf.set_string(rx, rect.y, " ", base_style);
-            rx += 1;
-        }
-        if rx + pg_dn_w <= max_x {
-            buf.set_string(rx, rect.y, pg_dn_lbl, pg_style);
-            hits.push(HitRegion {
-                rect: Rect {
-                    x: rx,
-                    y: rect.y,
-                    width: pg_dn_w,
-                    height: rect.height,
-                },
-                target: HitTarget::TriggerAction(Action::PageDown),
-            });
-            rx += pg_dn_w;
-        }
-        if scroll_lbl.is_some() && rx < max_x {
-            buf.set_string(rx, rect.y, " ", base_style);
-            rx += 1;
         }
     }
     if let Some(slbl) = scroll_lbl {
@@ -2599,6 +2545,145 @@ fn render_floating_dpad(
     });
 
     Some(disc)
+}
+
+fn rects_intersect(a: Rect, b: Rect) -> bool {
+    a.x < b.x.saturating_add(b.width)
+        && b.x < a.x.saturating_add(a.width)
+        && a.y < b.y.saturating_add(b.height)
+        && b.y < a.y.saturating_add(a.height)
+}
+
+fn resolve_eink_page_tab_rect(
+    term_rect: Rect,
+    is_left: bool,
+    obstacle: Option<Rect>,
+) -> Option<Rect> {
+    if term_rect.width < 12 || term_rect.height < 3 {
+        return None;
+    }
+    let tab_w: u16 = 3;
+    let tab_h: u16 = if term_rect.height >= 9 {
+        5
+    } else if term_rect.height >= 5 {
+        3
+    } else {
+        1
+    };
+    let x = if is_left {
+        term_rect.x
+    } else {
+        term_rect.x + term_rect.width - tab_w
+    };
+    let min_y = term_rect.y;
+    let max_y = term_rect.y + term_rect.height - tab_h;
+    let ideal_y = term_rect.y + (term_rect.height - tab_h) / 2;
+
+    let Some(obs) = obstacle else {
+        return Some(Rect {
+            x,
+            y: ideal_y,
+            width: tab_w,
+            height: tab_h,
+        });
+    };
+
+    let mut candidates = [None; 5];
+    candidates[0] = Some(ideal_y);
+    candidates[1] = obs.y.checked_sub(tab_h + 1).filter(|&y| y >= min_y);
+    candidates[2] = obs.y.checked_sub(tab_h).filter(|&y| y >= min_y);
+    let below_gap = obs.y.saturating_add(obs.height).saturating_add(1);
+    if below_gap <= max_y {
+        candidates[3] = Some(below_gap);
+    }
+    let below_flush = obs.y.saturating_add(obs.height);
+    if below_flush <= max_y {
+        candidates[4] = Some(below_flush);
+    }
+
+    for cand_y in candidates.into_iter().flatten() {
+        let rect = Rect {
+            x,
+            y: cand_y.clamp(min_y, max_y),
+            width: tab_w,
+            height: tab_h,
+        };
+        if !rects_intersect(rect, obs) {
+            return Some(rect);
+        }
+    }
+    None
+}
+
+fn paint_eink_page_tab(buf: &mut Buffer, rect: Rect, is_left: bool) {
+    let mid_y = rect.y + rect.height / 2;
+    let icon_x = if is_left {
+        rect.x
+    } else {
+        rect.x + rect.width.saturating_sub(1)
+    };
+    let chevron = if is_left { "‹" } else { "›" };
+
+    for y in rect.y..rect.y.saturating_add(rect.height) {
+        for x in rect.x..rect.x.saturating_add(rect.width) {
+            if x >= buf.area.width || y >= buf.area.height {
+                continue;
+            }
+            if x == icon_x && y == mid_y {
+                let was_wide_lead = buf[(x, y)].symbol().width() == 2;
+                let was_wide_cont = x > 0 && buf[(x - 1, y)].symbol().width() == 2;
+                if was_wide_cont {
+                    let prev = &mut buf[(x - 1, y)];
+                    prev.set_symbol(" ");
+                }
+                let cell = &mut buf[(x, y)];
+                cell.set_symbol(chevron);
+                cell.set_bg(EINK_SURFACE);
+                cell.set_fg(EINK_INK);
+                cell.modifier.insert(Modifier::BOLD);
+                if was_wide_lead && x + 1 < buf.area.width {
+                    let next = &mut buf[(x + 1, y)];
+                    next.set_symbol(" ");
+                    if x + 1 < rect.x + rect.width {
+                        next.set_bg(EINK_SURFACE);
+                        if next.fg == EINK_PAPER {
+                            next.set_fg(EINK_INK);
+                        }
+                    }
+                }
+            } else {
+                let cell = &mut buf[(x, y)];
+                cell.set_bg(EINK_SURFACE);
+                if cell.fg == EINK_PAPER {
+                    cell.set_fg(EINK_INK);
+                }
+            }
+        }
+    }
+}
+
+fn render_eink_page_turn_tabs(
+    f: &mut Frame,
+    term_rect: Rect,
+    mod_rect: Option<Rect>,
+    dpad_rect: Option<Rect>,
+    hits: &mut Vec<HitRegion>,
+) {
+    let buf = f.buffer_mut();
+    if let Some(left_rect) = resolve_eink_page_tab_rect(term_rect, true, mod_rect) {
+        paint_eink_page_tab(buf, left_rect, true);
+        hits.push(HitRegion {
+            rect: left_rect,
+            target: HitTarget::TriggerAction(Action::PageUp),
+        });
+    }
+    if let Some(right_rect) = resolve_eink_page_tab_rect(term_rect, false, dpad_rect) {
+        paint_eink_page_tab(buf, right_rect, false);
+        hits.push(HitRegion {
+            rect: right_rect,
+            target: HitTarget::TriggerAction(Action::PageDown),
+        });
+    }
 }
 
 fn shorten_home_path(path: &str) -> String {
@@ -3886,7 +3971,7 @@ fn render_help_modal(f: &mut Frame, area: Rect, eink_mode: bool, hits: &mut Vec<
         Line::from("  Quick Fuzzy Switcher     ^b w          or  ^b f"),
         Line::from("  Jump Next Alert Agent    ^b a          (◉ blocked / ✓ done)"),
         Line::from("  Scrollback / History     ^b [          or  Tap [▼ BOT] on status bar"),
-        Line::from("  Page Up / Down           ^b PgUp / PgDn /  Tap [▲Pg] / [▼Pg] (--eink / ?)"),
+        Line::from("  Page Up / Down           ^b PgUp / PgDn /  Tap Left [‹] / Right [›] (-e)"),
         Line::from("  E-Ink / Clean Redraw     ^b e (E-Ink)  /   ^b r (clean redraw)"),
         Line::from("  Detach (keep running)    ^b q / ^b d   or  Ctrl+\\ / Tap [ ⏏ ]"),
         Line::from(""),
@@ -5899,6 +5984,8 @@ mod tests {
                 "⣿ Vertical\r\n",
                 "⣤ Column\r\n",
                 "◜ CornerArc",
+                "\x1b[9;1HSeeThrough",
+                "\x1b[11;1H中A\x1b[11;99H中",
             )
             .as_bytes(),
         );
@@ -5957,23 +6044,52 @@ mod tests {
         assert!(top_row.contains("!1:"));
         assert!(top_row.contains("*2:"));
         assert!(top_row.contains("✓3:"));
+        let active_byte = top_row.find("4:sh-idl").expect("active tab in top row");
+        let active_x = top_row[..active_byte].chars().count() as u16;
+        assert_eq!(buf[(active_x, 0)].bg, EINK_PAPER);
+        assert_eq!(buf[(active_x, 0)].fg, EINK_INK);
+        assert!(buf[(active_x, 0)]
+            .modifier
+            .contains(Modifier::UNDERLINED | Modifier::BOLD));
+        let inactive_byte = top_row
+            .find("!1:")
+            .expect("inactive blocked tab in top row");
+        let inactive_x = top_row[..inactive_byte].chars().count() as u16;
+        assert_eq!(buf[(inactive_x, 0)].bg, EINK_PAPER);
+        assert!(!buf[(inactive_x, 0)].modifier.contains(Modifier::UNDERLINED));
 
         let bot_row: String = (0..100).map(|x| buf[(x, 23)].symbol()).collect();
         assert!(bot_row.contains("12%!"));
         assert!(bot_row.contains('█'));
         assert!(bot_row.contains('─'));
         assert!(!bot_row.contains('░'));
-        assert!(bot_row.contains("▲Pg"));
-        assert!(bot_row.contains("▼Pg"));
-        assert!(geom_hits
-            .iter()
-            .any(|h| h.target == HitTarget::TriggerAction(Action::PageUp)));
-        assert!(geom_hits
-            .iter()
-            .any(|h| h.target == HitTarget::TriggerAction(Action::PageDown)));
+        assert!(!bot_row.contains("▲Pg"));
+        assert!(!bot_row.contains("▼Pg"));
+        assert!(geom_hits.iter().any(|h| h.rect == Rect::new(0, 9, 3, 5)
+            && h.target == HitTarget::TriggerAction(Action::PageUp)));
+        assert!(geom_hits.iter().any(|h| h.rect == Rect::new(97, 9, 3, 5)
+            && h.target == HitTarget::TriggerAction(Action::PageDown)));
         assert!(geom_hits
             .iter()
             .any(|h| h.target == HitTarget::ExitScrollback));
+
+        // Left & right vertically-centered see-through book page-turn tabs preserve text
+        // outside the centered chevron and sanitize half-wide CJK glyphs under the chevron.
+        assert_eq!(buf[(0, 9)].symbol(), "S");
+        assert_eq!(buf[(0, 9)].bg, EINK_SURFACE);
+        assert_eq!(buf[(1, 9)].symbol(), "e");
+        assert_eq!(buf[(1, 9)].bg, EINK_SURFACE);
+        assert_eq!(buf[(0, 11)].symbol(), "‹");
+        assert_eq!(buf[(0, 11)].bg, EINK_SURFACE);
+        assert_eq!(buf[(0, 11)].fg, EINK_INK);
+        assert_eq!(buf[(1, 11)].symbol(), " ");
+        assert_eq!(buf[(1, 11)].bg, EINK_SURFACE);
+        assert_eq!(buf[(2, 11)].symbol(), "A");
+        assert_eq!(buf[(2, 11)].bg, EINK_SURFACE);
+        assert_eq!(buf[(98, 11)].symbol(), " ");
+        assert_eq!(buf[(98, 11)].bg, EINK_SURFACE);
+        assert_eq!(buf[(99, 11)].symbol(), "›");
+        assert_eq!(buf[(99, 11)].bg, EINK_SURFACE);
 
         // Verify VtScreenWidget spinner freezing, vertical/horizontal sparkline & corner-arc
         // preservation, DIM removal, and RGB de-fog
