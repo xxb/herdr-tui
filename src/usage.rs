@@ -301,6 +301,20 @@ pub fn render_progress_bar(percent: f64, width: usize) -> String {
     out
 }
 
+/// Dither-free solid-block progress bar (`█` / `─`) for 300 PPI monochrome E-Ink panels.
+pub fn render_eink_progress_bar(percent: f64, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let clamped = percent.clamp(0.0, 100.0);
+    let filled = (((clamped / 100.0) * (width as f64)).round() as usize).min(width);
+    let mut out = String::with_capacity(width * 3);
+    for i in 0..width {
+        out.push(if i < filled { '█' } else { '─' });
+    }
+    out
+}
+
 pub fn format_duration_short(secs: u64) -> String {
     if secs == 0 {
         return "0m".to_string();
@@ -2168,5 +2182,16 @@ mod tests {
             .unwrap()
             .metrics
             .is_empty());
+    }
+
+    #[test]
+    fn eink_progress_bar_avoids_dithered_blocks() {
+        assert_eq!(render_eink_progress_bar(83.0, 0), "");
+        assert_eq!(render_eink_progress_bar(0.0, 8), "────────");
+        assert_eq!(render_eink_progress_bar(50.0, 8), "████────");
+        assert_eq!(render_eink_progress_bar(83.0, 8), "███████─");
+        assert_eq!(render_eink_progress_bar(100.0, 8), "████████");
+        assert_eq!(render_eink_progress_bar(140.0, 4), "████");
+        assert_eq!(render_eink_progress_bar(-10.0, 4), "────");
     }
 }

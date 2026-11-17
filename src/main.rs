@@ -14,13 +14,14 @@ use crate::keys::{
     encode_key_event, is_prefix_key, match_direct_action, match_prefix_action, prefix_bytes,
     Action, FileConfig,
 };
-use crate::model::{EventDisposition, World};
+use crate::model::{AgentState, EventDisposition, World};
 use crate::ui::{
-    collect_fuzzy_items, collect_overview_items, compute_terminal_rect, find_hit_target,
-    is_in_rect, is_on_dpad_disc, overview_selection_after_query_change,
-    overview_selection_for_index, render_ui_with_pads_and_quota, resolve_dpad_disc_rect,
-    resolve_fuzzy_selection, resolve_mod_cross_rect, resolve_overview_selection, HitRegion,
-    HitTarget, Modal, OverviewItem, OverviewSelection, PromptKind, TerminalSelection,
+    capture_eink_screen_snapshot, collect_fuzzy_items, collect_overview_items,
+    compute_terminal_rect, find_hit_target, is_in_rect, is_on_dpad_disc,
+    overview_selection_after_query_change, overview_selection_for_index, render_ui_full,
+    resolve_dpad_disc_rect, resolve_fuzzy_selection, resolve_mod_cross_rect,
+    resolve_overview_selection, EinkScreenSnapshot, HitRegion, HitTarget, Modal, OverviewItem,
+    OverviewSelection, PromptKind, TerminalSelection,
 };
 use crate::usage::UsageTracker;
 use anyhow::Result;
@@ -64,6 +65,9 @@ const HORIZ_SWIPE_ACCUM_WINDOW: Duration = Duration::from_millis(250);
 const VIEWPORT_HORIZ_SWIPE_THRESHOLD: u8 = 3;
 const TOP_BAR_HORIZ_SWIPE_THRESHOLD: u8 = 1;
 const SPACE_MENU_HORIZ_SWIPE_THRESHOLD: u8 = 1;
+const DEFAULT_EINK_INTERVAL_MS: u64 = 250;
+const MAX_EINK_INTERVAL_MS: u64 = 2000;
+const EINK_REFRESH_OSC: &[u8] = b"\x1b]777;shelldeck;eink-refresh\x07";
 
 enum AppEvent {
     Core(CoreMessage),
@@ -174,6 +178,74 @@ struct Cli {
     /// Refuse running `hct` nested inside another terminal multiplexer (overrides `ui.allow_nested = true`)
     #[arg(long, conflicts_with = "allow_nested")]
     no_allow_nested: bool,
+
+    /// Optimize UI and frame pacing for 300 PPI monochrome E-Ink displays
+    #[arg(long)]
+    eink: bool,
+
+    /// Disable E-Ink mode (overrides ui.eink = true or environment detection)
+    #[arg(long, conflicts_with = "eink")]
+    no_eink: bool,
+
+    /// Passive PTY output coalescing interval in milliseconds when --eink is enabled (default: 250)
+    #[arg(long)]
+    eink_interval_ms: Option<u64>,
+}
+
+fn resolve_eink_mode<F>(
+    cli_eink: bool,
+    cli_no_eink: bool,
+    cfg_eink: Option<bool>,
+    mut get_env: F,
+) -> bool
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    if cli_eink {
+        return true;
+    }
+    if cli_no_eink {
+        return false;
+    }
+    if let Some(v) = cfg_eink {
+        return v;
+    }
+    for var in ["HCT_EINK", "SHELLDECK_EINK"] {
+        if let Some(raw) = get_env(var) {
+            let trimmed = raw.trim().to_ascii_lowercase();
+            match trimmed.as_str() {
+                "1" | "true" | "yes" | "on" => return true,
+                "0" | "false" | "no" | "off" => return false,
+                _ => {}
+            }
+        }
+    }
+    for var in ["LC_TERMINAL_PROFILE", "HCT_THEME", "TERM"] {
+        if let Some(raw) = get_env(var) {
+            let lower = raw.trim().to_ascii_lowercase();
+            if lower.contains("eink") || lower.contains("e-ink") || lower.contains("monochrome") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn resolve_eink_interval(cli_ms: Option<u64>, cfg_ms: Option<u64>) -> Duration {
+    Duration::from_millis(
+        cli_ms
+            .or(cfg_ms)
+            .unwrap_or(DEFAULT_EINK_INTERVAL_MS)
+            .min(MAX_EINK_INTERVAL_MS),
+    )
+}
+
+fn main_scrollback_wheel_step(term_height: u16, eink_mode: bool) -> usize {
+    if eink_mode {
+        (term_height as usize / 2).max(3)
+    } else {
+        3
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1500,6 +1572,10 @@ fn main() -> Result<()> {
     } else {
         file_cfg.ui.touch_mode.unwrap_or(false)
     };
+    let eink_mode = resolve_eink_mode(cli.eink, cli.no_eink, file_cfg.ui.eink, |k| {
+        std::env::var_os(k).map(|v| v.to_string_lossy().into_owned())
+    });
+    let eink_interval = resolve_eink_interval(cli.eink_interval_ms, file_cfg.ui.eink_interval_ms);
 
     let (app_tx, app_rx) = mpsc::channel::<AppEvent>();
     let core =
@@ -1569,6 +1645,8 @@ fn main() -> Result<()> {
         sidebar_width,
         mobile_threshold,
         touch_mode,
+        eink_mode,
+        eink_interval,
     );
 
     // Disable mouse capture, bracketed paste, and alternate screen BEFORE disabling raw mode
@@ -1767,6 +1845,10 @@ fn execute_action(
     _sidebar_open: &mut bool,
     scrollback_offset: &mut usize,
     modal: &mut Modal,
+    term_rect: Rect,
+    eink_mode: &mut bool,
+    force_clear: &mut bool,
+    pending_eink_osc: &mut bool,
 ) -> Result<bool> {
     match action {
         Action::Detach => return Ok(true),
@@ -1875,6 +1957,41 @@ fn execute_action(
             } else {
                 Modal::Help
             };
+        }
+        Action::ToggleEink => {
+            *eink_mode = !*eink_mode;
+            *force_clear = true;
+            *pending_eink_osc = *eink_mode;
+        }
+        Action::RedrawScreen => {
+            *force_clear = true;
+            if *eink_mode {
+                *pending_eink_osc = true;
+            }
+        }
+        Action::PageUp => {
+            if attached.is_some_and(|a| a.parser.screen().alternate_screen())
+                && *scrollback_offset == 0
+            {
+                if let Some(att) = attached {
+                    core.send_input(att.channel, b"\x1b[5~");
+                }
+            } else {
+                let step = (term_rect.height as usize).saturating_sub(2).max(1);
+                *scrollback_offset = scrollback_offset.saturating_add(step);
+            }
+        }
+        Action::PageDown => {
+            if attached.is_some_and(|a| a.parser.screen().alternate_screen())
+                && *scrollback_offset == 0
+            {
+                if let Some(att) = attached {
+                    core.send_input(att.channel, b"\x1b[6~");
+                }
+            } else {
+                let step = (term_rect.height as usize).saturating_sub(2).max(1);
+                *scrollback_offset = scrollback_offset.saturating_sub(step);
+            }
         }
     }
     Ok(false)
@@ -2456,6 +2573,50 @@ enum KeyOutcome {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn promote_due_pty_dirty(
+    eink_mode: bool,
+    eink_interval: Duration,
+    now: Instant,
+    pty_dirty: &mut bool,
+    dirty: &mut bool,
+    last_draw_at: &mut Option<Instant>,
+    last_eink_snap: &Option<(String, EinkScreenSnapshot)>,
+    active_addr: Option<&str>,
+    attached_map: &mut BTreeMap<String, AttachedTerminal>,
+    term_rect: Rect,
+    scrollback_offset: &mut usize,
+    modal: &Modal,
+    selection: &Option<TerminalSelection>,
+) {
+    if !*pty_dirty || *dirty {
+        return;
+    }
+    let due = !eink_mode
+        || eink_interval.is_zero()
+        || last_draw_at.is_none_or(|t| now.saturating_duration_since(t) >= eink_interval);
+    if !due {
+        return;
+    }
+    if eink_mode && matches!(modal, Modal::None) && selection.is_none() {
+        if let Some(att) = active_addr.and_then(|a| attached_map.get_mut(a)) {
+            att.parser.screen_mut().set_scrollback(*scrollback_offset);
+            *scrollback_offset = att.parser.screen().scrollback();
+            let snap =
+                capture_eink_screen_snapshot(att.parser.screen(), term_rect, *scrollback_offset);
+            if last_eink_snap
+                .as_ref()
+                .is_some_and(|(a, prev)| Some(a.as_str()) == active_addr && prev == &snap)
+            {
+                *pty_dirty = false;
+                *last_draw_at = Some(now);
+                return;
+            }
+        }
+    }
+    *dirty = true;
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<BufWriter<io::Stdout>>>,
     core: &CoreClient,
@@ -2467,6 +2628,8 @@ fn run_app(
     sidebar_width: u16,
     mobile_threshold: u16,
     touch_mode: bool,
+    eink_mode: bool,
+    eink_interval: Duration,
 ) -> Result<()> {
     let mut attached_map: BTreeMap<String, AttachedTerminal> = BTreeMap::new();
     let mut active_addr: Option<String> = None;
@@ -2481,6 +2644,8 @@ fn run_app(
         sidebar_width,
         mobile_threshold,
         touch_mode,
+        eink_mode,
+        eink_interval,
         &mut attached_map,
         &mut active_addr,
     );
@@ -2505,6 +2670,8 @@ fn run_app_loop(
     sidebar_width: u16,
     mobile_threshold: u16,
     touch_mode: bool,
+    mut eink_mode: bool,
+    eink_interval: Duration,
     attached_map: &mut BTreeMap<String, AttachedTerminal>,
     active_addr: &mut Option<String>,
 ) -> Result<()> {
@@ -2533,6 +2700,13 @@ fn run_app_loop(
     let mut last_usage_rev: u64 = 0;
     let mut has_focused_agent = false;
     let mut dirty = true;
+    let mut pty_dirty = false;
+    let mut last_draw_at: Option<Instant> = None;
+    let mut last_eink_snap: Option<(String, EinkScreenSnapshot)> = None;
+    let mut pending_eink_osc = eink_mode;
+    let mut prev_drawn_addr: Option<String> = None;
+    let mut prev_modal_open = false;
+    let mut prev_active_agent_state: Option<(String, AgentState)> = None;
     let mut need_sync_terminals = true;
     let mut more_events = false;
     let mut resynced_this_frame = false;
@@ -2624,6 +2798,22 @@ fn run_app_loop(
             .and_then(|a| attached_map.get(a))
             .map(|att| att.channel);
 
+        promote_due_pty_dirty(
+            eink_mode,
+            eink_interval,
+            now,
+            &mut pty_dirty,
+            &mut dirty,
+            &mut last_draw_at,
+            &last_eink_snap,
+            active_addr.as_deref(),
+            attached_map,
+            term_rect,
+            &mut scrollback_offset,
+            &modal,
+            &selection,
+        );
+
         // When completely idle, block on the unified `AppEvent` channel with zero polling.
         let mut first_event: Option<AppEvent> = None;
         if !dirty && !more_events && !need_sync_terminals && !newly_attached_active {
@@ -2634,9 +2824,19 @@ fn run_app_loop(
                 None
             };
             let retry_deadline = pending_attach_retry.as_ref().map(|(_, t)| *t);
-            for deadline in [copied_until, pending_sibling_resize_at, retry_deadline]
-                .into_iter()
-                .flatten()
+            let pty_deadline = if pty_dirty && eink_mode && !eink_interval.is_zero() {
+                Some(last_draw_at.map_or(now, |t| t + eink_interval))
+            } else {
+                None
+            };
+            for deadline in [
+                copied_until,
+                pending_sibling_resize_at,
+                retry_deadline,
+                pty_deadline,
+            ]
+            .into_iter()
+            .flatten()
             {
                 let rem = deadline.saturating_duration_since(now);
                 wait_timeout = Some(match wait_timeout {
@@ -2720,16 +2920,28 @@ fn run_app_loop(
                             flush_credits(core, &mut pending_credits, &mut pending_credit_bytes);
                         }
                         let is_active = active_channel == Some(channel);
-                        if is_active && !matches!(modal, Modal::TabOverview { .. }) {
-                            dirty = true;
-                        }
                         if let Some(att) = attached_map.values_mut().find(|a| a.channel == channel)
                         {
                             att.process_vt_bytes(&data);
-                            if is_active && selection.as_ref().is_some_and(|s| !s.active) {
-                                selection = None;
-                                selection_screen = None;
-                                selection_vt_seq = None;
+                        }
+                        let mut cleared_vis_sel = false;
+                        if is_active && selection.as_ref().is_some_and(|s| !s.active) {
+                            cleared_vis_sel = selection
+                                .as_ref()
+                                .is_some_and(TerminalSelection::is_non_empty);
+                            selection = None;
+                            selection_screen = None;
+                            selection_vt_seq = None;
+                        }
+                        if is_active && !matches!(modal, Modal::TabOverview { .. }) {
+                            if !eink_mode
+                                || eink_interval.is_zero()
+                                || !first_frame_drawn
+                                || cleared_vis_sel
+                            {
+                                dirty = true;
+                            } else {
+                                pty_dirty = true;
                             }
                         }
                     }
@@ -2906,6 +3118,10 @@ fn run_app_loop(
                                                 sidebar_open,
                                                 &mut scrollback_offset,
                                                 &mut modal,
+                                                term_rect,
+                                                &mut eink_mode,
+                                                &mut force_clear,
+                                                &mut pending_eink_osc,
                                             )? {
                                                 flush_credits(
                                                     core,
@@ -3046,31 +3262,36 @@ fn run_app_loop(
                                             };
                                             dirty = true;
                                         }
-                                        HitTarget::SendKey(kev) => match handle_key_event(
-                                            kev,
-                                            core,
-                                            world,
-                                            active_att,
-                                            prefix_spec,
-                                            sidebar_open,
-                                            &mut prefix_active,
-                                            &mut ctrl_active,
-                                            &mut alt_active,
-                                            &mut scrollback_offset,
-                                            &mut modal,
-                                            term_rect,
-                                        )? {
-                                            KeyOutcome::Quit => {
-                                                flush_credits(
-                                                    core,
-                                                    &mut pending_credits,
-                                                    &mut pending_credit_bytes,
-                                                );
-                                                return Ok(());
+                                        HitTarget::SendKey(kev) => {
+                                            match handle_key_event_with_eink(
+                                                kev,
+                                                core,
+                                                world,
+                                                active_att,
+                                                prefix_spec,
+                                                sidebar_open,
+                                                &mut prefix_active,
+                                                &mut ctrl_active,
+                                                &mut alt_active,
+                                                &mut scrollback_offset,
+                                                &mut modal,
+                                                term_rect,
+                                                &mut eink_mode,
+                                                &mut force_clear,
+                                                &mut pending_eink_osc,
+                                            )? {
+                                                KeyOutcome::Quit => {
+                                                    flush_credits(
+                                                        core,
+                                                        &mut pending_credits,
+                                                        &mut pending_credit_bytes,
+                                                    );
+                                                    return Ok(());
+                                                }
+                                                KeyOutcome::UiChanged => dirty = true,
+                                                KeyOutcome::ForwardedToPty => {}
                                             }
-                                            KeyOutcome::UiChanged => dirty = true,
-                                            KeyOutcome::ForwardedToPty => {}
-                                        },
+                                        }
                                     }
                                 } else if matches!(modal, Modal::TabOverview { .. }) {
                                     dpad_drag = None;
@@ -3205,7 +3426,7 @@ fn run_app_loop(
                                                 }
                                             }
                                             Some(HitTarget::SendKey(kev)) => {
-                                                match handle_key_event(
+                                                match handle_key_event_with_eink(
                                                     kev,
                                                     core,
                                                     world,
@@ -3218,6 +3439,9 @@ fn run_app_loop(
                                                     &mut scrollback_offset,
                                                     &mut modal,
                                                     term_rect,
+                                                    &mut eink_mode,
+                                                    &mut force_clear,
+                                                    &mut pending_eink_osc,
                                                 )? {
                                                     KeyOutcome::Quit => {
                                                         flush_credits(
@@ -3405,7 +3629,9 @@ fn run_app_loop(
                                         core.send_input(ch, &bytes);
                                     } else {
                                         let prev_scroll = scrollback_offset;
-                                        scrollback_offset = scrollback_offset.saturating_add(3);
+                                        let step =
+                                            main_scrollback_wheel_step(term_rect.height, eink_mode);
+                                        scrollback_offset = scrollback_offset.saturating_add(step);
                                         if scrollback_offset != prev_scroll {
                                             dirty = true;
                                         }
@@ -3535,7 +3761,9 @@ fn run_app_loop(
                                         core.send_input(ch, &bytes);
                                     } else {
                                         let prev_scroll = scrollback_offset;
-                                        scrollback_offset = scrollback_offset.saturating_sub(3);
+                                        let step =
+                                            main_scrollback_wheel_step(term_rect.height, eink_mode);
+                                        scrollback_offset = scrollback_offset.saturating_sub(step);
                                         if scrollback_offset != prev_scroll {
                                             dirty = true;
                                         }
@@ -3594,7 +3822,7 @@ fn run_app_loop(
                             if had_drag_or_sel {
                                 dirty = true;
                             }
-                            match handle_key_event(
+                            match handle_key_event_with_eink(
                                 kev,
                                 core,
                                 world,
@@ -3607,6 +3835,9 @@ fn run_app_loop(
                                 &mut scrollback_offset,
                                 &mut modal,
                                 term_rect,
+                                &mut eink_mode,
+                                &mut force_clear,
+                                &mut pending_eink_osc,
                             )? {
                                 KeyOutcome::Quit => {
                                     flush_credits(
@@ -3754,6 +3985,47 @@ fn run_app_loop(
             dirty = true;
         }
 
+        promote_due_pty_dirty(
+            eink_mode,
+            eink_interval,
+            Instant::now(),
+            &mut pty_dirty,
+            &mut dirty,
+            &mut last_draw_at,
+            &last_eink_snap,
+            active_addr.as_deref(),
+            attached_map,
+            term_rect,
+            &mut scrollback_offset,
+            &modal,
+            &selection,
+        );
+
+        let cur_agent = active_addr
+            .as_ref()
+            .and_then(|a| world.terminals.get(a))
+            .map(|i| (i.address.clone(), i.agent_state()));
+        if eink_mode {
+            if let (
+                Some((ref prev_addr, AgentState::Working)),
+                Some((ref cur_a, AgentState::Done | AgentState::Blocked)),
+            ) = (&prev_active_agent_state, &cur_agent)
+            {
+                if prev_addr == cur_a {
+                    force_clear = true;
+                    pending_eink_osc = true;
+                    dirty = true;
+                }
+            }
+            if first_frame_drawn && *active_addr != prev_drawn_addr {
+                pending_eink_osc = true;
+            }
+            if prev_modal_open && matches!(modal, Modal::None) {
+                pending_eink_osc = true;
+            }
+        }
+        prev_active_agent_state = cur_agent;
+
         if dirty {
             let active_att = active_addr.as_ref().and_then(|a| attached_map.get(a));
             let scr_ref = if selection.as_ref().is_some_and(|s| s.active) {
@@ -3772,7 +4044,7 @@ fn run_app_loop(
                 force_clear = false;
             }
             terminal.draw(|f| {
-                let geom = render_ui_with_pads_and_quota(
+                let geom = render_ui_full(
                     f,
                     world,
                     scr_ref,
@@ -3791,14 +4063,41 @@ fn run_app_loop(
                     dpad_pos,
                     dpad_dragging,
                     focused_quota.as_ref(),
+                    eink_mode,
                 );
                 last_hits = geom.hits;
                 last_mod_rect = geom.mod_rect;
                 last_dpad_rect = geom.dpad_rect;
                 last_space_slop_rect = geom.space_slop_rect;
             })?;
+            if pending_eink_osc {
+                if eink_mode {
+                    terminal.backend_mut().write_all(EINK_REFRESH_OSC)?;
+                }
+                pending_eink_osc = false;
+            }
             execute!(terminal.backend_mut(), EndSynchronizedUpdate)?;
             dirty = false;
+            pty_dirty = false;
+            last_draw_at = Some(Instant::now());
+            prev_drawn_addr = active_addr.clone();
+            prev_modal_open = !matches!(modal, Modal::None);
+            last_eink_snap = if eink_mode && matches!(modal, Modal::None) && selection.is_none() {
+                active_addr.as_ref().and_then(|addr| {
+                    attached_map.get(addr).map(|att| {
+                        (
+                            addr.clone(),
+                            capture_eink_screen_snapshot(
+                                att.parser.screen(),
+                                term_rect,
+                                scrollback_offset,
+                            ),
+                        )
+                    })
+                })
+            } else {
+                None
+            };
             if !first_frame_drawn {
                 first_frame_drawn = true;
                 need_sync_terminals = true;
@@ -3817,6 +4116,10 @@ fn handle_shortcut_in_tab_overview(
     sidebar_open: &mut bool,
     scrollback_offset: &mut usize,
     modal: &mut Modal,
+    term_rect: Rect,
+    eink_mode: &mut bool,
+    force_clear: &mut bool,
+    pending_eink_osc: &mut bool,
 ) -> Result<KeyOutcome> {
     match action {
         Action::Detach => {
@@ -3847,6 +4150,10 @@ fn handle_shortcut_in_tab_overview(
                     sidebar_open,
                     scrollback_offset,
                     modal,
+                    term_rect,
+                    eink_mode,
+                    force_clear,
+                    pending_eink_osc,
                 )? {
                     return Ok(KeyOutcome::Quit);
                 }
@@ -3854,7 +4161,13 @@ fn handle_shortcut_in_tab_overview(
             Ok(KeyOutcome::UiChanged)
         }
         other => {
-            if !matches!(other, Action::ToggleSidebar | Action::ToggleHelp) {
+            if !matches!(
+                other,
+                Action::ToggleSidebar
+                    | Action::ToggleHelp
+                    | Action::ToggleEink
+                    | Action::RedrawScreen
+            ) {
                 *modal = Modal::None;
             }
             if execute_action(
@@ -3866,6 +4179,10 @@ fn handle_shortcut_in_tab_overview(
                 sidebar_open,
                 scrollback_offset,
                 modal,
+                term_rect,
+                eink_mode,
+                force_clear,
+                pending_eink_osc,
             )? {
                 return Ok(KeyOutcome::Quit);
             }
@@ -3877,8 +4194,46 @@ fn handle_shortcut_in_tab_overview(
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn handle_key_event(
+    kev: KeyEvent,
+    core: &CoreClient,
+    world: &mut World,
+    attached: Option<&AttachedTerminal>,
+    prefix_spec: &str,
+    sidebar_open: &mut bool,
+    prefix_active: &mut bool,
+    ctrl_active: &mut bool,
+    alt_active: &mut bool,
+    scrollback_offset: &mut usize,
+    modal: &mut Modal,
+    term_rect: Rect,
+) -> Result<KeyOutcome> {
+    let mut eink_mode = false;
+    let mut force_clear = false;
+    let mut pending_eink_osc = false;
+    handle_key_event_with_eink(
+        kev,
+        core,
+        world,
+        attached,
+        prefix_spec,
+        sidebar_open,
+        prefix_active,
+        ctrl_active,
+        alt_active,
+        scrollback_offset,
+        modal,
+        term_rect,
+        &mut eink_mode,
+        &mut force_clear,
+        &mut pending_eink_osc,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_key_event_with_eink(
     mut kev: KeyEvent,
     core: &CoreClient,
     world: &mut World,
@@ -3891,6 +4246,9 @@ fn handle_key_event(
     scrollback_offset: &mut usize,
     modal: &mut Modal,
     term_rect: Rect,
+    eink_mode: &mut bool,
+    force_clear: &mut bool,
+    pending_eink_osc: &mut bool,
 ) -> Result<KeyOutcome> {
     let mut ui_changed = false;
     if *ctrl_active {
@@ -4038,6 +4396,10 @@ fn handle_key_event(
                     sidebar_open,
                     scrollback_offset,
                     modal,
+                    term_rect,
+                    eink_mode,
+                    force_clear,
+                    pending_eink_osc,
                 );
             }
             if matches!(modal, Modal::SpaceMenu | Modal::Help) {
@@ -4045,7 +4407,13 @@ fn handle_key_event(
                     *modal = Modal::None;
                     return Ok(KeyOutcome::UiChanged);
                 }
-                if !matches!(action, Action::ToggleSidebar | Action::ToggleHelp) {
+                if !matches!(
+                    action,
+                    Action::ToggleSidebar
+                        | Action::ToggleHelp
+                        | Action::ToggleEink
+                        | Action::RedrawScreen
+                ) {
                     *modal = Modal::None;
                 }
             }
@@ -4058,6 +4426,10 @@ fn handle_key_event(
                 sidebar_open,
                 scrollback_offset,
                 modal,
+                term_rect,
+                eink_mode,
+                force_clear,
+                pending_eink_osc,
             )? {
                 return Ok(KeyOutcome::Quit);
             }
@@ -4132,6 +4504,10 @@ fn handle_key_event(
                     sidebar_open,
                     scrollback_offset,
                     modal,
+                    term_rect,
+                    eink_mode,
+                    force_clear,
+                    pending_eink_osc,
                 );
             }
             return Ok(KeyOutcome::UiChanged);
@@ -4251,6 +4627,10 @@ fn handle_key_event(
             sidebar_open,
             scrollback_offset,
             modal,
+            term_rect,
+            eink_mode,
+            force_clear,
+            pending_eink_osc,
         )? {
             return Ok(KeyOutcome::Quit);
         }
@@ -6269,5 +6649,396 @@ mod tests {
         .unwrap();
         assert_eq!(h.modal, Modal::None);
         assert_eq!(h.world.active_tab_index(), 1);
+    }
+
+    #[test]
+    fn resolve_eink_mode_respects_cli_config_and_env_precedence() {
+        let env_map = |pairs: &[(&str, &str)]| {
+            let pairs: Vec<(String, String)> = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect();
+            move |key: &str| pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+        };
+
+        // CLI flags override config and env
+        assert!(resolve_eink_mode(
+            true,
+            false,
+            Some(false),
+            env_map(&[("HCT_EINK", "0")])
+        ));
+        assert!(!resolve_eink_mode(
+            false,
+            true,
+            Some(true),
+            env_map(&[("HCT_EINK", "1"), ("LC_TERMINAL_PROFILE", "eink")])
+        ));
+
+        // Config overrides env
+        assert!(resolve_eink_mode(
+            false,
+            false,
+            Some(true),
+            env_map(&[("HCT_EINK", "0")])
+        ));
+        assert!(!resolve_eink_mode(
+            false,
+            false,
+            Some(false),
+            env_map(&[("LC_TERMINAL_PROFILE", "eink")])
+        ));
+
+        // HCT_EINK / SHELLDECK_EINK explicit booleans
+        assert!(resolve_eink_mode(
+            false,
+            false,
+            None,
+            env_map(&[("HCT_EINK", "true")])
+        ));
+        assert!(!resolve_eink_mode(
+            false,
+            false,
+            None,
+            env_map(&[("HCT_EINK", "off"), ("SHELLDECK_EINK", "1")])
+        ));
+        assert!(resolve_eink_mode(
+            false,
+            false,
+            None,
+            env_map(&[("SHELLDECK_EINK", "yes")])
+        ));
+        assert!(!resolve_eink_mode(
+            false,
+            false,
+            None,
+            env_map(&[("SHELLDECK_EINK", "no"), ("LC_TERMINAL_PROFILE", "eink")])
+        ));
+
+        // Profile/theme/term auto-detection
+        assert!(resolve_eink_mode(
+            false,
+            false,
+            None,
+            env_map(&[("LC_TERMINAL_PROFILE", "eink")])
+        ));
+        assert!(resolve_eink_mode(
+            false,
+            false,
+            None,
+            env_map(&[("HCT_THEME", "E-Ink")])
+        ));
+        assert!(resolve_eink_mode(
+            false,
+            false,
+            None,
+            env_map(&[("TERM", "xterm-monochrome")])
+        ));
+        assert!(!resolve_eink_mode(
+            false,
+            false,
+            None,
+            env_map(&[("TERM", "xterm-256color")])
+        ));
+    }
+
+    #[test]
+    fn resolve_eink_interval_and_wheel_step_behave_accurately() {
+        assert_eq!(
+            resolve_eink_interval(None, None),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            resolve_eink_interval(Some(0), Some(400)),
+            Duration::from_millis(0)
+        );
+        assert_eq!(
+            resolve_eink_interval(None, Some(350)),
+            Duration::from_millis(350)
+        );
+        assert_eq!(
+            resolve_eink_interval(Some(9000), None),
+            Duration::from_millis(2000)
+        );
+
+        assert_eq!(main_scrollback_wheel_step(24, false), 3);
+        assert_eq!(main_scrollback_wheel_step(24, true), 12);
+        assert_eq!(main_scrollback_wheel_step(4, true), 3);
+    }
+
+    #[test]
+    fn eink_shortcuts_and_frame_pacing_promote_real_changes_and_elide_spinners() {
+        let core = CoreClient::dummy_for_tests();
+        let mut world = World::default();
+        let mut sidebar_open = false;
+        let mut prefix_active = false;
+        let mut ctrl_active = false;
+        let mut alt_active = false;
+        let mut scrollback_offset = 0usize;
+        let mut modal = Modal::None;
+        let term_rect = Rect::new(0, 1, 80, 22);
+        let mut eink_mode = false;
+        let mut force_clear = false;
+        let mut pending_eink_osc = false;
+
+        let ctrl_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        let mut press = |kev,
+                         world: &mut World,
+                         prefix_active: &mut bool,
+                         ctrl_active: &mut bool,
+                         alt_active: &mut bool,
+                         scrollback_offset: &mut usize,
+                         modal: &mut Modal,
+                         eink_mode: &mut bool,
+                         force_clear: &mut bool,
+                         pending_eink_osc: &mut bool| {
+            handle_key_event_with_eink(
+                kev,
+                &core,
+                world,
+                None,
+                "ctrl+b",
+                &mut sidebar_open,
+                prefix_active,
+                ctrl_active,
+                alt_active,
+                scrollback_offset,
+                modal,
+                term_rect,
+                eink_mode,
+                force_clear,
+                pending_eink_osc,
+            )
+            .unwrap()
+        };
+
+        // ^b e toggles E-Ink ON and requests force_clear + EINK_REFRESH_OSC
+        press(
+            ctrl_b,
+            &mut world,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut scrollback_offset,
+            &mut modal,
+            &mut eink_mode,
+            &mut force_clear,
+            &mut pending_eink_osc,
+        );
+        press(
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+            &mut world,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut scrollback_offset,
+            &mut modal,
+            &mut eink_mode,
+            &mut force_clear,
+            &mut pending_eink_osc,
+        );
+        assert!(eink_mode);
+        assert!(force_clear);
+        assert!(pending_eink_osc);
+
+        // ^b r triggers clean redraw + OSC refresh in E-Ink mode
+        force_clear = false;
+        pending_eink_osc = false;
+        press(
+            ctrl_b,
+            &mut world,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut scrollback_offset,
+            &mut modal,
+            &mut eink_mode,
+            &mut force_clear,
+            &mut pending_eink_osc,
+        );
+        press(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            &mut world,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut scrollback_offset,
+            &mut modal,
+            &mut eink_mode,
+            &mut force_clear,
+            &mut pending_eink_osc,
+        );
+        assert!(force_clear);
+        assert!(pending_eink_osc);
+
+        // ^b PageUp / PageDown jump by (term_rect.height - 2)
+        press(
+            ctrl_b,
+            &mut world,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut scrollback_offset,
+            &mut modal,
+            &mut eink_mode,
+            &mut force_clear,
+            &mut pending_eink_osc,
+        );
+        press(
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+            &mut world,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut scrollback_offset,
+            &mut modal,
+            &mut eink_mode,
+            &mut force_clear,
+            &mut pending_eink_osc,
+        );
+        assert_eq!(scrollback_offset, 20);
+        press(
+            ctrl_b,
+            &mut world,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut scrollback_offset,
+            &mut modal,
+            &mut eink_mode,
+            &mut force_clear,
+            &mut pending_eink_osc,
+        );
+        press(
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            &mut world,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut scrollback_offset,
+            &mut modal,
+            &mut eink_mode,
+            &mut force_clear,
+            &mut pending_eink_osc,
+        );
+        assert_eq!(scrollback_offset, 0);
+
+        // ^b R still opens RenameSpace prompt
+        world.doc.spaces.push(crate::model::SharedSpace {
+            id: "sp1".to_string(),
+            name: "main".to_string(),
+            ..Default::default()
+        });
+        press(
+            ctrl_b,
+            &mut world,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut scrollback_offset,
+            &mut modal,
+            &mut eink_mode,
+            &mut force_clear,
+            &mut pending_eink_osc,
+        );
+        press(
+            KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT),
+            &mut world,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut scrollback_offset,
+            &mut modal,
+            &mut eink_mode,
+            &mut force_clear,
+            &mut pending_eink_osc,
+        );
+        assert!(matches!(
+            modal,
+            Modal::Prompt {
+                kind: PromptKind::RenameSpace { .. },
+                ..
+            }
+        ));
+
+        // Frame pacing & zero-diff spinner elision
+        let mut attached_map: BTreeMap<String, AttachedTerminal> = BTreeMap::new();
+        let mut att = AttachedTerminal::new(1, term_rect.width, term_rect.height);
+        att.process_vt_bytes("\x1b[H⠋ Thinking...".as_bytes());
+        let baseline_snap = capture_eink_screen_snapshot(att.parser.screen(), term_rect, 0);
+        attached_map.insert("term-1".to_string(), att);
+        let last_snap = Some(("term-1".to_string(), baseline_snap));
+
+        // Spinner advance before interval -> held in pty_dirty
+        attached_map
+            .get_mut("term-1")
+            .unwrap()
+            .process_vt_bytes("\x1b[H⠙ Thinking...".as_bytes());
+        let t0 = Instant::now();
+        let mut last_draw_at = Some(t0);
+        let mut pty_dirty = true;
+        let mut dirty = false;
+        let interval = Duration::from_millis(250);
+        promote_due_pty_dirty(
+            true,
+            interval,
+            t0 + Duration::from_millis(50),
+            &mut pty_dirty,
+            &mut dirty,
+            &mut last_draw_at,
+            &last_snap,
+            Some("term-1"),
+            &mut attached_map,
+            term_rect,
+            &mut scrollback_offset,
+            &Modal::None,
+            &None,
+        );
+        assert!(pty_dirty);
+        assert!(!dirty);
+
+        // Once interval elapses, identical spinner snapshot is elided cleanly
+        let t1 = t0 + Duration::from_millis(300);
+        promote_due_pty_dirty(
+            true,
+            interval,
+            t1,
+            &mut pty_dirty,
+            &mut dirty,
+            &mut last_draw_at,
+            &last_snap,
+            Some("term-1"),
+            &mut attached_map,
+            term_rect,
+            &mut scrollback_offset,
+            &Modal::None,
+            &None,
+        );
+        assert!(!pty_dirty);
+        assert!(!dirty);
+        assert_eq!(last_draw_at, Some(t1));
+
+        // Real text update after interval promotes dirty = true
+        attached_map
+            .get_mut("term-1")
+            .unwrap()
+            .process_vt_bytes(b"\x1b[2;1HDone");
+        pty_dirty = true;
+        promote_due_pty_dirty(
+            true,
+            interval,
+            t1 + Duration::from_millis(300),
+            &mut pty_dirty,
+            &mut dirty,
+            &mut last_draw_at,
+            &last_snap,
+            Some("term-1"),
+            &mut attached_map,
+            term_rect,
+            &mut scrollback_offset,
+            &Modal::None,
+            &None,
+        );
+        assert!(dirty);
     }
 }

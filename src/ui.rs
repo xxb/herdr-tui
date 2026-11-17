@@ -4,7 +4,9 @@
 
 use crate::keys::Action;
 use crate::model::{AgentState, SharedSpace, World};
-use crate::usage::{render_progress_bar, AgentKind, AgentQuota, QuotaMetric};
+use crate::usage::{
+    render_eink_progress_bar, render_progress_bar, AgentKind, AgentQuota, QuotaMetric,
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     buffer::Buffer,
@@ -702,6 +704,7 @@ pub fn render_ui_with_pads(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn render_ui_with_pads_and_quota(
     f: &mut Frame,
@@ -722,6 +725,51 @@ pub fn render_ui_with_pads_and_quota(
     dpad_pos: Option<(u16, u16)>,
     dpad_dragging: bool,
     focused_quota: Option<&AgentQuota>,
+) -> UiGeometry {
+    render_ui_full(
+        f,
+        world,
+        screen,
+        sidebar_open,
+        sidebar_width,
+        touch_mode,
+        prefix_active,
+        ctrl_active,
+        alt_active,
+        scrollback_offset,
+        selection,
+        copied_flash,
+        modal,
+        mod_pos,
+        mod_dragging,
+        dpad_pos,
+        dpad_dragging,
+        focused_quota,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_ui_full(
+    f: &mut Frame,
+    world: &World,
+    screen: Option<&vt100::Screen>,
+    sidebar_open: bool,
+    sidebar_width: u16,
+    touch_mode: bool,
+    prefix_active: bool,
+    ctrl_active: bool,
+    alt_active: bool,
+    scrollback_offset: usize,
+    selection: Option<&TerminalSelection>,
+    copied_flash: bool,
+    modal: &Modal,
+    mod_pos: Option<(u16, u16)>,
+    mod_dragging: bool,
+    dpad_pos: Option<(u16, u16)>,
+    dpad_dragging: bool,
+    focused_quota: Option<&AgentQuota>,
+    eink_mode: bool,
 ) -> UiGeometry {
     let area = f.area();
     let mut hits = Vec::new();
@@ -751,6 +799,7 @@ pub fn render_ui_with_pads_and_quota(
             VtScreenWidget {
                 screen: scr,
                 selection,
+                eink_mode,
             },
             term_rect,
         );
@@ -764,8 +813,18 @@ pub fn render_ui_with_pads_and_quota(
             }
         }
     } else {
+        if eink_mode {
+            f.render_widget(
+                Block::default().style(Style::default().bg(EINK_PAPER).fg(EINK_INK)),
+                term_rect,
+            );
+        }
         let placeholder = Paragraph::new("Connecting to terminal...")
-            .style(Style::default().fg(Color::DarkGray))
+            .style(if eink_mode {
+                Style::default().bg(EINK_PAPER).fg(EINK_INK_MUTED)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            })
             .alignment(Alignment::Center);
         f.render_widget(placeholder, term_rect);
     }
@@ -780,6 +839,7 @@ pub fn render_ui_with_pads_and_quota(
         world,
         space_menu_open,
         tab_overview_open,
+        eink_mode,
         &mut hits,
     );
     let space_slop_rect = if matches!(modal, Modal::None) && term_rect.height > 0 {
@@ -812,6 +872,7 @@ pub fn render_ui_with_pads_and_quota(
             scrollback_offset
         },
         copied_flash,
+        eink_mode,
         &mut hits,
     );
 
@@ -826,13 +887,21 @@ pub fn render_ui_with_pads_and_quota(
                     prefix_active,
                     ctrl_active,
                     alt_active,
+                    eink_mode,
                     &mut hits,
                 );
-                dpad_rect = render_floating_dpad(f, term_rect, dpad_pos, dpad_dragging, &mut hits);
+                dpad_rect = render_floating_dpad(
+                    f,
+                    term_rect,
+                    dpad_pos,
+                    dpad_dragging,
+                    eink_mode,
+                    &mut hits,
+                );
             }
         }
         Modal::SpaceMenu => {
-            render_space_menu_modal(f, area, top_h, world, &mut hits);
+            render_space_menu_modal(f, area, top_h, world, eink_mode, &mut hits);
         }
         Modal::TabOverview {
             query,
@@ -846,17 +915,18 @@ pub fn render_ui_with_pads_and_quota(
                 query,
                 *selected,
                 selected_target,
+                eink_mode,
                 &mut hits,
             );
         }
         Modal::Help => {
-            render_help_modal(f, area, &mut hits);
+            render_help_modal(f, area, eink_mode, &mut hits);
         }
         Modal::ConfirmCloseTab { tab_id, tab_title } => {
-            render_confirm_close_modal(f, area, tab_id, tab_title, &mut hits);
+            render_confirm_close_modal(f, area, tab_id, tab_title, eink_mode, &mut hits);
         }
         Modal::Prompt { kind, input } => {
-            render_prompt_modal(f, area, kind, input, &mut hits);
+            render_prompt_modal(f, area, kind, input, eink_mode, &mut hits);
         }
         Modal::Fuzzy {
             query,
@@ -870,6 +940,7 @@ pub fn render_ui_with_pads_and_quota(
                 query,
                 *selected,
                 selected_tab_id.as_deref(),
+                eink_mode,
                 &mut hits,
             );
         }
@@ -883,6 +954,13 @@ pub fn render_ui_with_pads_and_quota(
         space_slop_rect,
     }
 }
+
+// 300 PPI Carta 4-bit neutral LUT tokens (R == G == B, multiples of 0x11)
+pub const EINK_PAPER: Color = Color::Rgb(255, 255, 255); // #ffffff
+pub const EINK_INK: Color = Color::Rgb(0, 0, 0); // #000000
+pub const EINK_INK_MUTED: Color = Color::Rgb(51, 51, 51); // #333333
+pub const EINK_SURFACE: Color = Color::Rgb(238, 238, 238); // #eeeeee
+pub const EINK_PILL_BG: Color = Color::Rgb(221, 221, 221); // #dddddd
 
 // Classic `herdr` Catppuccin Mocha palette tokens (`Palette::catppuccin()`)
 const HERDR_ACCENT: Color = Color::Rgb(137, 180, 250); // #89b4fa (Blue — focused tab bg)
@@ -936,7 +1014,38 @@ fn overflow_badge_label(hidden_count: usize, is_left: bool, compact: bool) -> Op
     }
 }
 
-fn tab_pill_style(st: AgentState, is_active: bool) -> Style {
+fn eink_tab_prefix(state: AgentState, is_active: bool) -> &'static str {
+    match state {
+        AgentState::Blocked => "!",
+        AgentState::Working if !is_active => "*",
+        AgentState::Done if !is_active => "✓",
+        _ => "",
+    }
+}
+
+fn tab_pill_style(st: AgentState, is_active: bool, eink_mode: bool) -> Style {
+    if eink_mode {
+        return if is_active {
+            Style::default()
+                .bg(EINK_INK)
+                .fg(EINK_PAPER)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            match st {
+                AgentState::Blocked | AgentState::Done => Style::default()
+                    .bg(EINK_PILL_BG)
+                    .fg(EINK_INK)
+                    .add_modifier(Modifier::BOLD),
+                AgentState::Working => Style::default()
+                    .bg(EINK_SURFACE)
+                    .fg(EINK_INK)
+                    .add_modifier(Modifier::BOLD),
+                AgentState::Idle | AgentState::None => {
+                    Style::default().bg(EINK_SURFACE).fg(EINK_INK_MUTED)
+                }
+            }
+        };
+    }
     if is_active {
         Style::default()
             .bg(HERDR_ACCENT)
@@ -965,6 +1074,7 @@ fn plan_top_tabbar_pills(
     space: &SharedSpace,
     rect_width: u16,
     avail_tabs_w: u16,
+    eink_mode: bool,
 ) -> PlannedTabBar {
     let total_tabs = space.tabs.len();
     if total_tabs == 0 || avail_tabs_w == 0 {
@@ -981,13 +1091,20 @@ fn plan_top_tabbar_pills(
         .collect();
     let states: Vec<AgentState> = space.tabs.iter().map(|tab| world.tab_state(tab)).collect();
 
-    let index_only_lbl = |ti: usize| format!(" {} ", ti + 1);
+    let state_prefix = |ti: usize| {
+        if eink_mode {
+            eink_tab_prefix(states[ti], ti == active_ti)
+        } else {
+            ""
+        }
+    };
+    let index_only_lbl = |ti: usize| format!(" {}{} ", state_prefix(ti), ti + 1);
     let titled_lbl = |ti: usize, max_name_w: usize| {
         let tname = truncate_to_width(&full_names[ti], max_name_w);
         if tname.is_empty() {
             index_only_lbl(ti)
         } else {
-            format!(" {}:{} ", ti + 1, tname)
+            format!(" {}{}:{} ", state_prefix(ti), ti + 1, tname)
         }
     };
     let build_all_pills = |labels: Vec<String>| PlannedTabBar {
@@ -1022,7 +1139,7 @@ fn plan_top_tabbar_pills(
     if all_idx_w <= avail_tabs_w {
         let inactive_plus_gaps_w = all_idx_w.saturating_sub(idx_labels[active_ti].width() as u16);
         let active_budget = avail_tabs_w.saturating_sub(inactive_plus_gaps_w) as usize;
-        let framing = (active_ti + 1).to_string().len() + 3;
+        let framing = (active_ti + 1).to_string().len() + 3 + state_prefix(active_ti).width();
         if rect_width >= 36 && active_budget >= framing + 2 {
             let max_active_name_w = (active_budget - framing).min(16);
             let candidate = titled_lbl(active_ti, max_active_name_w);
@@ -1072,7 +1189,7 @@ fn plan_top_tabbar_pills(
         let fallback = if stage4_labels[active_ti].width() <= max_w {
             stage4_labels[active_ti].clone()
         } else {
-            let unpadded = (active_ti + 1).to_string();
+            let unpadded = format!("{}{}", state_prefix(active_ti), active_ti + 1);
             if unpadded.width() <= max_w {
                 unpadded
             } else {
@@ -1157,6 +1274,7 @@ fn draw_touchbar_pill(
     label: &str,
     style: Style,
     emphasized: bool,
+    eink_mode: bool,
 ) {
     if rect.height == 0 || label.is_empty() {
         return;
@@ -1167,11 +1285,17 @@ fn draw_touchbar_pill(
         // - Row 0 (`rect.y`): continuous highlighted top divider line (`▔`) on `style` (`keycap_bg`)
         // - Row 1 (`rect.y + 1`): dead-center button label on `style` (`keycap_bg`)
         // - Row 2 (`rect.y + 2`): subtle bottom bevel (`▁`) on `style` (`keycap_bg`)
-        let top_fg = if emphasized { HERDR_TEXT } else { HERDR_ACCENT };
-        let bot_fg = if emphasized {
-            HERDR_ACCENT
+        let (top_fg, bot_fg) = if eink_mode {
+            (EINK_INK, EINK_INK)
         } else {
-            HERDR_SURFACE1
+            (
+                if emphasized { HERDR_TEXT } else { HERDR_ACCENT },
+                if emphasized {
+                    HERDR_ACCENT
+                } else {
+                    HERDR_SURFACE1
+                },
+            )
         };
         let top_line = "▔".repeat(lw as usize);
         let bot_line = "▁".repeat(lw as usize);
@@ -1183,10 +1307,17 @@ fn draw_touchbar_pill(
         // - Row 0 (`rect.y`): vertically centered glyph inside the colored pill (`style`)
         // - Row 1 (`rect.y + 1`): crisp bottom gloss highlight (`▔`) hugging the lower edge
         //   of Row 0 against the dark bar background so text never appears pushed down.
-        let bot_gloss_fg = if emphasized {
-            HERDR_ACCENT
+        let (gloss_bg, bot_gloss_fg) = if eink_mode {
+            (EINK_PAPER, EINK_INK)
         } else {
-            HERDR_SURFACE1
+            (
+                HERDR_PANEL_BG,
+                if emphasized {
+                    HERDR_ACCENT
+                } else {
+                    HERDR_SURFACE1
+                },
+            )
         };
         let bot_line = "▔".repeat(lw as usize);
         buf.set_string(x, rect.y, label, style);
@@ -1194,10 +1325,12 @@ fn draw_touchbar_pill(
             x,
             rect.y + 1,
             &bot_line,
-            Style::default().bg(HERDR_PANEL_BG).fg(bot_gloss_fg),
+            Style::default().bg(gloss_bg).fg(bot_gloss_fg),
         );
     } else {
-        let ul_color = if emphasized {
+        let ul_color = if eink_mode {
+            EINK_INK
+        } else if emphasized {
             TOPBAR_UNDERLINE_ACTIVE
         } else {
             TOPBAR_UNDERLINE_DIM
@@ -1216,16 +1349,28 @@ fn render_top_tabbar(
     world: &World,
     space_menu_open: bool,
     tab_overview_open: bool,
+    eink_mode: bool,
     hits: &mut Vec<HitRegion>,
 ) -> Option<(u16, u16)> {
     if rect.width == 0 || rect.height == 0 {
         return None;
     }
-    let mut bg_bar = Style::default().bg(HERDR_PANEL_BG).fg(HERDR_TEXT);
+    let bar_bg = if eink_mode {
+        EINK_PAPER
+    } else {
+        HERDR_PANEL_BG
+    };
+    let bar_fg = if eink_mode { EINK_INK } else { HERDR_TEXT };
+    let bar_ul = if eink_mode {
+        EINK_INK
+    } else {
+        TOPBAR_UNDERLINE_DIM
+    };
+    let mut bg_bar = Style::default().bg(bar_bg).fg(bar_fg);
     if rect.height == 1 {
         bg_bar = bg_bar
             .add_modifier(Modifier::UNDERLINED)
-            .underline_color(TOPBAR_UNDERLINE_DIM);
+            .underline_color(bar_ul);
     }
     f.render_widget(Block::default().style(bg_bar), rect);
 
@@ -1239,7 +1384,9 @@ fn render_top_tabbar(
             rect.x,
             rect.y,
             &full_line,
-            Style::default().bg(HERDR_PANEL_BG).fg(HERDR_ACCENT),
+            Style::default()
+                .bg(bar_bg)
+                .fg(if eink_mode { EINK_INK } else { HERDR_ACCENT }),
         );
     } else if rect.height == 2 {
         let full_line = "▔".repeat(rect.width as usize);
@@ -1247,7 +1394,9 @@ fn render_top_tabbar(
             rect.x,
             rect.y + 1,
             &full_line,
-            Style::default().bg(HERDR_PANEL_BG).fg(HERDR_SURFACE1),
+            Style::default()
+                .bg(bar_bg)
+                .fg(if eink_mode { EINK_INK } else { HERDR_SURFACE1 }),
         );
     }
 
@@ -1261,11 +1410,18 @@ fn render_top_tabbar(
 
     // 0. Far Left: Detach button (`[ ⏏ ]`) — equivalent to `^b q` (`Action::Detach`)
     if detach_w > 0 && x + detach_w <= max_x {
-        let dstyle = Style::default()
-            .bg(Color::Rgb(42, 30, 42))
-            .fg(HERDR_RED)
-            .add_modifier(Modifier::BOLD);
-        draw_touchbar_pill(buf, x, rect, detach_lbl, dstyle, false);
+        let dstyle = if eink_mode {
+            Style::default()
+                .bg(EINK_SURFACE)
+                .fg(EINK_INK)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .bg(Color::Rgb(42, 30, 42))
+                .fg(HERDR_RED)
+                .add_modifier(Modifier::BOLD)
+        };
+        draw_touchbar_pill(buf, x, rect, detach_lbl, dstyle, false, eink_mode);
         hits.push(HitRegion {
             rect: Rect {
                 x,
@@ -1328,15 +1484,37 @@ fn render_top_tabbar(
     let space_w = space_lbl.width() as u16;
     let mut drew_space = false;
     if space_w > 0 && x + space_w <= max_x {
-        let style = Style::default()
-            .bg(if space_menu_open {
-                HERDR_SURFACE1
+        let style = if eink_mode {
+            if space_menu_open {
+                Style::default()
+                    .bg(EINK_INK)
+                    .fg(EINK_PAPER)
+                    .add_modifier(Modifier::BOLD)
             } else {
-                Color::Rgb(36, 36, 54)
-            })
-            .fg(HERDR_MAUVE)
-            .add_modifier(Modifier::BOLD);
-        draw_touchbar_pill(buf, x, rect, &space_lbl, style, false);
+                Style::default()
+                    .bg(EINK_SURFACE)
+                    .fg(EINK_INK)
+                    .add_modifier(Modifier::BOLD)
+            }
+        } else {
+            Style::default()
+                .bg(if space_menu_open {
+                    HERDR_SURFACE1
+                } else {
+                    Color::Rgb(36, 36, 54)
+                })
+                .fg(HERDR_MAUVE)
+                .add_modifier(Modifier::BOLD)
+        };
+        draw_touchbar_pill(
+            buf,
+            x,
+            rect,
+            &space_lbl,
+            style,
+            eink_mode && space_menu_open,
+            eink_mode,
+        );
         x += space_w;
         drew_space = true;
     }
@@ -1344,11 +1522,15 @@ fn render_top_tabbar(
     // Subtle slash divider between Space button and Tab pills
     if x + 1 < avail_end {
         let div_y = if rect.height >= 3 { rect.y + 1 } else { rect.y };
-        let mut div_style = Style::default().bg(HERDR_PANEL_BG).fg(HERDR_OVERLAY0);
+        let mut div_style = Style::default().bg(bar_bg).fg(if eink_mode {
+            EINK_INK_MUTED
+        } else {
+            HERDR_OVERLAY0
+        });
         if rect.height == 1 {
             div_style = div_style
                 .add_modifier(Modifier::UNDERLINED)
-                .underline_color(TOPBAR_UNDERLINE_DIM);
+                .underline_color(bar_ul);
         }
         buf.set_string(x, div_y, "╱", div_style);
         x += 1;
@@ -1378,17 +1560,24 @@ fn render_top_tabbar(
     if let Some(space) = world.active_space() {
         let space_id = space.id.clone();
         let avail_tabs_w = tabs_limit_x.saturating_sub(x);
-        let plan = plan_top_tabbar_pills(world, space, rect.width, avail_tabs_w);
-        let overflow_style = Style::default()
-            .bg(HERDR_SURFACE0)
-            .fg(HERDR_ACCENT)
-            .add_modifier(Modifier::BOLD);
+        let plan = plan_top_tabbar_pills(world, space, rect.width, avail_tabs_w, eink_mode);
+        let overflow_style = if eink_mode {
+            Style::default()
+                .bg(EINK_SURFACE)
+                .fg(EINK_INK)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .bg(HERDR_SURFACE0)
+                .fg(HERDR_ACCENT)
+                .add_modifier(Modifier::BOLD)
+        };
 
         let mut drew_any = false;
         if let Some(lb) = plan.left_badge {
             let bw = lb.width() as u16;
             if bw > 0 && x + bw <= tabs_limit_x {
-                draw_touchbar_pill(buf, x, rect, &lb, overflow_style, false);
+                draw_touchbar_pill(buf, x, rect, &lb, overflow_style, false, eink_mode);
                 hits.push(HitRegion {
                     rect: Rect {
                         x,
@@ -1414,8 +1603,8 @@ fn render_top_tabbar(
             }
             x = next_x;
             let pill_active = is_active && !tab_overview_open;
-            let tstyle = tab_pill_style(st, pill_active);
-            draw_touchbar_pill(buf, x, rect, &lbl, tstyle, pill_active);
+            let tstyle = tab_pill_style(st, pill_active, eink_mode);
+            draw_touchbar_pill(buf, x, rect, &lbl, tstyle, pill_active, eink_mode);
             hits.push(HitRegion {
                 rect: Rect {
                     x,
@@ -1437,7 +1626,7 @@ fn render_top_tabbar(
             let next_x = x + u16::from(drew_any);
             if bw > 0 && next_x + bw <= tabs_limit_x {
                 x = next_x;
-                draw_touchbar_pill(buf, x, rect, &rb, overflow_style, false);
+                draw_touchbar_pill(buf, x, rect, &rb, overflow_style, false, eink_mode);
                 hits.push(HitRegion {
                     rect: Rect {
                         x,
@@ -1459,7 +1648,19 @@ fn render_top_tabbar(
 
     // 3. `[ + ]` button immediately after the tabs to add a new Tab
     if x + plus_w <= avail_end {
-        let pstyle = if tab_overview_open {
+        let pstyle = if eink_mode {
+            if tab_overview_open {
+                Style::default()
+                    .bg(EINK_INK)
+                    .fg(EINK_PAPER)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .bg(EINK_SURFACE)
+                    .fg(EINK_INK)
+                    .add_modifier(Modifier::BOLD)
+            }
+        } else if tab_overview_open {
             Style::default()
                 .bg(HERDR_ACCENT)
                 .fg(HERDR_PANEL_BG)
@@ -1470,7 +1671,7 @@ fn render_top_tabbar(
                 .fg(HERDR_GREEN)
                 .add_modifier(Modifier::BOLD)
         };
-        draw_touchbar_pill(buf, x, rect, plus_lbl, pstyle, tab_overview_open);
+        draw_touchbar_pill(buf, x, rect, plus_lbl, pstyle, tab_overview_open, eink_mode);
         hits.push(HitRegion {
             rect: Rect {
                 x,
@@ -1486,11 +1687,18 @@ fn render_top_tabbar(
     // 4. Far Right: `[ ? ]` Quick Actions & Help button
     let rx = max_x.saturating_sub(help_w);
     if rx >= x && rx + help_w <= max_x {
-        let hstyle = Style::default()
-            .bg(Color::Rgb(36, 36, 54))
-            .fg(HERDR_SUBTEXT0)
-            .add_modifier(Modifier::BOLD);
-        draw_touchbar_pill(buf, rx, rect, help_lbl, hstyle, false);
+        let hstyle = if eink_mode {
+            Style::default()
+                .bg(EINK_SURFACE)
+                .fg(EINK_INK)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .bg(Color::Rgb(36, 36, 54))
+                .fg(HERDR_SUBTEXT0)
+                .add_modifier(Modifier::BOLD)
+        };
+        draw_touchbar_pill(buf, rx, rect, help_lbl, hstyle, false, eink_mode);
         hits.push(HitRegion {
             rect: Rect {
                 x: rx,
@@ -1525,9 +1733,18 @@ fn agent_badge_colors(agent: AgentKind) -> (Color, Color) {
     }
 }
 
-fn metric_display_width(m: &QuotaMetric, bar_w: usize, show_detail: bool) -> usize {
+fn metric_display_width(
+    m: &QuotaMetric,
+    bar_w: usize,
+    show_detail: bool,
+    eink_mode: bool,
+) -> usize {
     let pct = m.remaining_percent.clamp(0.0, 100.0).round() as u64;
-    let pct_str = format!("{pct}%");
+    let pct_str = if eink_mode && m.remaining_percent <= 15.0 {
+        format!("{pct}%!")
+    } else {
+        format!("{pct}%")
+    };
     let bar_part = if bar_w > 0 { bar_w + 1 } else { 0 };
     let detail_part = if show_detail {
         m.detail.as_ref().map_or(0, |d| 3 + d.width())
@@ -1556,20 +1773,28 @@ fn render_bottom_status_bar(
     focused_quota: Option<&AgentQuota>,
     scrollback_offset: usize,
     copied_flash: bool,
+    eink_mode: bool,
     hits: &mut Vec<HitRegion>,
 ) {
     if rect.width == 0 || rect.height == 0 {
         return;
     }
-    let bar_bg = HERDR_PANEL_BG;
-    let base_style = Style::default().bg(bar_bg).fg(HERDR_SUBTEXT0);
+    let bar_bg = if eink_mode {
+        EINK_PAPER
+    } else {
+        HERDR_PANEL_BG
+    };
+    let base_style =
+        Style::default()
+            .bg(bar_bg)
+            .fg(if eink_mode { EINK_INK } else { HERDR_SUBTEXT0 });
     f.render_widget(Block::default().style(base_style), rect);
 
     let buf = f.buffer_mut();
     let max_x = rect.x + rect.width;
     let mut x = rect.x;
 
-    // Reserve right-side space for optional `✓ Copied` and `▼ BOT (+N)` indicators
+    // Reserve right-side space for optional `✓ Copied`, E-Ink page-turn pills, and `▼ BOT (+N)`
     let copied_lbl = if copied_flash {
         Some(if rect.width < 60 {
             " ✓ "
@@ -1590,14 +1815,27 @@ fn render_bottom_status_bar(
     };
     let copied_w = copied_lbl.map_or(0, |s| s.width() as u16);
     let scroll_w = scroll_lbl.as_ref().map_or(0, |s| s.width() as u16);
-    let right_reserved = copied_w + scroll_w;
+    let pg_up_lbl = " ▲Pg ";
+    let pg_dn_lbl = " ▼Pg ";
+    let pg_up_w = pg_up_lbl.width() as u16;
+    let pg_dn_w = pg_dn_lbl.width() as u16;
+    let pg_gap_before_scroll = u16::from(scroll_lbl.is_some());
+    let pg_pair_w = pg_up_w + 1 + pg_dn_w + pg_gap_before_scroll;
+    let show_pg_btns =
+        eink_mode && rect.width >= 32 && copied_w + scroll_w + pg_pair_w <= rect.width;
+    let pg_w = if show_pg_btns { pg_pair_w } else { 0 };
+    let right_reserved = copied_w + pg_w + scroll_w;
     let avail_end = max_x.saturating_sub(right_reserved);
 
     // Strictly render ONLY the currently focused agent's quota usage on this single row.
     // When no agent is focused (e.g. a plain shell tab), keep the left side clean without
     // repeating status/cwd/turn info that the terminal already displays.
     if let Some(quota) = focused_quota {
-        let (badge_bg, badge_fg) = agent_badge_colors(quota.agent);
+        let (badge_bg, badge_fg) = if eink_mode {
+            (EINK_INK, EINK_PAPER)
+        } else {
+            agent_badge_colors(quota.agent)
+        };
         let badge_lbl = if avail_end.saturating_sub(x) < 22 {
             match quota.agent {
                 AgentKind::Codex => " Cdx ".to_string(),
@@ -1632,7 +1870,11 @@ fn render_bottom_status_bar(
                 rect.y,
                 avail_end,
                 "剩余 --",
-                Style::default().bg(bar_bg).fg(Color::Rgb(126, 136, 168)),
+                Style::default().bg(bar_bg).fg(if eink_mode {
+                    EINK_INK_MUTED
+                } else {
+                    Color::Rgb(126, 136, 168)
+                }),
             );
         } else if x < avail_end {
             let avail_w = (avail_end - x) as usize;
@@ -1650,19 +1892,33 @@ fn render_bottom_status_bar(
                     let metrics_total: usize = quota
                         .metrics
                         .iter()
-                        .map(|m| metric_display_width(m, *bw, *sd))
+                        .map(|m| metric_display_width(m, *bw, *sd, eink_mode))
                         .sum();
                     metrics_total + sep_total <= avail_w
                 })
                 .unwrap_or((0, false, " · "));
 
-            let lbl_style = Style::default()
-                .bg(bar_bg)
-                .fg(Color::Rgb(192, 202, 245))
-                .add_modifier(Modifier::BOLD);
-            let track_style = Style::default().bg(bar_bg).fg(Color::Rgb(56, 64, 94));
-            let detail_style = Style::default().bg(bar_bg).fg(Color::Rgb(132, 142, 178));
-            let sep_style = Style::default().bg(bar_bg).fg(Color::Rgb(86, 94, 126));
+            let (lbl_style, track_style, detail_style, sep_style) = if eink_mode {
+                (
+                    Style::default()
+                        .bg(bar_bg)
+                        .fg(EINK_INK)
+                        .add_modifier(Modifier::BOLD),
+                    Style::default().bg(bar_bg).fg(EINK_INK_MUTED),
+                    Style::default().bg(bar_bg).fg(EINK_INK_MUTED),
+                    Style::default().bg(bar_bg).fg(EINK_INK_MUTED),
+                )
+            } else {
+                (
+                    Style::default()
+                        .bg(bar_bg)
+                        .fg(Color::Rgb(192, 202, 245))
+                        .add_modifier(Modifier::BOLD),
+                    Style::default().bg(bar_bg).fg(Color::Rgb(56, 64, 94)),
+                    Style::default().bg(bar_bg).fg(Color::Rgb(132, 142, 178)),
+                    Style::default().bg(bar_bg).fg(Color::Rgb(86, 94, 126)),
+                )
+            };
 
             for (idx, m) in quota.metrics.iter().enumerate() {
                 if x >= avail_end {
@@ -1674,24 +1930,54 @@ fn render_bottom_status_bar(
                 push_clamped_str(buf, &mut x, rect.y, avail_end, &m.window_label, lbl_style);
                 push_clamped_str(buf, &mut x, rect.y, avail_end, " ", base_style);
 
-                let u_col = quota_remaining_color(m.remaining_percent);
-                let fill_style = Style::default().bg(bar_bg).fg(u_col);
-                let pct_style = Style::default()
-                    .bg(bar_bg)
-                    .fg(u_col)
-                    .add_modifier(Modifier::BOLD);
+                let (fill_style, pct_style, pct_suffix) = if eink_mode {
+                    let low = m.remaining_percent <= 15.0;
+                    (
+                        Style::default().bg(bar_bg).fg(EINK_INK),
+                        if low {
+                            Style::default()
+                                .bg(EINK_INK)
+                                .fg(EINK_PAPER)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default()
+                                .bg(bar_bg)
+                                .fg(EINK_INK)
+                                .add_modifier(Modifier::BOLD)
+                        },
+                        if low { "!" } else { "" },
+                    )
+                } else {
+                    let u_col = quota_remaining_color(m.remaining_percent);
+                    (
+                        Style::default().bg(bar_bg).fg(u_col),
+                        Style::default()
+                            .bg(bar_bg)
+                            .fg(u_col)
+                            .add_modifier(Modifier::BOLD),
+                        "",
+                    )
+                };
 
                 if bar_w > 0 {
-                    let bar = render_progress_bar(m.remaining_percent, bar_w);
-                    let filled_part: String = bar.chars().take_while(|&c| c != '░').collect();
-                    let empty_part: String = bar.chars().skip_while(|&c| c != '░').collect();
-                    push_clamped_str(buf, &mut x, rect.y, avail_end, &filled_part, fill_style);
-                    push_clamped_str(buf, &mut x, rect.y, avail_end, &empty_part, track_style);
+                    if eink_mode {
+                        let bar = render_eink_progress_bar(m.remaining_percent, bar_w);
+                        let filled_part: String = bar.chars().take_while(|&c| c != '─').collect();
+                        let empty_part: String = bar.chars().skip_while(|&c| c != '─').collect();
+                        push_clamped_str(buf, &mut x, rect.y, avail_end, &filled_part, fill_style);
+                        push_clamped_str(buf, &mut x, rect.y, avail_end, &empty_part, track_style);
+                    } else {
+                        let bar = render_progress_bar(m.remaining_percent, bar_w);
+                        let filled_part: String = bar.chars().take_while(|&c| c != '░').collect();
+                        let empty_part: String = bar.chars().skip_while(|&c| c != '░').collect();
+                        push_clamped_str(buf, &mut x, rect.y, avail_end, &filled_part, fill_style);
+                        push_clamped_str(buf, &mut x, rect.y, avail_end, &empty_part, track_style);
+                    }
                     push_clamped_str(buf, &mut x, rect.y, avail_end, " ", base_style);
                 }
 
                 let pct = m.remaining_percent.clamp(0.0, 100.0).round() as u64;
-                let pct_str = format!("{pct}%");
+                let pct_str = format!("{pct}%{pct_suffix}");
                 push_clamped_str(buf, &mut x, rect.y, avail_end, &pct_str, pct_style);
 
                 if show_detail {
@@ -1712,12 +1998,59 @@ fn render_bottom_status_bar(
                 rx,
                 rect.y,
                 clbl,
-                Style::default()
-                    .bg(Color::Rgb(158, 206, 106))
-                    .fg(Color::Rgb(20, 22, 32))
-                    .add_modifier(Modifier::BOLD),
+                if eink_mode {
+                    Style::default()
+                        .bg(EINK_INK)
+                        .fg(EINK_PAPER)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .bg(Color::Rgb(158, 206, 106))
+                        .fg(Color::Rgb(20, 22, 32))
+                        .add_modifier(Modifier::BOLD)
+                },
             );
             rx += cw;
+        }
+    }
+    if show_pg_btns {
+        let pg_style = Style::default()
+            .bg(EINK_SURFACE)
+            .fg(EINK_INK)
+            .add_modifier(Modifier::BOLD);
+        if rx + pg_up_w <= max_x {
+            buf.set_string(rx, rect.y, pg_up_lbl, pg_style);
+            hits.push(HitRegion {
+                rect: Rect {
+                    x: rx,
+                    y: rect.y,
+                    width: pg_up_w,
+                    height: rect.height,
+                },
+                target: HitTarget::TriggerAction(Action::PageUp),
+            });
+            rx += pg_up_w;
+        }
+        if rx < max_x {
+            buf.set_string(rx, rect.y, " ", base_style);
+            rx += 1;
+        }
+        if rx + pg_dn_w <= max_x {
+            buf.set_string(rx, rect.y, pg_dn_lbl, pg_style);
+            hits.push(HitRegion {
+                rect: Rect {
+                    x: rx,
+                    y: rect.y,
+                    width: pg_dn_w,
+                    height: rect.height,
+                },
+                target: HitTarget::TriggerAction(Action::PageDown),
+            });
+            rx += pg_dn_w;
+        }
+        if scroll_lbl.is_some() && rx < max_x {
+            buf.set_string(rx, rect.y, " ", base_style);
+            rx += 1;
         }
     }
     if let Some(slbl) = scroll_lbl {
@@ -1727,10 +2060,17 @@ fn render_bottom_status_bar(
                 rx,
                 rect.y,
                 &slbl,
-                Style::default()
-                    .bg(Color::Rgb(125, 207, 255))
-                    .fg(Color::Rgb(20, 22, 32))
-                    .add_modifier(Modifier::BOLD),
+                if eink_mode {
+                    Style::default()
+                        .bg(EINK_INK)
+                        .fg(EINK_PAPER)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .bg(Color::Rgb(125, 207, 255))
+                        .fg(Color::Rgb(20, 22, 32))
+                        .add_modifier(Modifier::BOLD)
+                },
             );
             hits.push(HitRegion {
                 rect: Rect {
@@ -1754,6 +2094,7 @@ fn render_floating_mod_cross(
     prefix_active: bool,
     ctrl_active: bool,
     alt_active: bool,
+    eink_mode: bool,
     hits: &mut Vec<HitRegion>,
 ) -> Option<Rect> {
     let disc = resolve_mod_cross_rect(term_rect, mod_pos)?;
@@ -1824,41 +2165,57 @@ fn render_floating_mod_cross(
                 || (is_right && alt_active);
 
             let cell = &mut buf[(x, y)];
-            let base_bg = color_to_rgb(cell.bg, (18, 20, 30));
-            let base_fg = color_to_rgb(cell.fg, (169, 177, 214));
-            let (tint, alpha) = if sector_active {
-                (active_tint, active_alpha)
-            } else if is_center {
-                (center_tint, center_alpha)
+            let (cell_bg, eink_fg) = if eink_mode {
+                let inverted = dragging || sector_active;
+                if inverted {
+                    (EINK_INK, EINK_PAPER)
+                } else {
+                    (EINK_PAPER, EINK_INK)
+                }
             } else {
-                (base_tint, base_alpha)
+                let base_bg = color_to_rgb(cell.bg, (18, 20, 30));
+                let (tint, alpha) = if sector_active {
+                    (active_tint, active_alpha)
+                } else if is_center {
+                    (center_tint, center_alpha)
+                } else {
+                    (base_tint, base_alpha)
+                };
+                (blend_rgb(base_bg, tint, alpha), EINK_INK)
             };
-            let blended_bg = blend_rgb(base_bg, tint, alpha);
 
-            let ctl_col = if ctrl_active { active_fg } else { mod_fg };
-            let pfx_col = if prefix_active { active_fg } else { mod_fg };
-            let alt_col = if alt_active { active_fg } else { mod_fg };
+            let (b_fg, k_fg, ctl_col, pfx_col, alt_col) = if eink_mode {
+                (eink_fg, eink_fg, eink_fg, eink_fg, eink_fg)
+            } else {
+                (
+                    border_fg,
+                    key_fg,
+                    if ctrl_active { active_fg } else { mod_fg },
+                    if prefix_active { active_fg } else { mod_fg },
+                    if alt_active { active_fg } else { mod_fg },
+                )
+            };
 
             let glyph: Option<(&str, Color, bool)> = if full_15x7 {
                 match (dy, dx) {
                     // Row 0: top of Esc box
-                    (0, 5) => Some(("╭", border_fg, false)),
-                    (0, 6..=8) => Some(("─", border_fg, false)),
-                    (0, 9) => Some(("╮", border_fg, false)),
+                    (0, 5) => Some(("╭", b_fg, false)),
+                    (0, 6..=8) => Some(("─", b_fg, false)),
+                    (0, 9) => Some(("╮", b_fg, false)),
                     // Row 1: Esc label
-                    (1, 5) | (1, 9) => Some(("│", border_fg, false)),
-                    (1, 6) => Some(("E", key_fg, true)),
-                    (1, 7) => Some(("s", key_fg, true)),
-                    (1, 8) => Some(("c", key_fg, true)),
+                    (1, 5) | (1, 9) => Some(("│", b_fg, false)),
+                    (1, 6) => Some(("E", k_fg, true)),
+                    (1, 7) => Some(("s", k_fg, true)),
+                    (1, 8) => Some(("c", k_fg, true)),
                     // Row 2: top of Left / Center / Right
-                    (2, 0) | (2, 10) => Some(("╭", border_fg, false)),
-                    (2, 4) | (2, 14) => Some(("╮", border_fg, false)),
-                    (2, 5) => Some(("├", border_fg, false)),
-                    (2, 9) => Some(("┤", border_fg, false)),
-                    (2, 1..=3) | (2, 6..=8) | (2, 11..=13) => Some(("─", border_fg, false)),
+                    (2, 0) | (2, 10) => Some(("╭", b_fg, false)),
+                    (2, 4) | (2, 14) => Some(("╮", b_fg, false)),
+                    (2, 5) => Some(("├", b_fg, false)),
+                    (2, 9) => Some(("┤", b_fg, false)),
+                    (2, 1..=3) | (2, 6..=8) | (2, 11..=13) => Some(("─", b_fg, false)),
                     // Row 3: Ctl / ^B / Alt labels
                     (3, 0) | (3, 4) | (3, 5) | (3, 9) | (3, 10) | (3, 14) => {
-                        Some(("│", border_fg, false))
+                        Some(("│", b_fg, false))
                     }
                     (3, 1) => Some(("C", ctl_col, true)),
                     (3, 2) => Some(("t", ctl_col, true)),
@@ -1870,26 +2227,26 @@ fn render_floating_mod_cross(
                     (3, 12) => Some(("l", alt_col, true)),
                     (3, 13) => Some(("t", alt_col, true)),
                     // Row 4: bottom of Left / Center / Right
-                    (4, 0) | (4, 10) => Some(("╰", border_fg, false)),
-                    (4, 4) | (4, 14) => Some(("╯", border_fg, false)),
-                    (4, 5) => Some(("├", border_fg, false)),
-                    (4, 9) => Some(("┤", border_fg, false)),
-                    (4, 1..=3) | (4, 6..=8) | (4, 11..=13) => Some(("─", border_fg, false)),
+                    (4, 0) | (4, 10) => Some(("╰", b_fg, false)),
+                    (4, 4) | (4, 14) => Some(("╯", b_fg, false)),
+                    (4, 5) => Some(("├", b_fg, false)),
+                    (4, 9) => Some(("┤", b_fg, false)),
+                    (4, 1..=3) | (4, 6..=8) | (4, 11..=13) => Some(("─", b_fg, false)),
                     // Row 5: Tab label
-                    (5, 5) | (5, 9) => Some(("│", border_fg, false)),
-                    (5, 6) => Some(("T", key_fg, true)),
-                    (5, 7) => Some(("a", key_fg, true)),
-                    (5, 8) => Some(("b", key_fg, true)),
+                    (5, 5) | (5, 9) => Some(("│", b_fg, false)),
+                    (5, 6) => Some(("T", k_fg, true)),
+                    (5, 7) => Some(("a", k_fg, true)),
+                    (5, 8) => Some(("b", k_fg, true)),
                     // Row 6: bottom of Tab box
-                    (6, 5) => Some(("╰", border_fg, false)),
-                    (6, 6..=8) => Some(("─", border_fg, false)),
-                    (6, 9) => Some(("╯", border_fg, false)),
+                    (6, 5) => Some(("╰", b_fg, false)),
+                    (6, 6..=8) => Some(("─", b_fg, false)),
+                    (6, 9) => Some(("╯", b_fg, false)),
                     _ => None,
                 }
             } else if dy == up_label_y && dx == center_label_x {
-                Some(("E", key_fg, true))
+                Some(("E", k_fg, true))
             } else if dy == down_label_y && dx == center_label_x {
-                Some(("T", key_fg, true))
+                Some(("T", k_fg, true))
             } else if dy == mid_label_y && dx == left_label_x {
                 Some(("C", ctl_col, true))
             } else if dy == mid_label_y && dx == center_label_x {
@@ -1900,7 +2257,15 @@ fn render_floating_mod_cross(
                 None
             };
 
-            cell.set_bg(blended_bg);
+            let base_fg = color_to_rgb(cell.fg, (169, 177, 214));
+            let (tint, _) = if sector_active {
+                (active_tint, active_alpha)
+            } else if is_center {
+                (center_tint, center_alpha)
+            } else {
+                (base_tint, base_alpha)
+            };
+            cell.set_bg(cell_bg);
             if let Some((sym, fg, bold)) = glyph {
                 cell.set_symbol(sym);
                 cell.set_fg(fg);
@@ -1909,6 +2274,10 @@ fn render_floating_mod_cross(
                 } else {
                     cell.modifier.remove(Modifier::BOLD);
                 }
+            } else if eink_mode {
+                cell.set_symbol(" ");
+                cell.set_fg(eink_fg);
+                cell.modifier.remove(Modifier::BOLD);
             } else {
                 if cell.symbol().width() != 1 {
                     cell.set_symbol(" ");
@@ -2012,6 +2381,7 @@ fn render_floating_dpad(
     term_rect: Rect,
     dpad_pos: Option<(u16, u16)>,
     dragging: bool,
+    eink_mode: bool,
     hits: &mut Vec<HitRegion>,
 ) -> Option<Rect> {
     let disc = resolve_dpad_disc_rect(term_rect, dpad_pos)?;
@@ -2081,60 +2451,73 @@ fn render_floating_dpad(
             } else {
                 (arrow_tint, arrow_alpha)
             };
-            let blended_bg = blend_rgb(base_bg, tint, alpha);
+            let (cell_bg, eink_fg) = if eink_mode {
+                if dragging {
+                    (EINK_INK, EINK_PAPER)
+                } else {
+                    (EINK_PAPER, EINK_INK)
+                }
+            } else {
+                (blend_rgb(base_bg, tint, alpha), EINK_INK)
+            };
+            let (b_fg, a_fg, p_fg) = if eink_mode {
+                (eink_fg, eink_fg, eink_fg)
+            } else {
+                (border_fg, arrow_fg, paste_fg)
+            };
 
             let glyph: Option<(&str, Color, bool)> = if full_15x7 {
                 match (dy, dx) {
                     // Row 0: top of Up box
-                    (0, 5) => Some(("╭", border_fg, false)),
-                    (0, 6..=8) => Some(("─", border_fg, false)),
-                    (0, 9) => Some(("╮", border_fg, false)),
+                    (0, 5) => Some(("╭", b_fg, false)),
+                    (0, 6..=8) => Some(("─", b_fg, false)),
+                    (0, 9) => Some(("╮", b_fg, false)),
                     // Row 1: Up label
-                    (1, 5) | (1, 9) => Some(("│", border_fg, false)),
-                    (1, 7) => Some(("↑", arrow_fg, true)),
+                    (1, 5) | (1, 9) => Some(("│", b_fg, false)),
+                    (1, 7) => Some(("↑", a_fg, true)),
                     // Row 2: top of Left / Center / Right
-                    (2, 0) | (2, 10) => Some(("╭", border_fg, false)),
-                    (2, 4) | (2, 14) => Some(("╮", border_fg, false)),
-                    (2, 5) => Some(("├", border_fg, false)),
-                    (2, 9) => Some(("┤", border_fg, false)),
-                    (2, 1..=3) | (2, 6..=8) | (2, 11..=13) => Some(("─", border_fg, false)),
+                    (2, 0) | (2, 10) => Some(("╭", b_fg, false)),
+                    (2, 4) | (2, 14) => Some(("╮", b_fg, false)),
+                    (2, 5) => Some(("├", b_fg, false)),
+                    (2, 9) => Some(("┤", b_fg, false)),
+                    (2, 1..=3) | (2, 6..=8) | (2, 11..=13) => Some(("─", b_fg, false)),
                     // Row 3: Left / Paste / Right labels
                     (3, 0) | (3, 4) | (3, 5) | (3, 9) | (3, 10) | (3, 14) => {
-                        Some(("│", border_fg, false))
+                        Some(("│", b_fg, false))
                     }
-                    (3, 2) => Some(("←", arrow_fg, true)),
-                    (3, 7) => Some(("⎘", paste_fg, true)),
-                    (3, 12) => Some(("→", arrow_fg, true)),
+                    (3, 2) => Some(("←", a_fg, true)),
+                    (3, 7) => Some(("⎘", p_fg, true)),
+                    (3, 12) => Some(("→", a_fg, true)),
                     // Row 4: bottom of Left / Center / Right
-                    (4, 0) | (4, 10) => Some(("╰", border_fg, false)),
-                    (4, 4) | (4, 14) => Some(("╯", border_fg, false)),
-                    (4, 5) => Some(("├", border_fg, false)),
-                    (4, 9) => Some(("┤", border_fg, false)),
-                    (4, 1..=3) | (4, 6..=8) | (4, 11..=13) => Some(("─", border_fg, false)),
+                    (4, 0) | (4, 10) => Some(("╰", b_fg, false)),
+                    (4, 4) | (4, 14) => Some(("╯", b_fg, false)),
+                    (4, 5) => Some(("├", b_fg, false)),
+                    (4, 9) => Some(("┤", b_fg, false)),
+                    (4, 1..=3) | (4, 6..=8) | (4, 11..=13) => Some(("─", b_fg, false)),
                     // Row 5: Down label
-                    (5, 5) | (5, 9) => Some(("│", border_fg, false)),
-                    (5, 7) => Some(("↓", arrow_fg, true)),
+                    (5, 5) | (5, 9) => Some(("│", b_fg, false)),
+                    (5, 7) => Some(("↓", a_fg, true)),
                     // Row 6: bottom of Down box
-                    (6, 5) => Some(("╰", border_fg, false)),
-                    (6, 6..=8) => Some(("─", border_fg, false)),
-                    (6, 9) => Some(("╯", border_fg, false)),
+                    (6, 5) => Some(("╰", b_fg, false)),
+                    (6, 6..=8) => Some(("─", b_fg, false)),
+                    (6, 9) => Some(("╯", b_fg, false)),
                     _ => None,
                 }
             } else if dy == up_label_y && dx == center_label_x {
-                Some(("↑", arrow_fg, true))
+                Some(("↑", a_fg, true))
             } else if dy == down_label_y && dx == center_label_x {
-                Some(("↓", arrow_fg, true))
+                Some(("↓", a_fg, true))
             } else if dy == mid_label_y && dx == left_label_x {
-                Some(("←", arrow_fg, true))
+                Some(("←", a_fg, true))
             } else if dy == mid_label_y && dx == center_label_x {
-                Some(("⎘", paste_fg, true))
+                Some(("⎘", p_fg, true))
             } else if dy == mid_label_y && dx == right_label_x {
-                Some(("→", arrow_fg, true))
+                Some(("→", a_fg, true))
             } else {
                 None
             };
 
-            cell.set_bg(blended_bg);
+            cell.set_bg(cell_bg);
             if let Some((sym, fg, bold)) = glyph {
                 cell.set_symbol(sym);
                 cell.set_fg(fg);
@@ -2143,6 +2526,10 @@ fn render_floating_dpad(
                 } else {
                     cell.modifier.remove(Modifier::BOLD);
                 }
+            } else if eink_mode {
+                cell.set_symbol(" ");
+                cell.set_fg(eink_fg);
+                cell.modifier.remove(Modifier::BOLD);
             } else {
                 if cell.symbol().width() != 1 {
                     cell.set_symbol(" ");
@@ -2231,6 +2618,7 @@ fn render_space_menu_modal(
     area: Rect,
     top_h: u16,
     world: &World,
+    eink_mode: bool,
     hits: &mut Vec<HitRegion>,
 ) {
     hits.clear();
@@ -2260,13 +2648,17 @@ fn render_space_menu_modal(
         .title(" ❖ Spaces ")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(HERDR_ACCENT))
-        .style(Style::default().bg(HERDR_PANEL_BG).fg(HERDR_TEXT));
+        .border_style(Style::default().fg(if eink_mode { EINK_INK } else { HERDR_ACCENT }))
+        .style(if eink_mode {
+            Style::default().bg(EINK_PAPER).fg(EINK_INK)
+        } else {
+            Style::default().bg(HERDR_PANEL_BG).fg(HERDR_TEXT)
+        });
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
     let buf = f.buffer_mut();
-    draw_modal_close_button(buf, popup, hits);
+    draw_modal_close_button(buf, popup, eink_mode, hits);
 
     if inner.width == 0 || inner.height == 0 {
         return;
@@ -2309,7 +2701,25 @@ fn render_space_menu_modal(
         let folder = shorten_home_path(&space.folder);
         let row2 = format!("     {folder}");
 
-        let (r1_style, r2_style) = if is_active {
+        let (r1_style, r2_style) = if eink_mode {
+            if is_active {
+                (
+                    Style::default()
+                        .bg(EINK_INK)
+                        .fg(EINK_PAPER)
+                        .add_modifier(Modifier::BOLD),
+                    Style::default().bg(EINK_INK).fg(EINK_PAPER),
+                )
+            } else {
+                (
+                    Style::default()
+                        .bg(EINK_PAPER)
+                        .fg(EINK_INK)
+                        .add_modifier(Modifier::BOLD),
+                    Style::default().bg(EINK_PAPER).fg(EINK_INK_MUTED),
+                )
+            }
+        } else if is_active {
             (
                 Style::default()
                     .bg(HERDR_SURFACE0)
@@ -2332,20 +2742,27 @@ fn render_space_menu_modal(
             buf.set_string(inner.x, y + 1, pad_to_width(&row2, w), r2_style);
         }
         if is_active {
-            let accent = HERDR_ACCENT;
+            let accent = if eink_mode { EINK_PAPER } else { HERDR_ACCENT };
             buf.set_string(inner.x, y, "▍", r1_style.fg(accent));
             if use_two_row {
                 buf.set_string(inner.x, y + 1, "▍", r2_style.fg(accent));
             }
         }
         if inner.x + dot_x < inner.x + inner.width {
+            let sym_fg = if eink_mode {
+                if is_active {
+                    EINK_PAPER
+                } else {
+                    EINK_INK
+                }
+            } else {
+                state_color(sstate)
+            };
             buf.set_string(
                 inner.x + dot_x,
                 y,
                 sstate.symbol(),
-                r1_style
-                    .fg(state_color(sstate))
-                    .add_modifier(Modifier::BOLD),
+                r1_style.fg(sym_fg).add_modifier(Modifier::BOLD),
             );
         }
 
@@ -2373,10 +2790,17 @@ fn render_space_menu_modal(
         inner.x,
         btn_y,
         &btn_lbl,
-        Style::default()
-            .bg(Color::Rgb(26, 44, 64))
-            .fg(Color::Rgb(125, 207, 255))
-            .add_modifier(Modifier::BOLD),
+        if eink_mode {
+            Style::default()
+                .bg(EINK_SURFACE)
+                .fg(EINK_INK)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .bg(Color::Rgb(26, 44, 64))
+                .fg(Color::Rgb(125, 207, 255))
+                .add_modifier(Modifier::BOLD)
+        },
     );
     hits.push(HitRegion {
         rect: Rect {
@@ -2389,6 +2813,7 @@ fn render_space_menu_modal(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_tab_overview_page(
     f: &mut Frame,
     term_rect: Rect,
@@ -2396,17 +2821,30 @@ fn render_tab_overview_page(
     query: &str,
     selected: usize,
     selected_target: &OverviewSelection,
+    eink_mode: bool,
     hits: &mut Vec<HitRegion>,
 ) {
     if term_rect.width == 0 || term_rect.height == 0 {
         return;
     }
 
+    let page_bg = if eink_mode {
+        EINK_PAPER
+    } else {
+        HERDR_SURFACE_DIM
+    };
+    let page_fg = if eink_mode { EINK_INK } else { HERDR_TEXT };
+    let input_bg = if eink_mode {
+        EINK_SURFACE
+    } else {
+        HERDR_PANEL_BG
+    };
+
     // Do NOT clear `hits`: Top Bar (`[ ⏏ ]`, `[ ▾ Space ]`, tab pills, `[ + ]`, `[ ? ]`)
     // remains live above `term_rect`. Push `ModalNoop` on `term_rect` first so item rows pushed
     // afterward take priority in `find_hit_target`.
     f.render_widget(
-        Block::default().style(Style::default().bg(HERDR_SURFACE_DIM).fg(HERDR_TEXT)),
+        Block::default().style(Style::default().bg(page_bg).fg(page_fg)),
         term_rect,
     );
     hits.push(HitRegion {
@@ -2448,8 +2886,8 @@ fn render_tab_overview_page(
             content_y,
             pad_to_width(&left_hdr, cw),
             Style::default()
-                .bg(HERDR_SURFACE_DIM)
-                .fg(HERDR_MAUVE)
+                .bg(page_bg)
+                .fg(if eink_mode { EINK_INK } else { HERDR_MAUVE })
                 .add_modifier(Modifier::BOLD),
         );
         if left_hdr.width() + 2 + right_hdr.width() <= cw {
@@ -2458,7 +2896,11 @@ fn render_tab_overview_page(
                 rx,
                 content_y,
                 right_hdr,
-                Style::default().bg(HERDR_SURFACE_DIM).fg(HERDR_OVERLAY0),
+                Style::default().bg(page_bg).fg(if eink_mode {
+                    EINK_INK_MUTED
+                } else {
+                    HERDR_OVERLAY0
+                }),
             );
         }
 
@@ -2467,7 +2909,7 @@ fn render_tab_overview_page(
             col_x,
             filter_y,
             " ".repeat(cw),
-            Style::default().bg(HERDR_PANEL_BG).fg(HERDR_TEXT),
+            Style::default().bg(input_bg).fg(page_fg),
         );
         let prompt_prefix = truncate_to_width(" › ", cw);
         let pw = prompt_prefix.width() as u16;
@@ -2477,8 +2919,8 @@ fn render_tab_overview_page(
                 filter_y,
                 &prompt_prefix,
                 Style::default()
-                    .bg(HERDR_PANEL_BG)
-                    .fg(HERDR_ACCENT)
+                    .bg(input_bg)
+                    .fg(if eink_mode { EINK_INK } else { HERDR_ACCENT })
                     .add_modifier(Modifier::BOLD),
             );
         }
@@ -2487,16 +2929,20 @@ fn render_tab_overview_page(
             let (input_txt, input_fg) = if query.is_empty() {
                 (
                     "Filter tabs, or Enter for + New Tab…".to_string(),
-                    HERDR_OVERLAY1,
+                    if eink_mode {
+                        EINK_INK_MUTED
+                    } else {
+                        HERDR_OVERLAY1
+                    },
                 )
             } else {
-                (format!("{query}▏"), HERDR_TEXT)
+                (format!("{query}▏"), page_fg)
             };
             buf.set_string(
                 col_x + pw,
                 filter_y,
                 truncate_to_width(&input_txt, rem_w),
-                Style::default().bg(HERDR_PANEL_BG).fg(input_fg),
+                Style::default().bg(input_bg).fg(input_fg),
             );
         }
 
@@ -2509,7 +2955,11 @@ fn render_tab_overview_page(
             col_x,
             hint_y,
             &hint_txt,
-            Style::default().bg(HERDR_SURFACE_DIM).fg(HERDR_OVERLAY0),
+            Style::default().bg(page_bg).fg(if eink_mode {
+                EINK_INK_MUTED
+            } else {
+                HERDR_OVERLAY0
+            }),
         );
         (content_y + 3, hint_y)
     } else if avail_h >= 4 {
@@ -2518,7 +2968,13 @@ fn render_tab_overview_page(
         } else {
             format!(" ❖ {space_name} · › {query}▏")
         };
-        let fg = if query.is_empty() {
+        let fg = if eink_mode {
+            if query.is_empty() {
+                EINK_INK_MUTED
+            } else {
+                EINK_INK
+            }
+        } else if query.is_empty() {
             HERDR_SUBTEXT0
         } else {
             HERDR_TEXT
@@ -2527,7 +2983,7 @@ fn render_tab_overview_page(
             col_x,
             content_y,
             pad_to_width(&bar_txt, cw),
-            Style::default().bg(HERDR_PANEL_BG).fg(fg),
+            Style::default().bg(input_bg).fg(fg),
         );
         (content_y + 1, content_end_y)
     } else {
@@ -2559,7 +3015,13 @@ fn render_tab_overview_page(
             break;
         }
         let is_sel = idx == sel;
-        let row_bg = if is_sel {
+        let row_bg = if eink_mode {
+            if is_sel {
+                EINK_INK
+            } else {
+                EINK_PAPER
+            }
+        } else if is_sel {
             HERDR_SURFACE0
         } else {
             HERDR_SURFACE_DIM
@@ -2569,30 +3031,46 @@ fn render_tab_overview_page(
         match item {
             OverviewItem::NewTab { cwd } => {
                 let r1_title = format!(" {marker} + New Tab");
+                let r1_fg = if eink_mode {
+                    if is_sel {
+                        EINK_PAPER
+                    } else {
+                        EINK_INK
+                    }
+                } else {
+                    HERDR_GREEN
+                };
                 let r1_style = Style::default()
                     .bg(row_bg)
-                    .fg(HERDR_GREEN)
+                    .fg(r1_fg)
                     .add_modifier(Modifier::BOLD);
-                let r2_style = Style::default().bg(row_bg).fg(if is_sel {
+                let r2_fg = if eink_mode {
+                    if is_sel {
+                        EINK_PAPER
+                    } else {
+                        EINK_INK_MUTED
+                    }
+                } else if is_sel {
                     HERDR_SUBTEXT0
                 } else {
                     HERDR_OVERLAY1
-                });
+                };
+                let r2_style = Style::default().bg(row_bg).fg(r2_fg);
                 buf.set_string(col_x, y, pad_to_width(&r1_title, cw), r1_style);
                 let hint = "Enter / ^b c ";
                 if cw >= 32 && r1_title.width() + 2 + hint.width() <= cw {
                     let hx = col_x + col_w - hint.width() as u16;
-                    buf.set_string(hx, y, hint, Style::default().bg(row_bg).fg(HERDR_OVERLAY1));
+                    buf.set_string(hx, y, hint, r2_style);
                 }
                 if is_sel {
-                    buf.set_string(col_x, y, "▍", r1_style.fg(HERDR_GREEN));
+                    buf.set_string(col_x, y, "▍", r1_style);
                 }
                 if use_two_row {
                     let short_cwd = shorten_home_path(cwd);
                     let r2_text = format!("     new…  {short_cwd}");
                     buf.set_string(col_x, y + 1, pad_to_width(&r2_text, cw), r2_style);
                     if is_sel {
-                        buf.set_string(col_x, y + 1, "▍", r2_style.fg(HERDR_GREEN));
+                        buf.set_string(col_x, y + 1, "▍", r2_style.fg(r1_fg));
                     }
                 }
                 hits.push(HitRegion {
@@ -2624,7 +3102,22 @@ fn render_tab_overview_page(
                     format!(" ({term_addr})")
                 };
                 let r1_text = format!("{prefix}{sym} {tab_number}:{tab_name}{addr_part}");
-                let (r1_style, r2_style) = if is_sel {
+                let (r1_style, r2_style) = if eink_mode {
+                    if is_sel {
+                        (
+                            Style::default()
+                                .bg(EINK_INK)
+                                .fg(EINK_PAPER)
+                                .add_modifier(Modifier::BOLD),
+                            Style::default().bg(EINK_INK).fg(EINK_PAPER),
+                        )
+                    } else {
+                        (
+                            Style::default().bg(EINK_PAPER).fg(EINK_INK),
+                            Style::default().bg(EINK_PAPER).fg(EINK_INK_MUTED),
+                        )
+                    }
+                } else if is_sel {
                     (
                         Style::default()
                             .bg(HERDR_SURFACE0)
@@ -2638,15 +3131,23 @@ fn render_tab_overview_page(
                         Style::default().bg(HERDR_SURFACE_DIM).fg(HERDR_OVERLAY1),
                     )
                 };
+                let st_fg = if eink_mode {
+                    if is_sel {
+                        EINK_PAPER
+                    } else {
+                        EINK_INK
+                    }
+                } else {
+                    state_color(*state)
+                };
+                let accent_fg = if eink_mode { EINK_PAPER } else { HERDR_ACCENT };
                 buf.set_string(col_x, y, pad_to_width(&r1_text, cw), r1_style);
                 if sym_x + (sym.width() as u16) <= col_w {
                     buf.set_string(
                         col_x + sym_x,
                         y,
                         sym,
-                        r1_style
-                            .fg(state_color(*state))
-                            .add_modifier(Modifier::BOLD),
+                        r1_style.fg(st_fg).add_modifier(Modifier::BOLD),
                     );
                 }
                 if cw >= 40
@@ -2664,13 +3165,13 @@ fn render_tab_overview_page(
                             &badge,
                             Style::default()
                                 .bg(row_bg)
-                                .fg(state_color(*state))
+                                .fg(st_fg)
                                 .add_modifier(Modifier::BOLD),
                         );
                     }
                 }
                 if is_sel {
-                    buf.set_string(col_x, y, "▍", r1_style.fg(HERDR_ACCENT));
+                    buf.set_string(col_x, y, "▍", r1_style.fg(accent_fg));
                 }
                 if use_two_row {
                     let short_cwd = shorten_home_path(cwd);
@@ -2681,7 +3182,7 @@ fn render_tab_overview_page(
                     };
                     buf.set_string(col_x, y + 1, pad_to_width(&r2_text, cw), r2_style);
                     if is_sel {
-                        buf.set_string(col_x, y + 1, "▍", r2_style.fg(HERDR_ACCENT));
+                        buf.set_string(col_x, y + 1, "▍", r2_style.fg(accent_fg));
                     }
                 }
                 hits.push(HitRegion {
@@ -2706,7 +3207,11 @@ fn render_tab_overview_page(
             col_x,
             y,
             pad_to_width("   No matching tabs in this Space", cw),
-            Style::default().bg(HERDR_SURFACE_DIM).fg(HERDR_OVERLAY1),
+            Style::default().bg(page_bg).fg(if eink_mode {
+                EINK_INK_MUTED
+            } else {
+                HERDR_OVERLAY1
+            }),
         );
     }
 }
@@ -2714,6 +3219,255 @@ fn render_tab_overview_page(
 struct VtScreenWidget<'a> {
     screen: &'a vt100::Screen,
     selection: Option<&'a TerminalSelection>,
+    eink_mode: bool,
+}
+
+fn is_braille_char(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!((chars.next(), chars.next()), (Some(ch), None) if ('\u{2800}'..='\u{28FF}').contains(&ch))
+}
+
+fn resolve_eink_cell_symbol<'a>(
+    screen: &vt100::Screen,
+    r: u16,
+    c: u16,
+    cols: u16,
+    raw_sym: &'a str,
+) -> &'a str {
+    let mut chars = raw_sym.chars();
+    if let (Some(ch), None) = (chars.next(), chars.next()) {
+        if ('\u{2801}'..='\u{28FF}').contains(&ch) {
+            let left_braille = c > 0
+                && screen
+                    .cell(r, c - 1)
+                    .is_some_and(|lc| is_braille_char(lc.contents()));
+            let right_braille = c + 1 < cols
+                && screen
+                    .cell(r, c + 1)
+                    .is_some_and(|rc| is_braille_char(rc.contents()));
+            if !left_braille && !right_braille {
+                return "◈";
+            }
+        } else if matches!(
+            ch,
+            '◐' | '◓' | '◑' | '◒' | '◴' | '◷' | '◶' | '◵' | '◜' | '◝' | '◞' | '◟'
+        ) {
+            return "◈";
+        }
+    }
+    raw_sym
+}
+
+fn xterm256_rgb(idx: u8) -> (u8, u8, u8) {
+    match idx {
+        0 => (0, 0, 0),
+        1 => (128, 0, 0),
+        2 => (0, 128, 0),
+        3 => (128, 128, 0),
+        4 => (0, 0, 128),
+        5 => (128, 0, 128),
+        6 => (0, 128, 128),
+        7 => (192, 192, 192),
+        8 => (128, 128, 128),
+        9 => (255, 0, 0),
+        10 => (0, 255, 0),
+        11 => (255, 255, 0),
+        12 => (0, 0, 255),
+        13 => (255, 0, 255),
+        14 => (0, 255, 255),
+        15 => (255, 255, 255),
+        16..=231 => {
+            const STEPS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+            let v = idx - 16;
+            let r = v / 36;
+            let g = (v % 36) / 6;
+            let b = v % 6;
+            (STEPS[r as usize], STEPS[g as usize], STEPS[b as usize])
+        }
+        232..=255 => {
+            let gray = 8 + (idx - 232) * 10;
+            (gray, gray, gray)
+        }
+    }
+}
+
+fn vt_color_rgb(c: vt100::Color) -> Option<(u8, u8, u8)> {
+    match c {
+        vt100::Color::Default => None,
+        vt100::Color::Idx(i) => Some(xterm256_rgb(i)),
+        vt100::Color::Rgb(r, g, b) => Some((r, g, b)),
+    }
+}
+
+fn rgb_luma(r: u8, g: u8, b: u8) -> u8 {
+    ((299u32 * u32::from(r) + 587u32 * u32::from(g) + 114u32 * u32::from(b)) / 1000) as u8
+}
+
+fn resolve_eink_vt_colors_and_mods(cell: &vt100::Cell, selected: bool) -> (Color, Color, Modifier) {
+    if selected || cell.inverse() {
+        return (EINK_PAPER, EINK_INK, Modifier::BOLD);
+    }
+    let bg_col = match vt_color_rgb(cell.bgcolor()) {
+        None => EINK_PAPER,
+        Some((r, g, b)) => match rgb_luma(r, g, b) {
+            0..=35 => EINK_PAPER,
+            36..=95 => EINK_SURFACE,
+            96..=224 => EINK_PILL_BG,
+            _ => EINK_PAPER,
+        },
+    };
+    let fg_col = if cell.dim() {
+        EINK_INK_MUTED
+    } else {
+        match cell.fgcolor() {
+            vt100::Color::Default => EINK_INK,
+            c => match vt_color_rgb(c) {
+                Some((r, g, b)) => {
+                    let luma = rgb_luma(r, g, b);
+                    let chroma = r.max(g).max(b) - r.min(g).min(b);
+                    if matches!(c, vt100::Color::Idx(8 | 238..=249))
+                        || (chroma <= 18 && (70..=180).contains(&luma))
+                    {
+                        EINK_INK_MUTED
+                    } else {
+                        EINK_INK
+                    }
+                }
+                None => EINK_INK,
+            },
+        }
+    };
+    let mut mods = Modifier::empty();
+    if cell.bold() {
+        mods |= Modifier::BOLD;
+    }
+    if cell.italic() {
+        mods |= Modifier::ITALIC;
+    }
+    if cell.underline() {
+        mods |= Modifier::UNDERLINED;
+    }
+    (fg_col, bg_col, mods)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EinkSnapCell {
+    sym: String,
+    fg: Color,
+    bg: Color,
+    mods: Modifier,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EinkScreenSnapshot {
+    rows: u16,
+    cols: u16,
+    scrollback_offset: usize,
+    cursor: Option<(u16, u16)>,
+    cells: Vec<EinkSnapCell>,
+}
+
+fn normalized_narrow_vt_symbol<'a>(
+    screen: &vt100::Screen,
+    r: u16,
+    c: u16,
+    cols: u16,
+    raw_sym: &'a str,
+    eink_mode: bool,
+) -> &'a str {
+    let effective = if eink_mode {
+        resolve_eink_cell_symbol(screen, r, c, cols, raw_sym)
+    } else {
+        raw_sym
+    };
+    if effective.is_empty() || effective == " " {
+        " "
+    } else if (effective.len() == 1 && effective.as_bytes()[0].is_ascii_graphic())
+        || effective.width() == 1
+    {
+        effective
+    } else {
+        " "
+    }
+}
+
+pub fn capture_eink_screen_snapshot(
+    screen: &vt100::Screen,
+    area: Rect,
+    scrollback_offset: usize,
+) -> EinkScreenSnapshot {
+    let (scr_cols, scr_rows) = {
+        let (r, c) = screen.size();
+        (c.get(), r.get())
+    };
+    let (rows, cols) = vt_render_dims((scr_cols, scr_rows), area);
+    let mut cells = Vec::with_capacity(usize::from(rows) * usize::from(cols));
+    for r in 0..rows {
+        let mut c = 0;
+        while c < cols {
+            let Some(cell) = screen.cell(r, c) else {
+                c += 1;
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                c += 1;
+                continue;
+            }
+            let (fg, bg, mods) = resolve_eink_vt_colors_and_mods(cell, false);
+            let raw_sym = if cell.has_contents() {
+                cell.contents()
+            } else {
+                ""
+            };
+            if cell.is_wide() {
+                if c + 1 >= cols {
+                    cells.push(EinkSnapCell {
+                        sym: " ".to_string(),
+                        fg,
+                        bg,
+                        mods,
+                    });
+                    c += 1;
+                } else {
+                    let sym = if raw_sym.width() == 2 { raw_sym } else { " " };
+                    cells.push(EinkSnapCell {
+                        sym: sym.to_string(),
+                        fg,
+                        bg,
+                        mods,
+                    });
+                    cells.push(EinkSnapCell {
+                        sym: String::new(),
+                        fg,
+                        bg,
+                        mods,
+                    });
+                    c += 2;
+                }
+            } else {
+                let sym = normalized_narrow_vt_symbol(screen, r, c, cols, raw_sym, true);
+                cells.push(EinkSnapCell {
+                    sym: sym.to_string(),
+                    fg,
+                    bg,
+                    mods,
+                });
+                c += 1;
+            }
+        }
+    }
+    let cursor =
+        (scrollback_offset == 0 && !screen.hide_cursor() && rows > 0 && cols > 0).then(|| {
+            let (cr, cc) = screen.cursor_position();
+            (cr.min(rows - 1), cc.min(cols - 1))
+        });
+    EinkScreenSnapshot {
+        rows,
+        cols,
+        scrollback_offset,
+        cursor,
+        cells,
+    }
 }
 
 /// Resolve how many rows and columns of the vt100 screen to paint into `area`.
@@ -2737,6 +3491,18 @@ fn vt_render_dims(screen: (u16, u16), area: Rect) -> (u16, u16) {
 
 impl Widget for VtScreenWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        if self.eink_mode {
+            for y in area.y..area.y.saturating_add(area.height) {
+                for x in area.x..area.x.saturating_add(area.width) {
+                    if let Some(dst) = buf.cell_mut((x, y)) {
+                        dst.reset();
+                        dst.set_symbol(" ");
+                        dst.set_bg(EINK_PAPER);
+                        dst.set_fg(EINK_INK);
+                    }
+                }
+            }
+        }
         let (scr_cols, scr_rows) = {
             let (r, c) = self.screen.size();
             (c.get(), r.get())
@@ -2765,7 +3531,10 @@ impl Widget for VtScreenWidget<'_> {
                         sel.contains(r, c) || (is_wide && sel.contains(r, c + 1))
                     });
 
-                let style = if selected {
+                let style = if self.eink_mode {
+                    let (fg_col, bg_col, mods) = resolve_eink_vt_colors_and_mods(cell, selected);
+                    Style::default().fg(fg_col).bg(bg_col).add_modifier(mods)
+                } else if selected {
                     Style::default()
                         .bg(Color::Rgb(58, 114, 200))
                         .fg(Color::White)
@@ -2820,15 +3589,14 @@ impl Widget for VtScreenWidget<'_> {
                         c += 2;
                     }
                 } else {
-                    let sym = if raw_sym.is_empty() || raw_sym == " " {
-                        " "
-                    } else if (raw_sym.len() == 1 && raw_sym.as_bytes()[0].is_ascii_graphic())
-                        || raw_sym.width() == 1
-                    {
-                        raw_sym
-                    } else {
-                        " "
-                    };
+                    let sym = normalized_narrow_vt_symbol(
+                        self.screen,
+                        r,
+                        c,
+                        cols,
+                        raw_sym,
+                        self.eink_mode,
+                    );
                     if let Some(dst) = buf.cell_mut((x, y)) {
                         dst.reset();
                         dst.set_symbol(sym);
@@ -2860,7 +3628,12 @@ fn centered_rect(width: u16, height: u16, r: Rect) -> Rect {
     }
 }
 
-fn draw_modal_close_button(buf: &mut Buffer, popup: Rect, hits: &mut Vec<HitRegion>) {
+fn draw_modal_close_button(
+    buf: &mut Buffer,
+    popup: Rect,
+    eink_mode: bool,
+    hits: &mut Vec<HitRegion>,
+) {
     let close_lbl = " ✕ ";
     let cw = close_lbl.width() as u16;
     if popup.width > cw + 4 {
@@ -2870,10 +3643,17 @@ fn draw_modal_close_button(buf: &mut Buffer, popup: Rect, hits: &mut Vec<HitRegi
             cx,
             cy,
             close_lbl,
-            Style::default()
-                .bg(Color::Rgb(96, 38, 52))
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
+            if eink_mode {
+                Style::default()
+                    .bg(EINK_SURFACE)
+                    .fg(EINK_INK)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .bg(Color::Rgb(96, 38, 52))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            },
         );
         hits.push(HitRegion {
             rect: Rect {
@@ -2887,9 +3667,9 @@ fn draw_modal_close_button(buf: &mut Buffer, popup: Rect, hits: &mut Vec<HitRegi
     }
 }
 
-fn render_help_modal(f: &mut Frame, area: Rect, hits: &mut Vec<HitRegion>) {
+fn render_help_modal(f: &mut Frame, area: Rect, eink_mode: bool, hits: &mut Vec<HitRegion>) {
     hits.clear();
-    let popup = centered_rect(68, 28, area);
+    let popup = centered_rect(68, 32, area);
     f.render_widget(Clear, popup);
     hits.push(HitRegion {
         rect: popup,
@@ -2901,23 +3681,40 @@ fn render_help_modal(f: &mut Frame, area: Rect, hits: &mut Vec<HitRegion>) {
         .title(" Quick Actions & Help ")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Rgb(122, 162, 247)))
-        .style(Style::default().bg(Color::Rgb(20, 22, 34)).fg(Color::White));
+        .border_style(Style::default().fg(if eink_mode {
+            EINK_INK
+        } else {
+            Color::Rgb(122, 162, 247)
+        }))
+        .style(if eink_mode {
+            Style::default().bg(EINK_PAPER).fg(EINK_INK)
+        } else {
+            Style::default().bg(Color::Rgb(20, 22, 34)).fg(Color::White)
+        });
     if usize::from(popup.width) > version_badge.width() + 2 {
         block = block.title_bottom(
             Line::from(Span::styled(
                 version_badge,
-                Style::default().fg(Color::Rgb(147, 153, 178)),
+                Style::default().fg(if eink_mode {
+                    EINK_INK_MUTED
+                } else {
+                    Color::Rgb(147, 153, 178)
+                }),
             ))
             .right_aligned(),
         );
     }
     let inner = block.inner(popup);
 
-    // Reflow the 12 touch quick-action buttons across available inner width so narrow mobile
+    // Reflow the 14 touch quick-action buttons across available inner width so narrow mobile
     // viewports wrap buttons onto additional rows instead of dropping right-hand columns.
     let compact_btns = inner.width < 58;
-    let quick_actions: [(&str, &str, HitTarget); 12] = [
+    let (eink_wide, eink_short) = if eink_mode {
+        ("  ◐ E-Ink: ON   ", " ◐E:ON ")
+    } else {
+        ("  ◐ E-Ink: OFF  ", " ◐E:OF ")
+    };
+    let quick_actions: [(&str, &str, HitTarget); 14] = [
         (
             "  + New Tab     ",
             " +Tab ",
@@ -2969,6 +3766,16 @@ fn render_help_modal(f: &mut Frame, area: Rect, hits: &mut Vec<HitRegion>) {
             HitTarget::TriggerAction(Action::ToggleSidebar),
         ),
         (
+            eink_wide,
+            eink_short,
+            HitTarget::TriggerAction(Action::ToggleEink),
+        ),
+        (
+            "  ↻ Redraw      ",
+            " ↻Draw ",
+            HitTarget::TriggerAction(Action::RedrawScreen),
+        ),
+        (
             "  ⏏ Detach hct  ",
             " ⏏Exit ",
             HitTarget::TriggerAction(Action::Detach),
@@ -2996,7 +3803,11 @@ fn render_help_modal(f: &mut Frame, area: Rect, hits: &mut Vec<HitRegion>) {
     let mut lines = vec![Line::from(Span::styled(
         "  Touch Quick Actions (Tap to execute):",
         Style::default()
-            .fg(Color::LightCyan)
+            .fg(if eink_mode {
+                EINK_INK
+            } else {
+                Color::LightCyan
+            })
             .add_modifier(Modifier::BOLD),
     ))];
     for _ in 0..=btn_rows_count {
@@ -3006,7 +3817,7 @@ fn render_help_modal(f: &mut Frame, area: Rect, hits: &mut Vec<HitRegion>) {
         Line::from(Span::styled(
             "  Keyboard & Touch Shortcuts:",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(if eink_mode { EINK_INK } else { Color::Cyan })
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from("  Top Bar [ ⏏ ]            Detach hct while keeping sessions running (^b q)"),
@@ -3025,17 +3836,23 @@ fn render_help_modal(f: &mut Frame, area: Rect, hits: &mut Vec<HitRegion>) {
         Line::from("  Quick Fuzzy Switcher     ^b w          or  ^b f"),
         Line::from("  Jump Next Alert Agent    ^b a          (◉ blocked / ✓ done)"),
         Line::from("  Scrollback / History     ^b [          or  Tap [▼ BOT] on status bar"),
+        Line::from("  Page Up / Down           ^b PgUp / PgDn /  Tap [▲Pg] / [▼Pg] on status bar"),
+        Line::from("  E-Ink / Clean Redraw     ^b e (E-Ink)  /   ^b r (clean redraw)"),
         Line::from("  Detach (keep running)    ^b q / ^b d   or  Ctrl+\\ / Tap [ ⏏ ]"),
         Line::from(""),
         Line::from(Span::styled(
             "  Tap outside, [ ✕ ], Esc, Enter, or ? to close",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(if eink_mode {
+                EINK_INK_MUTED
+            } else {
+                Color::DarkGray
+            }),
         )),
     ]);
     f.render_widget(Paragraph::new(lines).block(block), popup);
 
     let buf = f.buffer_mut();
-    draw_modal_close_button(buf, popup, hits);
+    draw_modal_close_button(buf, popup, eink_mode, hits);
 
     for (rel_x, rel_row, lbl, target) in placed_btns {
         let by = inner.y + 1 + rel_row;
@@ -3047,10 +3864,24 @@ fn render_help_modal(f: &mut Frame, area: Rect, hits: &mut Vec<HitRegion>) {
         if bx + bw > inner.x + inner.width {
             continue;
         }
-        let bstyle = Style::default()
-            .bg(Color::Rgb(42, 52, 82))
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD);
+        let bstyle = if eink_mode {
+            if matches!(target, HitTarget::TriggerAction(Action::ToggleEink)) {
+                Style::default()
+                    .bg(EINK_INK)
+                    .fg(EINK_PAPER)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .bg(EINK_SURFACE)
+                    .fg(EINK_INK)
+                    .add_modifier(Modifier::BOLD)
+            }
+        } else {
+            Style::default()
+                .bg(Color::Rgb(42, 52, 82))
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        };
         buf.set_string(bx, by, lbl, bstyle);
         hits.push(HitRegion {
             rect: Rect {
@@ -3069,6 +3900,7 @@ fn render_confirm_close_modal(
     area: Rect,
     tab_id: &str,
     tab_title: &str,
+    eink_mode: bool,
     hits: &mut Vec<HitRegion>,
 ) {
     hits.clear();
@@ -3089,13 +3921,17 @@ fn render_confirm_close_modal(
         .title(" Close Tab ")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::LightRed))
-        .style(Style::default().bg(Color::Rgb(28, 20, 28)).fg(Color::White));
+        .border_style(Style::default().fg(if eink_mode { EINK_INK } else { Color::LightRed }))
+        .style(if eink_mode {
+            Style::default().bg(EINK_PAPER).fg(EINK_INK)
+        } else {
+            Style::default().bg(Color::Rgb(28, 20, 28)).fg(Color::White)
+        });
     let inner = block.inner(popup);
     f.render_widget(Paragraph::new(lines).block(block), popup);
 
     let buf = f.buffer_mut();
-    draw_modal_close_button(buf, popup, hits);
+    draw_modal_close_button(buf, popup, eink_mode, hits);
 
     if inner.height >= 4 {
         let by = inner.y + 3;
@@ -3109,10 +3945,17 @@ fn render_confirm_close_modal(
                 bx,
                 by,
                 yes_lbl,
-                Style::default()
-                    .bg(Color::Rgb(110, 36, 44))
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+                if eink_mode {
+                    Style::default()
+                        .bg(EINK_INK)
+                        .fg(EINK_PAPER)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .bg(Color::Rgb(110, 36, 44))
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                },
             );
             hits.push(HitRegion {
                 rect: Rect {
@@ -3132,10 +3975,17 @@ fn render_confirm_close_modal(
                 nx,
                 by,
                 no_lbl,
-                Style::default()
-                    .bg(Color::Rgb(48, 52, 72))
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+                if eink_mode {
+                    Style::default()
+                        .bg(EINK_SURFACE)
+                        .fg(EINK_INK)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .bg(Color::Rgb(48, 52, 72))
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                },
             );
             hits.push(HitRegion {
                 rect: Rect {
@@ -3155,6 +4005,7 @@ fn render_prompt_modal(
     area: Rect,
     kind: &PromptKind,
     input: &str,
+    eink_mode: bool,
     hits: &mut Vec<HitRegion>,
 ) {
     hits.clear();
@@ -3175,13 +4026,21 @@ fn render_prompt_modal(
         .title(title)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Rgb(122, 162, 247)))
-        .style(Style::default().bg(Color::Rgb(20, 22, 34)).fg(Color::White));
+        .border_style(Style::default().fg(if eink_mode {
+            EINK_INK
+        } else {
+            Color::Rgb(122, 162, 247)
+        }))
+        .style(if eink_mode {
+            Style::default().bg(EINK_PAPER).fg(EINK_INK)
+        } else {
+            Style::default().bg(Color::Rgb(20, 22, 34)).fg(Color::White)
+        });
     let inner = block.inner(popup);
     f.render_widget(Paragraph::new(lines).block(block), popup);
 
     let buf = f.buffer_mut();
-    draw_modal_close_button(buf, popup, hits);
+    draw_modal_close_button(buf, popup, eink_mode, hits);
 
     if inner.height >= 4 {
         let by = inner.y + 3;
@@ -3195,10 +4054,17 @@ fn render_prompt_modal(
                 bx,
                 by,
                 ok_lbl,
-                Style::default()
-                    .bg(Color::Rgb(36, 82, 58))
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+                if eink_mode {
+                    Style::default()
+                        .bg(EINK_INK)
+                        .fg(EINK_PAPER)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .bg(Color::Rgb(36, 82, 58))
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                },
             );
             hits.push(HitRegion {
                 rect: Rect {
@@ -3216,10 +4082,17 @@ fn render_prompt_modal(
                 cx,
                 by,
                 cancel_lbl,
-                Style::default()
-                    .bg(Color::Rgb(48, 52, 72))
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+                if eink_mode {
+                    Style::default()
+                        .bg(EINK_SURFACE)
+                        .fg(EINK_INK)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .bg(Color::Rgb(48, 52, 72))
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                },
             );
             hits.push(HitRegion {
                 rect: Rect {
@@ -3234,6 +4107,7 @@ fn render_prompt_modal(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_fuzzy_modal(
     f: &mut Frame,
     area: Rect,
@@ -3241,6 +4115,7 @@ fn render_fuzzy_modal(
     query: &str,
     selected: usize,
     selected_tab_id: Option<&str>,
+    eink_mode: bool,
     hits: &mut Vec<HitRegion>,
 ) {
     hits.clear();
@@ -3255,8 +4130,16 @@ fn render_fuzzy_modal(
         .title(" Quick Switch Space / Tab (^b w) ")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Rgb(122, 162, 247)))
-        .style(Style::default().bg(Color::Rgb(20, 22, 34)).fg(Color::White));
+        .border_style(Style::default().fg(if eink_mode {
+            EINK_INK
+        } else {
+            Color::Rgb(122, 162, 247)
+        }))
+        .style(if eink_mode {
+            Style::default().bg(EINK_PAPER).fg(EINK_INK)
+        } else {
+            Style::default().bg(Color::Rgb(20, 22, 34)).fg(Color::White)
+        });
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -3265,11 +4148,16 @@ fn render_fuzzy_modal(
         .constraints([Constraint::Length(2), Constraint::Min(1)])
         .split(inner);
 
-    let prompt = Paragraph::new(format!(" › {query}▏")).style(
+    let prompt = Paragraph::new(format!(" › {query}▏")).style(if eink_mode {
+        Style::default()
+            .bg(EINK_PAPER)
+            .fg(EINK_INK)
+            .add_modifier(Modifier::BOLD)
+    } else {
         Style::default()
             .fg(Color::LightCyan)
-            .add_modifier(Modifier::BOLD),
-    );
+            .add_modifier(Modifier::BOLD)
+    });
     f.render_widget(prompt, chunks[0]);
 
     let items = collect_fuzzy_items(world, query);
@@ -3278,29 +4166,60 @@ fn render_fuzzy_modal(
         .iter()
         .enumerate()
         .map(|(i, it)| {
-            let st_col = state_color(it.state);
-            let style = if i == sel {
-                Style::default()
-                    .bg(Color::Rgb(65, 75, 120))
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD)
+            let is_sel = i == sel;
+            if eink_mode {
+                let row_style = if is_sel {
+                    Style::default()
+                        .bg(EINK_INK)
+                        .fg(EINK_PAPER)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().bg(EINK_PAPER).fg(EINK_INK)
+                };
+                let muted_style = if is_sel {
+                    row_style
+                } else {
+                    row_style.fg(EINK_INK_MUTED)
+                };
+                let line = Line::from(vec![
+                    Span::styled(if is_sel { " ▸ " } else { "   " }, row_style),
+                    Span::styled(
+                        format!("{} ", it.state.symbol()),
+                        row_style.add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("[{}] ", it.space_name),
+                        row_style.add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!("{} ", it.tab_name), row_style),
+                    Span::styled(format!("({}) {}", it.term_addr, it.cwd), muted_style),
+                ]);
+                ListItem::new(line).style(row_style)
             } else {
-                Style::default().fg(Color::Gray)
-            };
-            let line = Line::from(vec![
-                Span::styled(if i == sel { " ▸ " } else { "   " }, style),
-                Span::styled(
-                    format!("{} ", it.state.symbol()),
-                    style.fg(st_col).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!("[{}] ", it.space_name), style.fg(Color::Cyan)),
-                Span::styled(format!("{} ", it.tab_name), style),
-                Span::styled(
-                    format!("({}) {}", it.term_addr, it.cwd),
-                    style.fg(Color::DarkGray),
-                ),
-            ]);
-            ListItem::new(line)
+                let st_col = state_color(it.state);
+                let style = if is_sel {
+                    Style::default()
+                        .bg(Color::Rgb(65, 75, 120))
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
+                let line = Line::from(vec![
+                    Span::styled(if is_sel { " ▸ " } else { "   " }, style),
+                    Span::styled(
+                        format!("{} ", it.state.symbol()),
+                        style.fg(st_col).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!("[{}] ", it.space_name), style.fg(Color::Cyan)),
+                    Span::styled(format!("{} ", it.tab_name), style),
+                    Span::styled(
+                        format!("({}) {}", it.term_addr, it.cwd),
+                        style.fg(Color::DarkGray),
+                    ),
+                ]);
+                ListItem::new(line)
+            }
         })
         .collect();
 
@@ -3311,7 +4230,7 @@ fn render_fuzzy_modal(
     f.render_stateful_widget(List::new(list_items), chunks[1], &mut list_state);
 
     let buf = f.buffer_mut();
-    draw_modal_close_button(buf, popup, hits);
+    draw_modal_close_button(buf, popup, eink_mode, hits);
 
     // Register touch hit regions for each visible row in the Fuzzy list
     let offset = list_state.offset();
@@ -4275,6 +5194,7 @@ mod tests {
                 VtScreenWidget {
                     screen: parser.screen(),
                     selection: None,
+                    eink_mode: false,
                 },
                 f.area(),
             );
@@ -4335,6 +5255,7 @@ mod tests {
                 VtScreenWidget {
                     screen: parser.screen(),
                     selection: None,
+                    eink_mode: false,
                 },
                 f.area(),
             );
@@ -4369,6 +5290,7 @@ mod tests {
                 VtScreenWidget {
                     screen: parser.screen(),
                     selection: None,
+                    eink_mode: false,
                 },
                 f.area(),
             );
@@ -4398,6 +5320,7 @@ mod tests {
                 VtScreenWidget {
                     screen: parser.screen(),
                     selection: None,
+                    eink_mode: false,
                 },
                 f.area(),
             );
@@ -4799,5 +5722,336 @@ mod tests {
                 .iter()
                 .any(|hit| hit.target == HitTarget::NewTab && hit.rect.y >= 1));
         }
+    }
+
+    fn assert_strict_eink_buffer(buf: &Buffer) {
+        let is_neutral_carta_color = |c: Color| match c {
+            Color::Rgb(r, g, b) => r == g && g == b && matches!(r, 0 | 51 | 221 | 238 | 255),
+            _ => false,
+        };
+        for y in buf.area.y..buf.area.y + buf.area.height {
+            for x in buf.area.x..buf.area.x + buf.area.width {
+                let cell = &buf[(x, y)];
+                assert!(
+                    !cell.modifier.contains(Modifier::DIM),
+                    "cell ({x}, {y}) symbol {:?} unexpectedly retained Modifier::DIM in E-Ink mode",
+                    cell.symbol()
+                );
+                assert!(
+                    is_neutral_carta_color(cell.fg),
+                    "cell ({x}, {y}) symbol {:?} has non-Carta fg {:?}",
+                    cell.symbol(),
+                    cell.fg
+                );
+                assert!(
+                    is_neutral_carta_color(cell.bg),
+                    "cell ({x}, {y}) symbol {:?} has non-Carta bg {:?}",
+                    cell.symbol(),
+                    cell.bg
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn eink_mode_quantizes_chrome_modals_crosses_and_vt_to_neutral_carta_lut() {
+        let mut world = World::default();
+        world.doc.spaces.push(SharedSpace {
+            id: "space-1".to_string(),
+            name: "main".to_string(),
+            folder: "/tmp/work".to_string(),
+            tabs: vec![
+                SharedTab {
+                    id: "tab-blk".to_string(),
+                    name: "agy-blk".to_string(),
+                    root: serde_json::json!({"content": {"terminal": "t-blk"}}),
+                    ..Default::default()
+                },
+                SharedTab {
+                    id: "tab-wrk".to_string(),
+                    name: "agy-wrk".to_string(),
+                    root: serde_json::json!({"content": {"terminal": "t-wrk"}}),
+                    ..Default::default()
+                },
+                SharedTab {
+                    id: "tab-don".to_string(),
+                    name: "agy-don".to_string(),
+                    root: serde_json::json!({"content": {"terminal": "t-don"}}),
+                    ..Default::default()
+                },
+                SharedTab {
+                    id: "tab-idl".to_string(),
+                    name: "sh-idl".to_string(),
+                    root: serde_json::json!({"content": {"terminal": "t-idl"}}),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        world.terminals.insert(
+            "t-blk".to_string(),
+            TerminalInfo {
+                address: "t-blk".to_string(),
+                status_word: Some("blocked".to_string()),
+                status_msg: Some("Approve command".to_string()),
+                ..Default::default()
+            },
+        );
+        world.terminals.insert(
+            "t-wrk".to_string(),
+            TerminalInfo {
+                address: "t-wrk".to_string(),
+                status_word: Some("working".to_string()),
+                ..Default::default()
+            },
+        );
+        world.terminals.insert(
+            "t-don".to_string(),
+            TerminalInfo {
+                address: "t-don".to_string(),
+                status_word: Some("idle".to_string()),
+                turn: 3,
+                seen_turn: Some(1),
+                ..Default::default()
+            },
+        );
+        world.terminals.insert(
+            "t-idl".to_string(),
+            TerminalInfo {
+                address: "t-idl".to_string(),
+                status_word: Some("idle".to_string()),
+                turn: 2,
+                seen_turn: Some(2),
+                ..Default::default()
+            },
+        );
+        world.select_tab_index(3);
+
+        let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
+        let mut parser = vt100::Parser::new(nz(22), nz(100), 0);
+        parser.process(
+            concat!(
+                "⠋ Thinking\r\n",
+                "◐ Loading\r\n",
+                "⣀⣤ Spark\r\n",
+                "\x1b[2mDimComment\x1b[0m ",
+                "\x1b[38;2;255;220;120;48;2;20;24;36mDarkBg\x1b[0m ",
+                "\x1b[7mInv\x1b[0m",
+            )
+            .as_bytes(),
+        );
+
+        let quota = AgentQuota {
+            agent: AgentKind::Antigravity,
+            metrics: vec![
+                QuotaMetric {
+                    window_label: "5h".to_string(),
+                    remaining_percent: 12.0,
+                    detail: Some("1h10m".to_string()),
+                },
+                QuotaMetric {
+                    window_label: "7d".to_string(),
+                    remaining_percent: 85.0,
+                    detail: None,
+                },
+            ],
+        };
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let mut geom_hits = Vec::new();
+        let mut mod_rect_out = None;
+        terminal
+            .draw(|f| {
+                let geom = render_ui_full(
+                    f,
+                    &world,
+                    Some(parser.screen()),
+                    false,
+                    24,
+                    true,
+                    true,
+                    false,
+                    false,
+                    5,
+                    None,
+                    true,
+                    &Modal::None,
+                    None,
+                    false,
+                    None,
+                    false,
+                    Some(&quota),
+                    true,
+                );
+                geom_hits = geom.hits;
+                mod_rect_out = geom.mod_rect;
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        assert_strict_eink_buffer(buf);
+
+        let top_row: String = (0..100).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(top_row.contains("!1:"));
+        assert!(top_row.contains("*2:"));
+        assert!(top_row.contains("✓3:"));
+
+        let bot_row: String = (0..100).map(|x| buf[(x, 23)].symbol()).collect();
+        assert!(bot_row.contains("12%!"));
+        assert!(bot_row.contains('█'));
+        assert!(bot_row.contains('─'));
+        assert!(!bot_row.contains('░'));
+        assert!(bot_row.contains("▲Pg"));
+        assert!(bot_row.contains("▼Pg"));
+        assert!(geom_hits
+            .iter()
+            .any(|h| h.target == HitTarget::TriggerAction(Action::PageUp)));
+        assert!(geom_hits
+            .iter()
+            .any(|h| h.target == HitTarget::TriggerAction(Action::PageDown)));
+        assert!(geom_hits
+            .iter()
+            .any(|h| h.target == HitTarget::ExitScrollback));
+
+        // Verify VtScreenWidget spinner freezing, sparkline preservation, DIM removal, and RGB de-fog
+        assert_eq!(buf[(0, 1)].symbol(), "◈");
+        assert_eq!(buf[(0, 2)].symbol(), "◈");
+        assert_eq!(buf[(0, 3)].symbol(), "⣀");
+        assert_eq!(buf[(1, 3)].symbol(), "⣤");
+        assert_eq!(buf[(0, 4)].symbol(), "D");
+        assert_eq!(buf[(0, 4)].fg, EINK_INK_MUTED);
+        assert_eq!(buf[(11, 4)].symbol(), "D");
+        assert_eq!(buf[(11, 4)].bg, EINK_PAPER);
+        assert_eq!(buf[(11, 4)].fg, EINK_INK);
+        assert_eq!(buf[(18, 4)].symbol(), "I");
+        assert_eq!(buf[(18, 4)].bg, EINK_INK);
+        assert_eq!(buf[(18, 4)].fg, EINK_PAPER);
+
+        // Verify left modifier cross corners are hollow (row 0, col 0 relative to disc keeps EINK_PAPER)
+        // and active center `^B` sector is inverted (`EINK_INK` bg / `EINK_PAPER` fg).
+        let mod_rect = mod_rect_out.expect("mod cross rect should be present");
+        assert_eq!(buf[(mod_rect.x, mod_rect.y)].bg, EINK_PAPER);
+        assert_eq!(buf[(mod_rect.x + 7, mod_rect.y + 3)].bg, EINK_INK);
+        assert_eq!(buf[(mod_rect.x + 7, mod_rect.y + 3)].fg, EINK_PAPER);
+
+        // Active Blocked tab also keeps `!` prefix
+        world.select_tab_index(0);
+        terminal
+            .draw(|f| {
+                let _ = render_ui_full(
+                    f,
+                    &world,
+                    Some(parser.screen()),
+                    false,
+                    24,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::None,
+                    None,
+                    false,
+                    None,
+                    false,
+                    None,
+                    true,
+                );
+            })
+            .unwrap();
+        let active_blk_top: String = (0..100)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect();
+        assert!(active_blk_top.contains("!1:"));
+
+        // All modals strictly obey the Carta neutral LUT & Help exposes ToggleEink / RedrawScreen hits
+        let modals = [
+            Modal::Help,
+            Modal::SpaceMenu,
+            Modal::default_tab_overview(),
+            Modal::Fuzzy {
+                query: String::new(),
+                selected: 0,
+                selected_tab_id: Some("tab-blk".to_string()),
+            },
+            Modal::ConfirmCloseTab {
+                tab_id: "tab-blk".to_string(),
+                tab_title: "agy-blk".to_string(),
+            },
+            Modal::Prompt {
+                kind: PromptKind::NewSpace,
+                input: "work".to_string(),
+            },
+        ];
+        for modal in &modals {
+            let mut modal_hits = Vec::new();
+            terminal
+                .draw(|f| {
+                    modal_hits = render_ui_full(
+                        f,
+                        &world,
+                        Some(parser.screen()),
+                        false,
+                        24,
+                        false,
+                        false,
+                        false,
+                        false,
+                        0,
+                        None,
+                        false,
+                        modal,
+                        None,
+                        false,
+                        None,
+                        false,
+                        Some(&quota),
+                        true,
+                    )
+                    .hits;
+                })
+                .unwrap();
+            assert_strict_eink_buffer(terminal.backend().buffer());
+            if matches!(modal, Modal::Help) {
+                assert!(modal_hits
+                    .iter()
+                    .any(|h| h.target == HitTarget::TriggerAction(Action::ToggleEink)));
+                assert!(modal_hits
+                    .iter()
+                    .any(|h| h.target == HitTarget::TriggerAction(Action::RedrawScreen)));
+            }
+        }
+    }
+
+    #[test]
+    fn eink_screen_snapshot_coalesces_spinners_and_detects_real_changes() {
+        let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
+        let mut parser = vt100::Parser::new(nz(6), nz(30), 100);
+        let area = Rect::new(0, 1, 30, 6);
+
+        parser.process("\x1b[?25l\x1b[H⠋ Thinking...".as_bytes());
+        let snap1 = capture_eink_screen_snapshot(parser.screen(), area, 0);
+
+        parser.process("\x1b[H⠙ Thinking...".as_bytes());
+        let snap2 = capture_eink_screen_snapshot(parser.screen(), area, 0);
+
+        parser.process("\x1b[H⠹ Thinking...".as_bytes());
+        let snap3 = capture_eink_screen_snapshot(parser.screen(), area, 0);
+
+        assert_eq!(snap1, snap2);
+        assert_eq!(snap2, snap3);
+
+        parser.process(b"\x1b[2;1HReady");
+        let snap4 = capture_eink_screen_snapshot(parser.screen(), area, 0);
+        assert_ne!(snap1, snap4);
+
+        parser.process(b"\x1b[?25h\x1b[2;6H");
+        let snap5 = capture_eink_screen_snapshot(parser.screen(), area, 0);
+        assert_ne!(snap4, snap5);
+
+        let snap6 = capture_eink_screen_snapshot(parser.screen(), area, 1);
+        assert_ne!(snap5, snap6);
     }
 }
