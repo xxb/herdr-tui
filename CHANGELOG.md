@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/xxb/herdr-tui/compare/v0.3.3...v0.4.0) (2026-11-17)
+
+
+### Features
+
+* **ui:** make horizontal swipe linear with trailing hc-style tab overview ([#57](https://github.com/xxb/herdr-tui/issues/57)) ([0e3df54](https://github.com/xxb/herdr-tui/commit/0e3df549c97d3f16f5591be9e0ac2ec9e63f38cd))
+
 ## [0.3.3](https://github.com/xxb/herdr-tui/compare/v0.3.2...v0.3.3) (2026-11-16)
 
 
