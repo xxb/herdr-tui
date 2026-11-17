@@ -2643,6 +2643,19 @@ impl EinkInputPacer {
     }
 }
 
+fn detect_eink_agent_settlement(
+    prev: Option<&(String, AgentState)>,
+    cur: Option<&(String, AgentState)>,
+) -> bool {
+    matches!(
+        (prev, cur),
+        (
+            Some((prev_addr, AgentState::Working)),
+            Some((cur_addr, cur_state)),
+        ) if prev_addr == cur_addr && *cur_state != AgentState::Working
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn promote_due_pty_dirty(
     eink_mode: bool,
@@ -4092,18 +4105,14 @@ fn run_app_loop(
             .as_ref()
             .and_then(|a| world.terminals.get(a))
             .map(|i| (i.address.clone(), i.agent_state()));
+        if eink_mode
+            && detect_eink_agent_settlement(prev_active_agent_state.as_ref(), cur_agent.as_ref())
+        {
+            force_clear = true;
+            pending_eink_osc = true;
+            dirty = true;
+        }
         if eink_mode {
-            if let (
-                Some((ref prev_addr, AgentState::Working)),
-                Some((ref cur_a, AgentState::Done | AgentState::Blocked)),
-            ) = (&prev_active_agent_state, &cur_agent)
-            {
-                if prev_addr == cur_a {
-                    force_clear = true;
-                    pending_eink_osc = true;
-                    dirty = true;
-                }
-            }
             if first_frame_drawn && *active_addr != prev_drawn_addr {
                 pending_eink_osc = true;
             }
@@ -7410,5 +7419,94 @@ mod tests {
         );
         assert!(pty_dirty);
         assert!(!dirty);
+    }
+
+    #[test]
+    fn eink_agent_settlement_detects_completion_after_mark_active_seen() {
+        use crate::model::{make_single_terminal_tab, SharedSpace, TerminalInfo};
+
+        let core = CoreClient::dummy_for_tests();
+        let mut world = World::default();
+        world.doc.spaces.push(SharedSpace {
+            id: "sp1".to_string(),
+            name: "main".to_string(),
+            tabs: vec![make_single_terminal_tab("tab1", "agent", "t1")],
+            ..Default::default()
+        });
+        world.terminals.insert(
+            "t1".to_string(),
+            TerminalInfo {
+                address: "t1".to_string(),
+                status_word: Some("working".to_string()),
+                turn: 1,
+                ..Default::default()
+            },
+        );
+
+        let cur_for = |w: &World| {
+            w.active_terminal_address()
+                .and_then(|a| w.terminals.get(&a))
+                .map(|i| (i.address.clone(), i.agent_state()))
+        };
+
+        let prev_working = cur_for(&world);
+        assert_eq!(prev_working, Some(("t1".to_string(), AgentState::Working)));
+
+        // Normal completion (`working` -> `idle`) followed immediately by `mark_active_seen`
+        {
+            let info = world.terminals.get_mut("t1").unwrap();
+            info.status_word = Some("idle".to_string());
+            info.turn = 2;
+        }
+        let cur_unseen = cur_for(&world);
+        assert_eq!(cur_unseen, Some(("t1".to_string(), AgentState::Done)));
+        assert!(detect_eink_agent_settlement(
+            prev_working.as_ref(),
+            cur_unseen.as_ref()
+        ));
+
+        world.mark_active_seen(&core);
+        let cur_idle_seen = cur_for(&world);
+        assert_eq!(cur_idle_seen, Some(("t1".to_string(), AgentState::Idle)));
+        assert!(detect_eink_agent_settlement(
+            prev_working.as_ref(),
+            cur_idle_seen.as_ref()
+        ));
+
+        // Cleared `status_word = None` after `mark_active_seen` resolves to `AgentState::None`
+        {
+            let info = world.terminals.get_mut("t1").unwrap();
+            info.status_word = None;
+            info.turn = 3;
+        }
+        world.mark_active_seen(&core);
+        let cur_none_seen = cur_for(&world);
+        assert_eq!(cur_none_seen, Some(("t1".to_string(), AgentState::None)));
+        assert!(detect_eink_agent_settlement(
+            prev_working.as_ref(),
+            cur_none_seen.as_ref()
+        ));
+
+        // Transition to Blocked also settles
+        let cur_blocked = Some(("t1".to_string(), AgentState::Blocked));
+        assert!(detect_eink_agent_settlement(
+            prev_working.as_ref(),
+            cur_blocked.as_ref()
+        ));
+
+        // Non-settlements return false
+        assert!(!detect_eink_agent_settlement(
+            prev_working.as_ref(),
+            prev_working.as_ref()
+        ));
+        assert!(!detect_eink_agent_settlement(
+            cur_idle_seen.as_ref(),
+            prev_working.as_ref()
+        ));
+        assert!(!detect_eink_agent_settlement(
+            prev_working.as_ref(),
+            Some(&("t2".to_string(), AgentState::Idle))
+        ));
+        assert!(!detect_eink_agent_settlement(prev_working.as_ref(), None));
     }
 }
