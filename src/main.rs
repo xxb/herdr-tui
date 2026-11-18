@@ -2261,7 +2261,7 @@ const PAGE_TAP_SLOP_CELLS: u16 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingPageTurnTap {
-    action: Action,
+    dir: HorizontalSwipeDir,
     start_col: u16,
     start_row: u16,
 }
@@ -2271,11 +2271,11 @@ fn match_eink_page_touch_zone(
     right_zone: Option<Rect>,
     col: u16,
     row: u16,
-) -> Option<Action> {
+) -> Option<HorizontalSwipeDir> {
     if is_in_rect(left_zone, col, row) {
-        Some(Action::PrevTab)
+        Some(HorizontalSwipeDir::Prev)
     } else if is_in_rect(right_zone, col, row) {
-        Some(Action::NextTab)
+        Some(HorizontalSwipeDir::Next)
     } else {
         None
     }
@@ -3628,6 +3628,13 @@ fn run_app_loop(
                                             scrollback_offset = 0;
                                             dirty = true;
                                         }
+                                        HitTarget::ExitTabOverview => {
+                                            prefix_active = false;
+                                            ctrl_active = false;
+                                            alt_active = false;
+                                            exit_tab_overview_to_last_tab(core, world, &mut modal);
+                                            dirty = true;
+                                        }
                                         HitTarget::ToggleSidebar | HitTarget::ToggleSpaceMenu => {
                                             prefix_active = false;
                                             ctrl_active = false;
@@ -3739,7 +3746,7 @@ fn run_app_loop(
                                     ctrl_active = false;
                                     alt_active = false;
                                     dirty = true;
-                                } else if let Some(action) = match_eink_page_touch_zone(
+                                } else if let Some(dir) = match_eink_page_touch_zone(
                                     last_page_up_rect,
                                     last_page_down_rect,
                                     mx,
@@ -3747,7 +3754,7 @@ fn run_app_loop(
                                 ) {
                                     dpad_drag = None;
                                     page_tap = Some(PendingPageTurnTap {
-                                        action,
+                                        dir,
                                         start_col: mx,
                                         start_row: my,
                                     });
@@ -3944,33 +3951,21 @@ fn run_app_loop(
                                     if matches!(modal, Modal::None)
                                         && page_tap_within_slop(&tap, mev.column, mev.row)
                                     {
+                                        let had_sticky = prefix_active || ctrl_active || alt_active;
                                         prefix_active = false;
                                         ctrl_active = false;
                                         alt_active = false;
-                                        if execute_action_full(
-                                            tap.action,
-                                            core,
-                                            world,
-                                            active_att,
-                                            prefix_spec,
-                                            sidebar_open,
-                                            &mut scrollback_offset,
-                                            &mut modal,
-                                            term_rect,
-                                            &mut eink_mode,
-                                            &mut eink_color,
-                                            &mut force_clear,
-                                            &mut pending_eink_osc,
-                                            Some(&mut pending_reader_osc),
-                                        )? {
-                                            flush_credits(
-                                                core,
-                                                &mut pending_credits,
-                                                &mut pending_credit_bytes,
-                                            );
-                                            return Ok(());
+                                        let changed = step_linear_tab_or_overview(
+                                            tap.dir, core, world, &mut modal,
+                                        );
+                                        if changed || had_sticky {
+                                            if eink_mode
+                                                && matches!(modal, Modal::TabOverview { .. })
+                                            {
+                                                pending_eink_osc = true;
+                                            }
+                                            dirty = true;
                                         }
-                                        dirty = true;
                                     }
                                 } else if let Some(ref mut sel) = selection {
                                     if sel.active {
@@ -8267,26 +8262,28 @@ mod tests {
         // Expanded touch zones hit across 8 cols x 8 rows while leaving middle viewport clear
         assert_eq!(
             match_eink_page_touch_zone(left_zone, right_zone, 0, 10),
-            Some(Action::PrevTab)
+            Some(HorizontalSwipeDir::Prev)
         );
         assert_eq!(
             match_eink_page_touch_zone(left_zone, right_zone, 7, 14),
-            Some(Action::PrevTab)
+            Some(HorizontalSwipeDir::Prev)
         );
         assert_eq!(
             match_eink_page_touch_zone(left_zone, right_zone, 92, 7),
-            Some(Action::NextTab)
+            Some(HorizontalSwipeDir::Next)
         );
         assert_eq!(
             match_eink_page_touch_zone(left_zone, right_zone, 99, 14),
-            Some(Action::NextTab)
+            Some(HorizontalSwipeDir::Next)
         );
         assert_eq!(
             match_eink_page_touch_zone(left_zone, right_zone, 20, 10),
             None
         );
 
-        // Edge taps switch active tabs PrevTab / NextTab cleanly across a multi-tab Space
+        // Edge taps follow PR #57 linear tab navigation:
+        // Prev clamps at Tab 0 (never wraps), Next advances past last tab into TabOverview,
+        // and Prev / ExitTabOverview returns cleanly to the last tab.
         let core = CoreClient::dummy_for_tests();
         let mut world = World::default();
         world.doc.spaces = vec![crate::model::SharedSpace {
@@ -8302,59 +8299,58 @@ mod tests {
         }];
         world
             .active_tab_by_space
-            .insert("sp1".to_string(), "t2".to_string());
-        let mut sidebar_open = false;
-        let mut scrollback_offset = 0usize;
+            .insert("sp1".to_string(), "t1".to_string());
         let mut modal = Modal::None;
-        let mut eink_mode = true;
-        let mut eink_color = false;
-        let mut force_clear = false;
-        let mut pending_eink_osc = false;
         let term_rect = Rect::new(0, 1, 100, 22);
 
-        let left_act = match_eink_page_touch_zone(left_zone, right_zone, 0, 10).unwrap();
-        execute_action_full(
-            left_act,
-            &core,
-            &mut world,
-            None,
-            "ctrl+b",
-            &mut sidebar_open,
-            &mut scrollback_offset,
-            &mut modal,
-            term_rect,
-            &mut eink_mode,
-            &mut eink_color,
-            &mut force_clear,
-            &mut pending_eink_osc,
-            None,
-        )
-        .unwrap();
+        let left_dir = match_eink_page_touch_zone(left_zone, right_zone, 0, 10).unwrap();
+        assert!(!step_linear_tab_or_overview(
+            left_dir, &core, &mut world, &mut modal
+        ));
         assert_eq!(world.active_tab_index(), 0);
+        assert_eq!(modal, Modal::None);
 
-        let right_act = match_eink_page_touch_zone(left_zone, right_zone, 99, 10).unwrap();
-        execute_action_full(
-            right_act,
-            &core,
-            &mut world,
-            None,
-            "ctrl+b",
-            &mut sidebar_open,
-            &mut scrollback_offset,
-            &mut modal,
-            term_rect,
-            &mut eink_mode,
-            &mut eink_color,
-            &mut force_clear,
-            &mut pending_eink_osc,
-            None,
-        )
-        .unwrap();
+        let right_dir = match_eink_page_touch_zone(left_zone, right_zone, 99, 10).unwrap();
+        assert!(step_linear_tab_or_overview(
+            right_dir, &core, &mut world, &mut modal
+        ));
         assert_eq!(world.active_tab_index(), 1);
+        assert!(step_linear_tab_or_overview(
+            right_dir, &core, &mut world, &mut modal
+        ));
+        assert_eq!(world.active_tab_index(), 2);
+        assert_eq!(modal, Modal::None);
+
+        // Past the last tab -> enters trailing Modal::TabOverview
+        assert!(step_linear_tab_or_overview(
+            right_dir, &core, &mut world, &mut modal
+        ));
+        assert!(matches!(modal, Modal::TabOverview { .. }));
+
+        // Next while on TabOverview clamps
+        assert!(!step_linear_tab_or_overview(
+            right_dir, &core, &mut world, &mut modal
+        ));
+        assert!(matches!(modal, Modal::TabOverview { .. }));
+
+        // Prev / [‹] on TabOverview exits back to the last tab (Tab 2)
+        assert!(step_linear_tab_or_overview(
+            left_dir, &core, &mut world, &mut modal
+        ));
+        assert_eq!(modal, Modal::None);
+        assert_eq!(world.active_tab_index(), 2);
+
+        assert!(step_linear_tab_or_overview(
+            right_dir, &core, &mut world, &mut modal
+        ));
+        assert!(matches!(modal, Modal::TabOverview { .. }));
+        exit_tab_overview_to_last_tab(&core, &mut world, &mut modal);
+        assert_eq!(modal, Modal::None);
+        assert_eq!(world.active_tab_index(), 2);
 
         // Tap slop absorbs ±1 col / ±1 row thumb jitter and promotes >= 2 cell drags
         let tap = PendingPageTurnTap {
-            action: Action::PrevTab,
+            dir: HorizontalSwipeDir::Prev,
             start_col: 4,
             start_row: 10,
         };
@@ -8368,7 +8364,7 @@ mod tests {
         let mut att = AttachedTerminal::new(1, term_rect.width, term_rect.height);
         att.process_vt_bytes(b"\x1b[10;1HSeeThrough line");
         let start_tap = PendingPageTurnTap {
-            action: Action::PrevTab,
+            dir: HorizontalSwipeDir::Prev,
             start_col: 0,
             start_row: 10,
         };
