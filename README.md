@@ -47,7 +47,7 @@ A fast, lightweight **multi-tab TUI client** for [`herdr-core` (`hc`)](https://g
 
 | Action / 功能 | Prefix Shortcut (`Ctrl+b`) | Direct / Touch Shortcut |
 |---|---|---|
-| **Next / Previous Tab** (切换标签页) | `^b n` / `^b p` | `Alt+Right` / `Alt+Left` (wrap), Tap Left `[ ‹ ]` / Right `[ › ]` in `-e` / `--eink`, Horiz Swipe / Top-Bar Wheel (linear + trailing overview page), Tap Tab |
+| **Next / Previous Tab** (切换标签页) | `^b n` / `^b p` | `Alt+Right` / `Alt+Left`, Horiz Swipe, Top-Bar Wheel, or `[ ‹ ]` / `[ › ]` in `-e` (linear + trailing overview page), Tap Tab |
 | **Select Tab 1..9** (跳转标签页 1..9) | `^b 1` .. `^b 9` | `Alt+1` .. `Alt+9` |
 | **New Tab in Space** (新建标签页) | `^b c` | Tap `[ + ]` on top tab bar |
 | **Rename Current Tab** (重命名标签页) | `^b ,` | — |

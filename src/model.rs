@@ -1111,33 +1111,6 @@ impl World {
         false
     }
 
-    pub fn next_tab(&mut self) {
-        let Some(space) = self.active_space() else {
-            return;
-        };
-        if space.tabs.is_empty() {
-            return;
-        }
-        let next = (self.active_tab_index() + 1) % space.tabs.len();
-        self.select_tab_index(next);
-    }
-
-    pub fn prev_tab(&mut self) {
-        let Some(space) = self.active_space() else {
-            return;
-        };
-        if space.tabs.is_empty() {
-            return;
-        }
-        let cur = self.active_tab_index();
-        let prev = if cur == 0 {
-            space.tabs.len() - 1
-        } else {
-            cur - 1
-        };
-        self.select_tab_index(prev);
-    }
-
     pub fn next_space(&mut self) {
         if self.doc.spaces.is_empty() {
             return;
