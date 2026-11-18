@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.2](https://github.com/xxb/herdr-tui/compare/v0.7.1...v0.7.2) (2026-11-18)
+
+
+### Bug Fixes
+
+* **nav:** make NextTab and PrevTab linear with trailing TabOverview ([#74](https://github.com/xxb/herdr-tui/issues/74)) ([d63b403](https://github.com/xxb/herdr-tui/commit/d63b403a8beb38a11b73e21e813ae07a2dd2cecc))
+
 ## [0.7.1](https://github.com/xxb/herdr-tui/compare/v0.7.0...v0.7.1) (2026-11-18)
 
 
