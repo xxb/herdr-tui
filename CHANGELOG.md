@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1](https://github.com/xxb/herdr-tui/compare/v0.7.0...v0.7.1) (2026-11-18)
+
+
+### Bug Fixes
+
+* **eink:** align edge [‹]/[›] buttons with linear tab stepping and trailing TabOverview ([#71](https://github.com/xxb/herdr-tui/issues/71)) ([4d810ab](https://github.com/xxb/herdr-tui/commit/4d810ab0e18d8a09e880e50760e76e09fcefe657))
+
 ## [0.7.0](https://github.com/xxb/herdr-tui/compare/v0.6.0...v0.7.0) (2026-11-18)
 
 
