@@ -291,27 +291,8 @@ fn scale_hex_component(hex: &str) -> Option<u8> {
     Some(scaled as u8)
 }
 
-fn parse_osc11_bg_rgb(bytes: &[u8]) -> Option<(u8, u8, u8)> {
-    let payload_start = if let Some(pos) = bytes.windows(5).position(|w| w == b"\x1b]11;") {
-        pos + 5
-    } else {
-        bytes.windows(4).position(|w| w == b"\x9d11;")? + 4
-    };
-    let tail = &bytes[payload_start..];
-    let mut payload_end = None;
-    let mut i = 0;
-    while i < tail.len() {
-        if tail[i] == 0x07 || tail[i] == 0x9c {
-            payload_end = Some(i);
-            break;
-        }
-        if tail[i] == 0x1b && tail.get(i + 1) == Some(&b'\\') {
-            payload_end = Some(i);
-            break;
-        }
-        i += 1;
-    }
-    let raw = std::str::from_utf8(&tail[..payload_end?])
+fn parse_osc11_payload(raw_bytes: &[u8]) -> Option<(u8, u8, u8)> {
+    let raw = std::str::from_utf8(raw_bytes)
         .ok()?
         .trim()
         .to_ascii_lowercase();
@@ -338,12 +319,12 @@ fn parse_osc11_bg_rgb(bytes: &[u8]) -> Option<(u8, u8, u8)> {
     None
 }
 
-fn has_dsr_status_reply(bytes: &[u8]) -> bool {
-    bytes.windows(4).any(|w| w == b"\x1b[0n" || w == b"\x1b[3n")
-        || bytes.windows(3).any(|w| w == b"\x9b0n" || w == b"\x9b3n")
+struct Osc11FrameMatch {
+    span: usize,
+    rgb: Option<(u8, u8, u8)>,
 }
 
-fn osc11_reply_span(bytes: &[u8]) -> Option<usize> {
+fn osc11_reply_span(bytes: &[u8]) -> Option<Osc11FrameMatch> {
     let header_len = if bytes.starts_with(b"\x1b]11;") {
         5
     } else if bytes.starts_with(b"\x9d11;") {
@@ -354,14 +335,88 @@ fn osc11_reply_span(bytes: &[u8]) -> Option<usize> {
     let mut i = header_len;
     while i < bytes.len() {
         if bytes[i] == 0x07 || bytes[i] == 0x9c {
-            return Some(i + 1);
+            let rgb = parse_osc11_payload(&bytes[header_len..i]);
+            return Some(Osc11FrameMatch { span: i + 1, rgb });
         }
         if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
-            return Some(i + 2);
+            let rgb = parse_osc11_payload(&bytes[header_len..i]);
+            return Some(Osc11FrameMatch { span: i + 2, rgb });
         }
         i += 1;
     }
     None
+}
+
+fn match_osc11_probe_frame(bytes: &[u8]) -> Option<Osc11FrameMatch> {
+    if let Some(res) = osc11_reply_span(bytes) {
+        return Some(res);
+    }
+    if bytes.starts_with(b"\x1bPtmux;") {
+        let mut i = 7;
+        let mut unescaped = Vec::with_capacity(48);
+        while i < bytes.len() {
+            if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&0x1b) {
+                unescaped.push(0x1b);
+                i += 2;
+            } else if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+                let outer_end = i + 2;
+                if let Some(inner) = osc11_reply_span(&unescaped) {
+                    if inner.span == unescaped.len() {
+                        return Some(Osc11FrameMatch {
+                            span: outer_end,
+                            rgb: inner.rgb,
+                        });
+                    }
+                }
+                break;
+            } else if bytes[i] == 0x9c {
+                let outer_end = i + 1;
+                if let Some(inner) = osc11_reply_span(&unescaped) {
+                    if inner.span == unescaped.len() {
+                        return Some(Osc11FrameMatch {
+                            span: outer_end,
+                            rgb: inner.rgb,
+                        });
+                    }
+                }
+                break;
+            } else {
+                unescaped.push(bytes[i]);
+                i += 1;
+            }
+        }
+    } else if bytes.starts_with(b"\x1bP") {
+        if let Some(inner) = osc11_reply_span(&bytes[2..]) {
+            let after = &bytes[2 + inner.span..];
+            if after.starts_with(b"\x1b\\") {
+                return Some(Osc11FrameMatch {
+                    span: 2 + inner.span + 2,
+                    rgb: inner.rgb,
+                });
+            }
+            if after.starts_with(b"\x9c") {
+                return Some(Osc11FrameMatch {
+                    span: 2 + inner.span + 1,
+                    rgb: inner.rgb,
+                });
+            }
+        }
+    }
+    None
+}
+
+fn parse_osc11_bg_rgb(bytes: &[u8]) -> Option<(u8, u8, u8)> {
+    for i in 0..bytes.len() {
+        if let Some(Osc11FrameMatch { rgb: Some(rgb), .. }) = match_osc11_probe_frame(&bytes[i..]) {
+            return Some(rgb);
+        }
+    }
+    None
+}
+
+fn has_dsr_status_reply(bytes: &[u8]) -> bool {
+    bytes.windows(4).any(|w| w == b"\x1b[0n" || w == b"\x1b[3n")
+        || bytes.windows(3).any(|w| w == b"\x9b0n" || w == b"\x9b3n")
 }
 
 fn dsr_reply_span(bytes: &[u8]) -> Option<usize> {
@@ -378,8 +433,8 @@ fn extract_non_probe_input(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
-        if let Some(span) = osc11_reply_span(&bytes[i..]) {
-            i += span;
+        if let Some(matched) = match_osc11_probe_frame(&bytes[i..]) {
+            i += matched.span;
         } else if let Some(span) = dsr_reply_span(&bytes[i..]) {
             i += span;
         } else {
@@ -392,9 +447,9 @@ fn extract_non_probe_input(bytes: &[u8]) -> Vec<u8> {
 
 fn format_osc11_query_sequence_with_env(in_tmux: bool, in_screen: bool) -> String {
     let wrapped = format_single_osc_sequence("11;?", in_tmux, in_screen);
-    if in_tmux {
-        // Send tmux DCS passthrough first (for outer terminal bg when allow-passthrough is on)
-        // followed by plain OSC 11 (for tmux's own reply when allow-passthrough is off) + DSR fence.
+    if in_tmux || in_screen {
+        // Send DCS passthrough first (for outer terminal bg when passthrough is enabled)
+        // followed by plain OSC 11 (for multiplexer fallback when passthrough is disabled) + DSR fence.
         format!("{wrapped}\x1b]11;?\x07\x1b[5n")
     } else {
         format!("{wrapped}\x1b[5n")
@@ -9285,7 +9340,7 @@ mod tests {
         );
         assert_eq!(
             format_osc11_query_sequence_with_env(false, true),
-            "\x1bP\x1b]11;?\x07\x1b\\\x1b[5n"
+            "\x1bP\x1b]11;?\x07\x1b\\\x1b]11;?\x07\x1b[5n"
         );
 
         struct ChunkReader {
@@ -9348,6 +9403,45 @@ mod tests {
         );
         assert_eq!(tmux_rgb, Some((255, 255, 255)));
         assert!(tmux_leftover.is_empty());
+
+        // DCS-wrapped OSC 11 replies (tmux BEL, tmux ST, screen BEL/ST) are parsed and fully stripped
+        let mut tmux_dcs_bel_reader = ChunkReader {
+            chunks: std::collections::VecDeque::from(vec![
+                b"a\x1bPtmux;\x1b\x1b]11;rgb:ffff/ffff/ffff\x07\x1b\\b".to_vec(),
+                b"\x1b[0nc".to_vec(),
+            ]),
+        };
+        let (tmux_dcs_rgb, tmux_dcs_leftover) = query_osc11_from_rw(
+            &mut tmux_dcs_bel_reader,
+            &mut Vec::new(),
+            |_| Ok(true),
+            Duration::from_millis(100),
+            tmux_query.as_bytes(),
+            true,
+        );
+        assert_eq!(tmux_dcs_rgb, Some((255, 255, 255)));
+        assert_eq!(tmux_dcs_leftover, b"abc");
+
+        let tmux_dcs_st = b"\x1bPtmux;\x1b\x1b]11;rgb:1e1e/1e1e/2e2e\x1b\x1b\\\x1b\\\x1b[0n";
+        assert_eq!(parse_osc11_bg_rgb(tmux_dcs_st), Some((0x1e, 0x1e, 0x2e)));
+        assert!(extract_non_probe_input(tmux_dcs_st).is_empty());
+
+        let screen_query = format_osc11_query_sequence_with_env(false, true);
+        let mut screen_dcs_reader = ChunkReader {
+            chunks: std::collections::VecDeque::from(vec![
+                b"x\x1bP\x1b]11;rgb:efef/f1f1/f5f5\x1b\\\x1b\\y\x1b[0n".to_vec(),
+            ]),
+        };
+        let (screen_dcs_rgb, screen_dcs_leftover) = query_osc11_from_rw(
+            &mut screen_dcs_reader,
+            &mut Vec::new(),
+            |_| Ok(true),
+            Duration::from_millis(100),
+            screen_query.as_bytes(),
+            true,
+        );
+        assert_eq!(screen_dcs_rgb, Some((0xef, 0xf1, 0xf5)));
+        assert_eq!(screen_dcs_leftover, b"xy");
 
         let mut dsr_only_reader = ChunkReader {
             chunks: std::collections::VecDeque::from(vec![b"\x1b[0n".to_vec()]),
