@@ -2928,19 +2928,24 @@ fn render_eink_overview_back_tab(f: &mut Frame, term_rect: Rect, hits: &mut Vec<
     let Some(vis) = resolve_eink_page_tab_rect(term_rect, true, None) else {
         return;
     };
-    paint_eink_page_tab(f.buffer_mut(), vis, true);
     let (col_x, _) = tab_overview_col_bounds(term_rect);
+    let margin_w = col_x.saturating_sub(term_rect.x);
+    let paint_w = vis.width.min(margin_w.max(1)).min(term_rect.width);
+    let paint_vis = Rect::new(vis.x, vis.y, paint_w, vis.height);
+    paint_eink_page_tab(f.buffer_mut(), paint_vis, true);
     let exp = expand_eink_page_touch_rect(term_rect, vis, true, None, None);
-    let has_clear_margin = col_x > term_rect.x + vis.width;
-    let hit_w = exp
-        .width
-        .min(col_x.saturating_sub(term_rect.x))
-        .max(vis.width)
-        .min(term_rect.width);
-    let (hit_y, hit_h) = if has_clear_margin {
-        (exp.y, exp.height)
+    let (hit_w, hit_y, hit_h) = if margin_w >= vis.width {
+        (
+            exp.width.min(margin_w).max(vis.width).min(term_rect.width),
+            exp.y,
+            exp.height,
+        )
     } else {
-        (vis.y, vis.height)
+        (
+            margin_w.max(1).min(term_rect.width),
+            paint_vis.y,
+            paint_vis.height,
+        )
     };
     hits.push(HitRegion {
         rect: Rect::new(term_rect.x, hit_y, hit_w, hit_h),
@@ -5588,7 +5593,7 @@ fn render_help_modal(
         Line::from("  Left Floating Cross (+)  Tap Esc / Ctl / ^B / Alt / Tab (drag to move)"),
         Line::from("  Right Floating Cross (+) Tap ↑ / ← / ⎘ (Paste) / → / ↓ (drag to move)"),
         Line::from("  Clipboard Copy / Paste   Drag text to copy (OSC 52); Tap ⎘ to paste"),
-        Line::from("  Next / Prev Tab          ^b n / ^b p, Swipe or [‹] / [›] (linear)"),
+        Line::from("  Next / Prev Tab          ^b n/p, Alt+Right/Left, Swipe, or [‹]/[›]"),
         Line::from("  Switch Tab 1..9          ^b 1..9       or  Alt+1..9"),
         Line::from("  New Tab in Space         ^b c          or  Tap [ + ] on top tab bar"),
         Line::from("  Rename / Close Tab       ^b , (rename) /   ^b x (close)"),
@@ -7980,6 +7985,55 @@ mod tests {
             find_hit_target(&narrow_ov_hits, 20, center_tab_y),
             Some(HitTarget::SelectTab { .. })
         ));
+
+        // Mid-width 60x24 Modal::TabOverview keeps ExitTabOverview strictly in col 0 without overlapping col 1 item rows
+        let mut mid_term = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        let mut ov60_hits = Vec::new();
+        mid_term
+            .draw(|f| {
+                ov60_hits = render_ui_full(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::default_tab_overview(),
+                    None,
+                    false,
+                    None,
+                    false,
+                    None,
+                    true,
+                )
+                .hits;
+            })
+            .unwrap();
+        let ov60_buf = mid_term.backend().buffer();
+        assert_strict_eink_buffer(ov60_buf);
+        assert_eq!(ov60_buf[(0, 11)].symbol(), "‹");
+        assert_eq!(
+            find_hit_target(&ov60_hits, 0, 11),
+            Some(HitTarget::ExitTabOverview)
+        );
+        let ov60_items: Vec<_> = ov60_hits
+            .iter()
+            .filter(|h| {
+                matches!(h.target, HitTarget::SelectTab { .. } | HitTarget::NewTab) && h.rect.y >= 1
+            })
+            .collect();
+        assert!(!ov60_items.is_empty());
+        for h in ov60_items {
+            for y in h.rect.y..h.rect.y + h.rect.height {
+                assert_eq!(find_hit_target(&ov60_hits, 1, y), Some(h.target.clone()));
+            }
+        }
     }
 
     #[test]
@@ -8089,7 +8143,7 @@ mod tests {
         let joined = rows.join("\n");
         assert!(joined.contains("Detach hct (keep sessions running) (^b q)"));
         assert!(joined.contains("Open Space popover menu / + New Space"));
-        assert!(joined.contains("Swipe or [‹] / [›] (linear)"));
+        assert!(joined.contains("^b n/p, Alt+Right/Left, Swipe, or [‹]/[›]"));
         assert!(joined.contains("^b PgUp / PgDn / Shift+PgUp (or in [ ? ])"));
         assert!(joined.contains("Tap [ 📖 Book View ]"));
         assert!(joined.contains("Tap outside, [ ✕ ], Esc, Enter, or ? to close"));
