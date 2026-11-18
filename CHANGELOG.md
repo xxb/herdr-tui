@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/xxb/herdr-tui/compare/v0.7.2...v0.8.0) (2026-11-18)
+
+
+### Features
+
+* **ui:** add light theme with terminal auto-detection and ^b t toggle ([#77](https://github.com/xxb/herdr-tui/issues/77)) ([d63458f](https://github.com/xxb/herdr-tui/commit/d63458f0ef3c70e0e0d7a2efdbe10c7462d19392))
+
 ## [0.7.2](https://github.com/xxb/herdr-tui/compare/v0.7.1...v0.7.2) (2026-11-18)
 
 
