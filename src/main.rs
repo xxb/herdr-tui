@@ -343,19 +343,80 @@ fn has_dsr_status_reply(bytes: &[u8]) -> bool {
         || bytes.windows(3).any(|w| w == b"\x9b0n" || w == b"\x9b3n")
 }
 
+fn osc11_reply_span(bytes: &[u8]) -> Option<usize> {
+    let header_len = if bytes.starts_with(b"\x1b]11;") {
+        5
+    } else if bytes.starts_with(b"\x9d11;") {
+        4
+    } else {
+        return None;
+    };
+    let mut i = header_len;
+    while i < bytes.len() {
+        if bytes[i] == 0x07 || bytes[i] == 0x9c {
+            return Some(i + 1);
+        }
+        if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+            return Some(i + 2);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn dsr_reply_span(bytes: &[u8]) -> Option<usize> {
+    if bytes.starts_with(b"\x1b[0n") || bytes.starts_with(b"\x1b[3n") {
+        Some(4)
+    } else if bytes.starts_with(b"\x9b0n") || bytes.starts_with(b"\x9b3n") {
+        Some(3)
+    } else {
+        None
+    }
+}
+
+fn extract_non_probe_input(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(span) = osc11_reply_span(&bytes[i..]) {
+            i += span;
+        } else if let Some(span) = dsr_reply_span(&bytes[i..]) {
+            i += span;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn format_osc11_query_sequence_with_env(in_tmux: bool, in_screen: bool) -> String {
+    let wrapped = format_single_osc_sequence("11;?", in_tmux, in_screen);
+    if in_tmux {
+        // Send tmux DCS passthrough first (for outer terminal bg when allow-passthrough is on)
+        // followed by plain OSC 11 (for tmux's own reply when allow-passthrough is off) + DSR fence.
+        format!("{wrapped}\x1b]11;?\x07\x1b[5n")
+    } else {
+        format!("{wrapped}\x1b[5n")
+    }
+}
+
 fn query_osc11_from_rw<R, W, P>(
     reader: &mut R,
     writer: &mut W,
     mut poll_ready: P,
     timeout: Duration,
-) -> Option<(u8, u8, u8)>
+    query_seq: &[u8],
+    passthrough_wrapped: bool,
+) -> (Option<(u8, u8, u8)>, Vec<u8>)
 where
     R: io::Read,
     W: io::Write,
     P: FnMut(Duration) -> io::Result<bool>,
 {
-    writer.write_all(b"\x1b]11;?\x07\x1b[5n").ok()?;
-    writer.flush().ok()?;
+    if writer.write_all(query_seq).is_err() || writer.flush().is_err() {
+        return (None, Vec::new());
+    }
 
     let deadline = Instant::now() + timeout;
     let mut buf = Vec::with_capacity(128);
@@ -372,7 +433,12 @@ where
                 Ok(n) => {
                     let take = n.min(1024 - buf.len());
                     buf.extend_from_slice(&chunk[..take]);
-                    if has_dsr_status_reply(&buf) {
+                    let done = if passthrough_wrapped {
+                        parse_osc11_bg_rgb(&buf).is_some() && has_dsr_status_reply(&buf)
+                    } else {
+                        has_dsr_status_reply(&buf)
+                    };
+                    if done {
                         break;
                     }
                 }
@@ -384,23 +450,32 @@ where
             Err(_) => break,
         }
     }
-    parse_osc11_bg_rgb(&buf)
+    let rgb = parse_osc11_bg_rgb(&buf);
+    let leftover = extract_non_probe_input(&buf);
+    (rgb, leftover)
 }
 
 #[cfg(unix)]
-fn query_terminal_bg_is_light() -> Option<bool> {
+fn query_terminal_bg_is_light() -> (Option<bool>, Vec<u8>) {
     use std::os::fd::AsRawFd;
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        return None;
+        return (None, Vec::new());
     }
-    let mut tty_in = std::fs::OpenOptions::new()
+    let Ok(mut tty_in) = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open("/dev/tty")
-        .ok()?;
-    let mut tty_out = tty_in.try_clone().ok()?;
+    else {
+        return (None, Vec::new());
+    };
+    let Ok(mut tty_out) = tty_in.try_clone() else {
+        return (None, Vec::new());
+    };
+    let in_tmux = std::env::var_os("TMUX").is_some_and(|v| !v.is_empty());
+    let in_screen = std::env::var_os("STY").is_some_and(|v| !v.is_empty());
+    let query_seq = format_osc11_query_sequence_with_env(in_tmux, in_screen);
     let fd = tty_in.as_raw_fd();
-    let rgb = query_osc11_from_rw(
+    let (rgb_opt, leftover) = query_osc11_from_rw(
         &mut tty_in,
         &mut tty_out,
         |wait| {
@@ -427,14 +502,27 @@ fn query_terminal_bg_is_light() -> Option<bool> {
                 return Ok(rc > 0 && (pfd.revents & libc::POLLIN) != 0);
             }
         },
-        Duration::from_millis(150),
-    )?;
-    Some(crate::ui::is_rgb_light(rgb.0, rgb.1, rgb.2))
+        Duration::from_millis(100),
+        query_seq.as_bytes(),
+        in_tmux || in_screen,
+    );
+    (
+        rgb_opt.map(|rgb| crate::ui::is_rgb_light(rgb.0, rgb.1, rgb.2)),
+        leftover,
+    )
 }
 
 #[cfg(not(unix))]
-fn query_terminal_bg_is_light() -> Option<bool> {
-    None
+fn query_terminal_bg_is_light() -> (Option<bool>, Vec<u8>) {
+    (None, Vec::new())
+}
+
+fn should_persist_fallback_theme(
+    theme_pref: ThemePref,
+    light_mode: bool,
+    prev_light_mode: bool,
+) -> bool {
+    theme_pref == ThemePref::Auto && light_mode != prev_light_mode
 }
 
 fn parse_colorfgbg_is_light(raw: Option<&str>) -> Option<bool> {
@@ -2114,19 +2202,20 @@ fn main() -> Result<()> {
     // restores raw mode, alternate screen, mouse capture, SGR state, and cursor visibility.
     enable_raw_mode()?;
     let _cleanup_guard = TerminalCleanupGuard;
-    let light_mode = match theme_pref {
-        ThemePref::Fixed(v) => v,
+    let (light_mode, startup_input) = match theme_pref {
+        ThemePref::Fixed(v) => (v, Vec::new()),
         ThemePref::Auto => {
-            let osc11 = if eink_mode {
-                None
+            let (osc11, leftover) = if eink_mode {
+                (None, Vec::new())
             } else {
                 query_terminal_bg_is_light()
             };
-            resolve_auto_light_mode(
+            let is_light = resolve_auto_light_mode(
                 osc11,
                 std::env::var("COLORFGBG").ok().as_deref(),
                 load_fallback_theme_state(),
-            )
+            );
+            (is_light, leftover)
         }
     };
     let mut stdout = BufWriter::with_capacity(64 * 1024, io::stdout());
@@ -2188,6 +2277,8 @@ fn main() -> Result<()> {
         eink_mode,
         eink_color,
         light_mode,
+        theme_pref,
+        startup_input,
         eink_interval,
     );
 
@@ -3362,6 +3453,8 @@ fn run_app(
     eink_mode: bool,
     eink_color: bool,
     light_mode: bool,
+    theme_pref: ThemePref,
+    startup_input: Vec<u8>,
     eink_interval: Duration,
 ) -> Result<()> {
     let mut attached_map: BTreeMap<String, AttachedTerminal> = BTreeMap::new();
@@ -3380,6 +3473,8 @@ fn run_app(
         eink_mode,
         eink_color,
         light_mode,
+        theme_pref,
+        startup_input,
         eink_interval,
         &mut attached_map,
         &mut active_addr,
@@ -3408,6 +3503,8 @@ fn run_app_loop(
     mut eink_mode: bool,
     mut eink_color: bool,
     mut light_mode: bool,
+    theme_pref: ThemePref,
+    mut pending_startup_input: Vec<u8>,
     eink_interval: Duration,
     attached_map: &mut BTreeMap<String, AttachedTerminal>,
     active_addr: &mut Option<String>,
@@ -3544,6 +3641,13 @@ fn run_app_loop(
             .as_ref()
             .and_then(|a| attached_map.get(a))
             .map(|att| att.channel);
+
+        if !pending_startup_input.is_empty() {
+            if let Some(ch) = active_channel {
+                core.send_input(ch, &pending_startup_input);
+                pending_startup_input.clear();
+            }
+        }
 
         promote_due_pty_dirty_with_color(
             eink_mode,
@@ -4870,7 +4974,9 @@ fn run_app_loop(
         prev_active_agent_state = cur_agent;
 
         if light_mode != prev_light_mode {
-            save_fallback_theme_state(light_mode);
+            if should_persist_fallback_theme(theme_pref, light_mode, prev_light_mode) {
+                save_fallback_theme_state(light_mode);
+            }
             prev_light_mode = light_mode;
         }
 
@@ -9167,7 +9273,21 @@ mod tests {
         );
         assert_eq!(parse_osc11_bg_rgb(b"\x1b[0n"), None);
 
-        // 2. query_osc11_from_rw handles chunked replies ending in DSR, DSR-only, and timeouts
+        // 2. query_osc11_from_rw handles tmux/screen wrapping, chunked replies, DSR-only, timeouts,
+        //    and preserves interleaved fast-typist input while stripping probe replies
+        assert_eq!(
+            format_osc11_query_sequence_with_env(false, false),
+            "\x1b]11;?\x07\x1b[5n"
+        );
+        assert_eq!(
+            format_osc11_query_sequence_with_env(true, false),
+            "\x1bPtmux;\x1b\x1b]11;?\x07\x1b\\\x1b]11;?\x07\x1b[5n"
+        );
+        assert_eq!(
+            format_osc11_query_sequence_with_env(false, true),
+            "\x1bP\x1b]11;?\x07\x1b\\\x1b[5n"
+        );
+
         struct ChunkReader {
             chunks: std::collections::VecDeque<Vec<u8>>,
         }
@@ -9183,27 +9303,51 @@ mod tests {
                 }
             }
         }
+        let plain_query = format_osc11_query_sequence_with_env(false, false);
         let mut writer = Vec::new();
         let mut reader = ChunkReader {
             chunks: std::collections::VecDeque::from(vec![
-                b"\x1b]11;rgb:ef".to_vec(),
-                b"ef/f1f1/f5f5\x07".to_vec(),
-                b"\x1b[0n".to_vec(),
+                b"l\x1b]11;rgb:ef".to_vec(),
+                b"ef/f1f1/f5f5\x07s".to_vec(),
+                b"\x1b[0n\r".to_vec(),
             ]),
         };
         let mut polls = 0usize;
-        let rgb = query_osc11_from_rw(
+        let (rgb, leftover) = query_osc11_from_rw(
             &mut reader,
             &mut writer,
             |_| {
                 polls += 1;
                 Ok(true)
             },
-            Duration::from_millis(150),
+            Duration::from_millis(100),
+            plain_query.as_bytes(),
+            false,
         );
         assert_eq!(writer, b"\x1b]11;?\x07\x1b[5n");
         assert_eq!(rgb, Some((0xef, 0xf1, 0xf5)));
+        assert_eq!(leftover, b"ls\r");
         assert_eq!(polls, 3);
+
+        // Passthrough-wrapped (tmux/screen): waits past an early `\x1b[0n` until OSC 11 arrives
+        let tmux_query = format_osc11_query_sequence_with_env(true, false);
+        let mut tmux_writer = Vec::new();
+        let mut tmux_reader = ChunkReader {
+            chunks: std::collections::VecDeque::from(vec![
+                b"\x1b[0n".to_vec(),
+                b"\x1b]11;rgb:ffff/ffff/ffff\x07".to_vec(),
+            ]),
+        };
+        let (tmux_rgb, tmux_leftover) = query_osc11_from_rw(
+            &mut tmux_reader,
+            &mut tmux_writer,
+            |_| Ok(true),
+            Duration::from_millis(100),
+            tmux_query.as_bytes(),
+            true,
+        );
+        assert_eq!(tmux_rgb, Some((255, 255, 255)));
+        assert!(tmux_leftover.is_empty());
 
         let mut dsr_only_reader = ChunkReader {
             chunks: std::collections::VecDeque::from(vec![b"\x1b[0n".to_vec()]),
@@ -9217,9 +9361,11 @@ mod tests {
                     dsr_polls += 1;
                     Ok(true)
                 },
-                Duration::from_millis(150),
+                Duration::from_millis(100),
+                plain_query.as_bytes(),
+                false,
             ),
-            None
+            (None, Vec::new())
         );
         assert_eq!(dsr_polls, 1);
 
@@ -9231,10 +9377,26 @@ mod tests {
                 &mut timeout_reader,
                 &mut Vec::new(),
                 |_| Ok(false),
-                Duration::from_millis(150),
+                Duration::from_millis(100),
+                plain_query.as_bytes(),
+                false,
             ),
-            None
+            (None, Vec::new())
         );
+
+        // Only Auto mode persists fallback theme state; explicit Fixed prefs leave it untouched
+        assert!(should_persist_fallback_theme(ThemePref::Auto, true, false));
+        assert!(!should_persist_fallback_theme(ThemePref::Auto, true, true));
+        assert!(!should_persist_fallback_theme(
+            ThemePref::Fixed(false),
+            true,
+            false
+        ));
+        assert!(!should_persist_fallback_theme(
+            ThemePref::Fixed(true),
+            false,
+            true
+        ));
 
         // 3. CLI / config / env precedence and non-eink / non-false-positive profile matching
         assert_eq!(
