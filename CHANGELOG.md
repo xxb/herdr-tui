@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/xxb/herdr-tui/compare/v0.6.0...v0.7.0) (2026-11-18)
+
+
+### Features
+
+* **eink:** demote agent thought/tool lines with italic and map edge chevrons to tab switch ([#68](https://github.com/xxb/herdr-tui/issues/68)) ([f65332b](https://github.com/xxb/herdr-tui/commit/f65332bafbe0dac23df176859359aae44a74d50d))
+
 ## [0.6.0](https://github.com/xxb/herdr-tui/compare/v0.5.0...v0.6.0) (2026-11-17)
 
 
