@@ -3787,6 +3787,9 @@ fn looks_like_numbered_code_line(trimmed: &str) -> bool {
 }
 
 fn has_tui_process_hint(trimmed: &str) -> bool {
+    if trimmed.contains("\"(ctrl+") || trimmed.contains("\"(esc ") {
+        return false;
+    }
     trimmed.contains("(ctrl+o to expand)")
         || trimmed.contains("(ctrl+r to expand)")
         || trimmed.contains("(ctrl+o to show")
@@ -3794,15 +3797,42 @@ fn has_tui_process_hint(trimmed: &str) -> bool {
         || trimmed.contains("(esc to cancel)")
 }
 
+fn strip_leading_gutter_bar<'a>(
+    scan: &ScannedEinkRow,
+    trimmed: &'a str,
+    trimmed_byte_start: usize,
+) -> (&'a str, usize, u16) {
+    let default_col = scan.cells[scan.first_idx].col;
+    let Some(bar_ch) = trimmed.chars().next() else {
+        return (trimmed, trimmed_byte_start, default_col);
+    };
+    if !matches!(bar_ch, '▎' | '▍' | '▌' | '▏' | '▕' | '▊' | '▉') {
+        return (trimmed, trimmed_byte_start, default_col);
+    }
+    let after_bar = &trimmed[bar_ch.len_utf8()..];
+    if !after_bar.starts_with(' ') {
+        return (trimmed, trimmed_byte_start, default_col);
+    }
+    let inner = after_bar.trim_start();
+    if inner.is_empty() {
+        return (trimmed, trimmed_byte_start, default_col);
+    }
+    let inner_byte_start = trimmed_byte_start + bar_ch.len_utf8() + (after_bar.len() - inner.len());
+    let inner_col = scan.cells[scan.first_idx..=scan.last_idx]
+        .iter()
+        .find(|cell| cell.byte_start == inner_byte_start)
+        .map_or(default_col, |cell| cell.col);
+    (inner, inner_byte_start, inner_col)
+}
+
 fn is_leading_spinner_status_row(
     screen: &vt100::Screen,
     r: u16,
     rows: u16,
     cols: u16,
-    scan: &ScannedEinkRow,
+    first_col: u16,
     trimmed: &str,
 ) -> bool {
-    let first_col = scan.cells[scan.first_idx].col;
     let Some(first_cell) = screen.cell(r, first_col) else {
         return false;
     };
@@ -3948,35 +3978,39 @@ fn classify_eink_process_row(
         return false;
     };
     let (trimmed, trimmed_byte_start) = scan.trimmed();
-    if trimmed.is_empty() || row_has_box_frame(trimmed) {
+    let (content_trimmed, content_byte_start, content_first_col) =
+        strip_leading_gutter_bar(&scan, trimmed, trimmed_byte_start);
+    if trimmed.is_empty() || row_has_box_frame(trimmed) || row_has_box_frame(content_trimmed) {
         return false;
     }
     if prev_wrapped && prev_is_process {
         return true;
     }
+    if looks_like_numbered_code_line(content_trimmed) {
+        return false;
+    }
     if prev_is_process
-        && !looks_like_numbered_code_line(trimmed)
-        && (trimmed.starts_with('⎿')
-            || trimmed.starts_with('↳')
-            || trimmed.starts_with("└ ")
+        && (content_trimmed.starts_with('⎿')
+            || content_trimmed.starts_with('↳')
+            || content_trimmed.starts_with("└ ")
             || (scan.leading_spaces >= 2 && scan.all_non_space_muted))
     {
         return true;
     }
-    if has_tui_process_hint(trimmed) {
+    if has_tui_process_hint(content_trimmed) {
         return true;
     }
-    if is_leading_spinner_status_row(screen, r, rows, cols, &scan, trimmed) {
+    if is_leading_spinner_status_row(screen, r, rows, cols, content_first_col, content_trimmed) {
         return true;
     }
     if scan.leading_spaces <= 4
-        && trimmed
+        && content_trimmed
             .strip_prefix("Thought for ")
             .is_some_and(|s| s.starts_with(|c: char| c.is_ascii_digit()))
     {
         return true;
     }
-    classify_status_lead_process_row(&scan, trimmed, trimmed_byte_start)
+    classify_status_lead_process_row(&scan, content_trimmed, content_byte_start)
 }
 
 fn detect_eink_process_rows(screen: &vt100::Screen, rows: u16, cols: u16) -> Vec<bool> {
@@ -4497,6 +4531,26 @@ fn resolve_eink_standard_fg_and_mods(cell: &vt100::Cell, bg_col: Color) -> (Colo
     (fg_col, mods)
 }
 
+fn resolve_eink_fg_and_mods(
+    cell: &vt100::Cell,
+    bg_col: Color,
+    row_is_process: bool,
+) -> (Color, Modifier) {
+    if row_is_process {
+        let fg_col = if bg_col != EINK_PILL_BG {
+            EINK_INK_PROCESS
+        } else {
+            EINK_INK
+        };
+        let mut mods = Modifier::ITALIC;
+        if cell.underline() {
+            mods |= Modifier::UNDERLINED;
+        }
+        return (fg_col, mods);
+    }
+    resolve_eink_standard_fg_and_mods(cell, bg_col)
+}
+
 fn resolve_eink_vt_colors_and_mods_with_diff(
     cell: &vt100::Cell,
     selected: bool,
@@ -4523,7 +4577,7 @@ fn resolve_eink_vt_colors_and_mods_with_diff(
             }
             return (diff.kind.kaleido_color(), EINK_PAPER, mods);
         }
-        let (fg_col, mods) = resolve_eink_standard_fg_and_mods(cell, bg_col);
+        let (fg_col, mods) = resolve_eink_fg_and_mods(cell, bg_col, row_is_process);
         return (fg_col, bg_col, mods);
     }
     resolve_eink_vt_colors_and_mods(cell, false, row_is_process)
@@ -4538,19 +4592,7 @@ fn resolve_eink_vt_colors_and_mods(
         return (EINK_PAPER, EINK_INK, Modifier::BOLD);
     }
     let bg_col = resolve_eink_vt_bg(cell);
-    if row_is_process {
-        let fg_col = if bg_col != EINK_PILL_BG {
-            EINK_INK_PROCESS
-        } else {
-            EINK_INK
-        };
-        let mut mods = Modifier::ITALIC;
-        if cell.underline() {
-            mods |= Modifier::UNDERLINED;
-        }
-        return (fg_col, bg_col, mods);
-    }
-    let (fg_col, mods) = resolve_eink_standard_fg_and_mods(cell, bg_col);
+    let (fg_col, mods) = resolve_eink_fg_and_mods(cell, bg_col, row_is_process);
     (fg_col, bg_col, mods)
 }
 
@@ -8812,6 +8854,7 @@ mod tests {
                 "\x1b[1;37m● Update(src/ui.rs)\x1b[0m\r\n",
                 "  ⎿  \x1b[90mUpdated src/ui.rs with 3 additions\x1b[0m\r\n",
                 "\x1b[90m      40   unchanged_ctx();\x1b[0m\r\n",
+                "\x1b[90m      41   // (esc to interrupt)\x1b[0m\r\n",
                 "● 这是正式回答正文 (补充说明)\r\n",
                 "- standard markdown bullet\r\n",
                 "• normal list bullet\r\n",
@@ -8875,21 +8918,24 @@ mod tests {
             assert_eq!(buf[(0, 3)].fg, EINK_INK_PROCESS);
             assert!(buf[(0, 3)].modifier.contains(Modifier::ITALIC));
 
-            // Row 6: numbered diff/code context under process sub-step stays upright #666666 without ITALIC
+            // Row 6 & 7: numbered diff/code context (even with TUI hint text in a comment) stays upright #666666 without ITALIC
             assert_eq!(buf[(6, 6)].symbol(), "4");
             assert_eq!(buf[(6, 6)].fg, EINK_INK_MUTED);
             assert!(!buf[(6, 6)].modifier.contains(Modifier::ITALIC));
+            assert_eq!(buf[(6, 7)].symbol(), "4");
+            assert_eq!(buf[(6, 7)].fg, EINK_INK_MUTED);
+            assert!(!buf[(6, 7)].modifier.contains(Modifier::ITALIC));
 
-            // Row 7: assistant reply starting with ● and non-muted `(补充说明)` stays crisp black upright prose
-            assert_eq!(buf[(0, 7)].symbol(), "●");
-            assert_eq!(buf[(0, 7)].fg, EINK_INK);
-            assert!(!buf[(0, 7)].modifier.contains(Modifier::ITALIC));
-
-            // Row 8 & 9: normal Markdown bullets stay crisp black upright prose
+            // Row 8: assistant reply starting with ● and non-muted `(补充说明)` stays crisp black upright prose
+            assert_eq!(buf[(0, 8)].symbol(), "●");
             assert_eq!(buf[(0, 8)].fg, EINK_INK);
             assert!(!buf[(0, 8)].modifier.contains(Modifier::ITALIC));
+
+            // Row 9 & 10: normal Markdown bullets stay crisp black upright prose
             assert_eq!(buf[(0, 9)].fg, EINK_INK);
             assert!(!buf[(0, 9)].modifier.contains(Modifier::ITALIC));
+            assert_eq!(buf[(0, 10)].fg, EINK_INK);
+            assert!(!buf[(0, 10)].modifier.contains(Modifier::ITALIC));
 
             // Snapshots match rendered colors & modifiers cleanly
             let area = Rect::new(0, 0, cols, rows);
@@ -8898,6 +8944,46 @@ mod tests {
             assert_eq!(snap.cells[0].fg, EINK_INK_PROCESS);
             assert!(snap.cells[0].mods.contains(Modifier::ITALIC));
         }
+
+        // Kaleido mode (--eink-color): gutter bar keeps marker accent while non-marker process cells
+        // and soft-wrapped process+diff continuations stay #777777 italic without BOLD.
+        let k_cols = 34u16;
+        let k_rows = 4u16;
+        let mut kaleido_proc = vt100::Parser::new(nz(k_rows), nz(k_cols), 10);
+        kaleido_proc.process(
+            "\x1b[32m\u{258e}\x1b[0m \x1b[1m● Used Swarm\x1b[0m \x1b[90m(Checked wrapped status line)\x1b[0m\r\n正文".as_bytes(),
+        );
+        let mut kaleido_term = Terminal::new(TestBackend::new(k_cols, k_rows)).unwrap();
+        kaleido_term
+            .draw(|f| {
+                f.render_widget(
+                    VtScreenWidget {
+                        screen: kaleido_proc.screen(),
+                        selection: None,
+                        eink_mode: true,
+                        eink_color: true,
+                    },
+                    f.area(),
+                );
+            })
+            .unwrap();
+        let kbuf = kaleido_term.backend().buffer();
+        assert_eq!(kbuf[(0, 0)].symbol(), "▎");
+        assert_eq!(kbuf[(0, 0)].fg, KALEIDO_GREEN);
+        assert!(kbuf[(0, 0)].modifier.contains(Modifier::BOLD));
+        for x in 2..k_cols {
+            assert_eq!(kbuf[(x, 0)].fg, EINK_INK_PROCESS);
+            assert!(kbuf[(x, 0)].modifier.contains(Modifier::ITALIC));
+            assert!(!kbuf[(x, 0)].modifier.contains(Modifier::BOLD));
+        }
+        // Soft-wrapped continuation on row 1 also carries both diff propagation and process styling cleanly
+        for x in 0..k_cols {
+            assert_eq!(kbuf[(x, 1)].fg, EINK_INK_PROCESS);
+            assert!(kbuf[(x, 1)].modifier.contains(Modifier::ITALIC));
+        }
+        assert_eq!(kbuf[(0, 2)].symbol(), "正");
+        assert_eq!(kbuf[(0, 2)].fg, EINK_INK);
+        assert!(!kbuf[(0, 2)].modifier.contains(Modifier::ITALIC));
 
         // Narrow screen soft-wrapped and indented process continuations
         let narrow_cols = 34u16;
