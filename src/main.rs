@@ -2095,12 +2095,13 @@ fn execute_action_full(
             }
         }
         Action::NextTab => {
-            world.next_tab();
-            world.mark_active_seen(core);
+            let changed = step_linear_tab_or_overview(HorizontalSwipeDir::Next, core, world, modal);
+            if changed && *eink_mode && matches!(modal, Modal::TabOverview { .. }) {
+                *pending_eink_osc = true;
+            }
         }
         Action::PrevTab => {
-            world.prev_tab();
-            world.mark_active_seen(core);
+            step_linear_tab_or_overview(HorizontalSwipeDir::Prev, core, world, modal);
         }
         Action::SelectTab(idx) => {
             world.select_tab_index(idx);
@@ -4533,6 +4534,9 @@ fn run_app_loop(
             if first_frame_drawn && *active_addr != prev_drawn_addr {
                 pending_eink_osc = true;
             }
+            if !prev_modal_open && matches!(modal, Modal::TabOverview { .. }) {
+                pending_eink_osc = true;
+            }
             if prev_modal_open && matches!(modal, Modal::None) {
                 pending_eink_osc = true;
             }
@@ -4659,11 +4663,7 @@ fn handle_shortcut_in_tab_overview(
             Ok(KeyOutcome::UiChanged)
         }
         Action::NextTab => {
-            *modal = Modal::None;
-            if world.active_space().is_some_and(|s| !s.tabs.is_empty()) {
-                world.select_tab_index(0);
-                world.mark_active_seen(core);
-            }
+            step_linear_tab_or_overview(HorizontalSwipeDir::Next, core, world, modal);
             Ok(KeyOutcome::UiChanged)
         }
         Action::SelectTab(idx) => {
@@ -6896,7 +6896,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_overview_supports_linear_topbar_wheel_filter_navigation_and_cyclic_shortcuts() {
+    fn tab_overview_supports_linear_topbar_wheel_filter_navigation_and_shortcuts() {
         let mut h = WheelTestHarness::new();
         let mut t = Instant::now();
         let step = Duration::from_millis(500);
@@ -6953,13 +6953,13 @@ mod tests {
         assert_eq!(h.modal, Modal::None);
         assert_eq!(h.world.active_tab_index(), 0);
 
-        // Return to 3-tab Space (`sp1`) and verify keyboard shortcuts stay cyclic while in Modal::None
+        // Return to 3-tab Space (`sp1`) and verify keyboard shortcuts step linearly into TabOverview even without -e
         h.world.prev_space();
         h.world.select_tab_index(0);
         let mut sidebar_open = false;
         let mut scrollback_offset = 0;
 
-        // Alt+Left at Tab 0 wraps to Tab 2 (`^b p` also wraps)
+        // Alt+Left and ^b p clamp at Tab 0 (never wrap to Tab 2)
         handle_key_event(
             KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
             &h.core,
@@ -6975,10 +6975,51 @@ mod tests {
             h.term_rect,
         )
         .unwrap();
-        assert_eq!(h.world.active_tab_index(), 2);
+        assert_eq!(h.world.active_tab_index(), 0);
         assert_eq!(h.modal, Modal::None);
 
-        // `^b n` at Tab 2 wraps to Tab 0
+        for kev in [
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+        ] {
+            handle_key_event(
+                kev,
+                &h.core,
+                &mut h.world,
+                None,
+                "ctrl+b",
+                &mut sidebar_open,
+                &mut h.prefix_active,
+                &mut h.ctrl_active,
+                &mut h.alt_active,
+                &mut scrollback_offset,
+                &mut h.modal,
+                h.term_rect,
+            )
+            .unwrap();
+        }
+        assert_eq!(h.world.active_tab_index(), 0);
+        assert_eq!(h.modal, Modal::None);
+
+        // Alt+Right steps 0 -> 1, ^b n steps 1 -> 2, and Alt+Right at Tab 2 enters TabOverview
+        handle_key_event(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+            &h.core,
+            &mut h.world,
+            None,
+            "ctrl+b",
+            &mut sidebar_open,
+            &mut h.prefix_active,
+            &mut h.ctrl_active,
+            &mut h.alt_active,
+            &mut scrollback_offset,
+            &mut h.modal,
+            h.term_rect,
+        )
+        .unwrap();
+        assert_eq!(h.world.active_tab_index(), 1);
+        assert_eq!(h.modal, Modal::None);
+
         for kev in [
             KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
@@ -6999,6 +7040,92 @@ mod tests {
             )
             .unwrap();
         }
+        assert_eq!(h.world.active_tab_index(), 2);
+        assert_eq!(h.modal, Modal::None);
+
+        handle_key_event(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+            &h.core,
+            &mut h.world,
+            None,
+            "ctrl+b",
+            &mut sidebar_open,
+            &mut h.prefix_active,
+            &mut h.ctrl_active,
+            &mut h.alt_active,
+            &mut scrollback_offset,
+            &mut h.modal,
+            h.term_rect,
+        )
+        .unwrap();
+        assert!(matches!(h.modal, Modal::TabOverview { .. }));
+        assert_eq!(h.world.active_tab_index(), 2);
+
+        // ^b p exits TabOverview back to Tab 2; ^b n at Tab 2 re-enters TabOverview; Alt+Left exits back to Tab 2
+        for kev in [
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+        ] {
+            handle_key_event(
+                kev,
+                &h.core,
+                &mut h.world,
+                None,
+                "ctrl+b",
+                &mut sidebar_open,
+                &mut h.prefix_active,
+                &mut h.ctrl_active,
+                &mut h.alt_active,
+                &mut scrollback_offset,
+                &mut h.modal,
+                h.term_rect,
+            )
+            .unwrap();
+        }
+        assert_eq!(h.modal, Modal::None);
+        assert_eq!(h.world.active_tab_index(), 2);
+
+        for kev in [
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        ] {
+            handle_key_event(
+                kev,
+                &h.core,
+                &mut h.world,
+                None,
+                "ctrl+b",
+                &mut sidebar_open,
+                &mut h.prefix_active,
+                &mut h.ctrl_active,
+                &mut h.alt_active,
+                &mut scrollback_offset,
+                &mut h.modal,
+                h.term_rect,
+            )
+            .unwrap();
+        }
+        assert!(matches!(h.modal, Modal::TabOverview { .. }));
+
+        handle_key_event(
+            KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+            &h.core,
+            &mut h.world,
+            None,
+            "ctrl+b",
+            &mut sidebar_open,
+            &mut h.prefix_active,
+            &mut h.ctrl_active,
+            &mut h.alt_active,
+            &mut scrollback_offset,
+            &mut h.modal,
+            h.term_rect,
+        )
+        .unwrap();
+        assert_eq!(h.modal, Modal::None);
+        assert_eq!(h.world.active_tab_index(), 2);
+
+        h.world.select_tab_index(0);
         assert_eq!(h.world.active_tab_index(), 0);
         assert_eq!(h.modal, Modal::None);
 
@@ -7177,7 +7304,7 @@ mod tests {
         assert_eq!(h.modal, Modal::None);
         assert_eq!(h.world.active_tab_index(), 2);
 
-        // Alt+Right while on TabOverview wraps forward to Tab 0
+        // Alt+Right and ^b n while on TabOverview clamp in TabOverview (never wrap to Tab 0)
         h.modal = Modal::default_tab_overview();
         handle_key_event(
             KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
@@ -7194,8 +7321,29 @@ mod tests {
             h.term_rect,
         )
         .unwrap();
-        assert_eq!(h.modal, Modal::None);
-        assert_eq!(h.world.active_tab_index(), 0);
+        assert!(matches!(h.modal, Modal::TabOverview { .. }));
+
+        for kev in [
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        ] {
+            handle_key_event(
+                kev,
+                &h.core,
+                &mut h.world,
+                None,
+                "ctrl+b",
+                &mut sidebar_open,
+                &mut h.prefix_active,
+                &mut h.ctrl_active,
+                &mut h.alt_active,
+                &mut scrollback_offset,
+                &mut h.modal,
+                h.term_rect,
+            )
+            .unwrap();
+        }
+        assert!(matches!(h.modal, Modal::TabOverview { .. }));
 
         // Out-of-range Alt+9 on TabOverview keeps TabOverview open; valid Alt+2 exits and selects Tab 1
         h.modal = Modal::default_tab_overview();
@@ -7215,7 +7363,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(h.modal, Modal::TabOverview { .. }));
-        assert_eq!(h.world.active_tab_index(), 0);
+        assert_eq!(h.world.active_tab_index(), 2);
 
         handle_key_event(
             KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT),
