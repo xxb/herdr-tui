@@ -1033,6 +1033,7 @@ pub fn render_ui_full_with_eink_color(
 pub const EINK_PAPER: Color = Color::Rgb(255, 255, 255); // #ffffff
 pub const EINK_INK: Color = Color::Rgb(0, 0, 0); // #000000
 pub const EINK_INK_MUTED: Color = Color::Rgb(102, 102, 102); // #666666
+pub const EINK_INK_PROCESS: Color = Color::Rgb(119, 119, 119); // #777777 (italic AI process/tool rows)
 pub const EINK_SURFACE: Color = Color::Rgb(238, 238, 238); // #eeeeee
 pub const EINK_PILL_BG: Color = Color::Rgb(221, 221, 221); // #dddddd
 
@@ -3664,6 +3665,343 @@ fn is_eink_muted_cell(cell: &vt100::Cell) -> bool {
     }
 }
 
+struct ScannedEinkCell {
+    col: u16,
+    byte_start: usize,
+    is_space: bool,
+    is_muted: bool,
+}
+
+struct ScannedEinkRow {
+    text: String,
+    cells: Vec<ScannedEinkCell>,
+    first_idx: usize,
+    last_idx: usize,
+    leading_spaces: u16,
+    all_non_space_muted: bool,
+}
+
+impl ScannedEinkRow {
+    fn trimmed(&self) -> (&str, usize) {
+        let start = self.cells[self.first_idx].byte_start;
+        let end = self
+            .cells
+            .get(self.last_idx + 1)
+            .map_or(self.text.len(), |c| c.byte_start);
+        (&self.text[start..end], start)
+    }
+}
+
+fn scan_eink_row_text(screen: &vt100::Screen, r: u16, cols: u16) -> Option<ScannedEinkRow> {
+    let mut text = String::with_capacity(usize::from(cols));
+    let mut cells = Vec::with_capacity(usize::from(cols));
+    for c in 0..cols {
+        let Some(cell) = screen.cell(r, c) else {
+            continue;
+        };
+        if cell.is_wide_continuation() {
+            continue;
+        }
+        let raw_sym = if cell.has_contents() {
+            cell.contents()
+        } else {
+            " "
+        };
+        let is_space = raw_sym.is_empty() || raw_sym == " ";
+        let sym = if is_space { " " } else { raw_sym };
+        let byte_start = text.len();
+        text.push_str(sym);
+        let is_muted = !is_space && is_eink_muted_cell(cell);
+        cells.push(ScannedEinkCell {
+            col: c,
+            byte_start,
+            is_space,
+            is_muted,
+        });
+    }
+    let first_idx = cells.iter().position(|c| !c.is_space)?;
+    let last_idx = cells.iter().rposition(|c| !c.is_space).unwrap_or(first_idx);
+    let leading_spaces = cells[first_idx].col;
+    let all_non_space_muted = cells[first_idx..=last_idx]
+        .iter()
+        .filter(|c| !c.is_space)
+        .all(|c| c.is_muted);
+    Some(ScannedEinkRow {
+        text,
+        cells,
+        first_idx,
+        last_idx,
+        leading_spaces,
+        all_non_space_muted,
+    })
+}
+
+fn is_structural_box_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '─' | '━'
+            | '│'
+            | '┃'
+            | '╭'
+            | '╮'
+            | '╰'
+            | '╯'
+            | '┌'
+            | '┐'
+            | '└'
+            | '┘'
+            | '├'
+            | '┤'
+            | '┬'
+            | '┴'
+            | '┼'
+            | '═'
+            | '║'
+            | '┏'
+            | '┓'
+            | '┗'
+            | '┛'
+    )
+}
+
+fn row_has_box_frame(trimmed: &str) -> bool {
+    let check_str = trimmed.strip_prefix("└ ").unwrap_or(trimmed);
+    if check_str.chars().any(is_structural_box_char) {
+        return true;
+    }
+    (trimmed.starts_with('|') && trimmed.ends_with('|') && trimmed.len() >= 3)
+        || ((trimmed.starts_with('|') || trimmed.ends_with('|')) && trimmed.contains(" | "))
+}
+
+fn looks_like_numbered_code_line(trimmed: &str) -> bool {
+    let bytes = trimmed.as_bytes();
+    let mut digits = 0usize;
+    while digits < bytes.len() && digits < 6 && bytes[digits].is_ascii_digit() {
+        digits += 1;
+    }
+    if digits == 0 || digits >= bytes.len() {
+        return false;
+    }
+    let next = trimmed[digits..].chars().next();
+    matches!(next, Some(' ' | ':' | '│' | '|'))
+}
+
+fn has_tui_process_hint(trimmed: &str) -> bool {
+    trimmed.contains("(ctrl+o to expand)")
+        || trimmed.contains("(ctrl+r to expand)")
+        || trimmed.contains("(ctrl+o to show")
+        || trimmed.contains("(esc to interrupt)")
+        || trimmed.contains("(esc to cancel)")
+}
+
+fn is_leading_spinner_status_row(
+    screen: &vt100::Screen,
+    r: u16,
+    rows: u16,
+    cols: u16,
+    scan: &ScannedEinkRow,
+    trimmed: &str,
+) -> bool {
+    let first_col = scan.cells[scan.first_idx].col;
+    let Some(first_cell) = screen.cell(r, first_col) else {
+        return false;
+    };
+    if !first_cell.has_contents() {
+        return false;
+    }
+    let sym = first_cell.contents();
+    let mut chars = sym.chars();
+    let (Some(ch), None) = (chars.next(), chars.next()) else {
+        return false;
+    };
+    let is_spinner = if ('\u{2801}'..='\u{28FF}').contains(&ch) {
+        !has_cardinal_neighbor(screen, r, first_col, rows, cols, is_braille_char)
+    } else if ('\u{25DC}'..='\u{25E1}').contains(&ch) {
+        !has_cardinal_neighbor(screen, r, first_col, rows, cols, is_arc_or_box_drawing_char)
+    } else {
+        matches!(
+            ch,
+            '◐' | '◓' | '◑' | '◒' | '◴' | '◷' | '◶' | '◵' | '✻' | '∴'
+        )
+    };
+    if !is_spinner {
+        return false;
+    }
+    let after = &trimmed[ch.len_utf8()..];
+    after.starts_with(char::is_whitespace) && after.trim().chars().any(char::is_alphabetic)
+}
+
+fn starts_with_tool_call_syntax(rest: &str) -> bool {
+    let Some(paren_idx) = rest.find('(') else {
+        return false;
+    };
+    if !(2..=28).contains(&paren_idx) || paren_idx + 1 >= rest.len() {
+        return false;
+    }
+    let name = &rest[..paren_idx];
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+fn has_muted_parenthetical_tail(scan: &ScannedEinkRow, rest: &str, rest_byte: usize) -> bool {
+    let Some(rel_paren) = rest.find(" (") else {
+        return false;
+    };
+    let header_chars = rest[..rel_paren].chars().count();
+    if !(1..=32).contains(&header_chars) {
+        return false;
+    }
+    let paren_byte = rest_byte + rel_paren + 1;
+    let mut count = 0usize;
+    for cell in &scan.cells[scan.first_idx..=scan.last_idx] {
+        if cell.byte_start >= paren_byte && !cell.is_space {
+            if !cell.is_muted {
+                return false;
+            }
+            count += 1;
+        }
+    }
+    count >= 3
+}
+
+fn classify_status_lead_process_row(
+    scan: &ScannedEinkRow,
+    trimmed: &str,
+    trimmed_byte_start: usize,
+) -> bool {
+    const PROCESS_MARKERS: &[&str] = &["○ ", "● ", "◈ ", "⎿", "↳"];
+    const PROCESS_VERBS: &[&str] = &[
+        "Used ",
+        "Scheduling ",
+        "Scheduled ",
+        "Reading ",
+        "Searching ",
+        "Searched ",
+        "Running ",
+        "Ran ",
+        "Editing ",
+        "Edited ",
+        "Updated ",
+        "Writing ",
+        "Wrote ",
+        "Calling ",
+        "Invoking ",
+        "Launching ",
+        "Subagent ",
+        "Explored ",
+    ];
+    const CODEX_VERBS: &[&str] = &["Ran ", "Explored ", "Searched ", "Edited ", "Updated "];
+
+    if let Some(after) = trimmed.strip_prefix("• ") {
+        let rest = after.trim_start();
+        if rest.is_empty() {
+            return false;
+        }
+        let rest_byte = trimmed_byte_start + "• ".len() + (after.len() - rest.len());
+        return CODEX_VERBS.iter().any(|v| rest.starts_with(v))
+            && (scan.all_non_space_muted || has_muted_parenthetical_tail(scan, rest, rest_byte));
+    }
+
+    let Some((marker, after)) = PROCESS_MARKERS
+        .iter()
+        .find_map(|&m| trimmed.strip_prefix(m).map(|rest| (m, rest)))
+    else {
+        return false;
+    };
+    let rest = after.trim_start();
+    if rest.is_empty() {
+        return false;
+    }
+    if rest.starts_with("Thought for ")
+        || rest.starts_with("Thought (")
+        || rest == "Thought"
+        || rest.starts_with("Thinking")
+        || rest.starts_with("Reasoning")
+    {
+        return true;
+    }
+    if PROCESS_VERBS.iter().any(|v| rest.starts_with(v))
+        || rest.starts_with("Scheduling...")
+        || rest.starts_with("Scheduling…")
+        || starts_with_tool_call_syntax(rest)
+    {
+        return true;
+    }
+    let rest_byte = trimmed_byte_start + marker.len() + (after.len() - rest.len());
+    if matches!(marker, "○ " | "● " | "◈ ") && has_muted_parenthetical_tail(scan, rest, rest_byte)
+    {
+        return true;
+    }
+    matches!(marker, "⎿" | "↳") && scan.all_non_space_muted
+}
+
+fn classify_eink_process_row(
+    screen: &vt100::Screen,
+    r: u16,
+    rows: u16,
+    cols: u16,
+    prev_wrapped: bool,
+    prev_is_process: bool,
+) -> bool {
+    let Some(scan) = scan_eink_row_text(screen, r, cols) else {
+        return false;
+    };
+    let (trimmed, trimmed_byte_start) = scan.trimmed();
+    if trimmed.is_empty() || row_has_box_frame(trimmed) {
+        return false;
+    }
+    if prev_wrapped && prev_is_process {
+        return true;
+    }
+    if prev_is_process
+        && !looks_like_numbered_code_line(trimmed)
+        && (trimmed.starts_with('⎿')
+            || trimmed.starts_with('↳')
+            || trimmed.starts_with("└ ")
+            || (scan.leading_spaces >= 2 && scan.all_non_space_muted))
+    {
+        return true;
+    }
+    if has_tui_process_hint(trimmed) {
+        return true;
+    }
+    if is_leading_spinner_status_row(screen, r, rows, cols, &scan, trimmed) {
+        return true;
+    }
+    if scan.leading_spaces <= 4
+        && trimmed
+            .strip_prefix("Thought for ")
+            .is_some_and(|s| s.starts_with(|c: char| c.is_ascii_digit()))
+    {
+        return true;
+    }
+    classify_status_lead_process_row(&scan, trimmed, trimmed_byte_start)
+}
+
+fn detect_eink_process_rows(screen: &vt100::Screen, rows: u16, cols: u16) -> Vec<bool> {
+    let mut out = vec![false; usize::from(rows)];
+    let mut prev_wrapped = false;
+    let mut prev_is_process = false;
+    for r in 0..rows {
+        let is_proc =
+            classify_eink_process_row(screen, r, rows, cols, prev_wrapped, prev_is_process);
+        out[usize::from(r)] = is_proc;
+        prev_wrapped = screen.row_wrapped(r);
+        prev_is_process = is_proc;
+    }
+    out
+}
+
+fn vt_row_trimmed_starts_with_fence(screen: &vt100::Screen, r: u16, cols: u16) -> bool {
+    scan_eink_row_text(screen, r, cols).is_some_and(|scan| {
+        let (trimmed, _) = scan.trimmed();
+        trimmed
+            .trim_start_matches(['│', '┃', '║', ' '])
+            .starts_with("```")
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DiffHue {
     Red,
@@ -4125,11 +4463,46 @@ fn detect_eink_diff_rows(
     out
 }
 
+fn resolve_eink_vt_bg(cell: &vt100::Cell) -> Color {
+    match vt_color_rgb(cell.bgcolor()) {
+        None => EINK_PAPER,
+        Some((r, g, b)) => match rgb_luma(r, g, b) {
+            0..=35 => EINK_PAPER,
+            36..=95 => EINK_SURFACE,
+            96..=224 => EINK_PILL_BG,
+            _ => EINK_PAPER,
+        },
+    }
+}
+
+fn resolve_eink_standard_fg_and_mods(cell: &vt100::Cell, bg_col: Color) -> (Color, Modifier) {
+    let is_muted = is_eink_muted_cell(cell);
+    // Keep at least >= 4.5:1 contrast when text sits inside a mid-light pill background (#dddddd).
+    let fg_col = if is_muted && bg_col != EINK_PILL_BG {
+        EINK_INK_MUTED
+    } else {
+        EINK_INK
+    };
+    let mut mods = Modifier::empty();
+    // Preserve BOLD only on foreground ink/headings so muted text (#666666) stays light.
+    if cell.bold() && !is_muted {
+        mods |= Modifier::BOLD;
+    }
+    if cell.italic() {
+        mods |= Modifier::ITALIC;
+    }
+    if cell.underline() {
+        mods |= Modifier::UNDERLINED;
+    }
+    (fg_col, mods)
+}
+
 fn resolve_eink_vt_colors_and_mods_with_diff(
     cell: &vt100::Cell,
     selected: bool,
     col: u16,
     row_diff: Option<EinkDiffRowHighlight>,
+    row_is_process: bool,
 ) -> (Color, Color, Modifier) {
     if selected || cell.inverse() {
         return (EINK_PAPER, EINK_INK, Modifier::BOLD);
@@ -4138,7 +4511,7 @@ fn resolve_eink_vt_colors_and_mods_with_diff(
         let bg_col = if diff.force_paper_bg {
             EINK_PAPER
         } else {
-            resolve_eink_vt_colors_and_mods(cell, false).1
+            resolve_eink_vt_bg(cell)
         };
         if diff.is_marker_col(col) {
             let mut mods = Modifier::BOLD;
@@ -4150,58 +4523,34 @@ fn resolve_eink_vt_colors_and_mods_with_diff(
             }
             return (diff.kind.kaleido_color(), EINK_PAPER, mods);
         }
-        let is_muted = is_eink_muted_cell(cell);
-        let fg_col = if is_muted && bg_col != EINK_PILL_BG {
-            EINK_INK_MUTED
+        let (fg_col, mods) = resolve_eink_standard_fg_and_mods(cell, bg_col);
+        return (fg_col, bg_col, mods);
+    }
+    resolve_eink_vt_colors_and_mods(cell, false, row_is_process)
+}
+
+fn resolve_eink_vt_colors_and_mods(
+    cell: &vt100::Cell,
+    selected: bool,
+    row_is_process: bool,
+) -> (Color, Color, Modifier) {
+    if selected || cell.inverse() {
+        return (EINK_PAPER, EINK_INK, Modifier::BOLD);
+    }
+    let bg_col = resolve_eink_vt_bg(cell);
+    if row_is_process {
+        let fg_col = if bg_col != EINK_PILL_BG {
+            EINK_INK_PROCESS
         } else {
             EINK_INK
         };
-        let mut mods = Modifier::empty();
-        if cell.bold() && !is_muted {
-            mods |= Modifier::BOLD;
-        }
-        if cell.italic() {
-            mods |= Modifier::ITALIC;
-        }
+        let mut mods = Modifier::ITALIC;
         if cell.underline() {
             mods |= Modifier::UNDERLINED;
         }
         return (fg_col, bg_col, mods);
     }
-    resolve_eink_vt_colors_and_mods(cell, false)
-}
-
-fn resolve_eink_vt_colors_and_mods(cell: &vt100::Cell, selected: bool) -> (Color, Color, Modifier) {
-    if selected || cell.inverse() {
-        return (EINK_PAPER, EINK_INK, Modifier::BOLD);
-    }
-    let bg_col = match vt_color_rgb(cell.bgcolor()) {
-        None => EINK_PAPER,
-        Some((r, g, b)) => match rgb_luma(r, g, b) {
-            0..=35 => EINK_PAPER,
-            36..=95 => EINK_SURFACE,
-            96..=224 => EINK_PILL_BG,
-            _ => EINK_PAPER,
-        },
-    };
-    let is_muted = is_eink_muted_cell(cell);
-    // Keep at least >= 4.5:1 contrast when text sits inside a mid-light pill background (#dddddd).
-    let fg_col = if is_muted && bg_col != EINK_PILL_BG {
-        EINK_INK_MUTED
-    } else {
-        EINK_INK
-    };
-    let mut mods = Modifier::empty();
-    // Preserve BOLD only on foreground ink/headings so muted process text (#666666) stays light.
-    if cell.bold() && !is_muted {
-        mods |= Modifier::BOLD;
-    }
-    if cell.italic() {
-        mods |= Modifier::ITALIC;
-    }
-    if cell.underline() {
-        mods |= Modifier::UNDERLINED;
-    }
+    let (fg_col, mods) = resolve_eink_standard_fg_and_mods(cell, bg_col);
     (fg_col, bg_col, mods)
 }
 
@@ -4375,7 +4724,8 @@ pub fn extract_clean_reader_json(screen: &mut vt100::Screen, title: &str) -> Str
     const MAX_JSON_BYTES: usize = 48_000;
 
     let (rows_nz, cols_nz) = screen.size();
-    let rows = usize::from(rows_nz.get());
+    let rows_u16 = rows_nz.get();
+    let rows = usize::from(rows_u16);
     let cols = cols_nz.get();
     let total_sb = screen.scrollback_len();
     let hist_rows = total_sb.min(MAX_SCAN_ROWS.saturating_sub(rows));
@@ -4386,19 +4736,46 @@ pub fn extract_clean_reader_json(screen: &mut vt100::Screen, title: &str) -> Str
         runs: Vec<(String, u8)>,
     }
 
+    struct ReaderProcessTracker {
+        prev_wrapped: bool,
+        prev_is_process: bool,
+        in_code_fence: bool,
+    }
+
     let mut logical_lines: Vec<RawLogical> = Vec::new();
     let mut cur_runs: Vec<(String, u8)> = Vec::new();
     let mut cur_in_live = false;
+    let mut proc_tracker = ReaderProcessTracker {
+        prev_wrapped: false,
+        prev_is_process: false,
+        in_code_fence: false,
+    };
 
     let append_visible_row = |scr: &vt100::Screen,
                               r: u16,
                               in_live: bool,
                               cur_runs: &mut Vec<(String, u8)>,
                               cur_in_live: &mut bool,
+                              proc_state: &mut ReaderProcessTracker,
                               out: &mut Vec<RawLogical>| {
         if cur_runs.is_empty() && in_live {
             *cur_in_live = true;
         }
+        let row_is_fence =
+            !proc_state.prev_wrapped && vt_row_trimmed_starts_with_fence(scr, r, cols);
+        if row_is_fence {
+            proc_state.in_code_fence = !proc_state.in_code_fence;
+        }
+        let row_is_process = !row_is_fence
+            && !proc_state.in_code_fence
+            && classify_eink_process_row(
+                scr,
+                r,
+                rows_u16,
+                cols,
+                proc_state.prev_wrapped,
+                proc_state.prev_is_process,
+            );
         let mut prev_was_wide = false;
         let mut prev_col: u16 = 0;
         for col in 0..cols {
@@ -4411,7 +4788,7 @@ pub fn extract_clean_reader_json(screen: &mut vt100::Screen, title: &str) -> Str
             };
             prev_was_wide = cell.is_wide();
             if cell.has_contents() {
-                let style = if cell.dim() {
+                let style = if row_is_process || cell.dim() {
                     2
                 } else if cell.bold() {
                     1
@@ -4432,6 +4809,8 @@ pub fn extract_clean_reader_json(screen: &mut vt100::Screen, title: &str) -> Str
                 push_reader_run(cur_runs, cell.contents(), style);
             }
         }
+        proc_state.prev_wrapped = scr.row_wrapped(r);
+        proc_state.prev_is_process = row_is_process;
         if !scr.row_wrapped(r) {
             out.push(RawLogical {
                 in_live: *cur_in_live || in_live,
@@ -4453,6 +4832,7 @@ pub fn extract_clean_reader_json(screen: &mut vt100::Screen, title: &str) -> Str
                 false,
                 &mut cur_runs,
                 &mut cur_in_live,
+                &mut proc_tracker,
                 &mut logical_lines,
             );
         }
@@ -4467,6 +4847,7 @@ pub fn extract_clean_reader_json(screen: &mut vt100::Screen, title: &str) -> Str
             true,
             &mut cur_runs,
             &mut cur_in_live,
+            &mut proc_tracker,
             &mut logical_lines,
         );
     }
@@ -4632,11 +5013,13 @@ pub fn capture_eink_screen_snapshot_with_color(
     } else {
         None
     };
+    let process_rows = detect_eink_process_rows(screen, rows, cols);
     let mut cells = Vec::with_capacity(usize::from(rows) * usize::from(cols));
     for r in 0..rows {
         let row_diff = diff_rows
             .as_ref()
             .and_then(|rows_vec| rows_vec[usize::from(r)]);
+        let row_is_process = process_rows[usize::from(r)];
         let mut c = 0;
         while c < cols {
             let Some(cell) = screen.cell(r, c) else {
@@ -4648,9 +5031,9 @@ pub fn capture_eink_screen_snapshot_with_color(
                 continue;
             }
             let (fg, bg, mods) = if eink_color {
-                resolve_eink_vt_colors_and_mods_with_diff(cell, false, c, row_diff)
+                resolve_eink_vt_colors_and_mods_with_diff(cell, false, c, row_diff, row_is_process)
             } else {
-                resolve_eink_vt_colors_and_mods(cell, false)
+                resolve_eink_vt_colors_and_mods(cell, false, row_is_process)
             };
             let raw_sym = if cell.has_contents() {
                 cell.contents()
@@ -4751,6 +5134,11 @@ impl Widget for VtScreenWidget<'_> {
         } else {
             None
         };
+        let process_rows = if self.eink_mode {
+            Some(detect_eink_process_rows(self.screen, rows, cols))
+        } else {
+            None
+        };
         let active_sel = self.selection.filter(|s| s.is_non_empty());
         let sel_bounds = active_sel.map(|s| s.normalized());
 
@@ -4758,6 +5146,9 @@ impl Widget for VtScreenWidget<'_> {
             let row_diff = diff_rows
                 .as_ref()
                 .and_then(|rows_vec| rows_vec[usize::from(r)]);
+            let row_is_process = process_rows
+                .as_ref()
+                .is_some_and(|rows_vec| rows_vec[usize::from(r)]);
             let row_in_sel = sel_bounds.is_some_and(|((sr, _), (er, _))| r >= sr && r <= er);
             let mut c = 0;
             while c < cols {
@@ -4779,9 +5170,15 @@ impl Widget for VtScreenWidget<'_> {
 
                 let style = if self.eink_mode {
                     let (fg_col, bg_col, mods) = if self.eink_color {
-                        resolve_eink_vt_colors_and_mods_with_diff(cell, selected, c, row_diff)
+                        resolve_eink_vt_colors_and_mods_with_diff(
+                            cell,
+                            selected,
+                            c,
+                            row_diff,
+                            row_is_process,
+                        )
                     } else {
-                        resolve_eink_vt_colors_and_mods(cell, selected)
+                        resolve_eink_vt_colors_and_mods(cell, selected, row_is_process)
                     };
                     Style::default().fg(fg_col).bg(bg_col).add_modifier(mods)
                 } else if selected {
@@ -5108,7 +5505,7 @@ fn render_help_modal(
         Line::from("  Left Floating Cross (+)  Tap Esc / Ctl / ^B / Alt / Tab (drag to move)"),
         Line::from("  Right Floating Cross (+) Tap ↑ / ← / ⎘ (Paste) / → / ↓ (drag to move)"),
         Line::from("  Clipboard Copy / Paste   Drag text to copy (OSC 52); Tap ⎘ to paste"),
-        Line::from("  Next / Prev Tab          ^b n / ^b p, Alt+Right / Left, or Horiz Swipe"),
+        Line::from("  Next / Prev Tab          ^b n / ^b p, Alt+Right / Left, or [‹] / [›]"),
         Line::from("  Switch Tab 1..9          ^b 1..9       or  Alt+1..9"),
         Line::from("  New Tab in Space         ^b c          or  Tap [ + ] on top tab bar"),
         Line::from("  Rename / Close Tab       ^b , (rename) /   ^b x (close)"),
@@ -5118,7 +5515,7 @@ fn render_help_modal(
         Line::from("  Quick Fuzzy Switcher     ^b w          or  ^b f"),
         Line::from("  Jump Next Alert Agent    ^b a          (◉ blocked / ✓ done)"),
         Line::from("  Scrollback / History     ^b [          or  Tap [▼ BOT] on status bar"),
-        Line::from("  Page Up / Down           ^b PgUp / PgDn / Tap Left [‹] / Right [›]"),
+        Line::from("  Page Up / Down           ^b PgUp / PgDn / Shift+PgUp (or in [ ? ])"),
         Line::from("  E-Ink / Clean Redraw     ^b e (E-Ink)  /   ^b r (clean redraw)"),
         Line::from("  Kaleido Color Accent     ^b E (95% mono + 5% overprint accents)"),
         Line::from("  Book Reader (ShellDeck)  ^b v / ^b B   or  Tap [ 📖 Book View ]"),
@@ -7031,7 +7428,7 @@ mod tests {
 
     fn assert_strict_eink_buffer(buf: &Buffer) {
         let is_neutral_carta_color = |c: Color| match c {
-            Color::Rgb(r, g, b) => r == g && g == b && matches!(r, 0 | 102 | 221 | 238 | 255),
+            Color::Rgb(r, g, b) => r == g && g == b && matches!(r, 0 | 102 | 119 | 221 | 238 | 255),
             _ => false,
         };
         for y in buf.area.y..buf.area.y + buf.area.height {
@@ -7537,7 +7934,8 @@ mod tests {
         let joined = rows.join("\n");
         assert!(joined.contains("Detach hct (keep sessions running) (^b q)"));
         assert!(joined.contains("Open Space popover menu / + New Space"));
-        assert!(joined.contains("^b PgUp / PgDn / Tap Left [‹] / Right [›]"));
+        assert!(joined.contains("Alt+Right / Left, or [‹] / [›]"));
+        assert!(joined.contains("^b PgUp / PgDn / Shift+PgUp (or in [ ? ])"));
         assert!(joined.contains("Tap [ 📖 Book View ]"));
         assert!(joined.contains("Tap outside, [ ✕ ], Esc, Enter, or ? to close"));
     }
@@ -8397,5 +8795,173 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn eink_demotes_agent_process_thought_tool_and_spinner_rows_to_italic_process_gray() {
+        let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
+        let rows = 14u16;
+        let cols = 72u16;
+        let mut parser = vt100::Parser::new(nz(rows), nz(cols), 40);
+        parser.process(
+            concat!(
+                "\x1b[38;2;148;163;184m○ Thought for 5.6s (The duplicate notification timing...)\x1b[0m\r\n",
+                "\x1b[1;32m●\x1b[0m \x1b[1mUsed Swarm\x1b[0m \x1b[90m(Checked swarm status (xBoard 几何吸附、...)\x1b[0m\r\n",
+                "\x1b[1;36m●\x1b[0m \x1b[1mScheduling 1 timer\x1b[0m \x1b[90m(240s: Chec...) (ctrl+o to expand)\x1b[0m\r\n",
+                "\x1b[34m⣷\x1b[0m  \x1b[1mScheduling...\x1b[0m\r\n",
+                "\x1b[1;37m● Update(src/ui.rs)\x1b[0m\r\n",
+                "  ⎿  \x1b[90mUpdated src/ui.rs with 3 additions\x1b[0m\r\n",
+                "\x1b[90m      40   unchanged_ctx();\x1b[0m\r\n",
+                "● 这是正式回答正文 (补充说明)\r\n",
+                "- standard markdown bullet\r\n",
+                "• normal list bullet\r\n",
+            )
+            .as_bytes(),
+        );
+
+        for eink_color in [false, true] {
+            let backend = TestBackend::new(cols, rows);
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|f| {
+                f.render_widget(
+                    VtScreenWidget {
+                        screen: parser.screen(),
+                        selection: None,
+                        eink_mode: true,
+                        eink_color,
+                    },
+                    f.area(),
+                );
+            })
+            .unwrap();
+
+            let buf = term.backend().buffer();
+            // Rows 0..=5 are AI process/tool/spinner/sub-step rows -> all cells #777777 + ITALIC without BOLD/DIM
+            for y in 0..=5u16 {
+                let mut x = 0u16;
+                while x < cols {
+                    let cell = &buf[(x, y)];
+                    assert_eq!(
+                        cell.fg, EINK_INK_PROCESS,
+                        "eink_color={eink_color} row {y} col {x} ({:?}) should use EINK_INK_PROCESS",
+                        cell.symbol()
+                    );
+                    assert!(
+                        cell.modifier.contains(Modifier::ITALIC),
+                        "eink_color={eink_color} row {y} col {x} should be italic"
+                    );
+                    assert!(
+                        !cell.modifier.contains(Modifier::BOLD),
+                        "eink_color={eink_color} row {y} col {x} must drop BOLD"
+                    );
+                    assert!(
+                        !cell.modifier.contains(Modifier::DIM),
+                        "eink_color={eink_color} row {y} col {x} must drop DIM"
+                    );
+                    x += cell.symbol().width().max(1) as u16;
+                }
+            }
+            // Wide CJK chars inside `几何吸附` remain intact with EINK_INK_PROCESS + ITALIC
+            let mut row1_txt = String::new();
+            let mut rx = 0u16;
+            while rx < cols {
+                let sym = buf[(rx, 1)].symbol();
+                row1_txt.push_str(sym);
+                rx += sym.width().max(1) as u16;
+            }
+            assert!(row1_txt.contains("几何吸附"));
+            // Leading isolated spinner on row 3 freezes to ◈ and uses process italic gray
+            assert_eq!(buf[(0, 3)].symbol(), "◈");
+            assert_eq!(buf[(0, 3)].fg, EINK_INK_PROCESS);
+            assert!(buf[(0, 3)].modifier.contains(Modifier::ITALIC));
+
+            // Row 6: numbered diff/code context under process sub-step stays upright #666666 without ITALIC
+            assert_eq!(buf[(6, 6)].symbol(), "4");
+            assert_eq!(buf[(6, 6)].fg, EINK_INK_MUTED);
+            assert!(!buf[(6, 6)].modifier.contains(Modifier::ITALIC));
+
+            // Row 7: assistant reply starting with ● and non-muted `(补充说明)` stays crisp black upright prose
+            assert_eq!(buf[(0, 7)].symbol(), "●");
+            assert_eq!(buf[(0, 7)].fg, EINK_INK);
+            assert!(!buf[(0, 7)].modifier.contains(Modifier::ITALIC));
+
+            // Row 8 & 9: normal Markdown bullets stay crisp black upright prose
+            assert_eq!(buf[(0, 8)].fg, EINK_INK);
+            assert!(!buf[(0, 8)].modifier.contains(Modifier::ITALIC));
+            assert_eq!(buf[(0, 9)].fg, EINK_INK);
+            assert!(!buf[(0, 9)].modifier.contains(Modifier::ITALIC));
+
+            // Snapshots match rendered colors & modifiers cleanly
+            let area = Rect::new(0, 0, cols, rows);
+            let snap =
+                capture_eink_screen_snapshot_with_color(parser.screen(), area, 0, eink_color);
+            assert_eq!(snap.cells[0].fg, EINK_INK_PROCESS);
+            assert!(snap.cells[0].mods.contains(Modifier::ITALIC));
+        }
+
+        // Narrow screen soft-wrapped and indented process continuations
+        let narrow_cols = 34u16;
+        let narrow_rows = 8u16;
+        let mut narrow = vt100::Parser::new(nz(narrow_rows), nz(narrow_cols), 20);
+        narrow.process(
+            concat!(
+                "\x1b[1;32m●\x1b[0m \x1b[1mUsed Swarm\x1b[0m \x1b[90m(Checked swarm status xBoard 几何吸附 wrapped)\x1b[0m\r\n",
+                "  \x1b[90mwaiting for 2 peers\x1b[0m\r\n",
+                "正文结论。\r\n",
+            )
+            .as_bytes(),
+        );
+        let mut narrow_term = Terminal::new(TestBackend::new(narrow_cols, narrow_rows)).unwrap();
+        narrow_term
+            .draw(|f| {
+                f.render_widget(
+                    VtScreenWidget {
+                        screen: narrow.screen(),
+                        selection: None,
+                        eink_mode: true,
+                        eink_color: false,
+                    },
+                    f.area(),
+                );
+            })
+            .unwrap();
+        let nbuf = narrow_term.backend().buffer();
+        for y in 0..=2u16 {
+            let mut x = 0u16;
+            while x < narrow_cols {
+                let cell = &nbuf[(x, y)];
+                assert_eq!(cell.fg, EINK_INK_PROCESS);
+                assert!(cell.modifier.contains(Modifier::ITALIC));
+                x += cell.symbol().width().max(1) as u16;
+            }
+        }
+        assert_eq!(nbuf[(0, 3)].symbol(), "正");
+        assert_eq!(nbuf[(0, 3)].fg, EINK_INK);
+        assert!(!nbuf[(0, 3)].modifier.contains(Modifier::ITALIC));
+
+        // Clean Reader JSON export classifies whole process lines as style 2 (MUTED)
+        let reader_json: serde_json::Value =
+            serde_json::from_str(&extract_clean_reader_json(parser.screen_mut(), "proc")).unwrap();
+        let reader_lines = reader_json["lines"].as_array().unwrap();
+        for (idx, line) in reader_lines.iter().enumerate().take(6) {
+            let runs = line["r"].as_array().unwrap();
+            assert!(
+                runs.iter().all(|run| run[1] == 2),
+                "reader line {idx} must export entirely as muted style 2: {runs:?}"
+            );
+        }
+        let body_runs = reader_lines
+            .iter()
+            .find(|l| {
+                l["r"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r[0].as_str().unwrap().contains("这是正式回答正文"))
+            })
+            .unwrap()["r"]
+            .as_array()
+            .unwrap();
+        assert_eq!(body_runs[0][1], 0);
     }
 }
