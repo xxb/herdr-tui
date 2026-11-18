@@ -33,6 +33,7 @@ pub enum HitTarget {
     ToggleAlt,
     PasteClipboard,
     ExitScrollback,
+    ExitTabOverview,
     ToggleHelp,
     ConfirmCloseYes { tab_id: String },
     SubmitPrompt,
@@ -989,6 +990,9 @@ pub fn render_ui_full_with_eink_color(
                 effective_eink_color,
                 &mut hits,
             );
+            if eink_mode {
+                render_eink_overview_back_tab(f, term_rect, &mut hits);
+            }
         }
         Modal::Help => {
             render_help_modal(f, area, eink_mode, effective_eink_color, &mut hits);
@@ -2908,6 +2912,42 @@ fn render_eink_page_turn_tabs(
     (left_touch, right_touch)
 }
 
+fn tab_overview_col_bounds(term_rect: Rect) -> (u16, u16) {
+    let col_w = if term_rect.width >= 80 {
+        term_rect.width.saturating_sub(8).min(78)
+    } else if term_rect.width >= 24 {
+        term_rect.width.saturating_sub(2)
+    } else {
+        term_rect.width
+    };
+    let col_x = term_rect.x + (term_rect.width.saturating_sub(col_w)) / 2;
+    (col_x, col_w)
+}
+
+fn render_eink_overview_back_tab(f: &mut Frame, term_rect: Rect, hits: &mut Vec<HitRegion>) {
+    let Some(vis) = resolve_eink_page_tab_rect(term_rect, true, None) else {
+        return;
+    };
+    paint_eink_page_tab(f.buffer_mut(), vis, true);
+    let (col_x, _) = tab_overview_col_bounds(term_rect);
+    let exp = expand_eink_page_touch_rect(term_rect, vis, true, None, None);
+    let has_clear_margin = col_x > term_rect.x + vis.width;
+    let hit_w = exp
+        .width
+        .min(col_x.saturating_sub(term_rect.x))
+        .max(vis.width)
+        .min(term_rect.width);
+    let (hit_y, hit_h) = if has_clear_margin {
+        (exp.y, exp.height)
+    } else {
+        (vis.y, vis.height)
+    };
+    hits.push(HitRegion {
+        rect: Rect::new(term_rect.x, hit_y, hit_w, hit_h),
+        target: HitTarget::ExitTabOverview,
+    });
+}
+
 fn shorten_home_path(path: &str) -> String {
     if path.is_empty() {
         return "~".to_string();
@@ -3169,14 +3209,7 @@ fn render_tab_overview_page(
         target: HitTarget::ModalNoop,
     });
 
-    let col_w = if term_rect.width >= 80 {
-        term_rect.width.saturating_sub(8).min(78)
-    } else if term_rect.width >= 24 {
-        term_rect.width.saturating_sub(2)
-    } else {
-        term_rect.width
-    };
-    let col_x = term_rect.x + (term_rect.width.saturating_sub(col_w)) / 2;
+    let (col_x, col_w) = tab_overview_col_bounds(term_rect);
     let pad_v = u16::from(term_rect.height >= 12);
     let content_y = term_rect.y + pad_v;
     let content_end_y = (term_rect.y + term_rect.height).saturating_sub(pad_v);
@@ -3197,7 +3230,11 @@ fn render_tab_overview_page(
     let (list_y, list_end_y) = if avail_h >= 8 {
         let tab_word = if total_tabs == 1 { "tab" } else { "tabs" };
         let left_hdr = format!(" ❖ {space_name} ({total_tabs} {tab_word})");
-        let right_hdr = "← swipe / Esc back ";
+        let right_hdr = if eink_mode {
+            "[‹] / ← swipe / Esc back "
+        } else {
+            "← swipe / Esc back "
+        };
         buf.set_string(
             col_x,
             content_y,
@@ -3264,10 +3301,12 @@ fn render_tab_overview_page(
         }
 
         let hint_y = content_end_y - 1;
-        let hint_txt = truncate_to_width(
-            " ↑/↓ select · Enter open · Type filter · ← swipe / Esc exit",
-            cw,
-        );
+        let hint_raw = if eink_mode {
+            " ↑/↓ select · Enter open · Type filter · [‹] / Esc exit"
+        } else {
+            " ↑/↓ select · Enter open · Type filter · ← swipe / Esc exit"
+        };
+        let hint_txt = truncate_to_width(hint_raw, cw);
         buf.set_string(
             col_x,
             hint_y,
@@ -5549,7 +5588,7 @@ fn render_help_modal(
         Line::from("  Left Floating Cross (+)  Tap Esc / Ctl / ^B / Alt / Tab (drag to move)"),
         Line::from("  Right Floating Cross (+) Tap ↑ / ← / ⎘ (Paste) / → / ↓ (drag to move)"),
         Line::from("  Clipboard Copy / Paste   Drag text to copy (OSC 52); Tap ⎘ to paste"),
-        Line::from("  Next / Prev Tab          ^b n / ^b p, Alt+Right / Left, or [‹] / [›]"),
+        Line::from("  Next / Prev Tab          ^b n / ^b p, Swipe or [‹] / [›] (linear)"),
         Line::from("  Switch Tab 1..9          ^b 1..9       or  Alt+1..9"),
         Line::from("  New Tab in Space         ^b c          or  Tap [ + ] on top tab bar"),
         Line::from("  Rename / Close Tab       ^b , (rename) /   ^b x (close)"),
@@ -7809,6 +7848,31 @@ mod tests {
                 })
                 .unwrap();
             assert_strict_eink_buffer(terminal.backend().buffer());
+            if matches!(modal, Modal::TabOverview { .. }) {
+                let ov_buf = terminal.backend().buffer();
+                assert_eq!(ov_buf[(0, 11)].symbol(), "‹");
+                assert_ne!(ov_buf[(99, 11)].symbol(), "›");
+                assert_eq!(
+                    find_hit_target(&modal_hits, 0, 11),
+                    Some(HitTarget::ExitTabOverview)
+                );
+                assert!(modal_hits
+                    .iter()
+                    .any(|h| h.target == HitTarget::NewTab && h.rect.y >= 1));
+                assert!(modal_hits
+                    .iter()
+                    .any(|h| matches!(h.target, HitTarget::SelectTab { .. }) && h.rect.y >= 5));
+                let center_new_tab_y = modal_hits
+                    .iter()
+                    .find(|h| h.target == HitTarget::NewTab && h.rect.y >= 1)
+                    .unwrap()
+                    .rect
+                    .y;
+                assert_eq!(
+                    find_hit_target(&modal_hits, 50, center_new_tab_y),
+                    Some(HitTarget::NewTab)
+                );
+            }
             if matches!(modal, Modal::Help) {
                 assert!(modal_hits
                     .iter()
@@ -7869,6 +7933,53 @@ mod tests {
         assert_eq!(nbuf[(37, 11)].bg, EINK_PAPER);
         assert_eq!(narrow_up, Some(Rect::new(0, 8, 6, 8)));
         assert_eq!(narrow_dn, Some(Rect::new(34, 8, 6, 8)));
+
+        // Narrow 40x24 Modal::TabOverview in E-Ink mode keeps [‹] at x==0 without blocking item taps
+        let mut narrow_ov_hits = Vec::new();
+        narrow_term
+            .draw(|f| {
+                narrow_ov_hits = render_ui_full(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::default_tab_overview(),
+                    None,
+                    false,
+                    None,
+                    false,
+                    None,
+                    true,
+                )
+                .hits;
+            })
+            .unwrap();
+        let nov_buf = narrow_term.backend().buffer();
+        assert_strict_eink_buffer(nov_buf);
+        assert_eq!(nov_buf[(0, 11)].symbol(), "‹");
+        assert_ne!(nov_buf[(39, 11)].symbol(), "›");
+        assert_eq!(
+            find_hit_target(&narrow_ov_hits, 0, 11),
+            Some(HitTarget::ExitTabOverview)
+        );
+        let center_tab_y = narrow_ov_hits
+            .iter()
+            .find(|h| matches!(h.target, HitTarget::SelectTab { .. }) && h.rect.y >= 1)
+            .unwrap()
+            .rect
+            .y;
+        assert!(matches!(
+            find_hit_target(&narrow_ov_hits, 20, center_tab_y),
+            Some(HitTarget::SelectTab { .. })
+        ));
     }
 
     #[test]
@@ -7978,7 +8089,7 @@ mod tests {
         let joined = rows.join("\n");
         assert!(joined.contains("Detach hct (keep sessions running) (^b q)"));
         assert!(joined.contains("Open Space popover menu / + New Space"));
-        assert!(joined.contains("Alt+Right / Left, or [‹] / [›]"));
+        assert!(joined.contains("Swipe or [‹] / [›] (linear)"));
         assert!(joined.contains("^b PgUp / PgDn / Shift+PgUp (or in [ ? ])"));
         assert!(joined.contains("Tap [ 📖 Book View ]"));
         assert!(joined.contains("Tap outside, [ ✕ ], Esc, Enter, or ? to close"));
