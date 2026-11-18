@@ -3806,7 +3806,9 @@ fn strip_leading_gutter_bar<'a>(
     let Some(bar_ch) = trimmed.chars().next() else {
         return (trimmed, trimmed_byte_start, default_col);
     };
-    if !matches!(bar_ch, '▎' | '▍' | '▌' | '▏' | '▕' | '▊' | '▉') {
+    let mut utf8 = [0u8; 4];
+    let sym = bar_ch.encode_utf8(&mut utf8);
+    if !is_diff_thick_bar_sym(sym) && !matches!(bar_ch, '▏' | '▕') {
         return (trimmed, trimmed_byte_start, default_col);
     }
     let after_bar = &trimmed[bar_ch.len_utf8()..];
@@ -3980,7 +3982,7 @@ fn classify_eink_process_row(
     let (trimmed, trimmed_byte_start) = scan.trimmed();
     let (content_trimmed, content_byte_start, content_first_col) =
         strip_leading_gutter_bar(&scan, trimmed, trimmed_byte_start);
-    if trimmed.is_empty() || row_has_box_frame(trimmed) || row_has_box_frame(content_trimmed) {
+    if trimmed.is_empty() || row_has_box_frame(content_trimmed) {
         return false;
     }
     if prev_wrapped && prev_is_process {
@@ -8945,13 +8947,21 @@ mod tests {
             assert!(snap.cells[0].mods.contains(Modifier::ITALIC));
         }
 
-        // Kaleido mode (--eink-color): gutter bar keeps marker accent while non-marker process cells
-        // and soft-wrapped process+diff continuations stay #777777 italic without BOLD.
+        // Kaleido mode (--eink-color): gutter bar (`▎`, `▋`, `┃`) keeps marker accent while
+        // non-marker process cells and soft-wrapped process+diff continuations stay #777777
+        // italic without BOLD, and closed `┃ ... ┃` box cards remain rejected.
         let k_cols = 34u16;
-        let k_rows = 4u16;
+        let k_rows = 6u16;
         let mut kaleido_proc = vt100::Parser::new(nz(k_rows), nz(k_cols), 10);
         kaleido_proc.process(
-            "\x1b[32m\u{258e}\x1b[0m \x1b[1m● Used Swarm\x1b[0m \x1b[90m(Checked wrapped status line)\x1b[0m\r\n正文".as_bytes(),
+            concat!(
+                "\x1b[32m▎\x1b[0m \x1b[1m● Used Swarm\x1b[0m \x1b[90m(Checked wrapped status line)\x1b[0m\r\n",
+                "\x1b[32m▋\x1b[0m \x1b[1m● Used Bar\x1b[0m \x1b[90m(Checked 5/8 bar)\x1b[0m\r\n",
+                "\x1b[32m┃\x1b[0m \x1b[1m● Used Heavy\x1b[0m \x1b[90m(Checked box bar)\x1b[0m\r\n",
+                "┃ \x1b[1m● Used Box\x1b[0m ┃\r\n",
+                "正文",
+            )
+            .as_bytes(),
         );
         let mut kaleido_term = Terminal::new(TestBackend::new(k_cols, k_rows)).unwrap();
         kaleido_term
@@ -8981,9 +8991,23 @@ mod tests {
             assert_eq!(kbuf[(x, 1)].fg, EINK_INK_PROCESS);
             assert!(kbuf[(x, 1)].modifier.contains(Modifier::ITALIC));
         }
-        assert_eq!(kbuf[(0, 2)].symbol(), "正");
-        assert_eq!(kbuf[(0, 2)].fg, EINK_INK);
-        assert!(!kbuf[(0, 2)].modifier.contains(Modifier::ITALIC));
+        // Row 2 (`▋`) & Row 3 (`┃`) open gutter bars keep green BOLD marker and italicize process cells
+        for (row_y, bar_sym) in [(2u16, "▋"), (3u16, "┃")] {
+            assert_eq!(kbuf[(0, row_y)].symbol(), bar_sym);
+            assert_eq!(kbuf[(0, row_y)].fg, KALEIDO_GREEN);
+            assert!(kbuf[(0, row_y)].modifier.contains(Modifier::BOLD));
+            for x in 2..k_cols {
+                assert_eq!(kbuf[(x, row_y)].fg, EINK_INK_PROCESS);
+                assert!(kbuf[(x, row_y)].modifier.contains(Modifier::ITALIC));
+                assert!(!kbuf[(x, row_y)].modifier.contains(Modifier::BOLD));
+            }
+        }
+        // Row 4: closed `┃ ... ┃` box card is rejected cleanly
+        assert_eq!(kbuf[(2, 4)].symbol(), "●");
+        assert!(!kbuf[(2, 4)].modifier.contains(Modifier::ITALIC));
+        assert_eq!(kbuf[(0, 5)].symbol(), "正");
+        assert_eq!(kbuf[(0, 5)].fg, EINK_INK);
+        assert!(!kbuf[(0, 5)].modifier.contains(Modifier::ITALIC));
 
         // Narrow screen soft-wrapped and indented process continuations
         let narrow_cols = 34u16;
