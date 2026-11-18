@@ -339,13 +339,14 @@ fn fuzzy_subsequence(hay: &str, needle: &str) -> bool {
     true
 }
 
-pub fn state_color(state: AgentState) -> Color {
+fn state_color_for_theme(state: AgentState, light_mode: bool) -> Color {
+    let pal = ChromePalette::for_theme(light_mode);
     match state {
-        AgentState::Blocked => HERDR_RED,
-        AgentState::Working => HERDR_YELLOW,
-        AgentState::Done => HERDR_TEAL,
-        AgentState::Idle => HERDR_GREEN,
-        AgentState::None => HERDR_OVERLAY1,
+        AgentState::Blocked => pal.red,
+        AgentState::Working => pal.yellow,
+        AgentState::Done => pal.teal,
+        AgentState::Idle => pal.green,
+        AgentState::None => pal.overlay1,
     }
 }
 
@@ -799,6 +800,7 @@ pub fn render_ui_full(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn render_ui_full_with_eink_color(
     f: &mut Frame,
@@ -822,7 +824,58 @@ pub fn render_ui_full_with_eink_color(
     eink_mode: bool,
     eink_color: bool,
 ) -> UiGeometry {
+    render_ui_with_theme(
+        f,
+        world,
+        screen,
+        sidebar_open,
+        sidebar_width,
+        touch_mode,
+        prefix_active,
+        ctrl_active,
+        alt_active,
+        scrollback_offset,
+        selection,
+        copied_flash,
+        modal,
+        mod_pos,
+        mod_dragging,
+        dpad_pos,
+        dpad_dragging,
+        focused_quota,
+        eink_mode,
+        eink_color,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_ui_with_theme(
+    f: &mut Frame,
+    world: &World,
+    screen: Option<&vt100::Screen>,
+    sidebar_open: bool,
+    sidebar_width: u16,
+    touch_mode: bool,
+    prefix_active: bool,
+    ctrl_active: bool,
+    alt_active: bool,
+    scrollback_offset: usize,
+    selection: Option<&TerminalSelection>,
+    copied_flash: bool,
+    modal: &Modal,
+    mod_pos: Option<(u16, u16)>,
+    mod_dragging: bool,
+    dpad_pos: Option<(u16, u16)>,
+    dpad_dragging: bool,
+    focused_quota: Option<&AgentQuota>,
+    eink_mode: bool,
+    eink_color: bool,
+    light_mode: bool,
+) -> UiGeometry {
     let effective_eink_color = eink_mode && eink_color;
+    let effective_light = !eink_mode && light_mode;
+    let pal = ChromePalette::for_theme(effective_light);
     let area = f.area();
     let mut hits = Vec::new();
     let top_h = top_bar_height(area, touch_mode);
@@ -876,7 +929,7 @@ pub fn render_ui_full_with_eink_color(
             .style(if eink_mode {
                 Style::default().bg(EINK_PAPER).fg(EINK_INK_MUTED)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(pal.placeholder_fg)
             })
             .alignment(Alignment::Center);
         f.render_widget(placeholder, term_rect);
@@ -896,6 +949,7 @@ pub fn render_ui_full_with_eink_color(
         tab_overview_open,
         eink_mode,
         effective_eink_color,
+        effective_light,
         &mut hits,
     );
     let space_slop_rect = if matches!(modal, Modal::None) && term_rect.height > 0 {
@@ -930,6 +984,7 @@ pub fn render_ui_full_with_eink_color(
         copied_flash,
         eink_mode,
         effective_eink_color,
+        effective_light,
         &mut hits,
     );
 
@@ -945,6 +1000,7 @@ pub fn render_ui_full_with_eink_color(
                     ctrl_active,
                     alt_active,
                     eink_mode,
+                    effective_light,
                     &mut hits,
                 );
                 dpad_rect = render_floating_dpad(
@@ -953,6 +1009,7 @@ pub fn render_ui_full_with_eink_color(
                     dpad_pos,
                     dpad_dragging,
                     eink_mode,
+                    effective_light,
                     &mut hits,
                 );
             }
@@ -971,6 +1028,7 @@ pub fn render_ui_full_with_eink_color(
                 world,
                 eink_mode,
                 effective_eink_color,
+                effective_light,
                 &mut hits,
             );
         }
@@ -988,6 +1046,7 @@ pub fn render_ui_full_with_eink_color(
                 selected_target,
                 eink_mode,
                 effective_eink_color,
+                effective_light,
                 &mut hits,
             );
             if eink_mode {
@@ -995,13 +1054,28 @@ pub fn render_ui_full_with_eink_color(
             }
         }
         Modal::Help => {
-            render_help_modal(f, area, eink_mode, effective_eink_color, &mut hits);
+            render_help_modal(
+                f,
+                area,
+                eink_mode,
+                effective_eink_color,
+                effective_light,
+                &mut hits,
+            );
         }
         Modal::ConfirmCloseTab { tab_id, tab_title } => {
-            render_confirm_close_modal(f, area, tab_id, tab_title, eink_mode, &mut hits);
+            render_confirm_close_modal(
+                f,
+                area,
+                tab_id,
+                tab_title,
+                eink_mode,
+                effective_light,
+                &mut hits,
+            );
         }
         Modal::Prompt { kind, input } => {
-            render_prompt_modal(f, area, kind, input, eink_mode, &mut hits);
+            render_prompt_modal(f, area, kind, input, eink_mode, effective_light, &mut hits);
         }
         Modal::Fuzzy {
             query,
@@ -1017,6 +1091,7 @@ pub fn render_ui_full_with_eink_color(
                 selected_tab_id.as_deref(),
                 eink_mode,
                 effective_eink_color,
+                effective_light,
                 &mut hits,
             );
         }
@@ -1074,6 +1149,243 @@ const HERDR_TEAL: Color = Color::Rgb(148, 226, 213); // #94e2d5 (Done state)
 const TOPBAR_UNDERLINE_DIM: Color = HERDR_SURFACE1;
 const TOPBAR_UNDERLINE_ACTIVE: Color = HERDR_ACCENT;
 
+#[derive(Clone, Copy, Debug)]
+struct ChromePalette {
+    panel_bg: Color,
+    modal_bg: Color,
+    modal_fg: Color,
+    space_popup_bg: Color,
+    surface_dim: Color,
+    surface0: Color,
+    surface1: Color,
+    overlay0: Color,
+    overlay1: Color,
+    subtext0: Color,
+    text: Color,
+    accent: Color,
+    active_tab_fg: Color,
+    underline_dim: Color,
+    underline_active: Color,
+    mauve: Color,
+    green: Color,
+    yellow: Color,
+    red: Color,
+    teal: Color,
+    placeholder_fg: Color,
+    detach_bg: Color,
+    space_pill_bg: Color,
+    new_tab_bg: Color,
+    help_pill_bg: Color,
+    tab_blocked_bg: Color,
+    tab_done_bg: Color,
+    tab_working_bg: Color,
+    tab_working_fg: Color,
+    quota_empty_fg: Color,
+    quota_lbl_fg: Color,
+    quota_track_fg: Color,
+    quota_detail_fg: Color,
+    quota_sep_fg: Color,
+    quota_low_fg: Color,
+    quota_mid_fg: Color,
+    quota_high_fg: Color,
+    copied_bg: Color,
+    copied_fg: Color,
+    scroll_bg: Color,
+    scroll_fg: Color,
+    modal_close_bg: Color,
+    modal_close_fg: Color,
+    space_new_btn_bg: Color,
+    space_new_btn_fg: Color,
+    help_border_fg: Color,
+    help_heading1_fg: Color,
+    help_heading2_fg: Color,
+    help_btn_bg: Color,
+    help_btn_fg: Color,
+    help_version_fg: Color,
+    help_hint_fg: Color,
+    confirm_border_fg: Color,
+    confirm_modal_bg: Color,
+    confirm_yes_bg: Color,
+    confirm_yes_fg: Color,
+    modal_cancel_bg: Color,
+    modal_cancel_fg: Color,
+    prompt_ok_bg: Color,
+    prompt_ok_fg: Color,
+    fuzzy_prompt_fg: Color,
+    fuzzy_sel_bg: Color,
+    fuzzy_sel_fg: Color,
+    fuzzy_row_fg: Color,
+    fuzzy_space_fg: Color,
+    fuzzy_meta_fg: Color,
+}
+
+impl ChromePalette {
+    const fn dark() -> Self {
+        Self {
+            panel_bg: HERDR_PANEL_BG,
+            modal_bg: Color::Rgb(20, 22, 34),
+            modal_fg: Color::White,
+            space_popup_bg: HERDR_PANEL_BG,
+            surface_dim: HERDR_SURFACE_DIM,
+            surface0: HERDR_SURFACE0,
+            surface1: HERDR_SURFACE1,
+            overlay0: HERDR_OVERLAY0,
+            overlay1: HERDR_OVERLAY1,
+            subtext0: HERDR_SUBTEXT0,
+            text: HERDR_TEXT,
+            accent: HERDR_ACCENT,
+            active_tab_fg: HERDR_PANEL_BG,
+            underline_dim: TOPBAR_UNDERLINE_DIM,
+            underline_active: TOPBAR_UNDERLINE_ACTIVE,
+            mauve: HERDR_MAUVE,
+            green: HERDR_GREEN,
+            yellow: HERDR_YELLOW,
+            red: HERDR_RED,
+            teal: HERDR_TEAL,
+            placeholder_fg: Color::DarkGray,
+            detach_bg: Color::Rgb(42, 30, 42),
+            space_pill_bg: Color::Rgb(36, 36, 54),
+            new_tab_bg: Color::Rgb(32, 46, 42),
+            help_pill_bg: Color::Rgb(36, 36, 54),
+            tab_blocked_bg: Color::Rgb(64, 38, 50),
+            tab_done_bg: Color::Rgb(34, 54, 52),
+            tab_working_bg: Color::Rgb(56, 50, 38),
+            tab_working_fg: HERDR_YELLOW,
+            quota_empty_fg: Color::Rgb(126, 136, 168),
+            quota_lbl_fg: Color::Rgb(192, 202, 245),
+            quota_track_fg: Color::Rgb(56, 64, 94),
+            quota_detail_fg: Color::Rgb(132, 142, 178),
+            quota_sep_fg: Color::Rgb(86, 94, 126),
+            quota_low_fg: Color::Rgb(247, 118, 142),
+            quota_mid_fg: Color::Rgb(224, 175, 104),
+            quota_high_fg: Color::Rgb(115, 218, 146),
+            copied_bg: Color::Rgb(158, 206, 106),
+            copied_fg: Color::Rgb(20, 22, 32),
+            scroll_bg: Color::Rgb(125, 207, 255),
+            scroll_fg: Color::Rgb(20, 22, 32),
+            modal_close_bg: Color::Rgb(96, 38, 52),
+            modal_close_fg: Color::White,
+            space_new_btn_bg: Color::Rgb(26, 44, 64),
+            space_new_btn_fg: Color::Rgb(125, 207, 255),
+            help_border_fg: Color::Rgb(122, 162, 247),
+            help_heading1_fg: Color::LightCyan,
+            help_heading2_fg: Color::Cyan,
+            help_btn_bg: Color::Rgb(42, 52, 82),
+            help_btn_fg: Color::White,
+            help_version_fg: Color::Rgb(147, 153, 178),
+            help_hint_fg: Color::DarkGray,
+            confirm_border_fg: Color::LightRed,
+            confirm_modal_bg: Color::Rgb(28, 20, 28),
+            confirm_yes_bg: Color::Rgb(110, 36, 44),
+            confirm_yes_fg: Color::White,
+            modal_cancel_bg: Color::Rgb(48, 52, 72),
+            modal_cancel_fg: Color::White,
+            prompt_ok_bg: Color::Rgb(36, 82, 58),
+            prompt_ok_fg: Color::White,
+            fuzzy_prompt_fg: Color::LightCyan,
+            fuzzy_sel_bg: Color::Rgb(65, 75, 120),
+            fuzzy_sel_fg: Color::White,
+            fuzzy_row_fg: Color::Gray,
+            fuzzy_space_fg: Color::Cyan,
+            fuzzy_meta_fg: Color::DarkGray,
+        }
+    }
+
+    const fn light() -> Self {
+        let panel_bg = Color::Rgb(230, 233, 239);
+        let modal_bg = Color::Rgb(244, 246, 250);
+        let surface_dim = Color::Rgb(239, 241, 245);
+        let surface0 = Color::Rgb(204, 208, 218);
+        let surface1 = Color::Rgb(188, 192, 204);
+        let overlay0 = Color::Rgb(124, 130, 156);
+        let overlay1 = Color::Rgb(108, 114, 140);
+        let subtext0 = Color::Rgb(76, 82, 108);
+        let text = Color::Rgb(46, 51, 72);
+        let accent = Color::Rgb(30, 102, 245);
+        let mauve = Color::Rgb(108, 46, 190);
+        let green = Color::Rgb(24, 122, 52);
+        let yellow = Color::Rgb(176, 102, 8);
+        let red = Color::Rgb(184, 24, 52);
+        let teal = Color::Rgb(18, 122, 100);
+        Self {
+            panel_bg,
+            modal_bg,
+            modal_fg: text,
+            space_popup_bg: modal_bg,
+            surface_dim,
+            surface0,
+            surface1,
+            overlay0,
+            overlay1,
+            subtext0,
+            text,
+            accent,
+            active_tab_fg: Color::Rgb(255, 255, 255),
+            underline_dim: surface1,
+            underline_active: accent,
+            mauve,
+            green,
+            yellow,
+            red,
+            teal,
+            placeholder_fg: overlay1,
+            detach_bg: Color::Rgb(242, 218, 224),
+            space_pill_bg: Color::Rgb(224, 218, 242),
+            new_tab_bg: Color::Rgb(210, 238, 218),
+            help_pill_bg: Color::Rgb(216, 220, 232),
+            tab_blocked_bg: Color::Rgb(246, 214, 220),
+            tab_done_bg: Color::Rgb(208, 236, 228),
+            tab_working_bg: Color::Rgb(248, 232, 196),
+            tab_working_fg: Color::Rgb(154, 90, 8),
+            quota_empty_fg: Color::Rgb(104, 112, 138),
+            quota_lbl_fg: text,
+            quota_track_fg: Color::Rgb(178, 184, 202),
+            quota_detail_fg: Color::Rgb(94, 102, 128),
+            quota_sep_fg: Color::Rgb(136, 144, 168),
+            quota_low_fg: Color::Rgb(196, 28, 56),
+            quota_mid_fg: Color::Rgb(172, 96, 8),
+            quota_high_fg: Color::Rgb(22, 128, 58),
+            copied_bg: Color::Rgb(24, 134, 62),
+            copied_fg: Color::White,
+            scroll_bg: accent,
+            scroll_fg: Color::White,
+            modal_close_bg: Color::Rgb(242, 214, 220),
+            modal_close_fg: Color::Rgb(180, 28, 56),
+            space_new_btn_bg: Color::Rgb(212, 228, 250),
+            space_new_btn_fg: Color::Rgb(20, 92, 196),
+            help_border_fg: accent,
+            help_heading1_fg: accent,
+            help_heading2_fg: teal,
+            help_btn_bg: Color::Rgb(220, 226, 240),
+            help_btn_fg: Color::Rgb(36, 48, 84),
+            help_version_fg: overlay1,
+            help_hint_fg: overlay1,
+            confirm_border_fg: red,
+            confirm_modal_bg: Color::Rgb(250, 244, 246),
+            confirm_yes_bg: Color::Rgb(196, 32, 56),
+            confirm_yes_fg: Color::White,
+            modal_cancel_bg: surface1,
+            modal_cancel_fg: text,
+            prompt_ok_bg: Color::Rgb(24, 128, 62),
+            prompt_ok_fg: Color::White,
+            fuzzy_prompt_fg: accent,
+            fuzzy_sel_bg: Color::Rgb(206, 222, 250),
+            fuzzy_sel_fg: text,
+            fuzzy_row_fg: text,
+            fuzzy_space_fg: accent,
+            fuzzy_meta_fg: overlay1,
+        }
+    }
+
+    const fn for_theme(light_mode: bool) -> Self {
+        if light_mode {
+            Self::light()
+        } else {
+            Self::dark()
+        }
+    }
+}
+
 struct PlannedTabBar {
     left_badge: Option<String>,
     right_badge: Option<String>,
@@ -1116,7 +1428,7 @@ fn eink_tab_prefix(state: AgentState, is_active: bool) -> &'static str {
     }
 }
 
-fn tab_pill_style(st: AgentState, is_active: bool, eink_mode: bool) -> Style {
+fn tab_pill_style(st: AgentState, is_active: bool, eink_mode: bool, light_mode: bool) -> Style {
     if eink_mode {
         return if is_active {
             Style::default()
@@ -1135,24 +1447,27 @@ fn tab_pill_style(st: AgentState, is_active: bool, eink_mode: bool) -> Style {
             }
         };
     }
+    let pal = ChromePalette::for_theme(light_mode);
     if is_active {
         Style::default()
-            .bg(HERDR_ACCENT)
-            .fg(HERDR_PANEL_BG)
+            .bg(pal.accent)
+            .fg(pal.active_tab_fg)
             .add_modifier(Modifier::BOLD)
     } else {
         match st {
             AgentState::Blocked => Style::default()
-                .bg(Color::Rgb(64, 38, 50))
-                .fg(HERDR_RED)
+                .bg(pal.tab_blocked_bg)
+                .fg(pal.red)
                 .add_modifier(Modifier::BOLD),
             AgentState::Done => Style::default()
-                .bg(Color::Rgb(34, 54, 52))
-                .fg(HERDR_TEAL)
+                .bg(pal.tab_done_bg)
+                .fg(pal.teal)
                 .add_modifier(Modifier::BOLD),
-            AgentState::Working => Style::default().bg(Color::Rgb(56, 50, 38)).fg(HERDR_YELLOW),
+            AgentState::Working => Style::default()
+                .bg(pal.tab_working_bg)
+                .fg(pal.tab_working_fg),
             AgentState::Idle | AgentState::None => {
-                Style::default().bg(HERDR_SURFACE0).fg(HERDR_SUBTEXT0)
+                Style::default().bg(pal.surface0).fg(pal.subtext0)
             }
         }
     }
@@ -1356,6 +1671,7 @@ fn plan_top_tabbar_pills(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_touchbar_pill(
     buf: &mut Buffer,
     x: u16,
@@ -1364,6 +1680,7 @@ fn draw_touchbar_pill(
     style: Style,
     emphasized: bool,
     eink_mode: bool,
+    pal: &ChromePalette,
 ) {
     if rect.height == 0 || label.is_empty() {
         return;
@@ -1378,12 +1695,8 @@ fn draw_touchbar_pill(
             (EINK_INK, EINK_INK)
         } else {
             (
-                if emphasized { HERDR_TEXT } else { HERDR_ACCENT },
-                if emphasized {
-                    HERDR_ACCENT
-                } else {
-                    HERDR_SURFACE1
-                },
+                if emphasized { pal.text } else { pal.accent },
+                if emphasized { pal.accent } else { pal.surface1 },
             )
         };
         let top_line = "▔".repeat(lw as usize);
@@ -1395,17 +1708,13 @@ fn draw_touchbar_pill(
         // 2-row keycap pill:
         // - Row 0 (`rect.y`): vertically centered glyph inside the colored pill (`style`)
         // - Row 1 (`rect.y + 1`): crisp bottom gloss highlight (`▔`) hugging the lower edge
-        //   of Row 0 against the dark bar background so text never appears pushed down.
+        //   of Row 0 against the bar background so text never appears pushed down.
         let (gloss_bg, bot_gloss_fg) = if eink_mode {
             (EINK_PAPER, EINK_INK)
         } else {
             (
-                HERDR_PANEL_BG,
-                if emphasized {
-                    HERDR_ACCENT
-                } else {
-                    HERDR_SURFACE1
-                },
+                pal.panel_bg,
+                if emphasized { pal.accent } else { pal.surface1 },
             )
         };
         let bot_line = "▔".repeat(lw as usize);
@@ -1427,9 +1736,9 @@ fn draw_touchbar_pill(
         buf.set_string(x, rect.y, label, pill_style);
     } else {
         let ul_color = if emphasized {
-            TOPBAR_UNDERLINE_ACTIVE
+            pal.underline_active
         } else {
-            TOPBAR_UNDERLINE_DIM
+            pal.underline_dim
         };
         let pill_style = style
             .add_modifier(Modifier::UNDERLINED)
@@ -1447,21 +1756,19 @@ fn render_top_tabbar(
     tab_overview_open: bool,
     eink_mode: bool,
     eink_color: bool,
+    light_mode: bool,
     hits: &mut Vec<HitRegion>,
 ) -> Option<(u16, u16)> {
     if rect.width == 0 || rect.height == 0 {
         return None;
     }
-    let bar_bg = if eink_mode {
-        EINK_PAPER
-    } else {
-        HERDR_PANEL_BG
-    };
-    let bar_fg = if eink_mode { EINK_INK } else { HERDR_TEXT };
+    let pal = ChromePalette::for_theme(light_mode);
+    let bar_bg = if eink_mode { EINK_PAPER } else { pal.panel_bg };
+    let bar_fg = if eink_mode { EINK_INK } else { pal.text };
     let bar_ul = if eink_mode {
         EINK_INK
     } else {
-        TOPBAR_UNDERLINE_DIM
+        pal.underline_dim
     };
     let mut bg_bar = Style::default().bg(bar_bg).fg(bar_fg);
     if rect.height == 1 && !eink_mode {
@@ -1483,7 +1790,7 @@ fn render_top_tabbar(
             &full_line,
             Style::default()
                 .bg(bar_bg)
-                .fg(if eink_mode { EINK_INK } else { HERDR_ACCENT }),
+                .fg(if eink_mode { EINK_INK } else { pal.accent }),
         );
     } else if rect.height == 2 {
         let full_line = "▔".repeat(rect.width as usize);
@@ -1493,7 +1800,7 @@ fn render_top_tabbar(
             &full_line,
             Style::default()
                 .bg(bar_bg)
-                .fg(if eink_mode { EINK_INK } else { HERDR_SURFACE1 }),
+                .fg(if eink_mode { EINK_INK } else { pal.surface1 }),
         );
     }
 
@@ -1514,11 +1821,11 @@ fn render_top_tabbar(
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
-                .bg(Color::Rgb(42, 30, 42))
-                .fg(HERDR_RED)
+                .bg(pal.detach_bg)
+                .fg(pal.red)
                 .add_modifier(Modifier::BOLD)
         };
-        draw_touchbar_pill(buf, x, rect, detach_lbl, dstyle, false, eink_mode);
+        draw_touchbar_pill(buf, x, rect, detach_lbl, dstyle, false, eink_mode, &pal);
         hits.push(HitRegion {
             rect: Rect {
                 x,
@@ -1593,11 +1900,11 @@ fn render_top_tabbar(
         } else {
             Style::default()
                 .bg(if space_menu_open {
-                    HERDR_SURFACE1
+                    pal.surface1
                 } else {
-                    Color::Rgb(36, 36, 54)
+                    pal.space_pill_bg
                 })
-                .fg(HERDR_MAUVE)
+                .fg(pal.mauve)
                 .add_modifier(Modifier::BOLD)
         };
         draw_touchbar_pill(
@@ -1608,6 +1915,7 @@ fn render_top_tabbar(
             style,
             eink_mode && space_menu_open,
             eink_mode,
+            &pal,
         );
         if eink_mode
             && eink_color
@@ -1642,7 +1950,7 @@ fn render_top_tabbar(
         let mut div_style = Style::default().bg(bar_bg).fg(if eink_mode {
             EINK_INK_MUTED
         } else {
-            HERDR_OVERLAY0
+            pal.overlay0
         });
         if rect.height == 1 && !eink_mode {
             div_style = div_style
@@ -1685,8 +1993,8 @@ fn render_top_tabbar(
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
-                .bg(HERDR_SURFACE0)
-                .fg(HERDR_ACCENT)
+                .bg(pal.surface0)
+                .fg(pal.accent)
                 .add_modifier(Modifier::BOLD)
         };
 
@@ -1694,7 +2002,7 @@ fn render_top_tabbar(
         if let Some(lb) = plan.left_badge {
             let bw = lb.width() as u16;
             if bw > 0 && x + bw <= tabs_limit_x {
-                draw_touchbar_pill(buf, x, rect, &lb, overflow_style, false, eink_mode);
+                draw_touchbar_pill(buf, x, rect, &lb, overflow_style, false, eink_mode, &pal);
                 hits.push(HitRegion {
                     rect: Rect {
                         x,
@@ -1720,8 +2028,8 @@ fn render_top_tabbar(
             }
             x = next_x;
             let pill_active = is_active && !tab_overview_open;
-            let tstyle = tab_pill_style(st, pill_active, eink_mode);
-            draw_touchbar_pill(buf, x, rect, &lbl, tstyle, pill_active, eink_mode);
+            let tstyle = tab_pill_style(st, pill_active, eink_mode, light_mode);
+            draw_touchbar_pill(buf, x, rect, &lbl, tstyle, pill_active, eink_mode, &pal);
             if eink_mode && eink_color {
                 let prefix = eink_tab_prefix(st, is_active);
                 if !prefix.is_empty() {
@@ -1770,7 +2078,7 @@ fn render_top_tabbar(
             let next_x = x + u16::from(drew_any);
             if bw > 0 && next_x + bw <= tabs_limit_x {
                 x = next_x;
-                draw_touchbar_pill(buf, x, rect, &rb, overflow_style, false, eink_mode);
+                draw_touchbar_pill(buf, x, rect, &rb, overflow_style, false, eink_mode, &pal);
                 hits.push(HitRegion {
                     rect: Rect {
                         x,
@@ -1803,16 +2111,25 @@ fn render_top_tabbar(
                 .add_modifier(Modifier::BOLD)
         } else if tab_overview_open {
             Style::default()
-                .bg(HERDR_ACCENT)
-                .fg(HERDR_PANEL_BG)
+                .bg(pal.accent)
+                .fg(pal.active_tab_fg)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
-                .bg(Color::Rgb(32, 46, 42))
-                .fg(HERDR_GREEN)
+                .bg(pal.new_tab_bg)
+                .fg(pal.green)
                 .add_modifier(Modifier::BOLD)
         };
-        draw_touchbar_pill(buf, x, rect, plus_lbl, pstyle, tab_overview_open, eink_mode);
+        draw_touchbar_pill(
+            buf,
+            x,
+            rect,
+            plus_lbl,
+            pstyle,
+            tab_overview_open,
+            eink_mode,
+            &pal,
+        );
         hits.push(HitRegion {
             rect: Rect {
                 x,
@@ -1835,11 +2152,11 @@ fn render_top_tabbar(
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
-                .bg(Color::Rgb(36, 36, 54))
-                .fg(HERDR_SUBTEXT0)
+                .bg(pal.help_pill_bg)
+                .fg(pal.subtext0)
                 .add_modifier(Modifier::BOLD)
         };
-        draw_touchbar_pill(buf, rx, rect, help_lbl, hstyle, false, eink_mode);
+        draw_touchbar_pill(buf, rx, rect, help_lbl, hstyle, false, eink_mode, &pal);
         hits.push(HitRegion {
             rect: Rect {
                 x: rx,
@@ -1854,23 +2171,33 @@ fn render_top_tabbar(
     space_drawn_bounds
 }
 
-fn quota_remaining_color(remaining_percent: f64) -> Color {
+fn quota_remaining_color(remaining_percent: f64, pal: &ChromePalette) -> Color {
     if remaining_percent <= 15.0 {
-        Color::Rgb(247, 118, 142)
+        pal.quota_low_fg
     } else if remaining_percent <= 40.0 {
-        Color::Rgb(224, 175, 104)
+        pal.quota_mid_fg
     } else {
-        Color::Rgb(115, 218, 146)
+        pal.quota_high_fg
     }
 }
 
-fn agent_badge_colors(agent: AgentKind) -> (Color, Color) {
-    match agent {
-        AgentKind::Codex => (Color::Rgb(24, 52, 74), Color::Rgb(125, 207, 255)),
-        AgentKind::Claude => (Color::Rgb(62, 38, 28), Color::Rgb(245, 169, 127)),
-        AgentKind::OpenCode => (Color::Rgb(28, 54, 44), Color::Rgb(158, 206, 106)),
-        AgentKind::Antigravity => (Color::Rgb(48, 36, 74), Color::Rgb(187, 154, 247)),
-        AgentKind::Freebuff => (Color::Rgb(56, 48, 26), Color::Rgb(224, 175, 104)),
+fn agent_badge_colors(agent: AgentKind, light_mode: bool) -> (Color, Color) {
+    if light_mode {
+        match agent {
+            AgentKind::Codex => (Color::Rgb(208, 228, 248), Color::Rgb(14, 88, 168)),
+            AgentKind::Claude => (Color::Rgb(248, 224, 206), Color::Rgb(164, 72, 20)),
+            AgentKind::OpenCode => (Color::Rgb(212, 238, 216), Color::Rgb(24, 118, 52)),
+            AgentKind::Antigravity => (Color::Rgb(228, 216, 248), Color::Rgb(104, 42, 184)),
+            AgentKind::Freebuff => (Color::Rgb(248, 234, 198), Color::Rgb(150, 88, 10)),
+        }
+    } else {
+        match agent {
+            AgentKind::Codex => (Color::Rgb(24, 52, 74), Color::Rgb(125, 207, 255)),
+            AgentKind::Claude => (Color::Rgb(62, 38, 28), Color::Rgb(245, 169, 127)),
+            AgentKind::OpenCode => (Color::Rgb(28, 54, 44), Color::Rgb(158, 206, 106)),
+            AgentKind::Antigravity => (Color::Rgb(48, 36, 74), Color::Rgb(187, 154, 247)),
+            AgentKind::Freebuff => (Color::Rgb(56, 48, 26), Color::Rgb(224, 175, 104)),
+        }
     }
 }
 
@@ -1926,20 +2253,18 @@ fn render_bottom_status_bar(
     copied_flash: bool,
     eink_mode: bool,
     eink_color: bool,
+    light_mode: bool,
     hits: &mut Vec<HitRegion>,
 ) {
     if rect.width == 0 || rect.height == 0 {
         return;
     }
-    let bar_bg = if eink_mode {
-        EINK_PAPER
-    } else {
-        HERDR_PANEL_BG
-    };
+    let pal = ChromePalette::for_theme(light_mode);
+    let bar_bg = if eink_mode { EINK_PAPER } else { pal.panel_bg };
     let base_style =
         Style::default()
             .bg(bar_bg)
-            .fg(if eink_mode { EINK_INK } else { HERDR_SUBTEXT0 });
+            .fg(if eink_mode { EINK_INK } else { pal.subtext0 });
     f.render_widget(Block::default().style(base_style), rect);
 
     let buf = f.buffer_mut();
@@ -1977,7 +2302,7 @@ fn render_bottom_status_bar(
         let (badge_bg, badge_fg) = if eink_mode {
             (EINK_INK, EINK_PAPER)
         } else {
-            agent_badge_colors(quota.agent)
+            agent_badge_colors(quota.agent, light_mode)
         };
         let badge_lbl = if avail_end.saturating_sub(x) < 22 {
             match quota.agent {
@@ -2016,7 +2341,7 @@ fn render_bottom_status_bar(
                 Style::default().bg(bar_bg).fg(if eink_mode {
                     EINK_INK_MUTED
                 } else {
-                    Color::Rgb(126, 136, 168)
+                    pal.quota_empty_fg
                 }),
             );
         } else if x < avail_end {
@@ -2055,11 +2380,11 @@ fn render_bottom_status_bar(
                 (
                     Style::default()
                         .bg(bar_bg)
-                        .fg(Color::Rgb(192, 202, 245))
+                        .fg(pal.quota_lbl_fg)
                         .add_modifier(Modifier::BOLD),
-                    Style::default().bg(bar_bg).fg(Color::Rgb(56, 64, 94)),
-                    Style::default().bg(bar_bg).fg(Color::Rgb(132, 142, 178)),
-                    Style::default().bg(bar_bg).fg(Color::Rgb(86, 94, 126)),
+                    Style::default().bg(bar_bg).fg(pal.quota_track_fg),
+                    Style::default().bg(bar_bg).fg(pal.quota_detail_fg),
+                    Style::default().bg(bar_bg).fg(pal.quota_sep_fg),
                 )
             };
 
@@ -2102,7 +2427,7 @@ fn render_bottom_status_bar(
                         )
                     }
                 } else {
-                    let u_col = quota_remaining_color(m.remaining_percent);
+                    let u_col = quota_remaining_color(m.remaining_percent, &pal);
                     (
                         Style::default().bg(bar_bg).fg(u_col),
                         Style::default()
@@ -2159,8 +2484,8 @@ fn render_bottom_status_bar(
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
-                        .bg(Color::Rgb(158, 206, 106))
-                        .fg(Color::Rgb(20, 22, 32))
+                        .bg(pal.copied_bg)
+                        .fg(pal.copied_fg)
                         .add_modifier(Modifier::BOLD)
                 },
             );
@@ -2181,8 +2506,8 @@ fn render_bottom_status_bar(
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
-                        .bg(Color::Rgb(125, 207, 255))
-                        .fg(Color::Rgb(20, 22, 32))
+                        .bg(pal.scroll_bg)
+                        .fg(pal.scroll_fg)
                         .add_modifier(Modifier::BOLD)
                 },
             );
@@ -2209,34 +2534,74 @@ fn render_floating_mod_cross(
     ctrl_active: bool,
     alt_active: bool,
     eink_mode: bool,
+    light_mode: bool,
     hits: &mut Vec<HitRegion>,
 ) -> Option<Rect> {
     let disc = resolve_mod_cross_rect(term_rect, mod_pos)?;
     let buf = f.buffer_mut();
 
-    let base_tint = if dragging {
-        (64, 58, 114)
+    let (
+        base_tint,
+        center_tint,
+        active_tint,
+        border_fg,
+        key_fg,
+        mod_fg,
+        active_fg,
+        fallback_bg,
+        fallback_fg,
+    ) = if light_mode {
+        (
+            if dragging {
+                (206, 200, 238)
+            } else {
+                (224, 220, 244)
+            },
+            if dragging {
+                (196, 188, 236)
+            } else {
+                (214, 208, 242)
+            },
+            (250, 214, 140),
+            if dragging {
+                Color::Rgb(92, 56, 180)
+            } else {
+                Color::Rgb(126, 114, 178)
+            },
+            Color::Rgb(36, 40, 62),
+            Color::Rgb(88, 46, 168),
+            Color::Rgb(120, 56, 4),
+            (250, 251, 254),
+            (46, 51, 72),
+        )
     } else {
-        (46, 42, 86)
+        (
+            if dragging {
+                (64, 58, 114)
+            } else {
+                (46, 42, 86)
+            },
+            if dragging {
+                (78, 62, 128)
+            } else {
+                (58, 46, 98)
+            },
+            (214, 162, 84),
+            if dragging {
+                Color::Rgb(187, 154, 247)
+            } else {
+                Color::Rgb(124, 112, 178)
+            },
+            Color::Rgb(230, 238, 255),
+            Color::Rgb(210, 190, 255),
+            Color::Rgb(255, 248, 220),
+            (18, 20, 30),
+            (169, 177, 214),
+        )
     };
     let base_alpha = if dragging { 82 } else { 72 };
-    let center_tint = if dragging {
-        (78, 62, 128)
-    } else {
-        (58, 46, 98)
-    };
     let center_alpha = if dragging { 86 } else { 78 };
-    let active_tint = (214, 162, 84);
     let active_alpha = 88;
-
-    let border_fg = if dragging {
-        Color::Rgb(187, 154, 247)
-    } else {
-        Color::Rgb(124, 112, 178)
-    };
-    let key_fg = Color::Rgb(230, 238, 255);
-    let mod_fg = Color::Rgb(210, 190, 255);
-    let active_fg = Color::Rgb(255, 248, 220);
 
     // 15x7 Compact Cross (+) for Modifier Keys with 4 hollow corners:
     // col: 012345678901234
@@ -2287,7 +2652,7 @@ fn render_floating_mod_cross(
                     (EINK_PAPER, EINK_INK)
                 }
             } else {
-                let base_bg = color_to_rgb(cell.bg, (18, 20, 30));
+                let base_bg = color_to_rgb(cell.bg, fallback_bg);
                 let (tint, alpha) = if sector_active {
                     (active_tint, active_alpha)
                 } else if is_center {
@@ -2371,7 +2736,7 @@ fn render_floating_mod_cross(
                 None
             };
 
-            let base_fg = color_to_rgb(cell.fg, (169, 177, 214));
+            let base_fg = color_to_rgb(cell.fg, fallback_fg);
             let (tint, _) = if sector_active {
                 (active_tint, active_alpha)
             } else if is_center {
@@ -2461,6 +2826,7 @@ fn render_floating_mod_cross(
 fn color_to_rgb(c: Color, default_rgb: (u8, u8, u8)) -> (u8, u8, u8) {
     match c {
         Color::Rgb(r, g, b) => (r, g, b),
+        Color::Indexed(i) => xterm256_rgb(i),
         Color::Black => (20, 22, 32),
         Color::Red => (247, 118, 142),
         Color::Green => (158, 206, 106),
@@ -2496,32 +2862,60 @@ fn render_floating_dpad(
     dpad_pos: Option<(u16, u16)>,
     dragging: bool,
     eink_mode: bool,
+    light_mode: bool,
     hits: &mut Vec<HitRegion>,
 ) -> Option<Rect> {
     let disc = resolve_dpad_disc_rect(term_rect, dpad_pos)?;
     let buf = f.buffer_mut();
 
-    let arrow_tint = if dragging {
-        (58, 76, 124)
-    } else {
-        (42, 56, 94)
-    };
+    let (arrow_tint, center_tint, border_fg, arrow_fg, paste_fg, fallback_bg, fallback_fg) =
+        if light_mode {
+            (
+                if dragging {
+                    (198, 214, 242)
+                } else {
+                    (218, 228, 246)
+                },
+                if dragging {
+                    (186, 228, 220)
+                } else {
+                    (206, 236, 230)
+                },
+                if dragging {
+                    Color::Rgb(30, 102, 245)
+                } else {
+                    Color::Rgb(108, 126, 174)
+                },
+                Color::Rgb(34, 44, 72),
+                Color::Rgb(14, 108, 84),
+                (250, 251, 254),
+                (46, 51, 72),
+            )
+        } else {
+            (
+                if dragging {
+                    (58, 76, 124)
+                } else {
+                    (42, 56, 94)
+                },
+                if dragging {
+                    (48, 106, 122)
+                } else {
+                    (36, 84, 98)
+                },
+                if dragging {
+                    Color::Rgb(125, 207, 255)
+                } else {
+                    Color::Rgb(106, 124, 178)
+                },
+                Color::Rgb(230, 238, 255),
+                Color::Rgb(198, 248, 228),
+                (18, 20, 30),
+                (169, 177, 214),
+            )
+        };
     let arrow_alpha = if dragging { 82 } else { 72 };
-
-    let center_tint = if dragging {
-        (48, 106, 122)
-    } else {
-        (36, 84, 98)
-    };
     let center_alpha = if dragging { 86 } else { 78 };
-
-    let border_fg = if dragging {
-        Color::Rgb(125, 207, 255)
-    } else {
-        Color::Rgb(106, 124, 178)
-    };
-    let arrow_fg = Color::Rgb(230, 238, 255);
-    let paste_fg = Color::Rgb(198, 248, 228);
 
     // 15x7 Compact Cross (+) (or scaled 9/15 x 3/5/7 cross on constrained viewports),
     // with 4 hollow corners (100% transparent, no wasted space):
@@ -2558,8 +2952,8 @@ fn render_floating_dpad(
             let is_center =
                 (arm_w..mid_col_end).contains(&dx) && (arm_h..mid_row_end).contains(&dy);
             let cell = &mut buf[(x, y)];
-            let base_bg = color_to_rgb(cell.bg, (18, 20, 30));
-            let base_fg = color_to_rgb(cell.fg, (169, 177, 214));
+            let base_bg = color_to_rgb(cell.bg, fallback_bg);
+            let base_fg = color_to_rgb(cell.fg, fallback_fg);
             let (tint, alpha) = if is_center {
                 (center_tint, center_alpha)
             } else {
@@ -2978,8 +3372,10 @@ fn render_space_menu_modal(
     world: &World,
     eink_mode: bool,
     eink_color: bool,
+    light_mode: bool,
     hits: &mut Vec<HitRegion>,
 ) {
+    let pal = ChromePalette::for_theme(light_mode);
     hits.clear();
     let space_cnt = world.doc.spaces.len().max(1) as u16;
     let desired_h = (space_cnt * 2 + 5).max(7);
@@ -3007,17 +3403,17 @@ fn render_space_menu_modal(
         .title(" ❖ Spaces ")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(if eink_mode { EINK_INK } else { HERDR_ACCENT }))
+        .border_style(Style::default().fg(if eink_mode { EINK_INK } else { pal.accent }))
         .style(if eink_mode {
             Style::default().bg(EINK_PAPER).fg(EINK_INK)
         } else {
-            Style::default().bg(HERDR_PANEL_BG).fg(HERDR_TEXT)
+            Style::default().bg(pal.space_popup_bg).fg(pal.text)
         });
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
     let buf = f.buffer_mut();
-    draw_modal_close_button(buf, popup, eink_mode, hits);
+    draw_modal_close_button(buf, popup, eink_mode, &pal, hits);
 
     if inner.width == 0 || inner.height == 0 {
         return;
@@ -3081,18 +3477,18 @@ fn render_space_menu_modal(
         } else if is_active {
             (
                 Style::default()
-                    .bg(HERDR_SURFACE0)
-                    .fg(HERDR_TEXT)
+                    .bg(pal.surface0)
+                    .fg(pal.text)
                     .add_modifier(Modifier::BOLD),
-                Style::default().bg(HERDR_SURFACE0).fg(HERDR_SUBTEXT0),
+                Style::default().bg(pal.surface0).fg(pal.subtext0),
             )
         } else {
             (
                 Style::default()
-                    .bg(HERDR_SURFACE_DIM)
-                    .fg(HERDR_SUBTEXT0)
+                    .bg(pal.surface_dim)
+                    .fg(pal.subtext0)
                     .add_modifier(Modifier::BOLD),
-                Style::default().bg(HERDR_SURFACE_DIM).fg(HERDR_OVERLAY1),
+                Style::default().bg(pal.surface_dim).fg(pal.overlay1),
             )
         };
 
@@ -3101,7 +3497,7 @@ fn render_space_menu_modal(
             buf.set_string(inner.x, y + 1, pad_to_width(&row2, w), r2_style);
         }
         if is_active {
-            let accent = if eink_mode { EINK_PAPER } else { HERDR_ACCENT };
+            let accent = if eink_mode { EINK_PAPER } else { pal.accent };
             buf.set_string(inner.x, y, "▍", r1_style.fg(accent));
             if use_two_row {
                 buf.set_string(inner.x, y + 1, "▍", r2_style.fg(accent));
@@ -3117,7 +3513,7 @@ fn render_space_menu_modal(
                     EINK_INK
                 }
             } else {
-                state_color(sstate)
+                state_color_for_theme(sstate, light_mode)
             };
             buf.set_string(
                 inner.x + dot_x,
@@ -3158,8 +3554,8 @@ fn render_space_menu_modal(
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
-                .bg(Color::Rgb(26, 44, 64))
-                .fg(Color::Rgb(125, 207, 255))
+                .bg(pal.space_new_btn_bg)
+                .fg(pal.space_new_btn_fg)
                 .add_modifier(Modifier::BOLD)
         },
     );
@@ -3184,22 +3580,24 @@ fn render_tab_overview_page(
     selected_target: &OverviewSelection,
     eink_mode: bool,
     eink_color: bool,
+    light_mode: bool,
     hits: &mut Vec<HitRegion>,
 ) {
     if term_rect.width == 0 || term_rect.height == 0 {
         return;
     }
 
+    let pal = ChromePalette::for_theme(light_mode);
     let page_bg = if eink_mode {
         EINK_PAPER
     } else {
-        HERDR_SURFACE_DIM
+        pal.surface_dim
     };
-    let page_fg = if eink_mode { EINK_INK } else { HERDR_TEXT };
+    let page_fg = if eink_mode { EINK_INK } else { pal.text };
     let input_bg = if eink_mode {
         EINK_SURFACE
     } else {
-        HERDR_PANEL_BG
+        pal.panel_bg
     };
 
     // Do NOT clear `hits`: Top Bar (`[ ⏏ ]`, `[ ▾ Space ]`, tab pills, `[ + ]`, `[ ? ]`)
@@ -3246,7 +3644,7 @@ fn render_tab_overview_page(
             pad_to_width(&left_hdr, cw),
             Style::default()
                 .bg(page_bg)
-                .fg(if eink_mode { EINK_INK } else { HERDR_MAUVE })
+                .fg(if eink_mode { EINK_INK } else { pal.mauve })
                 .add_modifier(Modifier::BOLD),
         );
         if left_hdr.width() + 2 + right_hdr.width() <= cw {
@@ -3258,7 +3656,7 @@ fn render_tab_overview_page(
                 Style::default().bg(page_bg).fg(if eink_mode {
                     EINK_INK_MUTED
                 } else {
-                    HERDR_OVERLAY0
+                    pal.overlay0
                 }),
             );
         }
@@ -3279,7 +3677,7 @@ fn render_tab_overview_page(
                 &prompt_prefix,
                 Style::default()
                     .bg(input_bg)
-                    .fg(if eink_mode { EINK_INK } else { HERDR_ACCENT })
+                    .fg(if eink_mode { EINK_INK } else { pal.accent })
                     .add_modifier(Modifier::BOLD),
             );
         }
@@ -3291,7 +3689,7 @@ fn render_tab_overview_page(
                     if eink_mode {
                         EINK_INK_MUTED
                     } else {
-                        HERDR_OVERLAY1
+                        pal.overlay1
                     },
                 )
             } else {
@@ -3319,7 +3717,7 @@ fn render_tab_overview_page(
             Style::default().bg(page_bg).fg(if eink_mode {
                 EINK_INK_MUTED
             } else {
-                HERDR_OVERLAY0
+                pal.overlay0
             }),
         );
         (content_y + 3, hint_y)
@@ -3336,9 +3734,9 @@ fn render_tab_overview_page(
                 EINK_INK
             }
         } else if query.is_empty() {
-            HERDR_SUBTEXT0
+            pal.subtext0
         } else {
-            HERDR_TEXT
+            pal.text
         };
         buf.set_string(
             col_x,
@@ -3383,9 +3781,9 @@ fn render_tab_overview_page(
                 EINK_PAPER
             }
         } else if is_sel {
-            HERDR_SURFACE0
+            pal.surface0
         } else {
-            HERDR_SURFACE_DIM
+            pal.surface_dim
         };
         let marker = if is_sel { "▸" } else { " " };
 
@@ -3399,7 +3797,7 @@ fn render_tab_overview_page(
                         EINK_INK
                     }
                 } else {
-                    HERDR_GREEN
+                    pal.green
                 };
                 let r1_style = Style::default()
                     .bg(row_bg)
@@ -3412,9 +3810,9 @@ fn render_tab_overview_page(
                         EINK_INK_MUTED
                     }
                 } else if is_sel {
-                    HERDR_SUBTEXT0
+                    pal.subtext0
                 } else {
-                    HERDR_OVERLAY1
+                    pal.overlay1
                 };
                 let r2_style = Style::default().bg(row_bg).fg(r2_fg);
                 buf.set_string(col_x, y, pad_to_width(&r1_title, cw), r1_style);
@@ -3481,15 +3879,15 @@ fn render_tab_overview_page(
                 } else if is_sel {
                     (
                         Style::default()
-                            .bg(HERDR_SURFACE0)
-                            .fg(HERDR_TEXT)
+                            .bg(pal.surface0)
+                            .fg(pal.text)
                             .add_modifier(Modifier::BOLD),
-                        Style::default().bg(HERDR_SURFACE0).fg(HERDR_SUBTEXT0),
+                        Style::default().bg(pal.surface0).fg(pal.subtext0),
                     )
                 } else {
                     (
-                        Style::default().bg(HERDR_SURFACE_DIM).fg(HERDR_SUBTEXT0),
-                        Style::default().bg(HERDR_SURFACE_DIM).fg(HERDR_OVERLAY1),
+                        Style::default().bg(pal.surface_dim).fg(pal.subtext0),
+                        Style::default().bg(pal.surface_dim).fg(pal.overlay1),
                     )
                 };
                 let st_fg = if eink_mode {
@@ -3501,9 +3899,9 @@ fn render_tab_overview_page(
                         EINK_INK
                     }
                 } else {
-                    state_color(*state)
+                    state_color_for_theme(*state, light_mode)
                 };
-                let accent_fg = if eink_mode { EINK_PAPER } else { HERDR_ACCENT };
+                let accent_fg = if eink_mode { EINK_PAPER } else { pal.accent };
                 buf.set_string(col_x, y, pad_to_width(&r1_text, cw), r1_style);
                 if sym_x + (sym.width() as u16) <= col_w {
                     buf.set_string(
@@ -3573,7 +3971,7 @@ fn render_tab_overview_page(
             Style::default().bg(page_bg).fg(if eink_mode {
                 EINK_INK_MUTED
             } else {
-                HERDR_OVERLAY1
+                pal.overlay1
             }),
         );
     }
@@ -3686,6 +4084,21 @@ fn vt_color_rgb(c: vt100::Color) -> Option<(u8, u8, u8)> {
 
 fn rgb_luma(r: u8, g: u8, b: u8) -> u8 {
     ((299u32 * u32::from(r) + 587u32 * u32::from(g) + 114u32 * u32::from(b)) / 1000) as u8
+}
+
+pub(crate) fn is_rgb_light(r: u8, g: u8, b: u8) -> bool {
+    rgb_luma(r, g, b) >= 128
+}
+
+pub(crate) fn is_ansi_idx_light(idx: u8) -> bool {
+    match idx {
+        7 | 15 => true,
+        0..=6 | 8 => false,
+        _ => {
+            let (r, g, b) = xterm256_rgb(idx);
+            is_rgb_light(r, g, b)
+        }
+    }
 }
 
 fn is_eink_muted_cell(cell: &vt100::Cell) -> bool {
@@ -5368,6 +5781,7 @@ fn draw_modal_close_button(
     buf: &mut Buffer,
     popup: Rect,
     eink_mode: bool,
+    pal: &ChromePalette,
     hits: &mut Vec<HitRegion>,
 ) {
     let close_lbl = " ✕ ";
@@ -5386,8 +5800,8 @@ fn draw_modal_close_button(
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
-                    .bg(Color::Rgb(96, 38, 52))
-                    .fg(Color::White)
+                    .bg(pal.modal_close_bg)
+                    .fg(pal.modal_close_fg)
                     .add_modifier(Modifier::BOLD)
             },
         );
@@ -5408,8 +5822,10 @@ fn render_help_modal(
     area: Rect,
     eink_mode: bool,
     eink_color: bool,
+    light_mode: bool,
     hits: &mut Vec<HitRegion>,
 ) {
+    let pal = ChromePalette::for_theme(light_mode);
     hits.clear();
     let popup = centered_rect(74, 34, area);
     f.render_widget(Clear, popup);
@@ -5426,12 +5842,12 @@ fn render_help_modal(
         .border_style(Style::default().fg(if eink_mode {
             EINK_INK
         } else {
-            Color::Rgb(122, 162, 247)
+            pal.help_border_fg
         }))
         .style(if eink_mode {
             Style::default().bg(EINK_PAPER).fg(EINK_INK)
         } else {
-            Style::default().bg(Color::Rgb(20, 22, 34)).fg(Color::White)
+            Style::default().bg(pal.modal_bg).fg(pal.modal_fg)
         });
     if usize::from(popup.width) > version_badge.width() + 2 {
         block = block.title_bottom(
@@ -5440,7 +5856,7 @@ fn render_help_modal(
                 Style::default().fg(if eink_mode {
                     EINK_INK_MUTED
                 } else {
-                    Color::Rgb(147, 153, 178)
+                    pal.help_version_fg
                 }),
             ))
             .right_aligned(),
@@ -5448,9 +5864,14 @@ fn render_help_modal(
     }
     let inner = block.inner(popup);
 
-    // Reflow the 18 touch quick-action buttons across available inner width so narrow mobile
+    // Reflow the 19 touch quick-action buttons across available inner width so narrow mobile
     // viewports wrap buttons onto additional rows instead of dropping right-hand columns.
     let compact_btns = inner.width < 58;
+    let (light_wide, light_short) = if light_mode && !eink_mode {
+        ("  ☼ Light: ON   ", " ☼L:ON ")
+    } else {
+        ("  ☼ Light: OFF  ", " ☼L:OF ")
+    };
     let (eink_wide, eink_short) = if eink_mode {
         ("  ◐ E-Ink: ON   ", " ◐E:ON ")
     } else {
@@ -5461,7 +5882,7 @@ fn render_help_modal(
     } else {
         ("  ◈ Kaleido: OFF", " ◈K:OF ")
     };
-    let quick_actions: [(&str, &str, HitTarget); 18] = [
+    let quick_actions: [(&str, &str, HitTarget); 19] = [
         (
             "  + New Tab     ",
             " +Tab ",
@@ -5523,6 +5944,11 @@ fn render_help_modal(
             HitTarget::TriggerAction(Action::ToggleSidebar),
         ),
         (
+            light_wide,
+            light_short,
+            HitTarget::TriggerAction(Action::ToggleTheme),
+        ),
+        (
             eink_wide,
             eink_short,
             HitTarget::TriggerAction(Action::ToggleEink),
@@ -5573,7 +5999,7 @@ fn render_help_modal(
             .fg(if eink_mode {
                 EINK_INK
             } else {
-                Color::LightCyan
+                pal.help_heading1_fg
             })
             .add_modifier(Modifier::BOLD),
     ))];
@@ -5584,7 +6010,11 @@ fn render_help_modal(
         Line::from(Span::styled(
             "  Keyboard & Touch Shortcuts:",
             Style::default()
-                .fg(if eink_mode { EINK_INK } else { Color::Cyan })
+                .fg(if eink_mode {
+                    EINK_INK
+                } else {
+                    pal.help_heading2_fg
+                })
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from("  Top Bar [ ⏏ ]            Detach hct (keep sessions running) (^b q)"),
@@ -5604,7 +6034,7 @@ fn render_help_modal(
         Line::from("  Jump Next Alert Agent    ^b a          (◉ blocked / ✓ done)"),
         Line::from("  Scrollback / History     ^b [          or  Tap [▼ BOT] on status bar"),
         Line::from("  Page Up / Down           ^b PgUp / PgDn / Shift+PgUp (or in [ ? ])"),
-        Line::from("  E-Ink / Clean Redraw     ^b e (E-Ink)  /   ^b r (clean redraw)"),
+        Line::from("  Light / E-Ink / Redraw   ^b t (Light) / ^b e (E-Ink) / ^b r (redraw)"),
         Line::from("  Kaleido Color Accent     ^b E (95% mono + 5% overprint accents)"),
         Line::from("  Book Reader (ShellDeck)  ^b v / ^b B   or  Tap [ 📖 Book View ]"),
         Line::from("  Detach (keep running)    ^b q / ^b d   or  Ctrl+\\ / Tap [ ⏏ ]"),
@@ -5614,14 +6044,14 @@ fn render_help_modal(
             Style::default().fg(if eink_mode {
                 EINK_INK_MUTED
             } else {
-                Color::DarkGray
+                pal.help_hint_fg
             }),
         )),
     ]);
     f.render_widget(Paragraph::new(lines).block(block), popup);
 
     let buf = f.buffer_mut();
-    draw_modal_close_button(buf, popup, eink_mode, hits);
+    draw_modal_close_button(buf, popup, eink_mode, &pal, hits);
 
     for (rel_x, rel_row, lbl, target) in placed_btns {
         let by = inner.y + 1 + rel_row;
@@ -5648,10 +6078,15 @@ fn render_help_modal(
                     .fg(EINK_INK)
                     .add_modifier(Modifier::BOLD)
             }
+        } else if light_mode && matches!(target, HitTarget::TriggerAction(Action::ToggleTheme)) {
+            Style::default()
+                .bg(pal.accent)
+                .fg(pal.active_tab_fg)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
-                .bg(Color::Rgb(42, 52, 82))
-                .fg(Color::White)
+                .bg(pal.help_btn_bg)
+                .fg(pal.help_btn_fg)
                 .add_modifier(Modifier::BOLD)
         };
         buf.set_string(bx, by, lbl, bstyle);
@@ -5673,8 +6108,10 @@ fn render_confirm_close_modal(
     tab_id: &str,
     tab_title: &str,
     eink_mode: bool,
+    light_mode: bool,
     hits: &mut Vec<HitRegion>,
 ) {
+    let pal = ChromePalette::for_theme(light_mode);
     hits.clear();
     let popup = centered_rect(56, 8, area);
     f.render_widget(Clear, popup);
@@ -5693,17 +6130,21 @@ fn render_confirm_close_modal(
         .title(" Close Tab ")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(if eink_mode { EINK_INK } else { Color::LightRed }))
+        .border_style(Style::default().fg(if eink_mode {
+            EINK_INK
+        } else {
+            pal.confirm_border_fg
+        }))
         .style(if eink_mode {
             Style::default().bg(EINK_PAPER).fg(EINK_INK)
         } else {
-            Style::default().bg(Color::Rgb(28, 20, 28)).fg(Color::White)
+            Style::default().bg(pal.confirm_modal_bg).fg(pal.modal_fg)
         });
     let inner = block.inner(popup);
     f.render_widget(Paragraph::new(lines).block(block), popup);
 
     let buf = f.buffer_mut();
-    draw_modal_close_button(buf, popup, eink_mode, hits);
+    draw_modal_close_button(buf, popup, eink_mode, &pal, hits);
 
     if inner.height >= 4 {
         let by = inner.y + 3;
@@ -5724,8 +6165,8 @@ fn render_confirm_close_modal(
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
-                        .bg(Color::Rgb(110, 36, 44))
-                        .fg(Color::White)
+                        .bg(pal.confirm_yes_bg)
+                        .fg(pal.confirm_yes_fg)
                         .add_modifier(Modifier::BOLD)
                 },
             );
@@ -5754,8 +6195,8 @@ fn render_confirm_close_modal(
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
-                        .bg(Color::Rgb(48, 52, 72))
-                        .fg(Color::White)
+                        .bg(pal.modal_cancel_bg)
+                        .fg(pal.modal_cancel_fg)
                         .add_modifier(Modifier::BOLD)
                 },
             );
@@ -5778,8 +6219,10 @@ fn render_prompt_modal(
     kind: &PromptKind,
     input: &str,
     eink_mode: bool,
+    light_mode: bool,
     hits: &mut Vec<HitRegion>,
 ) {
+    let pal = ChromePalette::for_theme(light_mode);
     hits.clear();
     let popup = centered_rect(56, 8, area);
     f.render_widget(Clear, popup);
@@ -5801,18 +6244,18 @@ fn render_prompt_modal(
         .border_style(Style::default().fg(if eink_mode {
             EINK_INK
         } else {
-            Color::Rgb(122, 162, 247)
+            pal.help_border_fg
         }))
         .style(if eink_mode {
             Style::default().bg(EINK_PAPER).fg(EINK_INK)
         } else {
-            Style::default().bg(Color::Rgb(20, 22, 34)).fg(Color::White)
+            Style::default().bg(pal.modal_bg).fg(pal.modal_fg)
         });
     let inner = block.inner(popup);
     f.render_widget(Paragraph::new(lines).block(block), popup);
 
     let buf = f.buffer_mut();
-    draw_modal_close_button(buf, popup, eink_mode, hits);
+    draw_modal_close_button(buf, popup, eink_mode, &pal, hits);
 
     if inner.height >= 4 {
         let by = inner.y + 3;
@@ -5833,8 +6276,8 @@ fn render_prompt_modal(
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
-                        .bg(Color::Rgb(36, 82, 58))
-                        .fg(Color::White)
+                        .bg(pal.prompt_ok_bg)
+                        .fg(pal.prompt_ok_fg)
                         .add_modifier(Modifier::BOLD)
                 },
             );
@@ -5861,8 +6304,8 @@ fn render_prompt_modal(
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
-                        .bg(Color::Rgb(48, 52, 72))
-                        .fg(Color::White)
+                        .bg(pal.modal_cancel_bg)
+                        .fg(pal.modal_cancel_fg)
                         .add_modifier(Modifier::BOLD)
                 },
             );
@@ -5889,8 +6332,10 @@ fn render_fuzzy_modal(
     selected_tab_id: Option<&str>,
     eink_mode: bool,
     eink_color: bool,
+    light_mode: bool,
     hits: &mut Vec<HitRegion>,
 ) {
+    let pal = ChromePalette::for_theme(light_mode);
     hits.clear();
     let popup = centered_rect(72, 18, area);
     f.render_widget(Clear, popup);
@@ -5906,12 +6351,12 @@ fn render_fuzzy_modal(
         .border_style(Style::default().fg(if eink_mode {
             EINK_INK
         } else {
-            Color::Rgb(122, 162, 247)
+            pal.help_border_fg
         }))
         .style(if eink_mode {
             Style::default().bg(EINK_PAPER).fg(EINK_INK)
         } else {
-            Style::default().bg(Color::Rgb(20, 22, 34)).fg(Color::White)
+            Style::default().bg(pal.modal_bg).fg(pal.modal_fg)
         });
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -5928,7 +6373,7 @@ fn render_fuzzy_modal(
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
-            .fg(Color::LightCyan)
+            .fg(pal.fuzzy_prompt_fg)
             .add_modifier(Modifier::BOLD)
     });
     f.render_widget(prompt, chunks[0]);
@@ -5973,14 +6418,14 @@ fn render_fuzzy_modal(
                 ]);
                 ListItem::new(line).style(row_style)
             } else {
-                let st_col = state_color(it.state);
+                let st_col = state_color_for_theme(it.state, light_mode);
                 let style = if is_sel {
                     Style::default()
-                        .bg(Color::Rgb(65, 75, 120))
-                        .fg(Color::White)
+                        .bg(pal.fuzzy_sel_bg)
+                        .fg(pal.fuzzy_sel_fg)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::Gray)
+                    Style::default().fg(pal.fuzzy_row_fg)
                 };
                 let line = Line::from(vec![
                     Span::styled(if is_sel { " ▸ " } else { "   " }, style),
@@ -5988,11 +6433,14 @@ fn render_fuzzy_modal(
                         format!("{} ", it.state.symbol()),
                         style.fg(st_col).add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(format!("[{}] ", it.space_name), style.fg(Color::Cyan)),
+                    Span::styled(
+                        format!("[{}] ", it.space_name),
+                        style.fg(pal.fuzzy_space_fg),
+                    ),
                     Span::styled(format!("{} ", it.tab_name), style),
                     Span::styled(
                         format!("({}) {}", it.term_addr, it.cwd),
-                        style.fg(Color::DarkGray),
+                        style.fg(pal.fuzzy_meta_fg),
                     ),
                 ]);
                 ListItem::new(line)
@@ -6007,7 +6455,7 @@ fn render_fuzzy_modal(
     f.render_stateful_widget(List::new(list_items), chunks[1], &mut list_state);
 
     let buf = f.buffer_mut();
-    draw_modal_close_button(buf, popup, eink_mode, hits);
+    draw_modal_close_button(buf, popup, eink_mode, &pal, hits);
 
     // Register touch hit regions for each visible row in the Fuzzy list
     let offset = list_state.offset();
@@ -9238,5 +9686,401 @@ mod tests {
             .as_array()
             .unwrap();
         assert_eq!(body_runs[0][1], 0);
+    }
+
+    #[test]
+    fn light_theme_renders_top_tabbar_bottom_quota_and_preserves_vt_colors() {
+        let mut world = World::default();
+        world.doc.spaces.push(SharedSpace {
+            id: "space-1".to_string(),
+            name: "main".to_string(),
+            folder: "/tmp/work".to_string(),
+            tabs: vec![
+                SharedTab {
+                    id: "tab-blk".to_string(),
+                    name: "blk".to_string(),
+                    root: serde_json::json!({"content": {"terminal": "t-blk"}}),
+                    ..Default::default()
+                },
+                SharedTab {
+                    id: "tab-wrk".to_string(),
+                    name: "wrk".to_string(),
+                    root: serde_json::json!({"content": {"terminal": "t-wrk"}}),
+                    ..Default::default()
+                },
+                SharedTab {
+                    id: "tab-don".to_string(),
+                    name: "don".to_string(),
+                    root: serde_json::json!({"content": {"terminal": "t-don"}}),
+                    ..Default::default()
+                },
+                SharedTab {
+                    id: "tab-idl".to_string(),
+                    name: "idl".to_string(),
+                    root: serde_json::json!({"content": {"terminal": "t-idl"}}),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        world.terminals.insert(
+            "t-blk".to_string(),
+            TerminalInfo {
+                address: "t-blk".to_string(),
+                status_word: Some("blocked".to_string()),
+                ..Default::default()
+            },
+        );
+        world.terminals.insert(
+            "t-wrk".to_string(),
+            TerminalInfo {
+                address: "t-wrk".to_string(),
+                status_word: Some("working".to_string()),
+                ..Default::default()
+            },
+        );
+        world.terminals.insert(
+            "t-don".to_string(),
+            TerminalInfo {
+                address: "t-don".to_string(),
+                status_word: Some("idle".to_string()),
+                turn: 3,
+                seen_turn: Some(1),
+                ..Default::default()
+            },
+        );
+        world.terminals.insert(
+            "t-idl".to_string(),
+            TerminalInfo {
+                address: "t-idl".to_string(),
+                status_word: Some("idle".to_string()),
+                turn: 2,
+                seen_turn: Some(2),
+                ..Default::default()
+            },
+        );
+        world.select_tab_index(3);
+
+        let quota = AgentQuota {
+            agent: AgentKind::Codex,
+            metrics: vec![
+                QuotaMetric {
+                    window_label: "5h".to_string(),
+                    remaining_percent: 82.0,
+                    detail: Some("3h10m".to_string()),
+                },
+                QuotaMetric {
+                    window_label: "7d".to_string(),
+                    remaining_percent: 12.0,
+                    detail: Some("4d05h".to_string()),
+                },
+            ],
+        };
+
+        let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
+        let mut parser = vt100::Parser::new(nz(22), nz(100), 0);
+        parser.process(b"\x1b[38;2;200;40;60mRedRGB\x1b[0m \x1b[32mAnsiGreen\x1b[0m plain");
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let mut hits = Vec::new();
+        terminal
+            .draw(|f| {
+                let geom = render_ui_with_theme(
+                    f,
+                    &world,
+                    Some(parser.screen()),
+                    false,
+                    24,
+                    false,
+                    false,
+                    false,
+                    false,
+                    5,
+                    None,
+                    true,
+                    &Modal::None,
+                    None,
+                    false,
+                    None,
+                    false,
+                    Some(&quota),
+                    false,
+                    false,
+                    true,
+                );
+                hits = geom.hits;
+            })
+            .unwrap();
+
+        let pal = ChromePalette::light();
+        let buf = terminal.backend().buffer();
+
+        // Top bar background uses light panel_bg, never dark HERDR_PANEL_BG, and all top-bar bg cells are light
+        assert_ne!(buf[(0, 0)].bg, HERDR_PANEL_BG);
+        for x in 0..100u16 {
+            if let Color::Rgb(r, g, b) = buf[(x, 0)].bg {
+                assert!(
+                    is_rgb_light(r, g, b) || buf[(x, 0)].bg == pal.accent,
+                    "top bar cell {x} bg ({r},{g},{b}) should be light or active accent"
+                );
+            }
+        }
+        // Divider cell uses light panel_bg
+        let div_x = (0..100u16)
+            .find(|&x| buf[(x, 0)].symbol() == "╱")
+            .expect("slash divider missing");
+        assert_eq!(buf[(div_x, 0)].bg, pal.panel_bg);
+
+        // Active tab pill uses vivid light-mode accent + white bold text + active underline
+        let active_hit = hits
+            .iter()
+            .find(
+                |h| matches!(&h.target, HitTarget::SelectTab { tab_id, .. } if tab_id == "tab-idl"),
+            )
+            .unwrap();
+        assert_eq!(buf[(active_hit.rect.x + 1, 0)].bg, pal.accent);
+        assert_eq!(buf[(active_hit.rect.x + 1, 0)].fg, pal.active_tab_fg);
+        assert_eq!(
+            buf[(active_hit.rect.x + 1, 0)].underline_color,
+            pal.underline_active
+        );
+
+        // Blocked / Working / Done / Idle pills use light backgrounds and readable dark foregrounds
+        let blk_hit = hits
+            .iter()
+            .find(
+                |h| matches!(&h.target, HitTarget::SelectTab { tab_id, .. } if tab_id == "tab-blk"),
+            )
+            .unwrap();
+        assert_eq!(buf[(blk_hit.rect.x + 1, 0)].bg, pal.tab_blocked_bg);
+        assert_eq!(buf[(blk_hit.rect.x + 1, 0)].fg, pal.red);
+
+        let wrk_hit = hits
+            .iter()
+            .find(
+                |h| matches!(&h.target, HitTarget::SelectTab { tab_id, .. } if tab_id == "tab-wrk"),
+            )
+            .unwrap();
+        assert_eq!(buf[(wrk_hit.rect.x + 1, 0)].bg, pal.tab_working_bg);
+        assert_eq!(buf[(wrk_hit.rect.x + 1, 0)].fg, pal.tab_working_fg);
+
+        let don_hit = hits
+            .iter()
+            .find(
+                |h| matches!(&h.target, HitTarget::SelectTab { tab_id, .. } if tab_id == "tab-don"),
+            )
+            .unwrap();
+        assert_eq!(buf[(don_hit.rect.x + 1, 0)].bg, pal.tab_done_bg);
+        assert_eq!(buf[(don_hit.rect.x + 1, 0)].fg, pal.teal);
+
+        // Bottom quota status bar uses light panel_bg, light empty track, and colored usage fills
+        let bot_line: String = (0..100).map(|x| buf[(x, 23)].symbol()).collect();
+        assert!(bot_line.contains("Codex"));
+        assert!(bot_line.contains("82%"));
+        assert!(bot_line.contains("12%"));
+        assert!(bot_line.contains("✓ Copied"));
+        assert!(bot_line.contains("▼ BOT (+5)"));
+        let track_x = (0..100u16)
+            .find(|&x| buf[(x, 23)].symbol() == "░")
+            .expect("progress bar empty track missing");
+        assert_eq!(buf[(track_x, 23)].bg, pal.panel_bg);
+        assert_eq!(buf[(track_x, 23)].fg, pal.quota_track_fg);
+
+        // Viewport preserves native VT RGB / ANSI / Reset colors without E-Ink monochrome filtering
+        assert_eq!(buf[(0, 1)].symbol(), "R");
+        assert_eq!(buf[(0, 1)].fg, Color::Rgb(200, 40, 60));
+        assert_eq!(buf[(0, 1)].bg, Color::Reset);
+        assert_eq!(buf[(7, 1)].symbol(), "A");
+        assert_eq!(buf[(7, 1)].fg, Color::Indexed(2));
+        assert_eq!(buf[(17, 1)].symbol(), "p");
+        assert_eq!(buf[(17, 1)].fg, Color::Reset);
+    }
+
+    #[test]
+    fn light_theme_renders_all_modals_and_touch_crosses_with_light_surfaces() {
+        let world = sample_world();
+        let pal = ChromePalette::light();
+
+        // 1. Floating `--touch` crosses in light mode use light frosted tints & dark legible labels
+        let mut touch_term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        touch_term
+            .draw(|f| {
+                let geom = render_ui_with_theme(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    true,
+                    true,
+                    false,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::None,
+                    None,
+                    false,
+                    None,
+                    false,
+                    None,
+                    false,
+                    false,
+                    true,
+                );
+                let mr = geom.mod_rect.expect("mod cross rect expected");
+                let dr = geom.dpad_rect.expect("dpad cross rect expected");
+                let buf = f.buffer_mut();
+                if let Color::Rgb(r, g, b) = buf[(mr.x + 7, mr.y + 3)].bg {
+                    assert!(is_rgb_light(r, g, b), "mod cross bg should be light");
+                } else {
+                    panic!("expected RGB background on mod cross");
+                }
+                if let Color::Rgb(r, g, b) = buf[(dr.x + 7, dr.y + 3)].bg {
+                    assert!(is_rgb_light(r, g, b), "dpad cross bg should be light");
+                } else {
+                    panic!("expected RGB background on dpad cross");
+                }
+            })
+            .unwrap();
+
+        // 2. Modal::Help renders light surface, `[ ☼ Light: ON ]` / `[ ☼ Light: OFF ]`, ToggleTheme hit,
+        //    and keeps all shortcut lines including the bottom close hint inside 80x36 without clipping
+        let mut help_term = Terminal::new(TestBackend::new(80, 36)).unwrap();
+        let mut help_hits = Vec::new();
+        help_term
+            .draw(|f| {
+                let geom = render_ui_with_theme(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::Help,
+                    None,
+                    false,
+                    None,
+                    false,
+                    None,
+                    false,
+                    false,
+                    true,
+                );
+                help_hits = geom.hits;
+            })
+            .unwrap();
+        assert!(help_hits
+            .iter()
+            .any(|h| h.target == HitTarget::TriggerAction(Action::ToggleTheme)));
+        let hbuf = help_term.backend().buffer();
+        assert_eq!(hbuf[(40, 18)].bg, pal.modal_bg);
+        let help_text: String = (0..36)
+            .map(|y| {
+                let mut line = String::new();
+                let mut x = 0u16;
+                while x < 80 {
+                    let sym = hbuf[(x, y)].symbol();
+                    line.push_str(sym);
+                    x += sym.width().max(1) as u16;
+                }
+                line
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(help_text.contains("☼ Light: ON"));
+        assert!(help_text.contains("^b t (Light)"));
+        assert!(help_text.contains("Tap outside, [ ✕ ], Esc, Enter, or ? to close"));
+
+        // Help in dark mode renders `☼ Light: OFF`
+        help_term
+            .draw(|f| {
+                let _ = render_ui_with_theme(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::Help,
+                    None,
+                    false,
+                    None,
+                    false,
+                    None,
+                    false,
+                    false,
+                    false,
+                );
+            })
+            .unwrap();
+        let hbuf_dark = help_term.backend().buffer();
+        let help_dark_text: String = (0..36)
+            .map(|y| {
+                (0..80)
+                    .map(|x| hbuf_dark[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(help_dark_text.contains("☼ Light: OFF"));
+
+        // 3. SpaceMenu, TabOverview, ConfirmCloseTab, Prompt, and Fuzzy all paint light surfaces in light_mode
+        let modals = [
+            Modal::SpaceMenu,
+            Modal::default_tab_overview(),
+            Modal::ConfirmCloseTab {
+                tab_id: "tab-1".to_string(),
+                tab_title: "agent".to_string(),
+            },
+            Modal::Prompt {
+                kind: PromptKind::NewSpace,
+                input: "demo".to_string(),
+            },
+            Modal::Fuzzy {
+                query: String::new(),
+                selected: 0,
+                selected_tab_id: None,
+            },
+        ];
+        let mut modal_term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        for modal in &modals {
+            modal_term
+                .draw(|f| {
+                    let _ = render_ui_with_theme(
+                        f, &world, None, false, 24, false, false, false, false, 0, None, false,
+                        modal, None, false, None, false, None, false, false, true,
+                    );
+                })
+                .unwrap();
+            let mbuf = modal_term.backend().buffer();
+            let probe = match modal {
+                Modal::SpaceMenu => (5, 3),
+                _ => (40, 12),
+            };
+            if let Color::Rgb(r, g, b) = mbuf[probe].bg {
+                assert!(
+                    is_rgb_light(r, g, b),
+                    "modal {modal:?} probe bg ({r},{g},{b}) must be light"
+                );
+            } else {
+                panic!(
+                    "modal {modal:?} probe cell had non-RGB bg {:?}",
+                    mbuf[probe].bg
+                );
+            }
+        }
     }
 }
