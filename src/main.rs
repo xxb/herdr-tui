@@ -2273,9 +2273,9 @@ fn match_eink_page_touch_zone(
     row: u16,
 ) -> Option<Action> {
     if is_in_rect(left_zone, col, row) {
-        Some(Action::PageUp)
+        Some(Action::PrevTab)
     } else if is_in_rect(right_zone, col, row) {
-        Some(Action::PageDown)
+        Some(Action::NextTab)
     } else {
         None
     }
@@ -8267,28 +8267,94 @@ mod tests {
         // Expanded touch zones hit across 8 cols x 8 rows while leaving middle viewport clear
         assert_eq!(
             match_eink_page_touch_zone(left_zone, right_zone, 0, 10),
-            Some(Action::PageUp)
+            Some(Action::PrevTab)
         );
         assert_eq!(
             match_eink_page_touch_zone(left_zone, right_zone, 7, 14),
-            Some(Action::PageUp)
+            Some(Action::PrevTab)
         );
         assert_eq!(
             match_eink_page_touch_zone(left_zone, right_zone, 92, 7),
-            Some(Action::PageDown)
+            Some(Action::NextTab)
         );
         assert_eq!(
             match_eink_page_touch_zone(left_zone, right_zone, 99, 14),
-            Some(Action::PageDown)
+            Some(Action::NextTab)
         );
         assert_eq!(
             match_eink_page_touch_zone(left_zone, right_zone, 20, 10),
             None
         );
 
+        // Edge taps switch active tabs PrevTab / NextTab cleanly across a multi-tab Space
+        let core = CoreClient::dummy_for_tests();
+        let mut world = World::default();
+        world.doc.spaces = vec![crate::model::SharedSpace {
+            id: "sp1".to_string(),
+            name: "work".to_string(),
+            folder: String::new(),
+            tabs: vec![
+                crate::model::make_single_terminal_tab("t1", "tab1", "term1"),
+                crate::model::make_single_terminal_tab("t2", "tab2", "term2"),
+                crate::model::make_single_terminal_tab("t3", "tab3", "term3"),
+            ],
+            rest: serde_json::Map::new(),
+        }];
+        world
+            .active_tab_by_space
+            .insert("sp1".to_string(), "t2".to_string());
+        let mut sidebar_open = false;
+        let mut scrollback_offset = 0usize;
+        let mut modal = Modal::None;
+        let mut eink_mode = true;
+        let mut eink_color = false;
+        let mut force_clear = false;
+        let mut pending_eink_osc = false;
+        let term_rect = Rect::new(0, 1, 100, 22);
+
+        let left_act = match_eink_page_touch_zone(left_zone, right_zone, 0, 10).unwrap();
+        execute_action_full(
+            left_act,
+            &core,
+            &mut world,
+            None,
+            "ctrl+b",
+            &mut sidebar_open,
+            &mut scrollback_offset,
+            &mut modal,
+            term_rect,
+            &mut eink_mode,
+            &mut eink_color,
+            &mut force_clear,
+            &mut pending_eink_osc,
+            None,
+        )
+        .unwrap();
+        assert_eq!(world.active_tab_index(), 0);
+
+        let right_act = match_eink_page_touch_zone(left_zone, right_zone, 99, 10).unwrap();
+        execute_action_full(
+            right_act,
+            &core,
+            &mut world,
+            None,
+            "ctrl+b",
+            &mut sidebar_open,
+            &mut scrollback_offset,
+            &mut modal,
+            term_rect,
+            &mut eink_mode,
+            &mut eink_color,
+            &mut force_clear,
+            &mut pending_eink_osc,
+            None,
+        )
+        .unwrap();
+        assert_eq!(world.active_tab_index(), 1);
+
         // Tap slop absorbs ±1 col / ±1 row thumb jitter and promotes >= 2 cell drags
         let tap = PendingPageTurnTap {
-            action: Action::PageUp,
+            action: Action::PrevTab,
             start_col: 4,
             start_row: 10,
         };
@@ -8298,12 +8364,11 @@ mod tests {
         assert!(!page_tap_within_slop(&tap, 6, 10));
         assert!(!page_tap_within_slop(&tap, 4, 12));
 
-        // Dragging out from col 0 inside the page zone hands off to TerminalSelection at col 0
-        let term_rect = Rect::new(0, 1, 100, 22);
+        // Dragging out from col 0 inside the edge zone hands off to TerminalSelection at col 0
         let mut att = AttachedTerminal::new(1, term_rect.width, term_rect.height);
         att.process_vt_bytes(b"\x1b[10;1HSeeThrough line");
         let start_tap = PendingPageTurnTap {
-            action: Action::PageUp,
+            action: Action::PrevTab,
             start_col: 0,
             start_row: 10,
         };
