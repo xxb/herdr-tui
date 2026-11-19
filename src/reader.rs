@@ -1,6 +1,6 @@
 //! Unified lightweight reader extraction, viewport wrapping, and ShellDeck JSON export.
 
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Maximum terminal rows (scrollback + live) scanned in Agent Clean mode.
 pub const AGENT_MAX_SCAN_ROWS: usize = 600;
@@ -534,16 +534,15 @@ fn is_explicit_trailing_chrome(line: &ProcessedLine, text: &str) -> bool {
     if is_empty_agent_prompt_text(trimmed) {
         return true;
     }
-    let lower = trimmed.to_ascii_lowercase();
-    let is_input_placeholder = trimmed.chars().count() <= 120
-        && (lower.contains("type a message")
-            || lower.contains("send a message")
-            || lower.contains("ask anything")
-            || lower.contains("enter a message"));
-    if is_input_placeholder {
-        return true;
+    if trimmed.chars().count() > 120 {
+        return false;
     }
-    if lower.contains("? for shortcuts")
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("type a message")
+        || lower.contains("send a message")
+        || lower.contains("ask anything")
+        || lower.contains("enter a message")
+        || lower.contains("? for shortcuts")
         || lower.contains("shift+tab")
         || lower.contains("ctrl+c to exit")
         || lower.contains("ctrl+d to exit")
@@ -950,7 +949,7 @@ fn is_shell_prompt_line(text: &str) -> bool {
             return !after.trim().is_empty();
         }
     }
-    for marker in ["$ ", "❯ ", "% ", "➜ "] {
+    for marker in ["$ ", "❯ "] {
         if let Some(pos) = rest.find(marker) {
             let prefix = &rest[..pos];
             let after = &rest[pos + marker.len()..];
@@ -1090,21 +1089,70 @@ pub fn extract_reader_doc(
     }
 }
 
-fn char_display_width(ch: char) -> usize {
-    UnicodeWidthChar::width(ch).unwrap_or(0)
+struct WrapCluster {
+    text: String,
+    style: ReaderRunStyle,
+    width: usize,
+    is_ascii_ws: bool,
 }
 
-fn emit_atom_slice(
-    atoms: &[(char, ReaderRunStyle, usize)],
+fn is_regional_indicator(ch: char) -> bool {
+    ('\u{1F1E6}'..='\u{1F1FF}').contains(&ch)
+}
+
+fn is_cluster_continuation(ch: char) -> bool {
+    matches!(ch, '\u{FE00}'..='\u{FE0F}' | '\u{20E3}' | '\u{1F3FB}'..='\u{1F3FF}' | '\u{E0020}'..='\u{E007F}' | '\u{E0100}'..='\u{E01EF}')
+        || (!ch.is_control() && ch != '\u{200D}' && UnicodeWidthChar::width(ch).unwrap_or(0) == 0)
+}
+
+fn push_text_clusters(text: &str, style: ReaderRunStyle, atoms: &mut Vec<WrapCluster>) {
+    let mut chars = text.chars().peekable();
+    while let Some(first) = chars.next() {
+        let mut cluster = String::new();
+        cluster.push(first);
+
+        if is_regional_indicator(first) && chars.peek().is_some_and(|&c| is_regional_indicator(c)) {
+            if let Some(second) = chars.next() {
+                cluster.push(second);
+            }
+        }
+
+        while let Some(&next) = chars.peek() {
+            if next == '\u{200D}' {
+                cluster.push(chars.next().unwrap());
+                if let Some(&joined) = chars.peek() {
+                    if !joined.is_control() {
+                        cluster.push(chars.next().unwrap());
+                    }
+                }
+            } else if is_cluster_continuation(next) {
+                cluster.push(chars.next().unwrap());
+            } else {
+                break;
+            }
+        }
+
+        let is_ascii_ws = cluster.len() == 1 && cluster.as_bytes()[0].is_ascii_whitespace();
+        let width = UnicodeWidthStr::width(cluster.as_str());
+        atoms.push(WrapCluster {
+            text: cluster,
+            style,
+            width,
+            is_ascii_ws,
+        });
+    }
+}
+
+fn emit_cluster_slice(
+    atoms: &[WrapCluster],
     prefix: Option<(&str, ReaderRunStyle)>,
 ) -> ReaderLineKind {
     let mut runs: Vec<(String, ReaderRunStyle)> = Vec::new();
     if let Some((pfx, pfx_style)) = prefix {
         push_run(&mut runs, pfx, pfx_style);
     }
-    for &(ch, style, _) in atoms {
-        let mut buf = [0u8; 4];
-        push_run(&mut runs, ch.encode_utf8(&mut buf), style);
+    for atom in atoms {
+        push_run(&mut runs, &atom.text, atom.style);
     }
     ReaderLineKind::Text(runs)
 }
@@ -1124,15 +1172,13 @@ fn wrap_styled_runs(
             (None, content_width)
         };
 
-    let mut atoms: Vec<(char, ReaderRunStyle, usize)> = Vec::new();
+    let mut atoms: Vec<WrapCluster> = Vec::new();
     for (text, style) in runs {
-        for ch in text.chars() {
-            atoms.push((ch, *style, char_display_width(ch)));
-        }
+        push_text_clusters(text, *style, &mut atoms);
     }
 
     if atoms.is_empty() {
-        out.push(emit_atom_slice(&[], prefix));
+        out.push(emit_cluster_slice(&[], prefix));
         return;
     }
 
@@ -1143,11 +1189,11 @@ fn wrap_styled_runs(
         let mut last_ascii_ws: Option<usize> = None;
 
         while i < atoms.len() {
-            let cw = atoms[i].2;
+            let cw = atoms[i].width;
             if i > pos && w + cw > avail_w {
                 break;
             }
-            if i > pos && atoms[i].0.is_ascii_whitespace() {
+            if i > pos && atoms[i].is_ascii_ws {
                 last_ascii_ws = Some(i);
             }
             w += cw;
@@ -1155,19 +1201,15 @@ fn wrap_styled_runs(
         }
 
         if i == atoms.len() {
-            out.push(emit_atom_slice(&atoms[pos..], prefix));
+            out.push(emit_cluster_slice(&atoms[pos..], prefix));
             break;
         }
 
-        if atoms[i].0.is_ascii_whitespace()
-            && atoms[pos..i]
-                .iter()
-                .any(|(ch, _, _)| !ch.is_ascii_whitespace())
-        {
-            out.push(emit_atom_slice(&atoms[pos..i], prefix));
+        if atoms[i].is_ascii_ws && atoms[pos..i].iter().any(|c| !c.is_ascii_ws) {
+            out.push(emit_cluster_slice(&atoms[pos..i], prefix));
             pos = i + 1;
             if !is_code {
-                while pos < atoms.len() && atoms[pos].0.is_ascii_whitespace() {
+                while pos < atoms.len() && atoms[pos].is_ascii_ws {
                     pos += 1;
                 }
             }
@@ -1175,18 +1217,15 @@ fn wrap_styled_runs(
         }
 
         if let Some(ws_idx) = last_ascii_ws {
-            if atoms[pos..ws_idx]
-                .iter()
-                .any(|(ch, _, _)| !ch.is_ascii_whitespace())
-            {
+            if atoms[pos..ws_idx].iter().any(|c| !c.is_ascii_ws) {
                 let mut row_end = ws_idx;
-                while row_end > pos && atoms[row_end - 1].0.is_ascii_whitespace() {
+                while row_end > pos && atoms[row_end - 1].is_ascii_ws {
                     row_end -= 1;
                 }
-                out.push(emit_atom_slice(&atoms[pos..row_end], prefix));
+                out.push(emit_cluster_slice(&atoms[pos..row_end], prefix));
                 pos = ws_idx + 1;
                 if !is_code {
-                    while pos < atoms.len() && atoms[pos].0.is_ascii_whitespace() {
+                    while pos < atoms.len() && atoms[pos].is_ascii_ws {
                         pos += 1;
                     }
                 }
@@ -1194,7 +1233,7 @@ fn wrap_styled_runs(
             }
         }
 
-        out.push(emit_atom_slice(&atoms[pos..i], prefix));
+        out.push(emit_cluster_slice(&atoms[pos..i], prefix));
         pos = i;
     }
 }
@@ -1545,7 +1584,7 @@ fn is_collapsed_action_summary_row_fallback(trimmed: &str) -> bool {
         return false;
     };
     let noun = after_more
-        .split(|c: char| !c.is_ascii_alphabetic())
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
         .next()
         .unwrap_or("");
     NOUNS.iter().any(|&n| noun.eq_ignore_ascii_case(n))
@@ -2202,5 +2241,89 @@ mod tests {
         let wrapped = wrap_reader_doc(&narrow_doc, 3);
         assert!(wrapped.rows.len() >= 3);
         assert_eq!(wrapped.anchor_visual_row, 2);
+    }
+
+    #[test]
+    fn shell_percentage_logs_do_not_false_trigger_prompts_and_long_prose_not_stripped() {
+        let mut parser = vt100::Parser::new(nz(20), nz(80), 40);
+        parser.process(
+            concat!(
+                "$ cargo test\r\n",
+                "Progress: 50% complete\r\n",
+                "100% passed\r\n",
+                "CPU 12% avg\r\n",
+                "% echo zsh_prompt\r\n",
+                "➜ echo starship_prompt\r\n",
+                "~/repo❯ echo prefixed_chevron"
+            )
+            .as_bytes(),
+        );
+        let doc = extract_reader_doc(parser.screen_mut(), "pct", false, true);
+        let texts: Vec<String> = doc.lines.iter().map(line_text).collect();
+
+        // Percentage output lines must remain Body (not Bold prompts) and must NOT hijack anchor.
+        for pct_line in ["Progress: 50% complete", "100% passed", "CPU 12% avg"] {
+            let idx = texts.iter().position(|t| t == pct_line).unwrap();
+            assert_eq!(
+                doc.lines[idx],
+                ReaderLineKind::Text(vec![(pct_line.to_string(), ReaderRunStyle::Body)])
+            );
+        }
+        let last_prompt_idx = texts
+            .iter()
+            .position(|t| t == "~/repo❯ echo prefixed_chevron")
+            .unwrap();
+        assert_eq!(doc.anchor_line, last_prompt_idx);
+        assert_eq!(
+            doc.lines[last_prompt_idx],
+            ReaderLineKind::Text(vec![(
+                "~/repo❯ echo prefixed_chevron".to_string(),
+                ReaderRunStyle::Bold
+            )])
+        );
+
+        // Long trailing prose (> 120 chars) mentioning `shift+tab` or `? for shortcuts` stays intact.
+        let mut agent_parser = vt100::Parser::new(nz(10), nz(180), 20);
+        let long_prose = "In this long explanation we carefully describe how users press shift+tab or check ? for shortcuts in interactive terminal sessions across multiple workflows.";
+        assert!(long_prose.chars().count() > 120);
+        agent_parser
+            .process(format!("❯ Explain keys\r\n{long_prose}\r\n? for shortcuts").as_bytes());
+        let agent_doc = extract_reader_doc(agent_parser.screen_mut(), "prose", true, true);
+        let agent_texts: Vec<String> = agent_doc.lines.iter().map(line_text).collect();
+        assert!(agent_texts.iter().any(|t| t == long_prose));
+        assert!(!agent_texts.iter().any(|t| t == "? for shortcuts"));
+    }
+
+    #[test]
+    fn wrap_reader_doc_keeps_zwj_emoji_clusters_intact_at_narrow_widths() {
+        let doc = ReaderDoc {
+            title: "emoji".to_string(),
+            is_agent: true,
+            clean_mode: true,
+            lines: vec![ReaderLineKind::Text(vec![(
+                "ab👨‍💻cd 👍🏽 🇺🇸".to_string(),
+                ReaderRunStyle::Body,
+            )])],
+            anchor_line: 0,
+            hidden_process_lines: 0,
+        };
+
+        for width in [2u16, 3, 4] {
+            let wrapped = wrap_reader_doc(&doc, width);
+            let rows: Vec<String> = wrapped.rows.iter().map(line_text).collect();
+            assert!(
+                rows.iter().any(|r| r.contains("👨‍💻")),
+                "ZWJ cluster split at width {width}: {rows:?}"
+            );
+            assert!(
+                rows.iter().any(|r| r.contains("👍🏽")),
+                "skin-tone cluster split at width {width}: {rows:?}"
+            );
+            assert!(
+                rows.iter().any(|r| r.contains("🇺🇸")),
+                "regional flag cluster split at width {width}: {rows:?}"
+            );
+            assert!(!rows.iter().any(|r| r.ends_with('\u{200D}')));
+        }
     }
 }
