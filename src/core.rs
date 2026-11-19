@@ -30,6 +30,43 @@ pub enum CoreMessage {
 
 type PendingRpcMap = HashMap<u64, (String, Sender<Value>)>;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct TerminalReadResult {
+    pub text: String,
+    pub complete: bool,
+    pub how: String,
+    pub why: Option<String>,
+}
+
+impl TerminalReadResult {
+    #[allow(dead_code)]
+    pub fn from_value(v: &Value) -> Result<Self> {
+        let text = v
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("terminal.read result missing `text`"))?
+            .to_string();
+        let complete = v.get("complete").and_then(Value::as_bool).unwrap_or(true);
+        let how = v
+            .get("how")
+            .and_then(Value::as_str)
+            .unwrap_or("screen")
+            .to_string();
+        let why = v
+            .get("why")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        Ok(Self {
+            text,
+            complete,
+            how,
+            why,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LastPtyInput {
     pub seq: u64,
@@ -391,6 +428,17 @@ impl CoreClient {
             .unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Read clean terminal text and capture completeness metadata via `terminal.read`.
+    #[allow(dead_code)]
+    pub fn read_terminal(&self, terminal: &str, lines: usize) -> Result<TerminalReadResult> {
+        let result = self.call_timeout(
+            "terminal.read",
+            json!({ "terminal": terminal, "lines": lines }),
+            Duration::from_secs(3),
+        )?;
+        TerminalReadResult::from_value(&result)
+    }
+
     /// Resize an attached terminal channel.
     pub fn resize_channel(&self, channel: u32, cols: u16, rows: u16) {
         let mut payload = [0u8; 4];
@@ -437,5 +485,48 @@ impl Drop for TestCoreClient {
     fn drop(&mut self) {
         let _ = self.0._child.kill();
         let _ = self.0._child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_terminal_read_result_complete_and_partial_payloads() {
+        let complete = json!({
+            "text": "> hi\nhello",
+            "complete": true,
+            "how": "stitched",
+            "why": null
+        });
+        assert_eq!(
+            TerminalReadResult::from_value(&complete).unwrap(),
+            TerminalReadResult {
+                text: "> hi\nhello".to_string(),
+                complete: true,
+                how: "stitched".to_string(),
+                why: None,
+            }
+        );
+
+        let partial = json!({
+            "text": "working output",
+            "complete": false,
+            "how": "screen",
+            "why": "working"
+        });
+        assert_eq!(
+            TerminalReadResult::from_value(&partial).unwrap(),
+            TerminalReadResult {
+                text: "working output".to_string(),
+                complete: false,
+                how: "screen".to_string(),
+                why: Some("working".to_string()),
+            }
+        );
+
+        let invalid = json!({ "complete": true, "how": "screen" });
+        assert!(TerminalReadResult::from_value(&invalid).is_err());
     }
 }
