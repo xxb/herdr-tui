@@ -35,6 +35,11 @@ pub enum HitTarget {
     ExitScrollback,
     ExitTabOverview,
     ToggleHelp,
+    ReaderPageUp,
+    ReaderPageDown,
+    ReaderToggleClean,
+    ReaderExportNative,
+    ReaderJumpLatest,
     ConfirmCloseYes { tab_id: String },
     SubmitPrompt,
     CancelModal,
@@ -89,6 +94,12 @@ pub enum Modal {
         query: String,
         selected: usize,
         selected_tab_id: Option<String>,
+    },
+    Reader {
+        doc: crate::reader::ReaderDoc,
+        scroll: usize,
+        raw_text: String,
+        source_note: Option<String>,
     },
 }
 
@@ -959,10 +970,11 @@ pub fn render_ui_full_with_eink_color_and_fence(
     };
 
     let tab_overview_open = matches!(modal, Modal::TabOverview { .. });
+    let reader_open = matches!(modal, Modal::Reader { .. });
     let mut eink_snapshot = None;
 
-    if tab_overview_open {
-        // TabOverview owns the full terminal viewport; avoid painting stale background VT cells.
+    if tab_overview_open || reader_open {
+        // Full-viewport pages own the terminal viewport; avoid painting stale background VT cells.
     } else if let Some(scr) = screen {
         let (scr_cols, scr_rows) = {
             let (r, c) = scr.size();
@@ -1165,6 +1177,9 @@ pub fn render_ui_full_with_eink_color_and_fence(
                 effective_eink_color,
                 &mut hits,
             );
+        }
+        Modal::Reader { doc, scroll, .. } => {
+            render_reader_modal(f, term_rect, doc, *scroll, eink_mode, &mut hits);
         }
     }
 
@@ -4793,11 +4808,13 @@ fn resolve_eink_vt_colors_and_mods(
     (fg_col, bg_col, mods)
 }
 
+#[cfg(test)]
 #[derive(serde::Serialize)]
 struct CleanReaderLine {
     r: Vec<(String, u8)>,
 }
 
+#[cfg(test)]
 #[derive(serde::Serialize)]
 struct CleanReaderPayload<'a> {
     v: u8,
@@ -4806,6 +4823,7 @@ struct CleanReaderPayload<'a> {
     lines: Vec<CleanReaderLine>,
 }
 
+#[cfg(test)]
 fn push_reader_run(runs: &mut Vec<(String, u8)>, text: &str, style: u8) {
     if text.is_empty() {
         return;
@@ -4819,6 +4837,7 @@ fn push_reader_run(runs: &mut Vec<(String, u8)>, text: &str, style: u8) {
     runs.push((text.to_string(), style));
 }
 
+#[cfg(test)]
 fn trim_trailing_reader_runs(runs: &mut Vec<(String, u8)>) {
     while let Some((last_text, _)) = runs.last_mut() {
         let trimmed_len = last_text.trim_end().len();
@@ -4831,6 +4850,7 @@ fn trim_trailing_reader_runs(runs: &mut Vec<(String, u8)>) {
     }
 }
 
+#[cfg(test)]
 fn strip_leading_char(runs: &mut Vec<(String, u8)>, ch: char) -> bool {
     let Some((first, _)) = runs.first_mut() else {
         return false;
@@ -4845,6 +4865,7 @@ fn strip_leading_char(runs: &mut Vec<(String, u8)>, ch: char) -> bool {
     false
 }
 
+#[cfg(test)]
 fn strip_trailing_box_edge(runs: &mut Vec<(String, u8)>) {
     trim_trailing_reader_runs(runs);
     let Some((last, _)) = runs.last_mut() else {
@@ -4859,6 +4880,7 @@ fn strip_trailing_box_edge(runs: &mut Vec<(String, u8)>) {
     }
 }
 
+#[cfg(test)]
 fn trim_leading_whitespace_runs(runs: &mut Vec<(String, u8)>) {
     while runs
         .first()
@@ -4873,6 +4895,7 @@ fn trim_leading_whitespace_runs(runs: &mut Vec<(String, u8)>) {
     }
 }
 
+#[cfg(test)]
 fn strip_leading_box_rule_chars(runs: &mut Vec<(String, u8)>) {
     while let Some((first, _)) = runs.first_mut() {
         let trimmed = first.trim_start_matches(|c: char| {
@@ -4890,6 +4913,7 @@ fn strip_leading_box_rule_chars(runs: &mut Vec<(String, u8)>) {
     }
 }
 
+#[cfg(test)]
 fn strip_trailing_box_rule_chars(runs: &mut Vec<(String, u8)>) {
     while let Some((last, _)) = runs.last_mut() {
         let trimmed = last.trim_end_matches(|c: char| {
@@ -4907,6 +4931,7 @@ fn strip_trailing_box_rule_chars(runs: &mut Vec<(String, u8)>) {
     }
 }
 
+#[cfg(test)]
 fn clean_reader_logical_line(runs: &mut Vec<(String, u8)>) -> Option<Vec<(String, u8)>> {
     trim_trailing_reader_runs(runs);
     if runs.is_empty() {
@@ -4950,6 +4975,7 @@ fn clean_reader_logical_line(runs: &mut Vec<(String, u8)>) -> Option<Vec<(String
     }
 }
 
+#[cfg(test)]
 fn is_reader_fence_line(runs: &[(String, u8)]) -> bool {
     let joined: String = runs.iter().map(|(t, _)| t.as_str()).collect();
     joined.trim_start().starts_with("```")
@@ -4958,6 +4984,7 @@ fn is_reader_fence_line(runs: &[(String, u8)]) -> bool {
 /// Extract clean logical lines (joining soft-wrapped rows across scrollback + live screen)
 /// with 3-tier E-Ink style codes (`0` = body `#000000`, `1` = bold heading/emphasis,
 /// `2` = muted process `#666666`), stripped of Unicode TUI box frames and bounded for OSC 777.
+#[cfg(test)]
 pub fn extract_clean_reader_json(screen: &mut vt100::Screen, title: &str) -> String {
     const MAX_SCAN_ROWS: usize = 420;
     const MAX_JSON_BYTES: usize = 48_000;
@@ -5763,8 +5790,8 @@ fn render_help_modal(
             HitTarget::TriggerAction(Action::ToggleEinkColor),
         ),
         (
-            "  📖 Book View  ",
-            " 📖Book ",
+            "  📖 Reader     ",
+            " 📖Read ",
             HitTarget::TriggerAction(Action::OpenBookReader),
         ),
         (
@@ -5836,7 +5863,7 @@ fn render_help_modal(
         Line::from("  Page Up / Down           ^b PgUp / PgDn / Shift+PgUp (or in [ ? ])"),
         Line::from("  E-Ink Mode / Redraw      ^b e (E-Ink) / ^b r (clean redraw)"),
         Line::from("  Kaleido Color Accent     ^b E (95% mono + 5% overprint accents)"),
-        Line::from("  Book Reader (ShellDeck)  ^b v / ^b B   or  Tap [ 📖 Book View ]"),
+        Line::from("  Book Reader / Export     ^b v / ^b B (OSC) or Tap [ 📖 Reader ]"),
         Line::from("  Detach (keep running)    ^b q / ^b d   or  Ctrl+\\ / Tap [ ⏏ ]"),
         Line::from(""),
         Line::from(Span::styled(
@@ -5896,6 +5923,393 @@ fn render_help_modal(
             },
             target,
         });
+    }
+}
+
+pub fn reader_body_metrics(term_rect: Rect) -> (Rect, u16, u16) {
+    if term_rect.width == 0 || term_rect.height == 0 {
+        return (Rect::new(term_rect.x, term_rect.y, 0, 0), 0, 0);
+    }
+    let header_h = u16::from(term_rect.height >= 2);
+    let rule_h = u16::from(term_rect.height >= 4);
+    let footer_h = u16::from(term_rect.height >= 3);
+    let body_y = term_rect.y + header_h + rule_h;
+    let body_h = term_rect
+        .height
+        .saturating_sub(header_h + rule_h + footer_h);
+    let body_rect = Rect::new(term_rect.x, body_y, term_rect.width, body_h);
+    let pad_x = if term_rect.width >= 50 {
+        2
+    } else if term_rect.width >= 10 {
+        1
+    } else {
+        0
+    };
+    let content_width = body_rect.width.saturating_sub(pad_x * 2).max(1);
+    (body_rect, content_width, pad_x)
+}
+
+pub fn reader_initial_scroll(doc: &crate::reader::ReaderDoc, term_rect: Rect) -> (usize, usize) {
+    let (body_rect, content_width, _) = reader_body_metrics(term_rect);
+    if body_rect.height == 0 || content_width == 0 {
+        return (0, 0);
+    }
+    let wrapped = crate::reader::wrap_reader_doc(doc, content_width);
+    let body_h = usize::from(body_rect.height.max(1));
+    let max_scroll = wrapped.rows.len().saturating_sub(body_h);
+    let initial = wrapped.anchor_visual_row.min(max_scroll);
+    (initial, max_scroll)
+}
+
+fn render_reader_modal(
+    f: &mut Frame,
+    term_rect: Rect,
+    doc: &crate::reader::ReaderDoc,
+    scroll: usize,
+    eink_mode: bool,
+    hits: &mut Vec<HitRegion>,
+) {
+    if term_rect.width == 0 || term_rect.height == 0 {
+        return;
+    }
+
+    f.render_widget(Clear, term_rect);
+    if eink_mode {
+        f.render_widget(
+            Block::default().style(Style::default().bg(EINK_PAPER).fg(EINK_INK)),
+            term_rect,
+        );
+    }
+    // Keep top tab bar hits live above `term_rect`; push `ModalNoop` first so Reader controls take priority.
+    hits.push(HitRegion {
+        rect: term_rect,
+        target: HitTarget::ModalNoop,
+    });
+
+    let body_style = if eink_mode {
+        Style::default().bg(EINK_PAPER).fg(EINK_INK)
+    } else {
+        Style::default().bg(Color::Reset).fg(Color::Reset)
+    };
+    let bold_style = body_style.add_modifier(Modifier::BOLD);
+    let muted_style = if eink_mode {
+        Style::default()
+            .bg(EINK_PAPER)
+            .fg(EINK_INK_PROCESS)
+            .add_modifier(Modifier::ITALIC)
+    } else {
+        Style::default()
+            .bg(Color::Reset)
+            .fg(Color::Reset)
+            .add_modifier(Modifier::DIM | Modifier::ITALIC)
+    };
+    let code_style = if eink_mode {
+        Style::default().bg(EINK_PAPER).fg(EINK_INK)
+    } else {
+        Style::default().bg(Color::Reset).fg(Color::Cyan)
+    };
+    let dim_chrome_style = if eink_mode {
+        Style::default().bg(EINK_PAPER).fg(EINK_INK_MUTED)
+    } else {
+        Style::default()
+            .bg(Color::Reset)
+            .fg(Color::Reset)
+            .add_modifier(Modifier::DIM)
+    };
+    let badge_style = if eink_mode {
+        Style::default()
+            .bg(EINK_PAPER)
+            .fg(EINK_INK_MUTED)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().bg(Color::Reset).fg(Color::Magenta)
+    };
+    let btn_style = if eink_mode {
+        Style::default()
+            .bg(EINK_SURFACE)
+            .fg(EINK_INK)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .bg(Color::Reset)
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::UNDERLINED)
+    };
+    let close_style = if eink_mode {
+        btn_style
+    } else {
+        Style::default().bg(Color::Reset).fg(Color::Red)
+    };
+
+    let (body_rect, content_width, pad_x) = reader_body_metrics(term_rect);
+    let wrapped = crate::reader::wrap_reader_doc(doc, content_width);
+    let total_rows = wrapped.rows.len();
+    let body_h = usize::from(body_rect.height.max(1));
+    let max_scroll = total_rows.saturating_sub(body_h);
+    let cur_scroll = scroll.min(max_scroll);
+
+    let compact = term_rect.width < 50;
+    let buf = f.buffer_mut();
+
+    // 1. Header row
+    if term_rect.height >= 2 {
+        let hy = term_rect.y;
+        let mut right_edge = term_rect.x + term_rect.width;
+        let mut push_right_btn = |lbl: &str, style: Style, target: HitTarget| {
+            let w = lbl.width() as u16;
+            if w > 0 && right_edge > term_rect.x + w {
+                let bx = right_edge - w;
+                buf.set_string(bx, hy, lbl, style);
+                hits.push(HitRegion {
+                    rect: Rect::new(bx, hy, w, 1),
+                    target,
+                });
+                right_edge = bx.saturating_sub(1);
+            }
+        };
+        let close_lbl = if term_rect.width < 24 {
+            "[✕]"
+        } else {
+            "[ ✕ ]"
+        };
+        push_right_btn(close_lbl, close_style, HitTarget::CancelModal);
+        let export_lbl = if compact { "[ ↗ ]" } else { "[ ↗ Native ]" };
+        push_right_btn(export_lbl, btn_style, HitTarget::ReaderExportNative);
+        if doc.is_agent {
+            let mode_lbl = match (doc.clean_mode, compact) {
+                (true, false) => "[ Full ]",
+                (false, false) => "[ Clean ]",
+                (true, true) => "[Full]",
+                (false, true) => "[Cln]",
+            };
+            push_right_btn(mode_lbl, btn_style, HitTarget::ReaderToggleClean);
+        }
+
+        let left_limit = usize::from(right_edge.saturating_sub(term_rect.x));
+        let mut cx = term_rect.x;
+        let mut rem = left_limit;
+        if rem >= 2 {
+            cx += 1;
+            rem -= 1;
+        }
+        let badge = if doc.is_agent {
+            match (doc.clean_mode, compact) {
+                (true, false) => "Agent·Clean",
+                (false, false) => "Agent·Full",
+                (true, true) => "Ag·Cln",
+                (false, true) => "Ag·Ful",
+            }
+        } else {
+            "Shell"
+        };
+        let reserve_badge = if rem > badge.width() + 5 {
+            badge.width() + 1
+        } else {
+            0
+        };
+        let title_str = format!("📖 {}", doc.title);
+        let title_clip = truncate_to_width(&title_str, rem.saturating_sub(reserve_badge));
+        let tw = title_clip.width();
+        if tw > 0 {
+            buf.set_string(cx, hy, &title_clip, bold_style);
+            cx += tw as u16;
+            rem = rem.saturating_sub(tw);
+        }
+        if rem > badge.width() {
+            let badge_txt = format!(" {badge}");
+            let bw = badge_txt.width();
+            buf.set_string(cx, hy, &badge_txt, badge_style);
+            cx += bw as u16;
+            rem = rem.saturating_sub(bw);
+        }
+        if doc.is_agent && doc.clean_mode && doc.hidden_process_lines > 0 {
+            let hidden_txt = format!(" · {} hidden", doc.hidden_process_lines);
+            if rem >= hidden_txt.width() {
+                let hw = hidden_txt.width();
+                buf.set_string(cx, hy, &hidden_txt, dim_chrome_style);
+                cx += hw as u16;
+                rem = rem.saturating_sub(hw);
+            }
+        }
+        if let Some(ref note) = doc.source_note {
+            let note_txt = format!(" · {note}");
+            if rem > 4 {
+                let note_clip = truncate_to_width(&note_txt, rem);
+                buf.set_string(cx, hy, &note_clip, dim_chrome_style);
+            }
+        }
+    }
+
+    // 2. Hairline divider
+    if term_rect.height >= 4 {
+        buf.set_string(
+            term_rect.x,
+            term_rect.y + 1,
+            "─".repeat(usize::from(term_rect.width)),
+            dim_chrome_style,
+        );
+    }
+
+    // 3. Body rows
+    if body_rect.height > 0 && content_width > 0 {
+        if total_rows == 0 {
+            let msg = if doc.is_agent && doc.clean_mode && doc.hidden_process_lines > 0 {
+                format!(
+                    "No prose response yet ({} process lines hidden — press c for Full)",
+                    doc.hidden_process_lines
+                )
+            } else {
+                "No readable lines in this terminal yet.".to_string()
+            };
+            let msg_y = body_rect.y + (body_rect.height / 3).min(body_rect.height - 1);
+            let clipped = truncate_to_width(&msg, usize::from(content_width));
+            buf.set_string(body_rect.x + pad_x, msg_y, &clipped, muted_style);
+        } else {
+            for (dy, row_kind) in wrapped
+                .rows
+                .iter()
+                .skip(cur_scroll)
+                .take(usize::from(body_rect.height))
+                .enumerate()
+            {
+                let ry = body_rect.y + dy as u16;
+                let rx = body_rect.x + pad_x;
+                match row_kind {
+                    crate::reader::ReaderLineKind::Blank => {}
+                    crate::reader::ReaderLineKind::Divider => {
+                        buf.set_string(
+                            rx,
+                            ry,
+                            "─".repeat(usize::from(content_width)),
+                            dim_chrome_style,
+                        );
+                    }
+                    crate::reader::ReaderLineKind::Text(runs) => {
+                        let mut cx = rx;
+                        let mut rem = usize::from(content_width);
+                        for (txt, rstyle) in runs {
+                            if rem == 0 {
+                                break;
+                            }
+                            let clip = truncate_to_width(txt, rem);
+                            let cw = clip.width();
+                            if cw > 0 {
+                                let style = match rstyle {
+                                    crate::reader::ReaderRunStyle::Body => body_style,
+                                    crate::reader::ReaderRunStyle::Bold => bold_style,
+                                    crate::reader::ReaderRunStyle::Muted => muted_style,
+                                    crate::reader::ReaderRunStyle::Code => code_style,
+                                };
+                                buf.set_string(cx, ry, &clip, style);
+                                cx += cw as u16;
+                                rem = rem.saturating_sub(cw);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Footer row
+    if term_rect.height >= 3 {
+        let fy = term_rect.y + term_rect.height - 1;
+        let total_pages = if total_rows == 0 {
+            1
+        } else {
+            total_rows.div_ceil(body_h)
+        };
+        let cur_page = if total_rows == 0 {
+            1
+        } else if cur_scroll >= max_scroll && max_scroll > 0 {
+            total_pages
+        } else {
+            (cur_scroll / body_h + 1).min(total_pages)
+        };
+
+        let dn_lbl = if term_rect.width < 36 {
+            "[PgDn›]"
+        } else {
+            "[ PgDn › ]"
+        };
+        let dn_w = dn_lbl.width() as u16;
+        let dn_x = if term_rect.width > dn_w + 1 {
+            let x = term_rect.x + term_rect.width - dn_w - u16::from(term_rect.width >= 20);
+            buf.set_string(x, fy, dn_lbl, btn_style);
+            hits.push(HitRegion {
+                rect: Rect::new(x, fy, dn_w, 1),
+                target: HitTarget::ReaderPageDown,
+            });
+            x.saturating_sub(1)
+        } else {
+            term_rect.x + term_rect.width
+        };
+
+        let mut fx = term_rect.x + u16::from(term_rect.width >= 20);
+        let up_lbl = if term_rect.width < 36 {
+            "[‹PgUp]"
+        } else {
+            "[ ‹ PgUp ]"
+        };
+        let up_w = up_lbl.width() as u16;
+        if fx + up_w <= dn_x {
+            buf.set_string(fx, fy, up_lbl, btn_style);
+            hits.push(HitRegion {
+                rect: Rect::new(fx, fy, up_w, 1),
+                target: HitTarget::ReaderPageUp,
+            });
+            fx += up_w;
+        }
+
+        let pg_lbl = format!(" Pg {cur_page}/{total_pages}");
+        let pg_w = pg_lbl.width() as u16;
+        if fx + pg_w <= dn_x {
+            buf.set_string(fx, fy, &pg_lbl, dim_chrome_style);
+            fx += pg_w;
+        }
+
+        let latest_scroll = wrapped.anchor_visual_row.min(max_scroll);
+        if cur_scroll != latest_scroll {
+            let latest_lbl = "[ Latest ]";
+            let lw = latest_lbl.width() as u16;
+            if fx + 1 + lw <= dn_x {
+                fx += 1;
+                buf.set_string(fx, fy, latest_lbl, btn_style);
+                hits.push(HitRegion {
+                    rect: Rect::new(fx, fy, lw, 1),
+                    target: HitTarget::ReaderJumpLatest,
+                });
+                fx += lw;
+            }
+        }
+
+        if term_rect.width >= 72 && fx + 6 < dn_x {
+            let hint = if doc.is_agent {
+                "  j/k · PgUp/Dn · c Full/Clean · l Latest · r Refresh · s Export · q Close"
+            } else {
+                "  j/k · PgUp/Dn · l Latest · r Refresh · s Export · q Close"
+            };
+            let rem = usize::from(dn_x.saturating_sub(fx));
+            let clipped = truncate_to_width(hint, rem);
+            buf.set_string(fx, fy, &clipped, dim_chrome_style);
+        }
+    }
+
+    // Ratatui resets continuation cells of wide characters (e.g. 📖, CJK) to `Color::Reset`;
+    // normalize any reset cell back onto pure Carta paper/ink in E-Ink mode.
+    if eink_mode {
+        for y in term_rect.y..term_rect.y.saturating_add(term_rect.height) {
+            for x in term_rect.x..term_rect.x.saturating_add(term_rect.width) {
+                let cell = &mut buf[(x, y)];
+                if cell.fg == Color::Reset {
+                    cell.fg = EINK_INK;
+                }
+                if cell.bg == Color::Reset {
+                    cell.bg = EINK_PAPER;
+                }
+                cell.modifier.remove(Modifier::DIM);
+            }
+        }
     }
 }
 
@@ -7753,7 +8167,8 @@ mod tests {
             _ => false,
         };
         for y in buf.area.y..buf.area.y + buf.area.height {
-            for x in buf.area.x..buf.area.x + buf.area.width {
+            let mut x = buf.area.x;
+            while x < buf.area.x + buf.area.width {
                 let cell = &buf[(x, y)];
                 assert!(
                     !cell.modifier.contains(Modifier::DIM),
@@ -7772,6 +8187,8 @@ mod tests {
                     cell.symbol(),
                     cell.bg
                 );
+                // Ratatui's Buffer::diff skips trailing shadow cells of width-2 graphemes.
+                x += cell.symbol().width().max(1) as u16;
             }
         }
     }
@@ -8055,6 +8472,42 @@ mod tests {
             Modal::Prompt {
                 kind: PromptKind::NewSpace,
                 input: "work".to_string(),
+            },
+            Modal::Reader {
+                doc: crate::reader::build_reader_doc_from_text(
+                    "> Ask\n▸ Thought for 2s\n## Result\nBody prose\n```rust\nlet x = 1;\n```",
+                    "agy",
+                    true,
+                    true,
+                    Some("live · working".to_string()),
+                ),
+                scroll: 0,
+                raw_text: String::new(),
+                source_note: Some("live · working".to_string()),
+            },
+            Modal::Reader {
+                doc: crate::reader::build_reader_doc_from_text(
+                    "> Ask\n▸ Thought for 2s\nAnswer",
+                    "agy-full",
+                    true,
+                    false,
+                    None,
+                ),
+                scroll: 0,
+                raw_text: String::new(),
+                source_note: None,
+            },
+            Modal::Reader {
+                doc: crate::reader::build_reader_doc_from_text(
+                    "$ ls\nCargo.toml",
+                    "sh",
+                    false,
+                    true,
+                    None,
+                ),
+                scroll: 0,
+                raw_text: String::new(),
+                source_note: None,
             },
         ];
         for modal in &modals {
@@ -8378,7 +8831,7 @@ mod tests {
         assert!(joined.contains("Open Space popover menu / + New Space"));
         assert!(joined.contains("^b n/p, Alt+Right/Left, Swipe, or [‹]/[›]"));
         assert!(joined.contains("^b PgUp / PgDn / Shift+PgUp (or in [ ? ])"));
-        assert!(joined.contains("Tap [ 📖 Book View ]"));
+        assert!(joined.contains("Tap [ 📖 Reader ]"));
         assert!(joined.contains("Tap outside, [ ✕ ], Esc, Enter, or ? to close"));
     }
 
@@ -9965,6 +10418,42 @@ mod tests {
                 selected: 0,
                 selected_tab_id: None,
             },
+            Modal::Reader {
+                doc: crate::reader::build_reader_doc_from_text(
+                    "> Ask\n▸ Thought for 2s\n## Result\nBody prose\n```rust\nlet x = 1;\n```",
+                    "agy",
+                    true,
+                    true,
+                    Some("live · working".to_string()),
+                ),
+                scroll: 0,
+                raw_text: String::new(),
+                source_note: Some("live · working".to_string()),
+            },
+            Modal::Reader {
+                doc: crate::reader::build_reader_doc_from_text(
+                    "> Ask\n▸ Thought for 2s\nAnswer",
+                    "agy-full",
+                    true,
+                    false,
+                    None,
+                ),
+                scroll: 0,
+                raw_text: String::new(),
+                source_note: None,
+            },
+            Modal::Reader {
+                doc: crate::reader::build_reader_doc_from_text(
+                    "$ ls\nCargo.toml",
+                    "sh",
+                    false,
+                    true,
+                    None,
+                ),
+                scroll: 0,
+                raw_text: String::new(),
+                source_note: None,
+            },
         ];
         let mut modal_term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         for modal in &modals {
@@ -10857,5 +11346,130 @@ mod tests {
         })
         .unwrap();
         assert!(help_geom.unwrap().eink_snapshot.is_none());
+    }
+
+    #[test]
+    fn reader_modal_renders_wide_and_narrow_with_hit_targets_cjk_wrap_and_shell_badge() {
+        let mut world = World::default();
+        world.doc.spaces.push(SharedSpace {
+            id: "s1".to_string(),
+            name: "work".to_string(),
+            folder: String::new(),
+            tabs: vec![crate::model::make_single_terminal_tab(
+                "t1", "agy", "term-1",
+            )],
+            rest: Default::default(),
+        });
+
+        let mut raw = String::from("> Ask\n▸ Thought for 3s\n## 中文标题\n");
+        for i in 0..30 {
+            raw.push_str(&format!(
+                "第{i:02}行中文连续说明用于测试自动换行与分页滚动效果。\n\n"
+            ));
+        }
+        raw.push_str("```rust\nlet code_val = 42;\n```\n");
+        let agent_doc = crate::reader::build_reader_doc_from_text(&raw, "agy", true, true, None);
+        let (_, max_scroll) = reader_initial_scroll(&agent_doc, Rect::new(0, 1, 100, 28));
+        assert!(max_scroll > 0);
+        // Scrolled away from anchor shows [ Latest ] hit target
+        let modal = Modal::Reader {
+            doc: agent_doc,
+            scroll: max_scroll,
+            raw_text: raw.clone(),
+            source_note: None,
+        };
+
+        let mut wide_term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut wide_hits = Vec::new();
+        wide_term
+            .draw(|f| {
+                wide_hits = render_ui_full_with_eink_color(
+                    f, &world, None, false, 24, false, false, false, false, 0, None, false, &modal,
+                    None, false, None, false, None, false, false,
+                )
+                .hits;
+            })
+            .unwrap();
+        let wide_buf = wide_term.backend().buffer();
+        let header: String = (0..100).map(|x| wide_buf[(x, 1)].symbol()).collect();
+        let footer: String = (0..100).map(|x| wide_buf[(x, 28)].symbol()).collect();
+        assert!(header.contains("Agent·Clean"));
+        assert!(header.contains("1 hidden"));
+        assert!(footer.contains("Pg "));
+        assert!(footer.contains("[ Latest ]"));
+        for target in [
+            HitTarget::ModalNoop,
+            HitTarget::CancelModal,
+            HitTarget::ReaderToggleClean,
+            HitTarget::ReaderExportNative,
+            HitTarget::ReaderPageUp,
+            HitTarget::ReaderPageDown,
+            HitTarget::ReaderJumpLatest,
+        ] {
+            assert!(
+                wide_hits.iter().any(|h| h.target == target),
+                "missing wide Reader hit target {target:?}"
+            );
+        }
+
+        // Narrow 40x24 viewport in E-Ink mode + Shell tab (no ReaderToggleClean) + empty message
+        let shell_doc = crate::reader::build_reader_doc_from_text("", "sh", false, true, None);
+        let shell_modal = Modal::Reader {
+            doc: shell_doc,
+            scroll: 0,
+            raw_text: String::new(),
+            source_note: None,
+        };
+        let mut narrow_term = Terminal::new(TestBackend::new(40, 24)).unwrap();
+        let mut narrow_hits = Vec::new();
+        narrow_term
+            .draw(|f| {
+                narrow_hits = render_ui_full_with_eink_color(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &shell_modal,
+                    None,
+                    false,
+                    None,
+                    false,
+                    None,
+                    true,
+                    false,
+                )
+                .hits;
+            })
+            .unwrap();
+        assert_strict_eink_buffer(narrow_term.backend().buffer());
+        assert!(!narrow_hits
+            .iter()
+            .any(|h| h.target == HitTarget::ReaderToggleClean));
+        assert!(narrow_hits
+            .iter()
+            .any(|h| h.target == HitTarget::ReaderExportNative));
+        assert!(narrow_hits
+            .iter()
+            .any(|h| h.target == HitTarget::ReaderPageUp));
+        assert!(narrow_hits
+            .iter()
+            .any(|h| h.target == HitTarget::ReaderPageDown));
+        let n_rows: String = (0..24)
+            .map(|y| {
+                (0..40)
+                    .map(|x| narrow_term.backend().buffer()[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(n_rows.contains("No readable lines"));
     }
 }

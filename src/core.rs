@@ -31,7 +31,6 @@ pub enum CoreMessage {
 type PendingRpcMap = HashMap<u64, (String, Sender<Value>)>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct TerminalReadResult {
     pub text: String,
     pub complete: bool,
@@ -40,7 +39,6 @@ pub struct TerminalReadResult {
 }
 
 impl TerminalReadResult {
-    #[allow(dead_code)]
     pub fn from_value(v: &Value) -> Result<Self> {
         let text = v
             .get("text")
@@ -81,6 +79,8 @@ pub struct CoreClient {
     pending: Arc<Mutex<PendingRpcMap>>,
     events_channel: Arc<Mutex<Option<u32>>>,
     last_pty_input: Mutex<Option<LastPtyInput>>,
+    #[cfg(test)]
+    skip_rpc_for_tests: bool,
 }
 
 fn find_core_binary() -> PathBuf {
@@ -252,6 +252,8 @@ impl CoreClient {
             pending,
             events_channel,
             last_pty_input: Mutex::new(None),
+            #[cfg(test)]
+            skip_rpc_for_tests: false,
         })
     }
 
@@ -429,8 +431,11 @@ impl CoreClient {
     }
 
     /// Read clean terminal text and capture completeness metadata via `terminal.read`.
-    #[allow(dead_code)]
     pub fn read_terminal(&self, terminal: &str, lines: usize) -> Result<TerminalReadResult> {
+        #[cfg(test)]
+        if self.skip_rpc_for_tests {
+            bail!("dummy test core has no RPC endpoint");
+        }
         let result = self.call_timeout(
             "terminal.read",
             json!({ "terminal": terminal, "lines": lines }),
@@ -464,6 +469,7 @@ impl CoreClient {
             pending: Arc::new(Mutex::new(HashMap::new())),
             events_channel: Arc::new(Mutex::new(None)),
             last_pty_input: Mutex::new(None),
+            skip_rpc_for_tests: true,
         })
     }
 }

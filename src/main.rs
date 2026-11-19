@@ -1,7 +1,6 @@
 mod core;
 mod keys;
 mod model;
-#[allow(dead_code)]
 mod reader;
 mod ui;
 mod usage;
@@ -22,11 +21,11 @@ use crate::ui::capture_eink_screen_snapshot;
 use crate::ui::{
     capture_eink_screen_snapshot_with_color_and_fence, collect_fuzzy_items, collect_overview_items,
     compute_terminal_rect, find_hit_target, is_active_tab_agent, is_in_rect, is_on_dpad_disc,
-    overview_selection_after_query_change, overview_selection_for_index,
-    render_ui_full_with_eink_color_and_fence, resolve_dpad_disc_rect, resolve_fuzzy_selection,
-    resolve_mod_cross_rect, resolve_overview_selection, scan_viewport_initial_code_fence,
-    EinkScreenSnapshot, HitRegion, HitTarget, Modal, OverviewItem, OverviewSelection, PromptKind,
-    TerminalSelection,
+    overview_selection_after_query_change, overview_selection_for_index, reader_body_metrics,
+    reader_initial_scroll, render_ui_full_with_eink_color_and_fence, resolve_dpad_disc_rect,
+    resolve_fuzzy_selection, resolve_mod_cross_rect, resolve_overview_selection,
+    scan_viewport_initial_code_fence, EinkScreenSnapshot, HitRegion, HitTarget, Modal,
+    OverviewItem, OverviewSelection, PromptKind, TerminalSelection,
 };
 use crate::usage::UsageTracker;
 use anyhow::Result;
@@ -1556,33 +1555,387 @@ fn format_shelldeck_eink_refresh_osc() -> String {
     format_shelldeck_eink_refresh_osc_with_env(in_tmux, in_screen)
 }
 
+fn reader_page_step(term_rect: Rect) -> usize {
+    let (body_rect, _, _) = reader_body_metrics(term_rect);
+    usize::from(body_rect.height).saturating_sub(2).max(1)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReaderScrollMove {
+    Delta(isize),
+    Top,
+    Bottom,
+    Latest,
+}
+
+fn move_reader_scroll(modal: &mut Modal, term_rect: Rect, mv: ReaderScrollMove) -> bool {
+    let Modal::Reader {
+        ref doc,
+        ref mut scroll,
+        ..
+    } = *modal
+    else {
+        return false;
+    };
+    let (latest, max_scroll) = reader_initial_scroll(doc, term_rect);
+    let next = match mv {
+        ReaderScrollMove::Delta(d) if d < 0 => scroll.saturating_sub(d.unsigned_abs()),
+        ReaderScrollMove::Delta(d) => scroll.saturating_add(d as usize).min(max_scroll),
+        ReaderScrollMove::Top => 0,
+        ReaderScrollMove::Bottom => max_scroll,
+        ReaderScrollMove::Latest => latest,
+    };
+    let changed = next != *scroll;
+    *scroll = next;
+    changed
+}
+
+fn step_reader_modal_scroll(
+    modal: &mut Modal,
+    term_rect: Rect,
+    mv: ReaderScrollMove,
+    eink_mode: bool,
+    pending_eink_osc: &mut bool,
+) -> bool {
+    let changed = move_reader_scroll(modal, term_rect, mv);
+    if eink_mode && changed {
+        *pending_eink_osc = true;
+    }
+    changed
+}
+
+fn toggle_reader_clean_mode(modal: &mut Modal, term_rect: Rect) -> bool {
+    let Modal::Reader {
+        ref mut doc,
+        ref mut scroll,
+        ref raw_text,
+        ref source_note,
+    } = *modal
+    else {
+        return false;
+    };
+    if !doc.is_agent {
+        return false;
+    }
+    let next_clean = !doc.clean_mode;
+    *doc = crate::reader::build_reader_doc_from_text(
+        raw_text,
+        &doc.title,
+        true,
+        next_clean,
+        source_note.clone(),
+    );
+    (*scroll, _) = reader_initial_scroll(doc, term_rect);
+    true
+}
+
+fn handle_reader_mouse_hit(
+    target: HitTarget,
+    modal: &mut Modal,
+    term_rect: Rect,
+    eink_mode: bool,
+    pending_eink_osc: &mut bool,
+    pending_reader_osc: &mut bool,
+) -> (bool, bool) {
+    let step = reader_page_step(term_rect) as isize;
+    let moved = match target {
+        HitTarget::ReaderPageUp => Some(step_reader_modal_scroll(
+            modal,
+            term_rect,
+            ReaderScrollMove::Delta(-step),
+            eink_mode,
+            pending_eink_osc,
+        )),
+        HitTarget::ReaderPageDown => Some(step_reader_modal_scroll(
+            modal,
+            term_rect,
+            ReaderScrollMove::Delta(step),
+            eink_mode,
+            pending_eink_osc,
+        )),
+        HitTarget::ReaderJumpLatest => Some(step_reader_modal_scroll(
+            modal,
+            term_rect,
+            ReaderScrollMove::Latest,
+            eink_mode,
+            pending_eink_osc,
+        )),
+        HitTarget::ReaderToggleClean => {
+            if toggle_reader_clean_mode(modal, term_rect) {
+                if eink_mode {
+                    *pending_eink_osc = true;
+                }
+                return (true, true);
+            }
+            return (true, false);
+        }
+        HitTarget::ReaderExportNative => {
+            if matches!(modal, Modal::Reader { .. }) {
+                *pending_reader_osc = true;
+            }
+            return (true, false);
+        }
+        _ => None,
+    };
+    if let Some(changed) = moved {
+        (true, changed)
+    } else {
+        (false, false)
+    }
+}
+
+fn handle_reader_wheel(
+    up: bool,
+    modal: &mut Modal,
+    term_rect: Rect,
+    eink_mode: bool,
+    pending_eink_osc: &mut bool,
+) -> bool {
+    let magnitude = if eink_mode {
+        reader_page_step(term_rect) as isize
+    } else {
+        3
+    };
+    let delta = if up { -magnitude } else { magnitude };
+    step_reader_modal_scroll(
+        modal,
+        term_rect,
+        ReaderScrollMove::Delta(delta),
+        eink_mode,
+        pending_eink_osc,
+    )
+}
+
+fn handle_reader_drag(
+    reader_drag: &mut Option<u16>,
+    row: u16,
+    modal: &mut Modal,
+    term_rect: Rect,
+    eink_mode: bool,
+    pending_eink_osc: &mut bool,
+) -> bool {
+    let Some(last_row) = *reader_drag else {
+        return false;
+    };
+    if !matches!(modal, Modal::Reader { .. }) {
+        *reader_drag = None;
+        return false;
+    }
+    let dy = row as i32 - last_row as i32;
+    let threshold = if eink_mode { 2 } else { 1 };
+    if dy.abs() < threshold {
+        return false;
+    }
+    // On E-Ink, treat one vertical drag gesture as a single page flip to avoid multi-page skips.
+    if eink_mode {
+        *reader_drag = None;
+    } else {
+        *reader_drag = Some(row);
+    }
+    let delta = if eink_mode {
+        let step = reader_page_step(term_rect) as isize;
+        if dy < 0 {
+            step
+        } else {
+            -step
+        }
+    } else {
+        (-dy) as isize
+    };
+    step_reader_modal_scroll(
+        modal,
+        term_rect,
+        ReaderScrollMove::Delta(delta),
+        eink_mode,
+        pending_eink_osc,
+    )
+}
+
+fn clamp_reader_scroll_on_resize(modal: &mut Modal, term_rect: Rect) {
+    if let Modal::Reader {
+        ref doc,
+        ref mut scroll,
+        ..
+    } = *modal
+    {
+        let (_, max_scroll) = reader_initial_scroll(doc, term_rect);
+        *scroll = (*scroll).min(max_scroll);
+    }
+}
+
+type ReaderScope = (Option<String>, Option<String>, usize);
+
+fn current_reader_scope(world: &World) -> ReaderScope {
+    (
+        world.active_terminal_address(),
+        world.active_space().map(|s| s.id.clone()),
+        world.active_tab_index(),
+    )
+}
+
+fn sync_reader_modal_scope(
+    modal: &mut Modal,
+    world: &World,
+    reader_open_scope: &mut Option<ReaderScope>,
+    reader_drag: &mut Option<u16>,
+    eink_mode: bool,
+    pending_eink_osc: &mut bool,
+    dirty: &mut bool,
+) {
+    if !matches!(modal, Modal::Reader { .. }) {
+        *reader_open_scope = None;
+        *reader_drag = None;
+        return;
+    }
+    let cur = current_reader_scope(world);
+    let missing_term = cur
+        .0
+        .as_ref()
+        .is_some_and(|addr| !world.terminals.contains_key(addr));
+    match *reader_open_scope {
+        None if !missing_term => {
+            *reader_open_scope = Some(cur);
+        }
+        Some(ref opened) if opened == &cur && !missing_term => {}
+        _ => {
+            *modal = Modal::None;
+            *reader_open_scope = None;
+            *reader_drag = None;
+            *dirty = true;
+            if eink_mode {
+                *pending_eink_osc = true;
+            }
+        }
+    }
+}
+
+/// Fetch clean reader source text from `herdr-core` `terminal.read`, falling back to local VT screen.
+fn fetch_reader_source_for_terminal(
+    core: Option<&CoreClient>,
+    world: &World,
+    addr: &str,
+    attached: Option<&AttachedTerminal>,
+) -> Option<(String, bool, String, Option<String>)> {
+    let is_agent = world
+        .terminals
+        .get(addr)
+        .is_some_and(crate::model::TerminalInfo::is_agent);
+    let tab_title = world
+        .active_space()
+        .map(|s| world.tab_display_name(s, world.active_tab_index()))
+        .unwrap_or_else(|| addr.to_string());
+    let read_lines = if is_agent {
+        450
+    } else {
+        crate::reader::SHELL_MAX_CLEAN_LINES
+    };
+    if let Some(res) = core.and_then(|c| c.read_terminal(addr, read_lines).ok()) {
+        let source_note = (res.how == "screen")
+            .then(|| res.why.as_ref().map(|w| format!("live · {w}")))
+            .flatten();
+        return Some((tab_title, is_agent, res.text, source_note));
+    }
+    let att = attached?;
+    let max_rows = if is_agent {
+        crate::reader::AGENT_MAX_SCAN_ROWS
+    } else {
+        crate::reader::SHELL_MAX_SCAN_ROWS
+    };
+    let mut scr = att.parser.screen().clone();
+    let plain = crate::reader::extract_plain_text_from_screen(&mut scr, max_rows);
+    Some((tab_title, is_agent, plain, None))
+}
+
+fn build_reader_modal_state(
+    core: &CoreClient,
+    world: &World,
+    attached: Option<&AttachedTerminal>,
+    term_rect: Rect,
+    clean_mode: bool,
+) -> Modal {
+    let (tab_title, is_agent, raw_text, source_note) = match world.active_terminal_address() {
+        Some(addr) => fetch_reader_source_for_terminal(Some(core), world, &addr, attached)
+            .unwrap_or_else(|| {
+                let is_agent = world
+                    .terminals
+                    .get(&addr)
+                    .is_some_and(crate::model::TerminalInfo::is_agent);
+                let title = world
+                    .active_space()
+                    .map(|s| world.tab_display_name(s, world.active_tab_index()))
+                    .unwrap_or_else(|| addr.clone());
+                (title, is_agent, String::new(), None)
+            }),
+        None => {
+            let title = world
+                .active_space()
+                .map(|s| world.tab_display_name(s, world.active_tab_index()))
+                .unwrap_or_else(|| "reader".to_string());
+            (title, false, String::new(), None)
+        }
+    };
+    let doc = crate::reader::build_reader_doc_from_text(
+        &raw_text,
+        &tab_title,
+        is_agent,
+        clean_mode,
+        source_note.clone(),
+    );
+    let (scroll, _) = reader_initial_scroll(&doc, term_rect);
+    Modal::Reader {
+        doc,
+        scroll,
+        raw_text,
+        source_note,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn emit_shelldeck_reader_osc_with_env<W: Write>(
     out: &mut W,
+    core: Option<&CoreClient>,
     world: &World,
+    modal: &Modal,
     active_addr: Option<&String>,
     attached_map: &mut BTreeMap<String, AttachedTerminal>,
     in_tmux: bool,
     in_screen: bool,
 ) -> Result<()> {
-    if let Some(addr) = active_addr {
-        if let Some(att) = attached_map.get_mut(addr) {
-            let tab_title = world
-                .active_space()
-                .map(|s| world.tab_display_name(s, world.active_tab_index()))
-                .unwrap_or_else(|| addr.clone());
-            let json = crate::ui::extract_clean_reader_json(att.parser.screen_mut(), &tab_title);
-            let seq = format_shelldeck_reader_open_osc_with_env(&json, in_tmux, in_screen);
-            out.write_all(seq.as_bytes())?;
-            out.flush()?;
-        }
+    let json = if let Modal::Reader { ref doc, .. } = *modal {
+        Some(crate::reader::format_reader_doc_json(doc))
+    } else if let Some(addr) = active_addr {
+        let attached = attached_map.get(addr);
+        fetch_reader_source_for_terminal(core, world, addr, attached).map(
+            |(tab_title, is_agent, raw_text, source_note)| {
+                let doc = crate::reader::build_reader_doc_from_text(
+                    &raw_text,
+                    &tab_title,
+                    is_agent,
+                    true,
+                    source_note,
+                );
+                crate::reader::format_reader_doc_json(&doc)
+            },
+        )
+    } else {
+        None
+    };
+
+    if let Some(json) = json {
+        let seq = format_shelldeck_reader_open_osc_with_env(&json, in_tmux, in_screen);
+        out.write_all(seq.as_bytes())?;
+        out.flush()?;
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn flush_pending_reader_osc_with_env<W: Write>(
     out: &mut W,
     pending_reader_osc: &mut bool,
+    core: Option<&CoreClient>,
     world: &World,
+    modal: &Modal,
     active_addr: Option<&String>,
     attached_map: &mut BTreeMap<String, AttachedTerminal>,
     in_tmux: bool,
@@ -1591,7 +1944,9 @@ fn flush_pending_reader_osc_with_env<W: Write>(
     if *pending_reader_osc {
         emit_shelldeck_reader_osc_with_env(
             out,
+            core,
             world,
+            modal,
             active_addr,
             attached_map,
             in_tmux,
@@ -1605,7 +1960,9 @@ fn flush_pending_reader_osc_with_env<W: Write>(
 fn flush_pending_reader_osc<W: Write>(
     out: &mut W,
     pending_reader_osc: &mut bool,
+    core: &CoreClient,
     world: &World,
+    modal: &Modal,
     active_addr: Option<&String>,
     attached_map: &mut BTreeMap<String, AttachedTerminal>,
 ) -> Result<()> {
@@ -1615,7 +1972,9 @@ fn flush_pending_reader_osc<W: Write>(
         flush_pending_reader_osc_with_env(
             out,
             pending_reader_osc,
+            Some(core),
             world,
+            modal,
             active_addr,
             attached_map,
             in_tmux,
@@ -2238,12 +2597,31 @@ fn execute_action_full(
             }
         }
         Action::OpenBookReader => {
+            if matches!(modal, Modal::Reader { .. }) {
+                *modal = Modal::None;
+            } else {
+                *modal = build_reader_modal_state(core, world, attached, term_rect, true);
+            }
+            if *eink_mode {
+                *pending_eink_osc = true;
+            }
+        }
+        Action::ExportNativeBookReader => {
             if let Some(flag) = pending_reader_osc {
                 *flag = true;
             }
         }
         Action::PageUp => {
-            if attached.is_some_and(|a| a.parser.screen().alternate_screen())
+            if matches!(modal, Modal::Reader { .. }) {
+                let step = reader_page_step(term_rect) as isize;
+                step_reader_modal_scroll(
+                    modal,
+                    term_rect,
+                    ReaderScrollMove::Delta(-step),
+                    *eink_mode,
+                    pending_eink_osc,
+                );
+            } else if attached.is_some_and(|a| a.parser.screen().alternate_screen())
                 && *scrollback_offset == 0
             {
                 if let Some(att) = attached {
@@ -2255,7 +2633,16 @@ fn execute_action_full(
             }
         }
         Action::PageDown => {
-            if attached.is_some_and(|a| a.parser.screen().alternate_screen())
+            if matches!(modal, Modal::Reader { .. }) {
+                let step = reader_page_step(term_rect) as isize;
+                step_reader_modal_scroll(
+                    modal,
+                    term_rect,
+                    ReaderScrollMove::Delta(step),
+                    *eink_mode,
+                    pending_eink_osc,
+                );
+            } else if attached.is_some_and(|a| a.parser.screen().alternate_screen())
                 && *scrollback_offset == 0
             {
                 if let Some(att) = attached {
@@ -3013,7 +3400,7 @@ fn promote_due_pty_dirty_with_color(
     modal: &Modal,
     selection: &Option<TerminalSelection>,
 ) {
-    if *dirty {
+    if *dirty || matches!(modal, Modal::Reader { .. }) {
         return;
     }
     let Some(deadline) =
@@ -3168,6 +3555,8 @@ fn run_app_loop(
     let mut last_eink_snap: Option<(String, EinkScreenSnapshot)> = None;
     let mut pending_eink_osc = eink_mode;
     let mut pending_reader_osc = false;
+    let mut reader_drag: Option<u16> = None;
+    let mut reader_open_scope: Option<ReaderScope> = None;
     let mut prev_drawn_addr: Option<String> = None;
     let mut prev_modal_open = false;
     let mut prev_active_agent_state: Option<(String, AgentState)> = None;
@@ -3403,7 +3792,9 @@ fn run_app_loop(
                             selection_screen = None;
                             selection_vt_seq = None;
                         }
-                        if is_active && !matches!(modal, Modal::TabOverview { .. }) {
+                        if is_active
+                            && !matches!(modal, Modal::TabOverview { .. } | Modal::Reader { .. })
+                        {
                             if !eink_mode
                                 || eink_interval.is_zero()
                                 || !first_frame_drawn
@@ -3427,6 +3818,14 @@ fn run_app_loop(
                         if active_channel == Some(channel) {
                             *active_addr = None;
                             active_channel = None;
+                            if matches!(modal, Modal::Reader { .. }) {
+                                modal = Modal::None;
+                                reader_open_scope = None;
+                                reader_drag = None;
+                                if eink_mode {
+                                    pending_eink_osc = true;
+                                }
+                            }
                         }
                         pending_lifecycle_sync = true;
                     }
@@ -3462,7 +3861,15 @@ fn run_app_loop(
                                 *sidebar_open = false;
                             }
                             page_tap = None;
+                            reader_drag = None;
                             cur_size = (w, h);
+                            let next_term_rect = compute_terminal_rect(
+                                Rect::new(0, 0, w, h),
+                                *sidebar_open,
+                                sidebar_width,
+                                touch_mode,
+                            );
+                            clamp_reader_scroll_on_resize(&mut modal, next_term_rect);
                             pending_sibling_resize_at =
                                 Some(Instant::now() + SIBLING_RESIZE_DEBOUNCE);
                             need_sync_terminals = true;
@@ -3491,6 +3898,7 @@ fn run_app_loop(
                             MouseEventKind::Down(MouseButton::Left) => {
                                 horiz_wheel.clear_pending_horiz();
                                 page_tap = None;
+                                reader_drag = None;
                                 let mx = mev.column;
                                 let my = mev.row;
                                 let had_vis_sel = selection
@@ -3537,13 +3945,38 @@ fn run_app_loop(
                                         dirty = true;
                                     }
                                     match target {
-                                        HitTarget::ModalNoop => {}
+                                        HitTarget::ModalNoop => {
+                                            if matches!(modal, Modal::Reader { .. }) {
+                                                let (body_rect, _, _) =
+                                                    reader_body_metrics(term_rect);
+                                                if is_in_rect(Some(body_rect), mx, my) {
+                                                    reader_drag = Some(my);
+                                                }
+                                            }
+                                        }
                                         HitTarget::CancelModal => {
                                             modal = Modal::None;
                                             prefix_active = false;
                                             ctrl_active = false;
                                             alt_active = false;
                                             dirty = true;
+                                        }
+                                        HitTarget::ReaderPageUp
+                                        | HitTarget::ReaderPageDown
+                                        | HitTarget::ReaderToggleClean
+                                        | HitTarget::ReaderExportNative
+                                        | HitTarget::ReaderJumpLatest => {
+                                            let (_, changed) = handle_reader_mouse_hit(
+                                                target,
+                                                &mut modal,
+                                                term_rect,
+                                                eink_mode,
+                                                &mut pending_eink_osc,
+                                                &mut pending_reader_osc,
+                                            );
+                                            if changed {
+                                                dirty = true;
+                                            }
                                         }
                                         HitTarget::ConfirmCloseYes { tab_id } => {
                                             modal = Modal::None;
@@ -3861,6 +4294,17 @@ fn run_app_loop(
                                             }
                                         }
                                     }
+                                } else if reader_drag.is_some() {
+                                    if handle_reader_drag(
+                                        &mut reader_drag,
+                                        mev.row,
+                                        &mut modal,
+                                        term_rect,
+                                        eink_mode,
+                                        &mut pending_eink_osc,
+                                    ) {
+                                        dirty = true;
+                                    }
                                 } else if let Some(ref tap) = page_tap {
                                     if !page_tap_within_slop(tap, mev.column, mev.row) {
                                         let start_col = tap.start_col;
@@ -3913,6 +4357,7 @@ fn run_app_loop(
                                 }
                             }
                             MouseEventKind::Up(MouseButton::Left) => {
+                                reader_drag = None;
                                 if let Some(drag) = dpad_drag.take() {
                                     if drag.moved {
                                         dirty = true;
@@ -4154,6 +4599,22 @@ fn run_app_loop(
                                     ) {
                                         dirty = true;
                                     }
+                                } else if matches!(modal, Modal::Reader { .. })
+                                    && dpad_drag.is_none()
+                                    && !selection.as_ref().is_some_and(|s| s.active)
+                                    && mev.row >= term_rect.y
+                                    && mev.row < term_rect.y.saturating_add(term_rect.height)
+                                {
+                                    horiz_wheel.record_viewport_vertical_wheel(wheel_now);
+                                    if handle_reader_wheel(
+                                        true,
+                                        &mut modal,
+                                        term_rect,
+                                        eink_mode,
+                                        &mut pending_eink_osc,
+                                    ) {
+                                        dirty = true;
+                                    }
                                 } else if matches!(modal, Modal::TabOverview { .. })
                                     && dpad_drag.is_none()
                                     && !selection.as_ref().is_some_and(|s| s.active)
@@ -4284,6 +4745,22 @@ fn run_app_loop(
                                         &mut selection,
                                         &mut selection_screen,
                                         &mut selection_vt_seq,
+                                    ) {
+                                        dirty = true;
+                                    }
+                                } else if matches!(modal, Modal::Reader { .. })
+                                    && dpad_drag.is_none()
+                                    && !selection.as_ref().is_some_and(|s| s.active)
+                                    && mev.row >= term_rect.y
+                                    && mev.row < term_rect.y.saturating_add(term_rect.height)
+                                {
+                                    horiz_wheel.record_viewport_vertical_wheel(wheel_now);
+                                    if handle_reader_wheel(
+                                        false,
+                                        &mut modal,
+                                        term_rect,
+                                        eink_mode,
+                                        &mut pending_eink_osc,
                                     ) {
                                         dirty = true;
                                     }
@@ -4545,6 +5022,15 @@ fn run_app_loop(
                 }
             }
         }
+        sync_reader_modal_scope(
+            &mut modal,
+            world,
+            &mut reader_open_scope,
+            &mut reader_drag,
+            eink_mode,
+            &mut pending_eink_osc,
+            &mut dirty,
+        );
 
         if let Some(att) = active_addr.as_ref().and_then(|a| attached_map.get_mut(a)) {
             att.parser.screen_mut().set_scrollback(scrollback_offset);
@@ -4592,7 +5078,8 @@ fn run_app_loop(
             if first_frame_drawn && *active_addr != prev_drawn_addr {
                 pending_eink_osc = true;
             }
-            if !prev_modal_open && matches!(modal, Modal::TabOverview { .. }) {
+            if !prev_modal_open && matches!(modal, Modal::TabOverview { .. } | Modal::Reader { .. })
+            {
                 pending_eink_osc = true;
             }
             if prev_modal_open && matches!(modal, Modal::None) {
@@ -4609,7 +5096,7 @@ fn run_app_loop(
             let use_selection_screen =
                 selection.as_ref().is_some_and(|s| s.active) && selection_screen.is_some();
             let initial_in_code_fence = if (eink_mode || is_active_tab_agent(world))
-                && !matches!(modal, Modal::TabOverview { .. })
+                && !matches!(modal, Modal::TabOverview { .. } | Modal::Reader { .. })
             {
                 if use_selection_screen {
                     selection_initial_fence
@@ -4695,7 +5182,9 @@ fn run_app_loop(
         flush_pending_reader_osc(
             terminal.backend_mut(),
             &mut pending_reader_osc,
+            core,
             world,
+            &modal,
             active_addr.as_ref(),
             attached_map,
         )?;
@@ -5020,7 +5509,11 @@ fn handle_key_event_full(
             }
             return Ok(KeyOutcome::UiChanged);
         }
-        Modal::SpaceMenu | Modal::TabOverview { .. } | Modal::Help | Modal::None => {}
+        Modal::SpaceMenu
+        | Modal::TabOverview { .. }
+        | Modal::Help
+        | Modal::Reader { .. }
+        | Modal::None => {}
     }
 
     // 2. Prefix mode active (`Ctrl+b` pressed previously or `[^B]` tapped)
@@ -5058,6 +5551,22 @@ fn handle_key_event_full(
                         | Action::ToggleEink
                         | Action::ToggleEinkColor
                         | Action::RedrawScreen
+                ) {
+                    *modal = Modal::None;
+                }
+            } else if matches!(modal, Modal::Reader { .. }) {
+                if action == Action::SendPrefix {
+                    return Ok(KeyOutcome::UiChanged);
+                }
+                if !matches!(
+                    action,
+                    Action::OpenBookReader
+                        | Action::ExportNativeBookReader
+                        | Action::ToggleEink
+                        | Action::ToggleEinkColor
+                        | Action::RedrawScreen
+                        | Action::PageUp
+                        | Action::PageDown
                 ) {
                     *modal = Modal::None;
                 }
@@ -5260,6 +5769,100 @@ fn handle_key_event_full(
                 return Ok(KeyOutcome::Quit);
             }
             *modal = Modal::None;
+            return Ok(KeyOutcome::UiChanged);
+        }
+        Modal::Reader { .. } => {
+            if let Some(action) = match_direct_action(&kev) {
+                *modal = Modal::None;
+                if *eink_mode {
+                    *pending_eink_osc = true;
+                }
+                if execute_action_full(
+                    action,
+                    core,
+                    world,
+                    attached,
+                    prefix_spec,
+                    sidebar_open,
+                    scrollback_offset,
+                    modal,
+                    term_rect,
+                    eink_mode,
+                    eink_color,
+                    force_clear,
+                    pending_eink_osc,
+                    pending_reader_osc,
+                )? {
+                    return Ok(KeyOutcome::Quit);
+                }
+                return Ok(KeyOutcome::UiChanged);
+            }
+            let no_ctrl_alt = !kev
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+            let step = reader_page_step(term_rect) as isize;
+            let page_mv = match kev.code {
+                KeyCode::PageUp | KeyCode::BackTab => Some(ReaderScrollMove::Delta(-step)),
+                KeyCode::Char('b') if no_ctrl_alt => Some(ReaderScrollMove::Delta(-step)),
+                KeyCode::PageDown => Some(ReaderScrollMove::Delta(step)),
+                KeyCode::Char(' ') if no_ctrl_alt => Some(ReaderScrollMove::Delta(step)),
+                KeyCode::Home => Some(ReaderScrollMove::Top),
+                KeyCode::Char('g') if no_ctrl_alt => Some(ReaderScrollMove::Top),
+                KeyCode::End => Some(ReaderScrollMove::Bottom),
+                KeyCode::Char('G') if no_ctrl_alt => Some(ReaderScrollMove::Bottom),
+                KeyCode::Char('l') if no_ctrl_alt => Some(ReaderScrollMove::Latest),
+                _ => None,
+            };
+            if let Some(mv) = page_mv {
+                step_reader_modal_scroll(modal, term_rect, mv, *eink_mode, pending_eink_osc);
+                return Ok(KeyOutcome::UiChanged);
+            }
+            let line_delta = match kev.code {
+                KeyCode::Up => Some(-1),
+                KeyCode::Char('k') if no_ctrl_alt => Some(-1),
+                KeyCode::Down => Some(1),
+                KeyCode::Char('j') if no_ctrl_alt => Some(1),
+                _ => None,
+            };
+            if let Some(delta) = line_delta {
+                move_reader_scroll(modal, term_rect, ReaderScrollMove::Delta(delta));
+                return Ok(KeyOutcome::UiChanged);
+            }
+            match kev.code {
+                KeyCode::Esc | KeyCode::Char('q' | 'v') if no_ctrl_alt => {
+                    *modal = Modal::None;
+                    if *eink_mode {
+                        *pending_eink_osc = true;
+                    }
+                }
+                KeyCode::Char('c') if kev.modifiers.contains(KeyModifiers::CONTROL) => {
+                    *modal = Modal::None;
+                    if *eink_mode {
+                        *pending_eink_osc = true;
+                    }
+                }
+                KeyCode::Tab | KeyCode::Char('f' | 'c') if no_ctrl_alt => {
+                    if toggle_reader_clean_mode(modal, term_rect) && *eink_mode {
+                        *pending_eink_osc = true;
+                    }
+                }
+                KeyCode::Char('r') if no_ctrl_alt => {
+                    let clean_mode = match *modal {
+                        Modal::Reader { ref doc, .. } => doc.clean_mode,
+                        _ => true,
+                    };
+                    *modal = build_reader_modal_state(core, world, attached, term_rect, clean_mode);
+                    if *eink_mode {
+                        *pending_eink_osc = true;
+                    }
+                }
+                KeyCode::Char('s') if no_ctrl_alt => {
+                    if let Some(flag) = pending_reader_osc {
+                        *flag = true;
+                    }
+                }
+                _ => {}
+            }
             return Ok(KeyOutcome::UiChanged);
         }
         _ => {}
@@ -8590,10 +9193,45 @@ mod tests {
         assert_eq!(sel.extract_text(att.parser.screen()), "SeeThrough");
     }
 
-    #[test]
-    fn book_reader_shortcut_sets_pending_osc_and_formats_osc_777_sequence() {
-        let core = CoreClient::dummy_for_tests();
+    fn reader_test_world() -> World {
+        use crate::model::{make_single_terminal_tab, SharedSpace, TerminalInfo};
+
         let mut world = World::default();
+        world.terminals.insert(
+            "t1".to_string(),
+            TerminalInfo {
+                address: "t1".to_string(),
+                title: "demo".to_string(),
+                status_word: Some("idle".to_string()),
+                status_app: Some("codex".to_string()),
+                ..Default::default()
+            },
+        );
+        world.terminals.insert(
+            "t2".to_string(),
+            TerminalInfo {
+                address: "t2".to_string(),
+                title: "shell".to_string(),
+                ..Default::default()
+            },
+        );
+        world.doc.spaces.push(SharedSpace {
+            id: "s1".to_string(),
+            name: "main".to_string(),
+            folder: String::new(),
+            tabs: vec![
+                make_single_terminal_tab("tab1", "agy", "t1"),
+                make_single_terminal_tab("tab2", "sh", "t2"),
+            ],
+            rest: Default::default(),
+        });
+        world
+    }
+
+    #[test]
+    fn book_reader_shortcut_opens_modal_while_shift_b_exports_native_osc() {
+        let core = CoreClient::dummy_for_tests();
+        let mut world = reader_test_world();
         let mut sidebar_open = false;
         let mut prefix_active = false;
         let mut ctrl_active = false;
@@ -8608,48 +9246,64 @@ mod tests {
         let mut pending_reader_osc = false;
 
         let ctrl_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
-        let _ = handle_key_event_full(
+        for key in [
             ctrl_b,
-            &core,
-            &mut world,
-            None,
-            "ctrl+b",
-            &mut sidebar_open,
-            &mut prefix_active,
-            &mut ctrl_active,
-            &mut alt_active,
-            &mut scrollback_offset,
-            &mut modal,
-            term_rect,
-            &mut eink_mode,
-            &mut eink_color,
-            &mut force_clear,
-            &mut pending_eink_osc,
-            Some(&mut pending_reader_osc),
-        )
-        .unwrap();
-        let out = handle_key_event_full(
             KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
-            &core,
-            &mut world,
-            None,
-            "ctrl+b",
-            &mut sidebar_open,
-            &mut prefix_active,
-            &mut ctrl_active,
-            &mut alt_active,
-            &mut scrollback_offset,
-            &mut modal,
-            term_rect,
-            &mut eink_mode,
-            &mut eink_color,
-            &mut force_clear,
-            &mut pending_eink_osc,
-            Some(&mut pending_reader_osc),
-        )
-        .unwrap();
-        assert_eq!(out, KeyOutcome::UiChanged);
-        assert!(matches!(modal, Modal::None));
+        ] {
+            let out = handle_key_event_full(
+                key,
+                &core,
+                &mut world,
+                None,
+                "ctrl+b",
+                &mut sidebar_open,
+                &mut prefix_active,
+                &mut ctrl_active,
+                &mut alt_active,
+                &mut scrollback_offset,
+                &mut modal,
+                term_rect,
+                &mut eink_mode,
+                &mut eink_color,
+                &mut force_clear,
+                &mut pending_eink_osc,
+                Some(&mut pending_reader_osc),
+            )
+            .unwrap();
+            assert_eq!(out, KeyOutcome::UiChanged);
+        }
+        assert!(matches!(modal, Modal::Reader { .. }));
+        assert!(!pending_reader_osc);
+        assert!(pending_eink_osc);
+
+        pending_eink_osc = false;
+        for key in [
+            ctrl_b,
+            KeyEvent::new(KeyCode::Char('B'), KeyModifiers::SHIFT),
+        ] {
+            let out = handle_key_event_full(
+                key,
+                &core,
+                &mut world,
+                None,
+                "ctrl+b",
+                &mut sidebar_open,
+                &mut prefix_active,
+                &mut ctrl_active,
+                &mut alt_active,
+                &mut scrollback_offset,
+                &mut modal,
+                term_rect,
+                &mut eink_mode,
+                &mut eink_color,
+                &mut force_clear,
+                &mut pending_eink_osc,
+                Some(&mut pending_reader_osc),
+            )
+            .unwrap();
+            assert_eq!(out, KeyOutcome::UiChanged);
+        }
+        assert!(matches!(modal, Modal::Reader { .. }));
         assert!(pending_reader_osc);
 
         let raw_json = r#"{"v":1,"title":"tab","anchor":0,"lines":[]}"#;
@@ -8752,29 +9406,7 @@ mod tests {
 
     #[test]
     fn emit_shelldeck_reader_osc_runs_after_end_synchronized_update() {
-        use crate::model::{SharedSpace, SharedTab, TerminalInfo};
-
-        let mut world = World::default();
-        world.terminals.insert(
-            "t1".to_string(),
-            TerminalInfo {
-                address: "t1".to_string(),
-                title: "demo".to_string(),
-                ..Default::default()
-            },
-        );
-        world.doc.spaces.push(SharedSpace {
-            id: "s1".to_string(),
-            name: "main".to_string(),
-            folder: String::new(),
-            tabs: vec![SharedTab {
-                id: "tab1".to_string(),
-                name: "agy".to_string(),
-                root: serde_json::json!({ "type": "block", "content": { "terminal": "t1" } }),
-                rest: Default::default(),
-            }],
-            rest: Default::default(),
-        });
+        let world = reader_test_world();
         let mut attached_map = BTreeMap::new();
         let mut att = AttachedTerminal::new(1, 40, 4);
         att.process_vt_bytes(b"Reader output line");
@@ -8788,7 +9420,9 @@ mod tests {
         flush_pending_reader_osc_with_env(
             &mut buf,
             &mut pending_reader_osc,
+            None,
             &world,
+            &Modal::None,
             Some(&active_addr),
             &mut attached_map,
             false,
@@ -8808,6 +9442,323 @@ mod tests {
             reader_pos > end_sync_pos,
             "reader-open OSC must be emitted strictly after EndSynchronizedUpdate"
         );
+    }
+
+    #[test]
+    fn emit_shelldeck_reader_osc_exports_open_reader_modal_doc() {
+        let world = reader_test_world();
+        let mut attached_map = BTreeMap::new();
+        let active_addr = "t1".to_string();
+        let raw_text = "❯ hi\n○ Thought for 1s\nAnswer paragraph.\n".to_string();
+        let full_doc =
+            crate::reader::build_reader_doc_from_text(&raw_text, "agy", true, false, None);
+        let modal = Modal::Reader {
+            doc: full_doc.clone(),
+            scroll: 0,
+            raw_text,
+            source_note: None,
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        let mut pending = true;
+        flush_pending_reader_osc_with_env(
+            &mut buf,
+            &mut pending,
+            None,
+            &world,
+            &modal,
+            Some(&active_addr),
+            &mut attached_map,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(!pending);
+        let expected = format_shelldeck_reader_open_osc_with_env(
+            &crate::reader::format_reader_doc_json(&full_doc),
+            false,
+            false,
+        );
+        assert_eq!(String::from_utf8(buf).unwrap(), expected);
+    }
+
+    #[test]
+    fn reader_modal_keyboard_navigation_toggles_refresh_and_exit() {
+        let core = CoreClient::dummy_for_tests();
+        let mut world = reader_test_world();
+        let mut attached = AttachedTerminal::new(1, 60, 24);
+        let mut payload = String::from("> explain carefully\r\n");
+        payload.push_str("\u{25cb} Thought for 2s\r\n");
+        for i in 1..=35 {
+            payload.push_str(&format!("Paragraph {i}: readable response line.\r\n\r\n"));
+        }
+        attached.process_vt_bytes(payload.as_bytes());
+
+        let term_rect = Rect::new(0, 1, 60, 14);
+        let mut sidebar_open = false;
+        let mut prefix_active = false;
+        let mut ctrl_active = false;
+        let mut alt_active = false;
+        let mut scrollback_offset = 0;
+        let mut eink_mode = false;
+        let mut eink_color = false;
+        let mut force_clear = false;
+        let mut pending_eink_osc = false;
+        let mut pending_reader_osc = false;
+        let mut modal = build_reader_modal_state(&core, &world, Some(&attached), term_rect, true);
+
+        let initial_scroll = match modal {
+            Modal::Reader {
+                ref doc, scroll, ..
+            } => {
+                assert!(doc.is_agent);
+                assert!(doc.clean_mode);
+                assert!(doc.hidden_process_lines >= 1);
+                scroll
+            }
+            _ => panic!("expected Modal::Reader"),
+        };
+
+        macro_rules! send_key {
+            ($code:expr, $mods:expr) => {
+                handle_key_event_full(
+                    KeyEvent::new($code, $mods),
+                    &core,
+                    &mut world,
+                    Some(&attached),
+                    "ctrl+b",
+                    &mut sidebar_open,
+                    &mut prefix_active,
+                    &mut ctrl_active,
+                    &mut alt_active,
+                    &mut scrollback_offset,
+                    &mut modal,
+                    term_rect,
+                    &mut eink_mode,
+                    &mut eink_color,
+                    &mut force_clear,
+                    &mut pending_eink_osc,
+                    Some(&mut pending_reader_osc),
+                )
+                .unwrap()
+            };
+        }
+
+        // Line step down/up, End/Home, Latest anchor
+        assert_eq!(
+            send_key!(KeyCode::Char('j'), KeyModifiers::NONE),
+            KeyOutcome::UiChanged
+        );
+        let after_j = match modal {
+            Modal::Reader { scroll, .. } => scroll,
+            _ => panic!("expected Modal::Reader"),
+        };
+        assert!(after_j > initial_scroll);
+        send_key!(KeyCode::Char('k'), KeyModifiers::NONE);
+        match modal {
+            Modal::Reader { scroll, .. } => assert_eq!(scroll, initial_scroll),
+            _ => panic!("expected Modal::Reader"),
+        }
+        send_key!(KeyCode::Char('G'), KeyModifiers::SHIFT);
+        let at_bottom = match modal {
+            Modal::Reader { scroll, .. } => scroll,
+            _ => panic!("expected Modal::Reader"),
+        };
+        assert!(at_bottom >= after_j);
+        send_key!(KeyCode::Char('g'), KeyModifiers::NONE);
+        match modal {
+            Modal::Reader { scroll, .. } => assert_eq!(scroll, 0),
+            _ => panic!("expected Modal::Reader"),
+        }
+        send_key!(KeyCode::Char(' '), KeyModifiers::NONE);
+        let after_space = match modal {
+            Modal::Reader { scroll, .. } => scroll,
+            _ => panic!("expected Modal::Reader"),
+        };
+        assert!(after_space > 0);
+        send_key!(KeyCode::Char('b'), KeyModifiers::NONE);
+        match modal {
+            Modal::Reader { scroll, .. } => assert_eq!(scroll, 0),
+            _ => panic!("expected Modal::Reader"),
+        }
+        send_key!(KeyCode::Char('l'), KeyModifiers::NONE);
+        match modal {
+            Modal::Reader { scroll, .. } => assert_eq!(scroll, initial_scroll),
+            _ => panic!("expected Modal::Reader"),
+        }
+
+        // Toggle Clean <-> Full via 'c', export via 's', refresh via 'r'
+        send_key!(KeyCode::Char('c'), KeyModifiers::NONE);
+        match modal {
+            Modal::Reader { ref doc, .. } => {
+                assert!(!doc.clean_mode);
+                assert_eq!(doc.hidden_process_lines, 0);
+            }
+            _ => panic!("expected Modal::Reader"),
+        }
+        send_key!(KeyCode::Char('s'), KeyModifiers::NONE);
+        assert!(pending_reader_osc);
+        pending_reader_osc = false;
+
+        attached.process_vt_bytes(b"fresh line 36\r\n");
+        send_key!(KeyCode::Char('r'), KeyModifiers::NONE);
+        match modal {
+            Modal::Reader {
+                ref doc,
+                ref raw_text,
+                ..
+            } => {
+                assert!(!doc.clean_mode); // refresh preserves Clean/Full setting
+                assert!(raw_text.contains("fresh line 36"));
+            }
+            _ => panic!("expected Modal::Reader"),
+        }
+
+        // Prefix ^b PgDn keeps Modal::Reader open; ^b n closes Modal::Reader and switches tab
+        send_key!(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        send_key!(KeyCode::PageDown, KeyModifiers::NONE);
+        assert!(matches!(modal, Modal::Reader { .. }));
+        send_key!(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        send_key!(KeyCode::Char('n'), KeyModifiers::NONE);
+        assert!(matches!(modal, Modal::None));
+        assert_eq!(world.active_tab_index(), 1);
+
+        // Close via Ctrl+c and direct Alt+Right
+        world.select_tab_by_id("s1", "tab1");
+        modal = build_reader_modal_state(&core, &world, Some(&attached), term_rect, true);
+        send_key!(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(matches!(modal, Modal::None));
+        assert!(!pending_reader_osc);
+
+        modal = build_reader_modal_state(&core, &world, Some(&attached), term_rect, true);
+        send_key!(KeyCode::Right, KeyModifiers::ALT);
+        assert!(matches!(modal, Modal::None));
+        assert_eq!(world.active_tab_index(), 1);
+    }
+
+    #[test]
+    fn reader_modal_mouse_wheel_touch_drag_resize_and_scope_sync() {
+        let core = CoreClient::dummy_for_tests();
+        let mut world = reader_test_world();
+        let mut attached = AttachedTerminal::new(1, 60, 24);
+        let mut payload = String::new();
+        for i in 1..=50 {
+            payload.push_str(&format!("reader line {i}\r\n"));
+        }
+        attached.process_vt_bytes(payload.as_bytes());
+        let small_rect = Rect::new(0, 1, 60, 12);
+        let mut modal = build_reader_modal_state(&core, &world, Some(&attached), small_rect, true);
+        move_reader_scroll(&mut modal, small_rect, ReaderScrollMove::Top);
+
+        let mut pending_eink = false;
+        let mut pending_reader = false;
+        let (handled, dirty) = handle_reader_mouse_hit(
+            HitTarget::ReaderPageDown,
+            &mut modal,
+            small_rect,
+            true,
+            &mut pending_eink,
+            &mut pending_reader,
+        );
+        assert!(handled && dirty && pending_eink);
+        let page_pos = match modal {
+            Modal::Reader { scroll, .. } => scroll,
+            _ => panic!("expected Modal::Reader"),
+        };
+        assert!(page_pos > 0);
+
+        pending_eink = false;
+        assert!(handle_reader_wheel(
+            true,
+            &mut modal,
+            small_rect,
+            false,
+            &mut pending_eink,
+        ));
+        assert!(!pending_eink);
+        let after_wheel_up = match modal {
+            Modal::Reader { scroll, .. } => scroll,
+            _ => panic!("expected Modal::Reader"),
+        };
+        assert_eq!(after_wheel_up, page_pos.saturating_sub(3));
+
+        // Touch drag in Normal mode scrolls smoothly per row; in E-Ink mode 1 swipe = 1 page flip
+        let mut drag = Some(10u16);
+        assert!(handle_reader_drag(
+            &mut drag,
+            8,
+            &mut modal,
+            small_rect,
+            false,
+            &mut pending_eink,
+        ));
+        assert_eq!(drag, Some(8));
+
+        let mut eink_drag = Some(10u16);
+        pending_eink = false;
+        assert!(!handle_reader_drag(
+            &mut eink_drag,
+            9,
+            &mut modal,
+            small_rect,
+            true,
+            &mut pending_eink,
+        )); // below threshold 2
+        assert!(handle_reader_drag(
+            &mut eink_drag,
+            8,
+            &mut modal,
+            small_rect,
+            true,
+            &mut pending_eink,
+        ));
+        assert_eq!(eink_drag, None);
+        assert!(pending_eink);
+
+        // Resize taller clamps bottom scroll cleanly
+        move_reader_scroll(&mut modal, small_rect, ReaderScrollMove::Bottom);
+        let tall_rect = Rect::new(0, 1, 60, 40);
+        clamp_reader_scroll_on_resize(&mut modal, tall_rect);
+        let (_, max_after) = match modal {
+            Modal::Reader { ref doc, .. } => reader_initial_scroll(doc, tall_rect),
+            _ => panic!("expected Modal::Reader"),
+        };
+        match modal {
+            Modal::Reader { scroll, .. } => assert!(scroll <= max_after),
+            _ => panic!("expected Modal::Reader"),
+        }
+
+        // Scope sync captures initial scope, stays open while unchanged, closes on tab switch
+        let mut scope = None;
+        let mut drag_opt = Some(5u16);
+        let mut sync_dirty = false;
+        sync_reader_modal_scope(
+            &mut modal,
+            &world,
+            &mut scope,
+            &mut drag_opt,
+            true,
+            &mut pending_eink,
+            &mut sync_dirty,
+        );
+        assert!(matches!(modal, Modal::Reader { .. }));
+        assert!(scope.is_some());
+
+        world.select_tab_by_id("s1", "tab2");
+        pending_eink = false;
+        sync_reader_modal_scope(
+            &mut modal,
+            &world,
+            &mut scope,
+            &mut drag_opt,
+            true,
+            &mut pending_eink,
+            &mut sync_dirty,
+        );
+        assert!(matches!(modal, Modal::None));
+        assert!(scope.is_none());
+        assert!(drag_opt.is_none());
+        assert!(sync_dirty);
+        assert!(pending_eink);
     }
 
     #[test]
