@@ -20,10 +20,10 @@ use crate::ui::capture_eink_screen_snapshot;
 use crate::ui::{
     capture_eink_screen_snapshot_with_color, collect_fuzzy_items, collect_overview_items,
     compute_terminal_rect, find_hit_target, is_in_rect, is_on_dpad_disc,
-    overview_selection_after_query_change, overview_selection_for_index, render_ui_with_theme,
-    resolve_dpad_disc_rect, resolve_fuzzy_selection, resolve_mod_cross_rect,
-    resolve_overview_selection, EinkScreenSnapshot, HitRegion, HitTarget, Modal, OverviewItem,
-    OverviewSelection, PromptKind, TerminalSelection,
+    overview_selection_after_query_change, overview_selection_for_index,
+    render_ui_full_with_eink_color, resolve_dpad_disc_rect, resolve_fuzzy_selection,
+    resolve_mod_cross_rect, resolve_overview_selection, EinkScreenSnapshot, HitRegion, HitTarget,
+    Modal, OverviewItem, OverviewSelection, PromptKind, TerminalSelection,
 };
 use crate::usage::UsageTracker;
 use anyhow::Result;
@@ -47,8 +47,7 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::io::{self, BufWriter, IsTerminal, Write};
-use std::path::PathBuf;
+use std::io::{self, BufWriter, Write};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -201,437 +200,6 @@ struct Cli {
     /// Passive PTY output coalescing interval in milliseconds when --eink is enabled (default: 250, max: 2000)
     #[arg(long)]
     eink_interval_ms: Option<u64>,
-
-    /// Use high-contrast Light UI theme for bars, pads, and popovers
-    #[arg(long, conflicts_with = "dark")]
-    light: bool,
-
-    /// Use classic Dark UI theme for bars, pads, and popovers (overrides ui.theme = "light" or auto-detection)
-    #[arg(long, conflicts_with = "light")]
-    dark: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ThemePref {
-    Auto,
-    Fixed(bool),
-}
-
-fn parse_theme_token(raw: &str) -> Option<ThemePref> {
-    let lower = raw.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return None;
-    }
-    if lower == "auto" {
-        return Some(ThemePref::Auto);
-    }
-    if lower.contains("eink")
-        || lower.contains("e-ink")
-        || lower.contains("kaleido")
-        || lower.contains("monochrome")
-    {
-        return None;
-    }
-    let mut words = lower
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|w| !w.is_empty());
-    let mut found: Option<bool> = None;
-    for w in &mut words {
-        match w {
-            "light" | "latte" => found = Some(true),
-            "dark" | "mocha" => found = Some(false),
-            _ => {}
-        }
-    }
-    found.map(ThemePref::Fixed)
-}
-
-fn resolve_theme_pref<F>(
-    cli_light: bool,
-    cli_dark: bool,
-    cfg_theme: Option<&str>,
-    mut get_env: F,
-) -> ThemePref
-where
-    F: FnMut(&str) -> Option<String>,
-{
-    if cli_light {
-        return ThemePref::Fixed(true);
-    }
-    if cli_dark {
-        return ThemePref::Fixed(false);
-    }
-    if let Some(raw) = cfg_theme {
-        if let Some(pref) = parse_theme_token(raw) {
-            return pref;
-        }
-    }
-    for var in ["HCT_THEME", "LC_TERMINAL_PROFILE"] {
-        if let Some(raw) = get_env(var) {
-            if let Some(pref) = parse_theme_token(&raw) {
-                return pref;
-            }
-        }
-    }
-    ThemePref::Auto
-}
-
-fn scale_hex_component(hex: &str) -> Option<u8> {
-    if hex.is_empty() || hex.len() > 4 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    let v = u32::from_str_radix(hex, 16).ok()?;
-    let scaled = match hex.len() {
-        1 => v * 0x11,
-        2 => v,
-        3 => v >> 4,
-        4 => v >> 8,
-        _ => return None,
-    };
-    Some(scaled as u8)
-}
-
-fn parse_osc11_payload(raw_bytes: &[u8]) -> Option<(u8, u8, u8)> {
-    let raw = std::str::from_utf8(raw_bytes)
-        .ok()?
-        .trim()
-        .to_ascii_lowercase();
-    if let Some(spec) = raw
-        .strip_prefix("rgb:")
-        .or_else(|| raw.strip_prefix("rgba:"))
-    {
-        let mut parts = spec.split('/');
-        let r = scale_hex_component(parts.next()?)?;
-        let g = scale_hex_component(parts.next()?)?;
-        let b = scale_hex_component(parts.next()?)?;
-        return Some((r, g, b));
-    }
-    if let Some(hex) = raw.strip_prefix('#') {
-        let len = hex.len();
-        if matches!(len, 3 | 6 | 9 | 12) {
-            let step = len / 3;
-            let r = scale_hex_component(&hex[..step])?;
-            let g = scale_hex_component(&hex[step..step * 2])?;
-            let b = scale_hex_component(&hex[step * 2..])?;
-            return Some((r, g, b));
-        }
-    }
-    None
-}
-
-struct Osc11FrameMatch {
-    span: usize,
-    rgb: Option<(u8, u8, u8)>,
-}
-
-fn osc11_reply_span(bytes: &[u8]) -> Option<Osc11FrameMatch> {
-    let header_len = if bytes.starts_with(b"\x1b]11;") {
-        5
-    } else if bytes.starts_with(b"\x9d11;") {
-        4
-    } else {
-        return None;
-    };
-    let mut i = header_len;
-    while i < bytes.len() {
-        if bytes[i] == 0x07 || bytes[i] == 0x9c {
-            let rgb = parse_osc11_payload(&bytes[header_len..i]);
-            return Some(Osc11FrameMatch { span: i + 1, rgb });
-        }
-        if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
-            let rgb = parse_osc11_payload(&bytes[header_len..i]);
-            return Some(Osc11FrameMatch { span: i + 2, rgb });
-        }
-        i += 1;
-    }
-    None
-}
-
-fn match_osc11_probe_frame(bytes: &[u8]) -> Option<Osc11FrameMatch> {
-    if let Some(res) = osc11_reply_span(bytes) {
-        return Some(res);
-    }
-    if bytes.starts_with(b"\x1bPtmux;") {
-        let mut i = 7;
-        let mut unescaped = Vec::with_capacity(48);
-        while i < bytes.len() {
-            if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&0x1b) {
-                unescaped.push(0x1b);
-                i += 2;
-            } else if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
-                let outer_end = i + 2;
-                if let Some(inner) = osc11_reply_span(&unescaped) {
-                    if inner.span == unescaped.len() {
-                        return Some(Osc11FrameMatch {
-                            span: outer_end,
-                            rgb: inner.rgb,
-                        });
-                    }
-                }
-                break;
-            } else if bytes[i] == 0x9c {
-                let outer_end = i + 1;
-                if let Some(inner) = osc11_reply_span(&unescaped) {
-                    if inner.span == unescaped.len() {
-                        return Some(Osc11FrameMatch {
-                            span: outer_end,
-                            rgb: inner.rgb,
-                        });
-                    }
-                }
-                break;
-            } else {
-                unescaped.push(bytes[i]);
-                i += 1;
-            }
-        }
-    } else if bytes.starts_with(b"\x1bP") {
-        if let Some(inner) = osc11_reply_span(&bytes[2..]) {
-            let after = &bytes[2 + inner.span..];
-            if after.starts_with(b"\x1b\\") {
-                return Some(Osc11FrameMatch {
-                    span: 2 + inner.span + 2,
-                    rgb: inner.rgb,
-                });
-            }
-            if after.starts_with(b"\x9c") {
-                return Some(Osc11FrameMatch {
-                    span: 2 + inner.span + 1,
-                    rgb: inner.rgb,
-                });
-            }
-        }
-    }
-    None
-}
-
-fn parse_osc11_bg_rgb(bytes: &[u8]) -> Option<(u8, u8, u8)> {
-    for i in 0..bytes.len() {
-        if let Some(Osc11FrameMatch { rgb: Some(rgb), .. }) = match_osc11_probe_frame(&bytes[i..]) {
-            return Some(rgb);
-        }
-    }
-    None
-}
-
-fn has_dsr_status_reply(bytes: &[u8]) -> bool {
-    bytes.windows(4).any(|w| w == b"\x1b[0n" || w == b"\x1b[3n")
-        || bytes.windows(3).any(|w| w == b"\x9b0n" || w == b"\x9b3n")
-}
-
-fn dsr_reply_span(bytes: &[u8]) -> Option<usize> {
-    if bytes.starts_with(b"\x1b[0n") || bytes.starts_with(b"\x1b[3n") {
-        Some(4)
-    } else if bytes.starts_with(b"\x9b0n") || bytes.starts_with(b"\x9b3n") {
-        Some(3)
-    } else {
-        None
-    }
-}
-
-fn extract_non_probe_input(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if let Some(matched) = match_osc11_probe_frame(&bytes[i..]) {
-            i += matched.span;
-        } else if let Some(span) = dsr_reply_span(&bytes[i..]) {
-            i += span;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    out
-}
-
-fn format_osc11_query_sequence_with_env(in_tmux: bool, in_screen: bool) -> String {
-    let wrapped = format_single_osc_sequence("11;?", in_tmux, in_screen);
-    if in_tmux || in_screen {
-        // Send DCS passthrough first (for outer terminal bg when passthrough is enabled)
-        // followed by plain OSC 11 (for multiplexer fallback when passthrough is disabled) + DSR fence.
-        format!("{wrapped}\x1b]11;?\x07\x1b[5n")
-    } else {
-        format!("{wrapped}\x1b[5n")
-    }
-}
-
-fn query_osc11_from_rw<R, W, P>(
-    reader: &mut R,
-    writer: &mut W,
-    mut poll_ready: P,
-    timeout: Duration,
-    query_seq: &[u8],
-    passthrough_wrapped: bool,
-) -> (Option<(u8, u8, u8)>, Vec<u8>)
-where
-    R: io::Read,
-    W: io::Write,
-    P: FnMut(Duration) -> io::Result<bool>,
-{
-    if writer.write_all(query_seq).is_err() || writer.flush().is_err() {
-        return (None, Vec::new());
-    }
-
-    let deadline = Instant::now() + timeout;
-    let mut buf = Vec::with_capacity(128);
-    let mut chunk = [0u8; 256];
-    while buf.len() < 1024 {
-        let now = Instant::now();
-        if now >= deadline {
-            break;
-        }
-        let rem = deadline.saturating_duration_since(now);
-        match poll_ready(rem) {
-            Ok(true) => match reader.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let take = n.min(1024 - buf.len());
-                    buf.extend_from_slice(&chunk[..take]);
-                    let done = if passthrough_wrapped {
-                        parse_osc11_bg_rgb(&buf).is_some() && has_dsr_status_reply(&buf)
-                    } else {
-                        has_dsr_status_reply(&buf)
-                    };
-                    if done {
-                        break;
-                    }
-                }
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(_) => break,
-            },
-            Ok(false) => break,
-            Err(_) => break,
-        }
-    }
-    let rgb = parse_osc11_bg_rgb(&buf);
-    let leftover = extract_non_probe_input(&buf);
-    (rgb, leftover)
-}
-
-#[cfg(unix)]
-fn query_terminal_bg_is_light() -> (Option<bool>, Vec<u8>) {
-    use std::os::fd::AsRawFd;
-    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        return (None, Vec::new());
-    }
-    let Ok(mut tty_in) = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-    else {
-        return (None, Vec::new());
-    };
-    let Ok(mut tty_out) = tty_in.try_clone() else {
-        return (None, Vec::new());
-    };
-    let in_tmux = std::env::var_os("TMUX").is_some_and(|v| !v.is_empty());
-    let in_screen = std::env::var_os("STY").is_some_and(|v| !v.is_empty());
-    let query_seq = format_osc11_query_sequence_with_env(in_tmux, in_screen);
-    let fd = tty_in.as_raw_fd();
-    let (rgb_opt, leftover) = query_osc11_from_rw(
-        &mut tty_in,
-        &mut tty_out,
-        |wait| {
-            let ms = if wait.is_zero() {
-                0
-            } else {
-                i32::try_from(wait.as_millis().max(1)).unwrap_or(i32::MAX)
-            };
-            loop {
-                let mut pfd = libc::pollfd {
-                    fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                // SAFETY: `pfd` points to a single initialized `pollfd` struct for the open `/dev/tty` fd.
-                let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
-                if rc < 0 {
-                    let err = io::Error::last_os_error();
-                    if err.kind() == io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    return Err(err);
-                }
-                return Ok(rc > 0 && (pfd.revents & libc::POLLIN) != 0);
-            }
-        },
-        Duration::from_millis(100),
-        query_seq.as_bytes(),
-        in_tmux || in_screen,
-    );
-    (
-        rgb_opt.map(|rgb| crate::ui::is_rgb_light(rgb.0, rgb.1, rgb.2)),
-        leftover,
-    )
-}
-
-#[cfg(not(unix))]
-fn query_terminal_bg_is_light() -> (Option<bool>, Vec<u8>) {
-    (None, Vec::new())
-}
-
-fn should_persist_fallback_theme(
-    theme_pref: ThemePref,
-    light_mode: bool,
-    prev_light_mode: bool,
-) -> bool {
-    theme_pref == ThemePref::Auto && light_mode != prev_light_mode
-}
-
-fn parse_colorfgbg_is_light(raw: Option<&str>) -> Option<bool> {
-    let raw = raw?.trim();
-    let bg_tok = raw.rsplit(';').next()?.trim();
-    let idx: u8 = bg_tok.parse().ok()?;
-    Some(crate::ui::is_ansi_idx_light(idx))
-}
-
-fn resolve_auto_light_mode(
-    osc11_is_light: Option<bool>,
-    colorfgbg: Option<&str>,
-    saved_fallback: Option<bool>,
-) -> bool {
-    osc11_is_light
-        .or_else(|| parse_colorfgbg_is_light(colorfgbg))
-        .or(saved_fallback)
-        .unwrap_or(false)
-}
-
-fn fallback_theme_state_path() -> Option<PathBuf> {
-    if let Some(state_dir) = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
-        return Some(PathBuf::from(state_dir).join("herdr-tui/theme"));
-    }
-    std::env::var_os("HOME")
-        .filter(|v| !v.is_empty())
-        .map(|h| PathBuf::from(h).join(".local/state/herdr-tui/theme"))
-}
-
-fn parse_saved_theme_state(raw: &str) -> Option<bool> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "light" => Some(true),
-        "dark" => Some(false),
-        _ => None,
-    }
-}
-
-fn load_fallback_theme_state() -> Option<bool> {
-    let path = fallback_theme_state_path()?;
-    let raw = std::fs::read_to_string(path).ok()?;
-    parse_saved_theme_state(&raw)
-}
-
-fn save_fallback_theme_state(light_mode: bool) {
-    let Some(path) = fallback_theme_state_path() else {
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        if std::fs::create_dir_all(parent).is_err() {
-            return;
-        }
-    }
-    let val = if light_mode { "light\n" } else { "dark\n" };
-    let _ = std::fs::write(path, val);
 }
 
 fn resolve_eink_color_mode<F>(
@@ -2241,9 +1809,6 @@ fn main() -> Result<()> {
         |k| std::env::var_os(k).map(|v| v.to_string_lossy().into_owned()),
     );
     let eink_interval = resolve_eink_interval(cli.eink_interval_ms, file_cfg.ui.eink_interval_ms);
-    let theme_pref = resolve_theme_pref(cli.light, cli.dark, file_cfg.ui.theme.as_deref(), |k| {
-        std::env::var_os(k).map(|v| v.to_string_lossy().into_owned())
-    });
 
     let (app_tx, app_rx) = mpsc::channel::<AppEvent>();
     let core =
@@ -2257,22 +1822,6 @@ fn main() -> Result<()> {
     // restores raw mode, alternate screen, mouse capture, SGR state, and cursor visibility.
     enable_raw_mode()?;
     let _cleanup_guard = TerminalCleanupGuard;
-    let (light_mode, startup_input) = match theme_pref {
-        ThemePref::Fixed(v) => (v, Vec::new()),
-        ThemePref::Auto => {
-            let (osc11, leftover) = if eink_mode {
-                (None, Vec::new())
-            } else {
-                query_terminal_bg_is_light()
-            };
-            let is_light = resolve_auto_light_mode(
-                osc11,
-                std::env::var("COLORFGBG").ok().as_deref(),
-                load_fallback_theme_state(),
-            );
-            (is_light, leftover)
-        }
-    };
     let mut stdout = BufWriter::with_capacity(64 * 1024, io::stdout());
     write_terminal_enter_sequence(&mut stdout)?;
     let backend = CrosstermBackend::new(stdout);
@@ -2331,9 +1880,6 @@ fn main() -> Result<()> {
         touch_mode,
         eink_mode,
         eink_color,
-        light_mode,
-        theme_pref,
-        startup_input,
         eink_interval,
     );
 
@@ -2536,7 +2082,6 @@ fn execute_action_full(
     term_rect: Rect,
     eink_mode: &mut bool,
     eink_color: &mut bool,
-    light_mode: &mut bool,
     force_clear: &mut bool,
     pending_eink_osc: &mut bool,
     pending_reader_osc: Option<&mut bool>,
@@ -2649,15 +2194,6 @@ fn execute_action_full(
             } else {
                 Modal::Help
             };
-        }
-        Action::ToggleTheme => {
-            if *eink_mode {
-                *eink_mode = false;
-                *light_mode = true;
-            } else {
-                *light_mode = !*light_mode;
-            }
-            *force_clear = true;
         }
         Action::ToggleEink => {
             *eink_mode = !*eink_mode;
@@ -3507,9 +3043,6 @@ fn run_app(
     touch_mode: bool,
     eink_mode: bool,
     eink_color: bool,
-    light_mode: bool,
-    theme_pref: ThemePref,
-    startup_input: Vec<u8>,
     eink_interval: Duration,
 ) -> Result<()> {
     let mut attached_map: BTreeMap<String, AttachedTerminal> = BTreeMap::new();
@@ -3527,9 +3060,6 @@ fn run_app(
         touch_mode,
         eink_mode,
         eink_color,
-        light_mode,
-        theme_pref,
-        startup_input,
         eink_interval,
         &mut attached_map,
         &mut active_addr,
@@ -3557,16 +3087,12 @@ fn run_app_loop(
     touch_mode: bool,
     mut eink_mode: bool,
     mut eink_color: bool,
-    mut light_mode: bool,
-    theme_pref: ThemePref,
-    mut pending_startup_input: Vec<u8>,
     eink_interval: Duration,
     attached_map: &mut BTreeMap<String, AttachedTerminal>,
     active_addr: &mut Option<String>,
 ) -> Result<()> {
     let mut first_frame_drawn = false;
     let mut force_clear = true;
-    let mut prev_light_mode = light_mode;
     let mut prefix_active = false;
     let mut ctrl_active = false;
     let mut alt_active = false;
@@ -3696,13 +3222,6 @@ fn run_app_loop(
             .as_ref()
             .and_then(|a| attached_map.get(a))
             .map(|att| att.channel);
-
-        if !pending_startup_input.is_empty() {
-            if let Some(ch) = active_channel {
-                core.send_input(ch, &pending_startup_input);
-                pending_startup_input.clear();
-            }
-        }
 
         promote_due_pty_dirty_with_color(
             eink_mode,
@@ -4036,7 +3555,6 @@ fn run_app_loop(
                                                 term_rect,
                                                 &mut eink_mode,
                                                 &mut eink_color,
-                                                &mut light_mode,
                                                 &mut force_clear,
                                                 &mut pending_eink_osc,
                                                 Some(&mut pending_reader_osc),
@@ -4188,7 +3706,7 @@ fn run_app_loop(
                                             dirty = true;
                                         }
                                         HitTarget::SendKey(kev) => {
-                                            match handle_key_event_with_theme(
+                                            match handle_key_event_full(
                                                 kev,
                                                 core,
                                                 world,
@@ -4203,7 +3721,6 @@ fn run_app_loop(
                                                 term_rect,
                                                 &mut eink_mode,
                                                 &mut eink_color,
-                                                &mut light_mode,
                                                 &mut force_clear,
                                                 &mut pending_eink_osc,
                                                 Some(&mut pending_reader_osc),
@@ -4397,7 +3914,7 @@ fn run_app_loop(
                                                 }
                                             }
                                             Some(HitTarget::SendKey(kev)) => {
-                                                match handle_key_event_with_theme(
+                                                match handle_key_event_full(
                                                     kev,
                                                     core,
                                                     world,
@@ -4412,7 +3929,6 @@ fn run_app_loop(
                                                     term_rect,
                                                     &mut eink_mode,
                                                     &mut eink_color,
-                                                    &mut light_mode,
                                                     &mut force_clear,
                                                     &mut pending_eink_osc,
                                                     Some(&mut pending_reader_osc),
@@ -4820,7 +4336,7 @@ fn run_app_loop(
                             if had_drag_or_sel {
                                 dirty = true;
                             }
-                            match handle_key_event_with_theme(
+                            match handle_key_event_full(
                                 kev,
                                 core,
                                 world,
@@ -4835,7 +4351,6 @@ fn run_app_loop(
                                 term_rect,
                                 &mut eink_mode,
                                 &mut eink_color,
-                                &mut light_mode,
                                 &mut force_clear,
                                 &mut pending_eink_osc,
                                 Some(&mut pending_reader_osc),
@@ -5028,13 +4543,6 @@ fn run_app_loop(
         }
         prev_active_agent_state = cur_agent;
 
-        if light_mode != prev_light_mode {
-            if should_persist_fallback_theme(theme_pref, light_mode, prev_light_mode) {
-                save_fallback_theme_state(light_mode);
-            }
-            prev_light_mode = light_mode;
-        }
-
         if dirty {
             let active_att = active_addr.as_ref().and_then(|a| attached_map.get(a));
             let scr_ref = if selection.as_ref().is_some_and(|s| s.active) {
@@ -5053,7 +4561,7 @@ fn run_app_loop(
                 force_clear = false;
             }
             terminal.draw(|f| {
-                let geom = render_ui_with_theme(
+                let geom = render_ui_full_with_eink_color(
                     f,
                     world,
                     scr_ref,
@@ -5074,7 +4582,6 @@ fn run_app_loop(
                     focused_quota.as_ref(),
                     eink_mode,
                     eink_color,
-                    light_mode,
                 );
                 last_hits = geom.hits;
                 last_mod_rect = geom.mod_rect;
@@ -5142,7 +4649,6 @@ fn handle_shortcut_in_tab_overview(
     term_rect: Rect,
     eink_mode: &mut bool,
     eink_color: &mut bool,
-    light_mode: &mut bool,
     force_clear: &mut bool,
     pending_eink_osc: &mut bool,
     mut pending_reader_osc: Option<&mut bool>,
@@ -5175,7 +4681,6 @@ fn handle_shortcut_in_tab_overview(
                     term_rect,
                     eink_mode,
                     eink_color,
-                    light_mode,
                     force_clear,
                     pending_eink_osc,
                     pending_reader_osc.as_deref_mut(),
@@ -5190,7 +4695,6 @@ fn handle_shortcut_in_tab_overview(
                 other,
                 Action::ToggleSidebar
                     | Action::ToggleHelp
-                    | Action::ToggleTheme
                     | Action::ToggleEink
                     | Action::ToggleEinkColor
                     | Action::RedrawScreen
@@ -5209,7 +4713,6 @@ fn handle_shortcut_in_tab_overview(
                 term_rect,
                 eink_mode,
                 eink_color,
-                light_mode,
                 force_clear,
                 pending_eink_osc,
                 pending_reader_osc,
@@ -5303,52 +4806,8 @@ fn handle_key_event_with_eink(
     )
 }
 
-#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn handle_key_event_full(
-    kev: KeyEvent,
-    core: &CoreClient,
-    world: &mut World,
-    attached: Option<&AttachedTerminal>,
-    prefix_spec: &str,
-    sidebar_open: &mut bool,
-    prefix_active: &mut bool,
-    ctrl_active: &mut bool,
-    alt_active: &mut bool,
-    scrollback_offset: &mut usize,
-    modal: &mut Modal,
-    term_rect: Rect,
-    eink_mode: &mut bool,
-    eink_color: &mut bool,
-    force_clear: &mut bool,
-    pending_eink_osc: &mut bool,
-    pending_reader_osc: Option<&mut bool>,
-) -> Result<KeyOutcome> {
-    let mut light_mode = false;
-    handle_key_event_with_theme(
-        kev,
-        core,
-        world,
-        attached,
-        prefix_spec,
-        sidebar_open,
-        prefix_active,
-        ctrl_active,
-        alt_active,
-        scrollback_offset,
-        modal,
-        term_rect,
-        eink_mode,
-        eink_color,
-        &mut light_mode,
-        force_clear,
-        pending_eink_osc,
-        pending_reader_osc,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn handle_key_event_with_theme(
     mut kev: KeyEvent,
     core: &CoreClient,
     world: &mut World,
@@ -5363,7 +4822,6 @@ fn handle_key_event_with_theme(
     term_rect: Rect,
     eink_mode: &mut bool,
     eink_color: &mut bool,
-    light_mode: &mut bool,
     force_clear: &mut bool,
     pending_eink_osc: &mut bool,
     pending_reader_osc: Option<&mut bool>,
@@ -5517,7 +4975,6 @@ fn handle_key_event_with_theme(
                     term_rect,
                     eink_mode,
                     eink_color,
-                    light_mode,
                     force_clear,
                     pending_eink_osc,
                     pending_reader_osc,
@@ -5532,7 +4989,6 @@ fn handle_key_event_with_theme(
                     action,
                     Action::ToggleSidebar
                         | Action::ToggleHelp
-                        | Action::ToggleTheme
                         | Action::ToggleEink
                         | Action::ToggleEinkColor
                         | Action::RedrawScreen
@@ -5552,7 +5008,6 @@ fn handle_key_event_with_theme(
                 term_rect,
                 eink_mode,
                 eink_color,
-                light_mode,
                 force_clear,
                 pending_eink_osc,
                 pending_reader_osc,
@@ -5633,7 +5088,6 @@ fn handle_key_event_with_theme(
                     term_rect,
                     eink_mode,
                     eink_color,
-                    light_mode,
                     force_clear,
                     pending_eink_osc,
                     pending_reader_osc,
@@ -5759,7 +5213,6 @@ fn handle_key_event_with_theme(
             term_rect,
             eink_mode,
             eink_color,
-            light_mode,
             force_clear,
             pending_eink_osc,
             pending_reader_osc,
@@ -9289,405 +8742,5 @@ mod tests {
             reader_pos > end_sync_pos,
             "reader-open OSC must be emitted strictly after EndSynchronizedUpdate"
         );
-    }
-
-    #[test]
-    fn osc11_and_theme_resolution_precedence_behave_accurately() {
-        let env_map = |pairs: &[(&str, &str)]| {
-            let pairs: Vec<(String, String)> = pairs
-                .iter()
-                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-                .collect();
-            move |key: &str| pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
-        };
-
-        // 1. OSC 11 payload parsing across BEL, ST, 8-bit, rgb/rgba, #hex, and case insensitivity
-        assert_eq!(
-            parse_osc11_bg_rgb(b"\x1b]11;rgb:ffff/ffff/ffff\x07\x1b[0n"),
-            Some((255, 255, 255))
-        );
-        assert_eq!(
-            parse_osc11_bg_rgb(b"\x1b]11;rgb:1e1e/1e1e/2e2e\x1b\\"),
-            Some((0x1e, 0x1e, 0x2e))
-        );
-        assert_eq!(
-            parse_osc11_bg_rgb(b"\x1b]11;rgb:ef/f1/f5\x07"),
-            Some((0xef, 0xf1, 0xf5))
-        );
-        assert_eq!(
-            parse_osc11_bg_rgb(b"\x9d11;rgba:fdfd/f6f6/e3e3/ffff\x9c"),
-            Some((0xfd, 0xf6, 0xe3))
-        );
-        assert_eq!(
-            parse_osc11_bg_rgb(b"\x1b]11;#fdf6e3\x07"),
-            Some((0xfd, 0xf6, 0xe3))
-        );
-        assert_eq!(
-            parse_osc11_bg_rgb(b"\x1b]11;RGB:FFFF/FFFF/FFFF\x07"),
-            Some((255, 255, 255))
-        );
-        assert_eq!(parse_osc11_bg_rgb(b"\x1b[0n"), None);
-
-        // 2. query_osc11_from_rw handles tmux/screen wrapping, chunked replies, DSR-only, timeouts,
-        //    and preserves interleaved fast-typist input while stripping probe replies
-        assert_eq!(
-            format_osc11_query_sequence_with_env(false, false),
-            "\x1b]11;?\x07\x1b[5n"
-        );
-        assert_eq!(
-            format_osc11_query_sequence_with_env(true, false),
-            "\x1bPtmux;\x1b\x1b]11;?\x07\x1b\\\x1b]11;?\x07\x1b[5n"
-        );
-        assert_eq!(
-            format_osc11_query_sequence_with_env(false, true),
-            "\x1bP\x1b]11;?\x07\x1b\\\x1b]11;?\x07\x1b[5n"
-        );
-
-        struct ChunkReader {
-            chunks: std::collections::VecDeque<Vec<u8>>,
-        }
-        impl io::Read for ChunkReader {
-            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-                match self.chunks.pop_front() {
-                    Some(c) => {
-                        let n = c.len().min(out.len());
-                        out[..n].copy_from_slice(&c[..n]);
-                        Ok(n)
-                    }
-                    None => Ok(0),
-                }
-            }
-        }
-        let plain_query = format_osc11_query_sequence_with_env(false, false);
-        let mut writer = Vec::new();
-        let mut reader = ChunkReader {
-            chunks: std::collections::VecDeque::from(vec![
-                b"l\x1b]11;rgb:ef".to_vec(),
-                b"ef/f1f1/f5f5\x07s".to_vec(),
-                b"\x1b[0n\r".to_vec(),
-            ]),
-        };
-        let mut polls = 0usize;
-        let (rgb, leftover) = query_osc11_from_rw(
-            &mut reader,
-            &mut writer,
-            |_| {
-                polls += 1;
-                Ok(true)
-            },
-            Duration::from_millis(100),
-            plain_query.as_bytes(),
-            false,
-        );
-        assert_eq!(writer, b"\x1b]11;?\x07\x1b[5n");
-        assert_eq!(rgb, Some((0xef, 0xf1, 0xf5)));
-        assert_eq!(leftover, b"ls\r");
-        assert_eq!(polls, 3);
-
-        // Passthrough-wrapped (tmux/screen): waits past an early `\x1b[0n` until OSC 11 arrives
-        let tmux_query = format_osc11_query_sequence_with_env(true, false);
-        let mut tmux_writer = Vec::new();
-        let mut tmux_reader = ChunkReader {
-            chunks: std::collections::VecDeque::from(vec![
-                b"\x1b[0n".to_vec(),
-                b"\x1b]11;rgb:ffff/ffff/ffff\x07".to_vec(),
-            ]),
-        };
-        let (tmux_rgb, tmux_leftover) = query_osc11_from_rw(
-            &mut tmux_reader,
-            &mut tmux_writer,
-            |_| Ok(true),
-            Duration::from_millis(100),
-            tmux_query.as_bytes(),
-            true,
-        );
-        assert_eq!(tmux_rgb, Some((255, 255, 255)));
-        assert!(tmux_leftover.is_empty());
-
-        // DCS-wrapped OSC 11 replies (tmux BEL, tmux ST, screen BEL/ST) are parsed and fully stripped
-        let mut tmux_dcs_bel_reader = ChunkReader {
-            chunks: std::collections::VecDeque::from(vec![
-                b"a\x1bPtmux;\x1b\x1b]11;rgb:ffff/ffff/ffff\x07\x1b\\b".to_vec(),
-                b"\x1b[0nc".to_vec(),
-            ]),
-        };
-        let (tmux_dcs_rgb, tmux_dcs_leftover) = query_osc11_from_rw(
-            &mut tmux_dcs_bel_reader,
-            &mut Vec::new(),
-            |_| Ok(true),
-            Duration::from_millis(100),
-            tmux_query.as_bytes(),
-            true,
-        );
-        assert_eq!(tmux_dcs_rgb, Some((255, 255, 255)));
-        assert_eq!(tmux_dcs_leftover, b"abc");
-
-        let tmux_dcs_st = b"\x1bPtmux;\x1b\x1b]11;rgb:1e1e/1e1e/2e2e\x1b\x1b\\\x1b\\\x1b[0n";
-        assert_eq!(parse_osc11_bg_rgb(tmux_dcs_st), Some((0x1e, 0x1e, 0x2e)));
-        assert!(extract_non_probe_input(tmux_dcs_st).is_empty());
-
-        let screen_query = format_osc11_query_sequence_with_env(false, true);
-        let mut screen_dcs_reader = ChunkReader {
-            chunks: std::collections::VecDeque::from(vec![
-                b"x\x1bP\x1b]11;rgb:efef/f1f1/f5f5\x1b\\\x1b\\y\x1b[0n".to_vec(),
-            ]),
-        };
-        let (screen_dcs_rgb, screen_dcs_leftover) = query_osc11_from_rw(
-            &mut screen_dcs_reader,
-            &mut Vec::new(),
-            |_| Ok(true),
-            Duration::from_millis(100),
-            screen_query.as_bytes(),
-            true,
-        );
-        assert_eq!(screen_dcs_rgb, Some((0xef, 0xf1, 0xf5)));
-        assert_eq!(screen_dcs_leftover, b"xy");
-
-        let mut dsr_only_reader = ChunkReader {
-            chunks: std::collections::VecDeque::from(vec![b"\x1b[0n".to_vec()]),
-        };
-        let mut dsr_polls = 0usize;
-        assert_eq!(
-            query_osc11_from_rw(
-                &mut dsr_only_reader,
-                &mut Vec::new(),
-                |_| {
-                    dsr_polls += 1;
-                    Ok(true)
-                },
-                Duration::from_millis(100),
-                plain_query.as_bytes(),
-                false,
-            ),
-            (None, Vec::new())
-        );
-        assert_eq!(dsr_polls, 1);
-
-        let mut timeout_reader = ChunkReader {
-            chunks: std::collections::VecDeque::new(),
-        };
-        assert_eq!(
-            query_osc11_from_rw(
-                &mut timeout_reader,
-                &mut Vec::new(),
-                |_| Ok(false),
-                Duration::from_millis(100),
-                plain_query.as_bytes(),
-                false,
-            ),
-            (None, Vec::new())
-        );
-
-        // Only Auto mode persists fallback theme state; explicit Fixed prefs leave it untouched
-        assert!(should_persist_fallback_theme(ThemePref::Auto, true, false));
-        assert!(!should_persist_fallback_theme(ThemePref::Auto, true, true));
-        assert!(!should_persist_fallback_theme(
-            ThemePref::Fixed(false),
-            true,
-            false
-        ));
-        assert!(!should_persist_fallback_theme(
-            ThemePref::Fixed(true),
-            false,
-            true
-        ));
-
-        // 3. CLI / config / env precedence and non-eink / non-false-positive profile matching
-        assert_eq!(
-            resolve_theme_pref(true, false, Some("dark"), env_map(&[("HCT_THEME", "dark")])),
-            ThemePref::Fixed(true)
-        );
-        assert_eq!(
-            resolve_theme_pref(
-                false,
-                true,
-                Some("light"),
-                env_map(&[("HCT_THEME", "light")])
-            ),
-            ThemePref::Fixed(false)
-        );
-        assert_eq!(
-            resolve_theme_pref(
-                false,
-                false,
-                Some("light"),
-                env_map(&[("HCT_THEME", "dark")])
-            ),
-            ThemePref::Fixed(true)
-        );
-        assert_eq!(
-            resolve_theme_pref(
-                false,
-                false,
-                Some("auto"),
-                env_map(&[("HCT_THEME", "dark")])
-            ),
-            ThemePref::Auto
-        );
-        assert_eq!(
-            resolve_theme_pref(
-                false,
-                false,
-                None,
-                env_map(&[("LC_TERMINAL_PROFILE", "Solarized Light")])
-            ),
-            ThemePref::Fixed(true)
-        );
-        assert_eq!(
-            resolve_theme_pref(
-                false,
-                false,
-                None,
-                env_map(&[("LC_TERMINAL_PROFILE", "Twilight")])
-            ),
-            ThemePref::Auto
-        );
-        assert_eq!(
-            resolve_theme_pref(
-                false,
-                false,
-                None,
-                env_map(&[("LC_TERMINAL_PROFILE", "shelldeck-eink")])
-            ),
-            ThemePref::Auto
-        );
-
-        // 4. COLORFGBG and auto resolution fallback precedence
-        assert_eq!(parse_colorfgbg_is_light(Some("0;15")), Some(true));
-        assert_eq!(parse_colorfgbg_is_light(Some("15;0")), Some(false));
-        assert_eq!(parse_colorfgbg_is_light(Some("15;8")), Some(false));
-        assert_eq!(parse_colorfgbg_is_light(Some("15;default")), None);
-
-        assert!(resolve_auto_light_mode(
-            Some(true),
-            Some("15;0"),
-            Some(false)
-        ));
-        assert!(!resolve_auto_light_mode(
-            Some(false),
-            Some("0;15"),
-            Some(true)
-        ));
-        assert!(resolve_auto_light_mode(None, Some("0;15"), Some(false)));
-        assert!(resolve_auto_light_mode(None, None, Some(true)));
-        assert!(!resolve_auto_light_mode(None, None, None));
-
-        assert_eq!(parse_saved_theme_state("light\n"), Some(true));
-        assert_eq!(parse_saved_theme_state("dark\n"), Some(false));
-        assert_eq!(parse_saved_theme_state("other"), None);
-
-        // 5. CLI flag parsing
-        let cli_light = Cli::try_parse_from(["hct", "--light"]).unwrap();
-        assert!(cli_light.light);
-        assert!(!cli_light.dark);
-        let cli_dark = Cli::try_parse_from(["hct", "--dark"]).unwrap();
-        assert!(cli_dark.dark);
-        assert!(Cli::try_parse_from(["hct", "--light", "--dark"]).is_err());
-    }
-
-    #[test]
-    fn toggle_theme_shortcut_switches_dark_light_and_exits_eink_preserving_modals() {
-        let core = CoreClient::dummy_for_tests();
-        let mut world = World::default();
-        let mut sidebar_open = false;
-        let mut prefix_active = false;
-        let mut ctrl_active = false;
-        let mut alt_active = false;
-        let mut scrollback_offset = 0;
-        let mut modal = Modal::Help;
-        let term_rect = Rect::new(0, 1, 80, 22);
-        let mut eink_mode = false;
-        let mut eink_color = false;
-        let mut light_mode = false;
-        let mut force_clear = false;
-        let mut pending_eink_osc = false;
-
-        let mut press_prefix_t = |modal: &mut Modal,
-                                  eink_mode: &mut bool,
-                                  light_mode: &mut bool,
-                                  force_clear: &mut bool| {
-            let _ = handle_key_event_with_theme(
-                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
-                &core,
-                &mut world,
-                None,
-                "ctrl+b",
-                &mut sidebar_open,
-                &mut prefix_active,
-                &mut ctrl_active,
-                &mut alt_active,
-                &mut scrollback_offset,
-                modal,
-                term_rect,
-                eink_mode,
-                &mut eink_color,
-                light_mode,
-                force_clear,
-                &mut pending_eink_osc,
-                None,
-            )
-            .unwrap();
-            handle_key_event_with_theme(
-                KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
-                &core,
-                &mut world,
-                None,
-                "ctrl+b",
-                &mut sidebar_open,
-                &mut prefix_active,
-                &mut ctrl_active,
-                &mut alt_active,
-                &mut scrollback_offset,
-                modal,
-                term_rect,
-                eink_mode,
-                &mut eink_color,
-                light_mode,
-                force_clear,
-                &mut pending_eink_osc,
-                None,
-            )
-            .unwrap()
-        };
-
-        // Dark -> ^b t -> Light (keeps Help open)
-        let out = press_prefix_t(
-            &mut modal,
-            &mut eink_mode,
-            &mut light_mode,
-            &mut force_clear,
-        );
-        assert_eq!(out, KeyOutcome::UiChanged);
-        assert!(light_mode);
-        assert!(!eink_mode);
-        assert!(force_clear);
-        assert!(matches!(modal, Modal::Help));
-
-        // Light -> ^b t -> Dark (keeps TabOverview open)
-        modal = Modal::default_tab_overview();
-        force_clear = false;
-        let _ = press_prefix_t(
-            &mut modal,
-            &mut eink_mode,
-            &mut light_mode,
-            &mut force_clear,
-        );
-        assert!(!light_mode);
-        assert!(force_clear);
-        assert!(matches!(modal, Modal::TabOverview { .. }));
-
-        // E-Ink -> ^b t -> exits E-Ink into Light
-        eink_mode = true;
-        light_mode = false;
-        force_clear = false;
-        let _ = press_prefix_t(
-            &mut modal,
-            &mut eink_mode,
-            &mut light_mode,
-            &mut force_clear,
-        );
-        assert!(!eink_mode);
-        assert!(light_mode);
-        assert!(force_clear);
     }
 }

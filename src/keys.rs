@@ -22,7 +22,6 @@ pub enum Action {
     CyclePaneInTab,
     EnterScrollback,
     ToggleHelp,
-    ToggleTheme,
     ToggleEink,
     ToggleEinkColor,
     RedrawScreen,
@@ -62,7 +61,6 @@ pub struct UiFileConfig {
     pub mobile_width_threshold: Option<u16>,
     pub touch_mode: Option<bool>,
     pub allow_nested: Option<bool>,
-    pub theme: Option<String>,
     pub eink: Option<bool>,
     pub eink_color: Option<bool>,
     pub eink_interval_ms: Option<u64>,
@@ -178,7 +176,6 @@ pub fn match_prefix_action(ev: &KeyEvent, prefix_spec: &str) -> Option<Action> {
         KeyCode::Char('o') => Some(Action::CyclePaneInTab),
         KeyCode::Char('[') => Some(Action::EnterScrollback),
         KeyCode::Char('?') => Some(Action::ToggleHelp),
-        KeyCode::Char('t') => Some(Action::ToggleTheme),
         KeyCode::Char('e') => Some(Action::ToggleEink),
         KeyCode::Char('E') => Some(Action::ToggleEinkColor),
         KeyCode::Char('r') => Some(Action::RedrawScreen),
@@ -343,22 +340,12 @@ mod tests {
     fn file_config_parses_allow_nested_flag() {
         let default_cfg: FileConfig = toml::from_str("").unwrap();
         assert_eq!(default_cfg.ui.allow_nested, None);
-        assert_eq!(default_cfg.ui.theme, None);
         assert_eq!(default_cfg.ui.eink, None);
         assert_eq!(default_cfg.ui.eink_color, None);
         assert_eq!(default_cfg.ui.eink_interval_ms, None);
 
         let nested_cfg: FileConfig = toml::from_str("[ui]\nallow_nested = true\n").unwrap();
         assert_eq!(nested_cfg.ui.allow_nested, Some(true));
-
-        let theme_cfg: FileConfig = toml::from_str("[ui]\ntheme = \"light\"\n").unwrap();
-        assert_eq!(theme_cfg.ui.theme.as_deref(), Some("light"));
-
-        let theme_dark_cfg: FileConfig = toml::from_str("[ui]\ntheme = \"dark\"\n").unwrap();
-        assert_eq!(theme_dark_cfg.ui.theme.as_deref(), Some("dark"));
-
-        let theme_auto_cfg: FileConfig = toml::from_str("[ui]\ntheme = \"auto\"\n").unwrap();
-        assert_eq!(theme_auto_cfg.ui.theme.as_deref(), Some("auto"));
 
         let eink_cfg: FileConfig =
             toml::from_str("[ui]\neink = true\neink_color = true\neink_interval_ms = 300\n")
@@ -370,12 +357,6 @@ mod tests {
 
     #[test]
     fn eink_and_page_prefix_shortcuts_match_without_breaking_rename_space() {
-        let t_key = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE);
-        assert_eq!(
-            match_prefix_action(&t_key, "ctrl+b"),
-            Some(Action::ToggleTheme)
-        );
-
         let e_key = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE);
         assert_eq!(
             match_prefix_action(&e_key, "ctrl+b"),
