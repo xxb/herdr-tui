@@ -813,6 +813,31 @@ pub fn render_ui_full(
     )
 }
 
+fn is_known_agent_binary_name(fg_name: &str) -> bool {
+    let trimmed = fg_name.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let bin = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+    let lower = bin.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
+    matches!(
+        stem,
+        "codex"
+            | "codex-cli"
+            | "claude"
+            | "claude-code"
+            | "opencode"
+            | "antigravity"
+            | "antigravity-cli"
+            | "agy"
+            | "gemini"
+            | "gemini-cli"
+            | "freebuff"
+            | "freebuff-cli"
+    )
+}
+
 pub fn is_active_tab_agent(world: &World) -> bool {
     let Some(addr) = world.active_terminal_address_ref() else {
         return false;
@@ -823,12 +848,10 @@ pub fn is_active_tab_agent(world: &World) -> bool {
     info.status_app
         .as_deref()
         .is_some_and(|s| !s.trim().is_empty())
-        || info.agent_state() != AgentState::None
         || info
             .fg_name
             .as_deref()
-            .and_then(crate::usage::detect_agent_from_str)
-            .is_some()
+            .is_some_and(is_known_agent_binary_name)
 }
 
 pub fn scan_viewport_initial_code_fence(screen: &mut vt100::Screen, max_back: usize) -> bool {
@@ -3710,7 +3733,7 @@ fn rgb_luma(r: u8, g: u8, b: u8) -> u8 {
     ((299u32 * u32::from(r) + 587u32 * u32::from(g) + 114u32 * u32::from(b)) / 1000) as u8
 }
 
-pub(crate) fn is_eink_muted_cell(cell: &vt100::Cell) -> bool {
+fn is_eink_muted_cell(cell: &vt100::Cell) -> bool {
     if cell.dim() {
         return true;
     }
@@ -3748,6 +3771,77 @@ struct ScannedEinkRow {
 }
 
 impl ScannedEinkRow {
+    fn with_capacity(cols: u16) -> Self {
+        let cap = usize::from(cols);
+        Self {
+            text: String::with_capacity(cap),
+            cells: Vec::with_capacity(cap),
+            first_idx: 0,
+            last_idx: 0,
+            leading_spaces: 0,
+            all_non_space_muted: true,
+        }
+    }
+
+    fn scan_into(&mut self, screen: &vt100::Screen, r: u16, cols: u16) -> bool {
+        self.text.clear();
+        self.cells.clear();
+        let Some(first_col) = (0..cols).find(|&c| {
+            screen.cell(r, c).is_some_and(|cell| {
+                !cell.is_wide_continuation()
+                    && cell.has_contents()
+                    && !matches!(cell.contents(), "" | " ")
+            })
+        }) else {
+            return false;
+        };
+        let last_col = (first_col..cols)
+            .rfind(|&c| {
+                screen.cell(r, c).is_some_and(|cell| {
+                    !cell.is_wide_continuation()
+                        && cell.has_contents()
+                        && !matches!(cell.contents(), "" | " ")
+                })
+            })
+            .unwrap_or(first_col);
+        let mut all_non_space_muted = true;
+        for c in first_col..=last_col {
+            let Some(cell) = screen.cell(r, c) else {
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            let raw_sym = if cell.has_contents() {
+                cell.contents()
+            } else {
+                " "
+            };
+            let is_space = raw_sym.is_empty() || raw_sym == " ";
+            let sym = if is_space { " " } else { raw_sym };
+            let byte_start = self.text.len();
+            self.text.push_str(sym);
+            let is_muted = !is_space && is_eink_muted_cell(cell);
+            if !is_space && !is_muted {
+                all_non_space_muted = false;
+            }
+            self.cells.push(ScannedEinkCell {
+                col: c,
+                byte_start,
+                is_space,
+                is_muted,
+            });
+        }
+        let Some(last_idx) = self.cells.len().checked_sub(1) else {
+            return false;
+        };
+        self.first_idx = 0;
+        self.last_idx = last_idx;
+        self.leading_spaces = first_col;
+        self.all_non_space_muted = all_non_space_muted;
+        true
+    }
+
     fn trimmed(&self) -> (&str, usize) {
         let start = self.cells[self.first_idx].byte_start;
         let end = self
@@ -3756,65 +3850,6 @@ impl ScannedEinkRow {
             .map_or(self.text.len(), |c| c.byte_start);
         (&self.text[start..end], start)
     }
-}
-
-fn scan_eink_row_text(screen: &vt100::Screen, r: u16, cols: u16) -> Option<ScannedEinkRow> {
-    let first_col = (0..cols).find(|&c| {
-        screen.cell(r, c).is_some_and(|cell| {
-            !cell.is_wide_continuation()
-                && cell.has_contents()
-                && !matches!(cell.contents(), "" | " ")
-        })
-    })?;
-    let last_col = (first_col..cols)
-        .rfind(|&c| {
-            screen.cell(r, c).is_some_and(|cell| {
-                !cell.is_wide_continuation()
-                    && cell.has_contents()
-                    && !matches!(cell.contents(), "" | " ")
-            })
-        })
-        .unwrap_or(first_col);
-    let span = usize::from(last_col - first_col + 1);
-    let mut text = String::with_capacity(span);
-    let mut cells = Vec::with_capacity(span);
-    let mut all_non_space_muted = true;
-    for c in first_col..=last_col {
-        let Some(cell) = screen.cell(r, c) else {
-            continue;
-        };
-        if cell.is_wide_continuation() {
-            continue;
-        }
-        let raw_sym = if cell.has_contents() {
-            cell.contents()
-        } else {
-            " "
-        };
-        let is_space = raw_sym.is_empty() || raw_sym == " ";
-        let sym = if is_space { " " } else { raw_sym };
-        let byte_start = text.len();
-        text.push_str(sym);
-        let is_muted = !is_space && is_eink_muted_cell(cell);
-        if !is_space && !is_muted {
-            all_non_space_muted = false;
-        }
-        cells.push(ScannedEinkCell {
-            col: c,
-            byte_start,
-            is_space,
-            is_muted,
-        });
-    }
-    let last_idx = cells.len().checked_sub(1)?;
-    Some(ScannedEinkRow {
-        text,
-        cells,
-        first_idx: 0,
-        last_idx,
-        leading_spaces: first_col,
-        all_non_space_muted,
-    })
 }
 
 fn is_structural_box_char(ch: char) -> bool {
@@ -4077,20 +4112,21 @@ fn is_collapsed_action_summary_row(trimmed: &str) -> bool {
     })
 }
 
-pub(crate) fn classify_eink_process_row(
+fn classify_eink_process_row(
     screen: &vt100::Screen,
     r: u16,
     rows: u16,
     cols: u16,
     prev_wrapped: bool,
     prev_is_process: bool,
+    scratch: &mut ScannedEinkRow,
 ) -> bool {
-    let Some(scan) = scan_eink_row_text(screen, r, cols) else {
+    if !scratch.scan_into(screen, r, cols) {
         return false;
-    };
-    let (trimmed, trimmed_byte_start) = scan.trimmed();
+    }
+    let (trimmed, trimmed_byte_start) = scratch.trimmed();
     let (content_trimmed, content_byte_start, content_first_col) =
-        strip_leading_gutter_bar(&scan, trimmed, trimmed_byte_start);
+        strip_leading_gutter_bar(scratch, trimmed, trimmed_byte_start);
     if trimmed.is_empty() || row_has_box_frame(content_trimmed) {
         return false;
     }
@@ -4107,7 +4143,7 @@ pub(crate) fn classify_eink_process_row(
         && (content_trimmed.starts_with('⎿')
             || content_trimmed.starts_with('↳')
             || content_trimmed.starts_with("└ ")
-            || (scan.leading_spaces >= 2 && scan.all_non_space_muted))
+            || (scratch.leading_spaces >= 2 && scratch.all_non_space_muted))
     {
         return true;
     }
@@ -4117,17 +4153,18 @@ pub(crate) fn classify_eink_process_row(
     if is_leading_spinner_status_row(screen, r, rows, cols, content_first_col, content_trimmed) {
         return true;
     }
-    if scan.leading_spaces <= 4
+    if scratch.leading_spaces <= 4
         && content_trimmed
             .strip_prefix("Thought for ")
             .is_some_and(|s| s.starts_with(|c: char| c.is_ascii_digit()))
     {
         return true;
     }
-    classify_status_lead_process_row(&scan, content_trimmed, content_byte_start)
+    classify_status_lead_process_row(scratch, content_trimmed, content_byte_start)
 }
 
-pub(crate) fn detect_eink_process_rows(screen: &vt100::Screen, rows: u16, cols: u16) -> Vec<bool> {
+#[cfg(test)]
+fn detect_eink_process_rows(screen: &vt100::Screen, rows: u16, cols: u16) -> Vec<bool> {
     detect_eink_process_rows_with_fence(screen, rows, cols, false)
 }
 
@@ -4141,6 +4178,7 @@ fn detect_eink_process_rows_with_fence(
     let mut prev_wrapped = false;
     let mut prev_is_process = false;
     let mut in_code_fence = initial_in_code_fence;
+    let mut scratch = ScannedEinkRow::with_capacity(cols);
     for r in 0..rows {
         let row_is_fence = !prev_wrapped && vt_row_trimmed_starts_with_fence(screen, r, cols);
         if row_is_fence {
@@ -4149,7 +4187,15 @@ fn detect_eink_process_rows_with_fence(
         let is_proc = if row_is_fence || in_code_fence {
             false
         } else {
-            classify_eink_process_row(screen, r, rows, cols, prev_wrapped, prev_is_process)
+            classify_eink_process_row(
+                screen,
+                r,
+                rows,
+                cols,
+                prev_wrapped,
+                prev_is_process,
+                &mut scratch,
+            )
         };
         out[usize::from(r)] = is_proc;
         prev_wrapped = screen.row_wrapped(r);
@@ -4158,7 +4204,7 @@ fn detect_eink_process_rows_with_fence(
     out
 }
 
-pub(crate) fn vt_row_trimmed_starts_with_fence(screen: &vt100::Screen, r: u16, cols: u16) -> bool {
+fn vt_row_trimmed_starts_with_fence(screen: &vt100::Screen, r: u16, cols: u16) -> bool {
     let mut backticks = 0u8;
     for c in 0..cols {
         let Some(cell) = screen.cell(r, c) else {
@@ -4941,6 +4987,7 @@ pub fn extract_clean_reader_json(screen: &mut vt100::Screen, title: &str) -> Str
         prev_wrapped: bool,
         prev_is_process: bool,
         in_code_fence: bool,
+        scratch: ScannedEinkRow,
     }
 
     let mut logical_lines: Vec<RawLogical> = Vec::new();
@@ -4950,6 +4997,7 @@ pub fn extract_clean_reader_json(screen: &mut vt100::Screen, title: &str) -> Str
         prev_wrapped: false,
         prev_is_process: false,
         in_code_fence: false,
+        scratch: ScannedEinkRow::with_capacity(cols),
     };
 
     let append_visible_row = |scr: &vt100::Screen,
@@ -4976,6 +5024,7 @@ pub fn extract_clean_reader_json(screen: &mut vt100::Screen, title: &str) -> Str
                 cols,
                 proc_state.prev_wrapped,
                 proc_state.prev_is_process,
+                &mut proc_state.scratch,
             );
         let mut prev_was_wide = false;
         let mut prev_col: u16 = 0;
@@ -5198,11 +5247,28 @@ pub fn capture_eink_screen_snapshot(
     capture_eink_screen_snapshot_with_color(screen, area, scrollback_offset, false)
 }
 
+#[cfg(test)]
 pub fn capture_eink_screen_snapshot_with_color(
     screen: &vt100::Screen,
     area: Rect,
     scrollback_offset: usize,
     eink_color: bool,
+) -> EinkScreenSnapshot {
+    capture_eink_screen_snapshot_with_color_and_fence(
+        screen,
+        area,
+        scrollback_offset,
+        eink_color,
+        false,
+    )
+}
+
+pub fn capture_eink_screen_snapshot_with_color_and_fence(
+    screen: &vt100::Screen,
+    area: Rect,
+    scrollback_offset: usize,
+    eink_color: bool,
+    initial_in_code_fence: bool,
 ) -> EinkScreenSnapshot {
     let (scr_cols, scr_rows) = {
         let (r, c) = screen.size();
@@ -5214,7 +5280,8 @@ pub fn capture_eink_screen_snapshot_with_color(
     } else {
         None
     };
-    let process_rows = detect_eink_process_rows(screen, rows, cols);
+    let process_rows =
+        detect_eink_process_rows_with_fence(screen, rows, cols, initial_in_code_fence);
     let mut cells = Vec::with_capacity(usize::from(rows) * usize::from(cols));
     for r in 0..rows {
         let row_diff = diff_rows
@@ -10205,9 +10272,33 @@ mod tests {
                     ..Default::default()
                 },
                 SharedTab {
+                    id: "tab-agy".to_string(),
+                    name: "agy-path".to_string(),
+                    root: serde_json::json!({"content": {"terminal": "t-agy"}}),
+                    ..Default::default()
+                },
+                SharedTab {
+                    id: "tab-cc".to_string(),
+                    name: "cc".to_string(),
+                    root: serde_json::json!({"content": {"terminal": "t-cc"}}),
+                    ..Default::default()
+                },
+                SharedTab {
                     id: "tab-done".to_string(),
                     name: "done-tab".to_string(),
                     root: serde_json::json!({"content": {"terminal": "t-done"}}),
+                    ..Default::default()
+                },
+                SharedTab {
+                    id: "tab-fg-notes".to_string(),
+                    name: "notes".to_string(),
+                    root: serde_json::json!({"content": {"terminal": "t-fg-notes"}}),
+                    ..Default::default()
+                },
+                SharedTab {
+                    id: "tab-fg-proxy".to_string(),
+                    name: "proxy".to_string(),
+                    root: serde_json::json!({"content": {"terminal": "t-fg-proxy"}}),
                     ..Default::default()
                 },
             ],
@@ -10249,6 +10340,22 @@ mod tests {
             },
         );
         world.terminals.insert(
+            "t-agy".to_string(),
+            TerminalInfo {
+                address: "t-agy".to_string(),
+                fg_name: Some("/usr/local/bin/agy".to_string()),
+                ..Default::default()
+            },
+        );
+        world.terminals.insert(
+            "t-cc".to_string(),
+            TerminalInfo {
+                address: "t-cc".to_string(),
+                fg_name: Some("claude-code".to_string()),
+                ..Default::default()
+            },
+        );
+        world.terminals.insert(
             "t-done".to_string(),
             TerminalInfo {
                 address: "t-done".to_string(),
@@ -10257,18 +10364,49 @@ mod tests {
                 ..Default::default()
             },
         );
+        world.terminals.insert(
+            "t-fg-notes".to_string(),
+            TerminalInfo {
+                address: "t-fg-notes".to_string(),
+                fg_name: Some("claude-notes".to_string()),
+                ..Default::default()
+            },
+        );
+        world.terminals.insert(
+            "t-fg-proxy".to_string(),
+            TerminalInfo {
+                address: "t-fg-proxy".to_string(),
+                fg_name: Some("gemini-proxy".to_string()),
+                ..Default::default()
+            },
+        );
 
         // Plain shell with OSC title `~/codes/gemini-proxy` and tab/terminal name `claude-notes` must return false
         world.select_tab_index(0);
         assert!(!is_active_tab_agent(&world));
+        // `status_word` alone without `status_app` or agent `fg_name` must return false
         world.select_tab_index(1);
-        assert!(is_active_tab_agent(&world));
+        assert!(!is_active_tab_agent(&world));
+        // `status_app: Some("custom-agent")` -> true
         world.select_tab_index(2);
         assert!(is_active_tab_agent(&world));
+        // `fg_name: Some("claude")`, `Some("/usr/local/bin/agy")`, `Some("claude-code")` -> true
         world.select_tab_index(3);
         assert!(is_active_tab_agent(&world));
         world.select_tab_index(4);
         assert!(is_active_tab_agent(&world));
+        world.select_tab_index(5);
+        assert!(is_active_tab_agent(&world));
+        // `turn: 2` without `status_app`/`fg_name` -> false
+        world.select_tab_index(6);
+        assert!(!is_active_tab_agent(&world));
+        // `fg_name: Some("claude-notes")` and `Some("gemini-proxy")` -> false
+        world.select_tab_index(7);
+        assert!(!is_active_tab_agent(&world));
+        world.select_tab_index(8);
+        assert!(!is_active_tab_agent(&world));
+        // Windows-style path + `.exe` suffix still matches exact binary stem
+        assert!(is_known_agent_binary_name(r"C:\tools\CODEX.EXE"));
 
         // End-to-end render_ui_full_with_eink_color uses is_active_tab_agent(world) in Normal mode
         let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
@@ -10480,5 +10618,27 @@ mod tests {
         // y=4 (`● Used Tool`) after closing fence -> italicized
         assert_eq!(buf[(0, 4)].symbol(), "●");
         assert!(buf[(0, 4)].modifier.contains(Modifier::ITALIC));
+
+        // E-Ink snapshot respects `initial_in_code_fence` (`false` vs `true` differs on process-looking rows)
+        let snap_area = Rect::new(0, 0, cols, rows);
+        let snap_outside = capture_eink_screen_snapshot_with_color_and_fence(
+            open_parser.screen(),
+            snap_area,
+            0,
+            false,
+            false,
+        );
+        let snap_inside = capture_eink_screen_snapshot_with_color_and_fence(
+            open_parser.screen(),
+            snap_area,
+            0,
+            false,
+            true,
+        );
+        assert_ne!(snap_outside, snap_inside);
+        assert_eq!(snap_outside.cells[0].fg, EINK_INK_PROCESS);
+        assert!(snap_outside.cells[0].mods.contains(Modifier::ITALIC));
+        assert_eq!(snap_inside.cells[0].fg, EINK_INK);
+        assert!(!snap_inside.cells[0].mods.contains(Modifier::ITALIC));
     }
 }
