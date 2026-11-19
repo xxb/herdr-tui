@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0](https://github.com/xxb/herdr-tui/compare/v0.12.0...v0.13.0) (2026-11-19)
+
+
+### Features
+
+* **reader:** make reader full-screen with semantic divider hierarchy ([#94](https://github.com/xxb/herdr-tui/issues/94)) ([3ae9c9c](https://github.com/xxb/herdr-tui/commit/3ae9c9c6b340cbe70df3e9fd4358a19ec1e3c24d))
+
 ## [0.12.0](https://github.com/xxb/herdr-tui/compare/v0.11.0...v0.12.0) (2026-11-19)
 
 
