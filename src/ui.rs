@@ -1120,22 +1120,12 @@ fn tab_pill_style(st: AgentState, is_active: bool, eink_mode: bool) -> Style {
             }
         };
     }
-    let st_fg = match st {
-        AgentState::Blocked => Color::Red,
-        AgentState::Done => Color::Green,
-        AgentState::Working => Color::Yellow,
-        AgentState::Idle => Color::Cyan,
-        AgentState::None => Color::Reset,
-    };
-    let style = Style::default().bg(Color::Reset);
+    let base = normal_state_style(st);
     if is_active {
-        style.fg(st_fg).add_modifier(Modifier::BOLD)
-    } else if matches!(st, AgentState::None) {
-        style.fg(Color::Reset).add_modifier(Modifier::DIM)
-    } else if matches!(st, AgentState::Blocked | AgentState::Done) {
-        style.fg(st_fg).add_modifier(Modifier::BOLD)
+        base.remove_modifier(Modifier::DIM)
+            .add_modifier(Modifier::BOLD)
     } else {
-        style.fg(st_fg)
+        base
     }
 }
 
@@ -2227,11 +2217,11 @@ fn render_floating_mod_cross(
                 let border = if dragging {
                     (Color::Cyan, Modifier::BOLD)
                 } else {
-                    (Color::Reset, Modifier::DIM)
+                    (Color::Magenta, Modifier::empty())
                 };
                 let mod_st = |active: bool| {
                     if active {
-                        (Color::Yellow, Modifier::BOLD | Modifier::UNDERLINED)
+                        (Color::Cyan, Modifier::BOLD | Modifier::UNDERLINED)
                     } else {
                         (Color::Magenta, Modifier::BOLD)
                     }
@@ -2272,7 +2262,6 @@ fn render_floating_mod_cross(
                     (3, 3) => Some(("l", ctl_style.0, ctl_style.1)),
                     (3, 6) => Some(("^", pfx_style.0, pfx_style.1)),
                     (3, 7) => Some(("B", pfx_style.0, pfx_style.1)),
-                    (3, 8) => Some((" ", pfx_style.0, Modifier::empty())),
                     (3, 11) => Some(("A", alt_style.0, alt_style.1)),
                     (3, 12) => Some(("l", alt_style.0, alt_style.1)),
                     (3, 13) => Some(("t", alt_style.0, alt_style.1)),
@@ -2317,9 +2306,11 @@ fn render_floating_mod_cross(
                 cell.set_fg(eink_fg);
                 cell.modifier.remove(Modifier::BOLD);
             } else {
-                cell.set_symbol(" ");
+                if cell.symbol().width() != 1 {
+                    cell.set_symbol(" ");
+                }
                 cell.set_fg(Color::Reset);
-                cell.modifier = Modifier::empty();
+                cell.modifier = Modifier::DIM;
             }
         }
     }
@@ -2438,7 +2429,7 @@ fn render_floating_dpad(
                 let border = if dragging {
                     (Color::Cyan, Modifier::BOLD)
                 } else {
-                    (Color::Reset, Modifier::DIM)
+                    (Color::Cyan, Modifier::empty())
                 };
                 (border.0, border.1, Color::Reset, Color::Cyan)
             };
@@ -2504,9 +2495,11 @@ fn render_floating_dpad(
                 cell.set_fg(eink_fg);
                 cell.modifier.remove(Modifier::BOLD);
             } else {
-                cell.set_symbol(" ");
+                if cell.symbol().width() != 1 {
+                    cell.set_symbol(" ");
+                }
                 cell.set_fg(Color::Reset);
-                cell.modifier = Modifier::empty();
+                cell.modifier = Modifier::DIM;
             }
         }
     }
@@ -3387,12 +3380,12 @@ fn render_tab_overview_page(
                     let badge = format!(" {} ", state.label());
                     if r1_text.width() + 2 + badge.width() <= cw {
                         let bx = col_x + col_w - badge.width() as u16;
-                        buf.set_string(
-                            bx,
-                            y,
-                            &badge,
-                            st_style.bg(row_bg).add_modifier(Modifier::BOLD),
-                        );
+                        let badge_style = if eink_mode {
+                            st_style.bg(row_bg).add_modifier(Modifier::BOLD)
+                        } else {
+                            st_style.bg(row_bg)
+                        };
+                        buf.set_string(bx, y, &badge, badge_style);
                     }
                 }
                 if is_sel {
@@ -9208,6 +9201,10 @@ mod tests {
         let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
         let mut parser = vt100::Parser::new(nz(22), nz(100), 0);
         parser.process(b"\x1b[38;2;200;40;60mRedRGB\x1b[0m \x1b[32mAnsiGreen\x1b[0m plain");
+        for row in 2..=22 {
+            let line = format!("\x1b[{row};1H{}", "X".repeat(98));
+            parser.process(line.as_bytes());
+        }
 
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         let mut geom_out = None;
@@ -9308,13 +9305,19 @@ mod tests {
                 }
             }
         }
-        assert_eq!(buf[(mr.x + 1, mr.y + 3)].fg, Color::Yellow);
+        assert_eq!(buf[(mr.x + 1, mr.y + 3)].fg, Color::Cyan);
         assert!(buf[(mr.x + 1, mr.y + 3)]
             .modifier
             .contains(Modifier::BOLD | Modifier::UNDERLINED));
-        assert_eq!(buf[(mr.x + 6, mr.y + 3)].fg, Color::Yellow);
-        assert_eq!(buf[(mr.x + 5, mr.y)].fg, Color::Reset);
-        assert!(buf[(mr.x + 5, mr.y)].modifier.contains(Modifier::DIM));
+        assert_eq!(buf[(mr.x + 6, mr.y + 3)].fg, Color::Cyan);
+        assert_eq!(buf[(mr.x + 5, mr.y)].fg, Color::Magenta);
+        assert_eq!(buf[(dr.x + 5, dr.y)].fg, Color::Cyan);
+        // Non-glyph padding cell inside D-Pad arm preserves underlying VT glyph dimmed (semi-transparent)
+        let inner_cell = &buf[(dr.x + 6, dr.y + 1)];
+        assert_eq!(inner_cell.symbol(), "X");
+        assert_eq!(inner_cell.bg, Color::Reset);
+        assert_eq!(inner_cell.fg, Color::Reset);
+        assert!(inner_cell.modifier.contains(Modifier::DIM));
 
         // 2. Idle bottom bar (`focused_quota = None, copied_flash = false, scrollback_offset = 0`)
         //    must be 100% transparent (`bg == Color::Reset`, `fg == Color::Reset`, empty modifiers).
