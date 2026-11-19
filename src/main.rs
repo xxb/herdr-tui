@@ -102,7 +102,11 @@ fn write_terminal_enter_sequence<W: Write>(w: &mut W) -> io::Result<()> {
     )
 }
 
-fn write_terminal_leave_sequence<W: Write>(w: &mut W) -> io::Result<()> {
+fn write_terminal_leave_sequence_with_mux<W: Write>(
+    w: &mut W,
+    in_tmux: bool,
+    in_screen: bool,
+) -> io::Result<()> {
     execute!(
         w,
         EndSynchronizedUpdate,
@@ -120,7 +124,15 @@ fn write_terminal_leave_sequence<W: Write>(w: &mut W) -> io::Result<()> {
         SetUnderlineColor(CrosstermColor::Reset),
         SetAttribute(CrosstermAttribute::Reset),
         Show,
-    )
+    )?;
+    let clear_osc = format_herdr_session_clear_osc(in_tmux, in_screen);
+    w.write_all(clear_osc.as_bytes())?;
+    w.flush()
+}
+
+#[cfg(test)]
+fn write_terminal_leave_sequence<W: Write>(w: &mut W) -> io::Result<()> {
+    write_terminal_leave_sequence_with_mux(w, false, false)
 }
 
 fn drain_pending_input_events() {
@@ -136,12 +148,15 @@ fn drain_pending_input_events() {
     }
 }
 
-struct TerminalCleanupGuard;
+struct TerminalCleanupGuard {
+    in_tmux: bool,
+    in_screen: bool,
+}
 
 impl Drop for TerminalCleanupGuard {
     fn drop(&mut self) {
         let mut stdout = io::stdout();
-        let _ = write_terminal_leave_sequence(&mut stdout);
+        let _ = write_terminal_leave_sequence_with_mux(&mut stdout, self.in_tmux, self.in_screen);
         drain_pending_input_events();
         let _ = disable_raw_mode();
     }
@@ -332,6 +347,51 @@ struct NestedMultiplexer {
     program: &'static str,
     env_var: &'static str,
     value: String,
+}
+
+fn read_env_lossy(key: &str) -> Option<String> {
+    std::env::var_os(key).map(|v| v.to_string_lossy().into_owned())
+}
+
+fn detect_multiplexer_env_with<F: Fn(&str) -> Option<String>>(env_get: F) -> (bool, bool) {
+    let in_tmux = env_get("TMUX").is_some_and(|v| !v.trim().is_empty());
+    let in_screen = env_get("STY").is_some_and(|v| !v.trim().is_empty());
+    (in_tmux, in_screen)
+}
+
+fn detect_multiplexer_env() -> (bool, bool) {
+    detect_multiplexer_env_with(read_env_lossy)
+}
+
+/// Resolve the effective `herdr-core` session name (`--session` overrides `$HC_SESSION`,
+/// trimming surrounding whitespace and turning empty/whitespace values into `None`).
+/// `main()` passes the resolved value back through `connect_session_arg` to
+/// `CoreClient::connect_with_sender` so `herdr-core` and `herdr_session` always match.
+fn resolve_herdr_session<F: Fn(&str) -> Option<String>>(
+    cli_session: Option<&str>,
+    env_get: F,
+) -> Option<String> {
+    if let Some(raw) = cli_session {
+        let trimmed = raw.trim();
+        return (!trimmed.is_empty()).then(|| trimmed.to_string());
+    }
+    env_get("HC_SESSION").and_then(|raw| {
+        let trimmed = raw.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
+}
+
+fn connect_session_arg<'a>(
+    cli_session: Option<&str>,
+    resolved_session: Option<&'a str>,
+) -> Option<&'a str> {
+    if resolved_session.is_some() {
+        resolved_session
+    } else if cli_session.is_some() {
+        Some("")
+    } else {
+        None
+    }
 }
 
 fn resolve_allow_nested(cli_allow: bool, cli_no_allow: bool, cfg_allow: Option<bool>) -> bool {
@@ -1527,6 +1587,77 @@ fn format_osc52_sequence(b64: &str, in_tmux: bool, in_screen: bool) -> String {
     }
 }
 
+const OSC_USER_VAR_TERMINAL: &str = "herdr_terminal";
+const OSC_USER_VAR_SESSION: &str = "herdr_session";
+
+fn format_osc1337_user_var(key: &str, value: &str, in_tmux: bool, in_screen: bool) -> String {
+    let b64 = base64_encode(value.as_bytes());
+    format_single_osc_sequence(&format!("1337;SetUserVar={key}={b64}"), in_tmux, in_screen)
+}
+
+fn format_herdr_session_clear_osc(in_tmux: bool, in_screen: bool) -> String {
+    let mut out = format_osc1337_user_var(OSC_USER_VAR_TERMINAL, "", in_tmux, in_screen);
+    out.push_str(&format_osc1337_user_var(
+        OSC_USER_VAR_SESSION,
+        "",
+        in_tmux,
+        in_screen,
+    ));
+    out
+}
+
+#[derive(Debug)]
+struct OuterSessionReporter {
+    session: Option<String>,
+    in_tmux: bool,
+    in_screen: bool,
+    announced_session: bool,
+    last_terminal: Option<Option<String>>,
+}
+
+impl OuterSessionReporter {
+    fn new(session: Option<String>, in_tmux: bool, in_screen: bool) -> Self {
+        Self {
+            session,
+            in_tmux,
+            in_screen,
+            announced_session: false,
+            last_terminal: None,
+        }
+    }
+
+    fn sync_sequence(&mut self, current_terminal: Option<&str>) -> Option<String> {
+        let cur_norm = current_terminal.map(str::trim).filter(|s| !s.is_empty());
+        let mut out = String::new();
+        if !self.announced_session {
+            out.push_str(&format_osc1337_user_var(
+                OSC_USER_VAR_SESSION,
+                self.session.as_deref().unwrap_or(""),
+                self.in_tmux,
+                self.in_screen,
+            ));
+            self.announced_session = true;
+        }
+        if self.last_terminal.as_ref().map(|o| o.as_deref()) != Some(cur_norm) {
+            out.push_str(&format_osc1337_user_var(
+                OSC_USER_VAR_TERMINAL,
+                cur_norm.unwrap_or(""),
+                self.in_tmux,
+                self.in_screen,
+            ));
+            self.last_terminal = Some(cur_norm.map(String::from));
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn clear_sequence(&mut self) -> String {
+        self.announced_session = false;
+        self.last_terminal = None;
+        format_herdr_session_clear_osc(self.in_tmux, self.in_screen)
+    }
+}
+
 fn reader_page_step(term_rect: Rect) -> usize {
     let (body_rect, _, _) = reader_body_metrics(term_rect);
     usize::from(body_rect.height).saturating_sub(2).max(1)
@@ -1944,8 +2075,7 @@ fn copy_to_clipboard(text: &str) {
     // so remote SSH clients (iPad Termius, Blink, ShellFish, WezTerm, Kitty, iTerm2, Ghostty)
     // automatically update the client device's native clipboard.
     let b64 = base64_encode(text.as_bytes());
-    let in_tmux = std::env::var_os("TMUX").is_some_and(|v| !v.is_empty());
-    let in_screen = std::env::var_os("STY").is_some_and(|v| !v.is_empty());
+    let (in_tmux, in_screen) = detect_multiplexer_env();
     let seq = format_osc52_sequence(&b64, in_tmux, in_screen);
     let mut stdout = io::stdout();
     let _ = stdout.write_all(seq.as_bytes());
@@ -2111,9 +2241,7 @@ fn main() -> Result<()> {
         file_cfg.ui.allow_nested,
     );
     if !allow_nested {
-        if let Some(nested) = detect_nested_multiplexer(|k| {
-            std::env::var_os(k).map(|v| v.to_string_lossy().into_owned())
-        }) {
+        if let Some(nested) = detect_nested_multiplexer(read_env_lossy) {
             anyhow::bail!("{}", format_nested_session_error(&nested));
         }
     }
@@ -2138,13 +2266,15 @@ fn main() -> Result<()> {
         cli.no_eink_color,
         file_cfg.ui.eink,
         file_cfg.ui.eink_color,
-        |k| std::env::var_os(k).map(|v| v.to_string_lossy().into_owned()),
+        read_env_lossy,
     );
     let eink_interval = resolve_eink_interval(cli.eink_interval_ms, file_cfg.ui.eink_interval_ms);
+    let (in_tmux, in_screen) = detect_multiplexer_env();
+    let herdr_session = resolve_herdr_session(cli.session.as_deref(), read_env_lossy);
+    let connect_session = connect_session_arg(cli.session.as_deref(), herdr_session.as_deref());
 
     let (app_tx, app_rx) = mpsc::channel::<AppEvent>();
-    let core =
-        CoreClient::connect_with_sender(cli.session.as_deref(), app_tx.clone(), AppEvent::Core)?;
+    let core = CoreClient::connect_with_sender(connect_session, app_tx.clone(), AppEvent::Core)?;
     let snapshot = core.subscribe_events()?;
 
     let mut world = World::default();
@@ -2153,7 +2283,8 @@ fn main() -> Result<()> {
     // Setup terminal with an immediate RAII guard so any setup or runtime error
     // restores raw mode, alternate screen, mouse capture, SGR state, and cursor visibility.
     enable_raw_mode()?;
-    let _cleanup_guard = TerminalCleanupGuard;
+    let _cleanup_guard = TerminalCleanupGuard { in_tmux, in_screen };
+    let mut session_reporter = OuterSessionReporter::new(herdr_session, in_tmux, in_screen);
     let mut stdout = BufWriter::with_capacity(64 * 1024, io::stdout());
     write_terminal_enter_sequence(&mut stdout)?;
     let backend = CrosstermBackend::new(stdout);
@@ -2213,12 +2344,14 @@ fn main() -> Result<()> {
         eink_mode,
         eink_color,
         eink_interval,
+        &mut session_reporter,
     );
 
     // Disable mouse capture, bracketed paste, and alternate screen BEFORE disabling raw mode
     // so late mouse/terminal packets never echo onto the outer shell prompt.
     input_running.store(false, Ordering::SeqCst);
-    let leave_ok = write_terminal_leave_sequence(terminal.backend_mut()).is_ok();
+    let leave_ok =
+        write_terminal_leave_sequence_with_mux(terminal.backend_mut(), in_tmux, in_screen).is_ok();
     drop(app_rx);
     let _ = input_thread.join();
     drain_pending_input_events();
@@ -3414,6 +3547,7 @@ fn run_app(
     eink_mode: bool,
     eink_color: bool,
     eink_interval: Duration,
+    session_reporter: &mut OuterSessionReporter,
 ) -> Result<()> {
     let mut attached_map: BTreeMap<String, AttachedTerminal> = BTreeMap::new();
     let mut active_addr: Option<String> = None;
@@ -3431,6 +3565,7 @@ fn run_app(
         eink_mode,
         eink_color,
         eink_interval,
+        session_reporter,
         &mut attached_map,
         &mut active_addr,
     );
@@ -3458,6 +3593,7 @@ fn run_app_loop(
     mut eink_mode: bool,
     mut eink_color: bool,
     eink_interval: Duration,
+    session_reporter: &mut OuterSessionReporter,
     attached_map: &mut BTreeMap<String, AttachedTerminal>,
     active_addr: &mut Option<String>,
 ) -> Result<()> {
@@ -3594,6 +3730,12 @@ fn run_app_loop(
                 eink_pacer.reset_on_channel_switch();
                 dirty = true;
             }
+        }
+
+        if let Some(osc) = session_reporter.sync_sequence(world.active_terminal_address_ref()) {
+            let backend = terminal.backend_mut();
+            backend.write_all(osc.as_bytes())?;
+            backend.flush()?;
         }
 
         let mut active_channel = active_addr
@@ -10060,5 +10202,281 @@ mod tests {
             dirty,
             "fence state flip must promote dirty instead of zero-diff elision"
         );
+    }
+
+    #[test]
+    fn detect_multiplexer_env_with_handles_empty_whitespace_and_active_values() {
+        let env_from = |pairs: &[(&str, &str)]| {
+            let map: BTreeMap<&str, &str> = pairs.iter().copied().collect();
+            detect_multiplexer_env_with(|k| map.get(k).map(|v| (*v).to_string()))
+        };
+
+        assert_eq!(env_from(&[]), (false, false));
+        assert_eq!(env_from(&[("TMUX", ""), ("STY", "   ")]), (false, false));
+        assert_eq!(env_from(&[("TMUX", "session,42,0")]), (true, false));
+        assert_eq!(env_from(&[("STY", "1234.pts-0.box")]), (false, true));
+        assert_eq!(
+            env_from(&[("TMUX", "session,42,0"), ("STY", "1234.pts-0.box")]),
+            (true, true)
+        );
+    }
+
+    #[test]
+    fn resolve_herdr_session_handles_cli_precedence_trimming_and_empty() {
+        let env_with = |val: Option<&str>| {
+            let owned = val.map(str::to_string);
+            move |k: &str| {
+                if k == "HC_SESSION" {
+                    owned.clone()
+                } else {
+                    None
+                }
+            }
+        };
+
+        assert_eq!(
+            resolve_herdr_session(Some("work"), env_with(Some("from-env"))),
+            Some("work".to_string())
+        );
+        assert_eq!(
+            resolve_herdr_session(Some("  work  "), env_with(None)),
+            Some("work".to_string())
+        );
+        // Explicit empty/whitespace `--session` overrides `$HC_SESSION` just like CoreClient::connect_with_sender
+        assert_eq!(
+            resolve_herdr_session(Some("   "), env_with(Some("from-env"))),
+            None
+        );
+        assert_eq!(resolve_herdr_session(Some(""), env_with(None)), None);
+        assert_eq!(
+            resolve_herdr_session(None, env_with(Some("  from-env  "))),
+            Some("from-env".to_string())
+        );
+        assert_eq!(resolve_herdr_session(None, env_with(Some("   "))), None);
+        assert_eq!(resolve_herdr_session(None, env_with(None)), None);
+
+        // `connect_session_arg` forwards trimmed session names to `CoreClient` and overrides
+        // inherited `$HC_SESSION` with `Some("")` when `--session` was explicitly blank.
+        assert_eq!(
+            connect_session_arg(Some("  work  "), Some("work")),
+            Some("work")
+        );
+        assert_eq!(connect_session_arg(Some("   "), None), Some(""));
+        assert_eq!(
+            connect_session_arg(None, Some("from-env")),
+            Some("from-env")
+        );
+        assert_eq!(connect_session_arg(None, None), None);
+    }
+
+    #[test]
+    fn format_osc1337_user_var_and_clear_support_plain_tmux_and_screen_dcs() {
+        assert_eq!(base64_encode(b"t7"), "dDc=");
+        assert_eq!(base64_encode(b"machine/t7"), "bWFjaGluZS90Nw==");
+
+        let plain_term = format_osc1337_user_var("herdr_terminal", "t7", false, false);
+        assert_eq!(plain_term, "\x1b]1337;SetUserVar=herdr_terminal=dDc=\x07");
+
+        let plain_remote = format_osc1337_user_var("herdr_terminal", "machine/t7", false, false);
+        assert_eq!(
+            plain_remote,
+            "\x1b]1337;SetUserVar=herdr_terminal=bWFjaGluZS90Nw==\x07"
+        );
+
+        let plain_clear = format_herdr_session_clear_osc(false, false);
+        assert_eq!(
+            plain_clear,
+            "\x1b]1337;SetUserVar=herdr_terminal=\x07\x1b]1337;SetUserVar=herdr_session=\x07"
+        );
+
+        // Long payload exercises tmux DCS chunking (<=76 pre-escape bytes) and ESC doubling.
+        let long_val = "node-alpha/".to_string() + &"x".repeat(90);
+        let expected_b64 = base64_encode(long_val.as_bytes());
+        let expected_osc = format!("\x1b]1337;SetUserVar=herdr_terminal={expected_b64}\x07");
+
+        let tmux_seq = format_osc1337_user_var("herdr_terminal", &long_val, true, false);
+        assert!(tmux_seq.starts_with("\x1bPtmux;\x1b\x1b]1337;SetUserVar="));
+        assert!(tmux_seq.ends_with("\x1b\\"));
+        let mut tmux_frames = 0usize;
+        let mut tmux_unwrapped = String::new();
+        let mut rest_tmux = tmux_seq.as_str();
+        while !rest_tmux.is_empty() {
+            let body_plus = rest_tmux
+                .strip_prefix("\x1bPtmux;")
+                .expect("every tmux DCS chunk must start with ESC P tmux;");
+            let end_idx = body_plus
+                .find("\x1b\\")
+                .expect("every tmux DCS chunk must end with ST");
+            let frame_inner = &body_plus[..end_idx];
+            let unescaped = frame_inner.replace("\x1b\x1b", "\x1b");
+            assert!(unescaped.len() <= 76);
+            assert_eq!(
+                frame_inner.matches('\x1b').count(),
+                unescaped.matches('\x1b').count() * 2
+            );
+            tmux_unwrapped.push_str(&unescaped);
+            tmux_frames += 1;
+            rest_tmux = &body_plus[end_idx + 2..];
+        }
+        assert!(
+            tmux_frames >= 2,
+            "expected chunked tmux frames, got {tmux_frames}"
+        );
+        assert_eq!(tmux_unwrapped, expected_osc);
+
+        // Screen DCS passthrough chunks into <=76-byte frames.
+        let screen_seq = format_osc1337_user_var("herdr_terminal", &long_val, false, true);
+        assert!(screen_seq.starts_with("\x1bP\x1b]1337;SetUserVar="));
+        assert!(screen_seq.ends_with("\x1b\\"));
+        let mut screen_frames = 0usize;
+        let mut screen_unwrapped = String::new();
+        let mut rest_screen = screen_seq.as_str();
+        while !rest_screen.is_empty() {
+            let body_plus = rest_screen
+                .strip_prefix("\x1bP")
+                .expect("every screen DCS chunk must start with ESC P");
+            let end_idx = body_plus
+                .find("\x1b\\")
+                .expect("every screen DCS chunk must end with ST");
+            let frame_inner = &body_plus[..end_idx];
+            assert!(frame_inner.len() <= 76);
+            screen_unwrapped.push_str(frame_inner);
+            screen_frames += 1;
+            rest_screen = &body_plus[end_idx + 2..];
+        }
+        assert!(
+            screen_frames >= 2,
+            "expected chunked screen frames, got {screen_frames}"
+        );
+        assert_eq!(screen_unwrapped, expected_osc);
+
+        // Clear helper emits herdr_terminal then herdr_session through tmux/screen DCS wrappers too.
+        let tmux_clear = format_herdr_session_clear_osc(true, false);
+        assert_eq!(
+            tmux_clear,
+            format!(
+                "{}{}",
+                format_osc1337_user_var("herdr_terminal", "", true, false),
+                format_osc1337_user_var("herdr_session", "", true, false),
+            )
+        );
+        let screen_clear = format_herdr_session_clear_osc(false, true);
+        assert_eq!(
+            screen_clear,
+            format!(
+                "{}{}",
+                format_osc1337_user_var("herdr_terminal", "", false, true),
+                format_osc1337_user_var("herdr_session", "", false, true),
+            )
+        );
+    }
+
+    #[test]
+    fn outer_session_reporter_tracks_session_dedup_focus_switches_and_clear() {
+        let mut reporter = OuterSessionReporter::new(Some("work".to_string()), false, false);
+
+        // 1. Initial sync announces both herdr_session and herdr_terminal
+        let first = reporter.sync_sequence(Some("t7")).expect("initial sync");
+        let work_b64 = base64_encode(b"work");
+        assert_eq!(
+            first,
+            format!(
+                "\x1b]1337;SetUserVar=herdr_session={work_b64}\x07\
+                 \x1b]1337;SetUserVar=herdr_terminal=dDc=\x07"
+            )
+        );
+
+        // 2. Unchanged focus (including surrounding whitespace) is deduplicated
+        assert_eq!(reporter.sync_sequence(Some("t7")), None);
+        assert_eq!(reporter.sync_sequence(Some("  t7  ")), None);
+
+        // 3. Terminal focus switch emits ONLY herdr_terminal
+        let switched = reporter
+            .sync_sequence(Some("machine/t7"))
+            .expect("terminal switch");
+        assert_eq!(
+            switched,
+            "\x1b]1337;SetUserVar=herdr_terminal=bWFjaGluZS90Nw==\x07"
+        );
+        assert_eq!(reporter.sync_sequence(Some("machine/t7")), None);
+
+        // 4. Switching to an empty Space (None or whitespace) clears herdr_terminal only
+        let cleared_term = reporter.sync_sequence(None).expect("empty space clear");
+        assert_eq!(cleared_term, "\x1b]1337;SetUserVar=herdr_terminal=\x07");
+        assert_eq!(reporter.sync_sequence(None), None);
+        assert_eq!(reporter.sync_sequence(Some("   ")), None);
+
+        // 5. Recovering from empty Space back to a live terminal emits herdr_terminal
+        let recovered = reporter
+            .sync_sequence(Some("t2"))
+            .expect("recover terminal");
+        assert_eq!(
+            recovered,
+            format!(
+                "\x1b]1337;SetUserVar=herdr_terminal={}\x07",
+                base64_encode(b"t2")
+            )
+        );
+
+        // 6. clear_sequence clears both vars and resets state so next sync re-announces both
+        let cleared_all = reporter.clear_sequence();
+        assert_eq!(
+            cleared_all,
+            "\x1b]1337;SetUserVar=herdr_terminal=\x07\x1b]1337;SetUserVar=herdr_session=\x07"
+        );
+        let reannounced = reporter
+            .sync_sequence(Some("t2"))
+            .expect("reannounce after clear");
+        assert_eq!(
+            reannounced,
+            format!(
+                "\x1b]1337;SetUserVar=herdr_session={work_b64}\x07\
+                 \x1b]1337;SetUserVar=herdr_terminal={}\x07",
+                base64_encode(b"t2")
+            )
+        );
+
+        // 7. Default (None) session emits empty herdr_session= on first sync to clear stale values
+        let mut default_reporter = OuterSessionReporter::new(None, false, false);
+        let default_first = default_reporter
+            .sync_sequence(None)
+            .expect("default session initial clear");
+        assert_eq!(
+            default_first,
+            "\x1b]1337;SetUserVar=herdr_session=\x07\x1b]1337;SetUserVar=herdr_terminal=\x07"
+        );
+        assert_eq!(default_reporter.sync_sequence(None), None);
+    }
+
+    #[test]
+    fn write_terminal_leave_sequence_with_mux_preserves_order_and_appends_session_clear() {
+        for (in_tmux, in_screen) in [(false, false), (true, false), (false, true)] {
+            let mut buf = Vec::new();
+            write_terminal_leave_sequence_with_mux(&mut buf, in_tmux, in_screen).unwrap();
+            let leave_str = String::from_utf8(buf).expect("UTF-8 terminal leave sequence");
+            let disable_mouse_idx = leave_str
+                .find("\x1b[?1000l")
+                .expect("DisableMouseCapture on leave");
+            let clear_idx = leave_str
+                .find("\x1b[2J")
+                .expect("Clear(ClearType::All) before LeaveAlternateScreen");
+            let alt_leave_idx = leave_str
+                .find("\x1b[?1049l")
+                .expect("LeaveAlternateScreen on leave");
+            let show_idx = leave_str
+                .rfind("\x1b[?25h")
+                .expect("Show cursor after LeaveAlternateScreen");
+            assert!(disable_mouse_idx < clear_idx);
+            assert!(clear_idx < alt_leave_idx);
+            assert!(alt_leave_idx < show_idx);
+
+            let expected_clear = format_herdr_session_clear_osc(in_tmux, in_screen);
+            assert!(
+                leave_str.ends_with(&expected_clear),
+                "expected leave sequence for mux=({in_tmux}, {in_screen}) to end with {expected_clear:?}"
+            );
+            let clear_start = leave_str.len() - expected_clear.len();
+            assert!(show_idx < clear_start);
+        }
     }
 }
