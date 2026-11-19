@@ -26,6 +26,7 @@ pub enum Action {
     ToggleEinkColor,
     RedrawScreen,
     OpenBookReader,
+    ExportNativeBookReader,
     PageUp,
     PageDown,
     Detach,
@@ -179,7 +180,8 @@ pub fn match_prefix_action(ev: &KeyEvent, prefix_spec: &str) -> Option<Action> {
         KeyCode::Char('e') => Some(Action::ToggleEink),
         KeyCode::Char('E') => Some(Action::ToggleEinkColor),
         KeyCode::Char('r') => Some(Action::RedrawScreen),
-        KeyCode::Char('v' | 'B') => Some(Action::OpenBookReader),
+        KeyCode::Char('v') => Some(Action::OpenBookReader),
+        KeyCode::Char('B') => Some(Action::ExportNativeBookReader),
         KeyCode::PageUp => Some(Action::PageUp),
         KeyCode::PageDown => Some(Action::PageDown),
         KeyCode::Char('q' | 'd') => Some(Action::Detach),
@@ -399,7 +401,7 @@ mod tests {
         let b_upper = KeyEvent::new(KeyCode::Char('B'), KeyModifiers::SHIFT);
         assert_eq!(
             match_prefix_action(&b_upper, "ctrl+b"),
-            Some(Action::OpenBookReader)
+            Some(Action::ExportNativeBookReader)
         );
 
         let b_lower = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE);
