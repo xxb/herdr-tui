@@ -35,7 +35,7 @@ pub enum CoreMessage {
 }
 
 type PendingRpcMap = HashMap<u64, (String, Sender<Value>)>;
-type PendingAsyncReadMap = HashMap<u64, String>;
+type PendingAsyncReadMap = HashMap<u64, (String, Instant)>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalReadResult {
@@ -133,7 +133,7 @@ fn handle_rpc_reply_value<T, F>(
                 }
             }
             let _ = tx.send(val);
-        } else if let Some(terminal) = pending_async_reads
+        } else if let Some((terminal, _)) = pending_async_reads
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&id)
@@ -495,17 +495,19 @@ impl CoreClient {
             "params": { "terminal": terminal, "lines": lines },
         });
         let bytes = serde_json::to_vec(&req).ok()?;
+        let now = Instant::now();
         {
             let mut map = self
                 .pending_async_reads
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
+            map.retain(|_, (_, at)| now.saturating_duration_since(*at) < Duration::from_secs(10));
             if map.len() >= 64 {
                 if let Some(&oldest_id) = map.keys().min() {
                     map.remove(&oldest_id);
                 }
             }
-            map.insert(id, terminal.to_string());
+            map.insert(id, (terminal.to_string(), now));
         }
         if self.send_frame(0, wire::DATA, &bytes).is_err() {
             self.pending_async_reads
@@ -515,6 +517,14 @@ impl CoreClient {
             return None;
         }
         Some(id)
+    }
+
+    /// Drop an expired or superseded `terminal.read` tracking entry so a silent core cannot leak map entries.
+    pub fn cancel_terminal_read(&self, request_id: u64) {
+        self.pending_async_reads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&request_id);
     }
 
     /// Resize an attached terminal channel.
@@ -703,5 +713,23 @@ mod tests {
         }
         assert!(rx.try_recv().is_err());
         assert!(core.pending_async_reads.lock().unwrap().is_empty());
+
+        // cancel_terminal_read removes entry cleanly and aged >10s entries prune on subsequent request
+        let id_cancel = core.request_terminal_read("t1", 100).unwrap();
+        assert_eq!(core.pending_async_reads.lock().unwrap().len(), 1);
+        core.cancel_terminal_read(id_cancel);
+        assert!(core.pending_async_reads.lock().unwrap().is_empty());
+
+        core.pending_async_reads.lock().unwrap().insert(
+            777,
+            (
+                "stale".to_string(),
+                Instant::now() - Duration::from_secs(11),
+            ),
+        );
+        let id_fresh = core.request_terminal_read("t1", 100).unwrap();
+        let map = core.pending_async_reads.lock().unwrap();
+        assert!(!map.contains_key(&777));
+        assert!(map.contains_key(&id_fresh));
     }
 }

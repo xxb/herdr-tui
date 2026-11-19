@@ -1308,8 +1308,16 @@ pub fn format_reader_doc_json(doc: &ReaderDoc) -> String {
             hi = mid - 1;
         }
     }
-    debug_assert!(best.len() <= MAX_SHELLDECK_JSON_BYTES);
-    best
+    if best.len() <= MAX_SHELLDECK_JSON_BYTES {
+        return best;
+    }
+    serde_json::to_string(&ShellDeckPayload {
+        v: 1,
+        title: "",
+        anchor: 0,
+        lines: Vec::new(),
+    })
+    .unwrap_or_else(|_| "{}".to_string())
 }
 
 #[cfg(test)]

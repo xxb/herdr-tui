@@ -1773,6 +1773,8 @@ fn current_reader_scope(world: &World) -> ReaderScope {
     )
 }
 
+const READER_RPC_TIMEOUT: Duration = Duration::from_secs(3);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingReaderRpc {
     request_id: u64,
@@ -1780,6 +1782,7 @@ struct PendingReaderRpc {
     clean_mode: bool,
     for_native_export: bool,
     user_scrolled: bool,
+    deadline: Instant,
 }
 
 struct ReaderActionOut<'a> {
@@ -1804,28 +1807,80 @@ fn set_reader_user_scrolled(pending_rpc: &mut Option<PendingReaderRpc>, scrolled
     }
 }
 
-fn clear_non_export_reader_rpc(pending_rpc: &mut Option<PendingReaderRpc>) {
+fn clear_non_export_reader_rpc(core: &CoreClient, pending_rpc: &mut Option<PendingReaderRpc>) {
     if pending_rpc
         .as_ref()
         .is_some_and(|rpc| !rpc.for_native_export)
     {
-        *pending_rpc = None;
+        if let Some(old) = pending_rpc.take() {
+            core.cancel_terminal_read(old.request_id);
+        }
+    }
+}
+
+fn set_pending_reader_rpc(
+    core: &CoreClient,
+    pending_rpc: &mut Option<PendingReaderRpc>,
+    next: Option<PendingReaderRpc>,
+) {
+    if let Some(old) = pending_rpc.take() {
+        core.cancel_terminal_read(old.request_id);
+    }
+    *pending_rpc = next;
+}
+
+fn clear_reader_syncing_badge(modal: &mut Modal) -> bool {
+    if let Modal::Reader {
+        ref mut doc,
+        ref mut source_note,
+        ..
+    } = *modal
+    {
+        if source_note.as_deref() == Some("syncing…") {
+            *source_note = None;
+            doc.source_note = None;
+            return true;
+        }
+    }
+    false
+}
+
+fn expire_pending_reader_rpc(
+    now: Instant,
+    core: &CoreClient,
+    world: &World,
+    modal: &mut Modal,
+    pending_rpc: &mut Option<PendingReaderRpc>,
+    pending_reader_osc: &mut bool,
+    dirty: &mut bool,
+) {
+    if !pending_rpc.as_ref().is_some_and(|rpc| now >= rpc.deadline) {
+        return;
+    }
+    let expired = pending_rpc.take().expect("checked above");
+    core.cancel_terminal_read(expired.request_id);
+    if world.active_terminal_address().as_deref() != Some(expired.terminal.as_str()) {
+        return;
+    }
+    if expired.for_native_export {
+        *pending_reader_osc = true;
+    } else if clear_reader_syncing_badge(modal) {
+        *dirty = true;
     }
 }
 
 fn sync_reader_modal_scope(
+    core: &CoreClient,
     modal: &mut Modal,
     world: &World,
     reader_open_scope: &mut Option<ReaderScope>,
     reader_drag: &mut Option<u16>,
     pending_reader_rpc: &mut Option<PendingReaderRpc>,
-    eink_mode: bool,
-    pending_eink_osc: &mut bool,
 ) -> bool {
     if !matches!(modal, Modal::Reader { .. }) {
         *reader_open_scope = None;
         *reader_drag = None;
-        clear_non_export_reader_rpc(pending_reader_rpc);
+        clear_non_export_reader_rpc(core, pending_reader_rpc);
         return false;
     }
     let cur = current_reader_scope(world);
@@ -1843,10 +1898,7 @@ fn sync_reader_modal_scope(
             *modal = Modal::None;
             *reader_open_scope = None;
             *reader_drag = None;
-            clear_non_export_reader_rpc(pending_reader_rpc);
-            if eink_mode {
-                *pending_eink_osc = true;
-            }
+            clear_non_export_reader_rpc(core, pending_reader_rpc);
             true
         }
     }
@@ -1914,7 +1966,7 @@ fn build_reader_modal_state(
         .as_deref()
         .and_then(|addr| core.request_terminal_read(addr, reader_line_budget(is_agent)));
     if let Some(slot) = pending_reader_rpc {
-        *slot = dispatched_id
+        let next = dispatched_id
             .zip(active_addr)
             .map(|(request_id, terminal)| PendingReaderRpc {
                 request_id,
@@ -1922,7 +1974,9 @@ fn build_reader_modal_state(
                 clean_mode,
                 for_native_export: false,
                 user_scrolled: false,
+                deadline: Instant::now() + READER_RPC_TIMEOUT,
             });
+        set_pending_reader_rpc(core, slot, next);
     }
     let source_note = dispatched_id.map(|_| "syncing…".to_string());
     let doc = crate::reader::build_reader_doc_from_text(
@@ -2026,9 +2080,7 @@ fn apply_terminal_read_message(
             }
         }
         Err(_) => {
-            if source_note.as_deref() == Some("syncing…") {
-                *source_note = None;
-                doc.source_note = None;
+            if clear_reader_syncing_badge(modal) {
                 *dirty = true;
             }
         }
@@ -2748,7 +2800,7 @@ fn execute_action_full(
             if matches!(modal, Modal::Reader { .. }) {
                 *modal = Modal::None;
                 if let Some(ref mut out) = reader_out {
-                    clear_non_export_reader_rpc(out.pending_rpc);
+                    clear_non_export_reader_rpc(core, out.pending_rpc);
                 }
             } else {
                 *modal = build_reader_modal_state(
@@ -2773,13 +2825,18 @@ fn execute_action_full(
                     if let Some(request_id) =
                         core.request_terminal_read(&addr, reader_line_budget(is_agent))
                     {
-                        *out.pending_rpc = Some(PendingReaderRpc {
-                            request_id,
-                            terminal: addr,
-                            clean_mode: true,
-                            for_native_export: true,
-                            user_scrolled: false,
-                        });
+                        set_pending_reader_rpc(
+                            core,
+                            out.pending_rpc,
+                            Some(PendingReaderRpc {
+                                request_id,
+                                terminal: addr,
+                                clean_mode: true,
+                                for_native_export: true,
+                                user_scrolled: false,
+                                deadline: Instant::now() + READER_RPC_TIMEOUT,
+                            }),
+                        );
                     } else {
                         *out.pending_osc = true;
                     }
@@ -3764,6 +3821,15 @@ fn run_app_loop(
             copied_until = None;
             dirty = true;
         }
+        expire_pending_reader_rpc(
+            now,
+            core,
+            world,
+            &mut modal,
+            &mut pending_reader_rpc,
+            &mut pending_reader_osc,
+            &mut dirty,
+        );
         if pending_sibling_resize_at.is_some_and(|t| now >= t) {
             pending_sibling_resize_at = None;
             need_sync_terminals = true;
@@ -3868,6 +3934,7 @@ fn run_app_loop(
                 None
             };
             let retry_deadline = pending_attach_retry.as_ref().map(|(_, t)| *t);
+            let reader_rpc_deadline = pending_reader_rpc.as_ref().map(|r| r.deadline);
             let pty_deadline = if eink_mode && !eink_interval.is_zero() {
                 eink_pacer.next_deadline(pty_dirty, eink_mode, eink_interval, now, last_draw_at)
             } else {
@@ -3877,6 +3944,7 @@ fn run_app_loop(
                 copied_until,
                 pending_sibling_resize_at,
                 retry_deadline,
+                reader_rpc_deadline,
                 pty_deadline,
             ]
             .into_iter()
@@ -3897,6 +3965,15 @@ fn run_app_loop(
                             copied_until = None;
                             dirty = true;
                         }
+                        expire_pending_reader_rpc(
+                            after,
+                            core,
+                            world,
+                            &mut modal,
+                            &mut pending_reader_rpc,
+                            &mut pending_reader_osc,
+                            &mut dirty,
+                        );
                         if pending_sibling_resize_at.is_some_and(|t| after >= t) {
                             pending_sibling_resize_at = None;
                             need_sync_terminals = true;
@@ -4007,7 +4084,7 @@ fn run_app_loop(
                                 modal = Modal::None;
                                 reader_open_scope = None;
                                 reader_drag = None;
-                                clear_non_export_reader_rpc(&mut pending_reader_rpc);
+                                clear_non_export_reader_rpc(core, &mut pending_reader_rpc);
                                 if eink_mode {
                                     pending_eink_osc = true;
                                 }
@@ -4231,7 +4308,10 @@ fn run_app_loop(
                                         }
                                         HitTarget::TriggerAction(act) => {
                                             modal = Modal::None;
-                                            clear_non_export_reader_rpc(&mut pending_reader_rpc);
+                                            clear_non_export_reader_rpc(
+                                                core,
+                                                &mut pending_reader_rpc,
+                                            );
                                             prefix_active = false;
                                             ctrl_active = false;
                                             alt_active = false;
@@ -5254,15 +5334,17 @@ fn run_app_loop(
             }
         }
         if sync_reader_modal_scope(
+            core,
             &mut modal,
             world,
             &mut reader_open_scope,
             &mut reader_drag,
             &mut pending_reader_rpc,
-            eink_mode,
-            &mut pending_eink_osc,
         ) {
             dirty = true;
+            if eink_mode {
+                pending_eink_osc = true;
+            }
         }
 
         if let Some(att) = active_addr.as_ref().and_then(|a| attached_map.get_mut(a)) {
@@ -5803,7 +5885,7 @@ fn handle_key_event_full(
                 ) {
                     *modal = Modal::None;
                     if let Some(ref mut out) = reader_out {
-                        clear_non_export_reader_rpc(out.pending_rpc);
+                        clear_non_export_reader_rpc(core, out.pending_rpc);
                     }
                 }
             }
@@ -6011,7 +6093,7 @@ fn handle_key_event_full(
             if let Some(action) = match_direct_action(&kev) {
                 *modal = Modal::None;
                 if let Some(ref mut out) = reader_out {
-                    clear_non_export_reader_rpc(out.pending_rpc);
+                    clear_non_export_reader_rpc(core, out.pending_rpc);
                 }
                 if *eink_mode {
                     *pending_eink_osc = true;
@@ -6083,7 +6165,7 @@ fn handle_key_event_full(
                 KeyCode::Esc | KeyCode::Char('q' | 'v') if no_ctrl_alt => {
                     *modal = Modal::None;
                     if let Some(ref mut out) = reader_out {
-                        clear_non_export_reader_rpc(out.pending_rpc);
+                        clear_non_export_reader_rpc(core, out.pending_rpc);
                     }
                     if *eink_mode {
                         *pending_eink_osc = true;
@@ -6092,7 +6174,7 @@ fn handle_key_event_full(
                 KeyCode::Char('c') if kev.modifiers.contains(KeyModifiers::CONTROL) => {
                     *modal = Modal::None;
                     if let Some(ref mut out) = reader_out {
-                        clear_non_export_reader_rpc(out.pending_rpc);
+                        clear_non_export_reader_rpc(core, out.pending_rpc);
                     }
                     if *eink_mode {
                         *pending_eink_osc = true;
@@ -10041,37 +10123,35 @@ mod tests {
             clean_mode: true,
             for_native_export: false,
             user_scrolled: false,
+            deadline: Instant::now() + READER_RPC_TIMEOUT,
         });
         assert!(!sync_reader_modal_scope(
+            &core,
             &mut modal,
             &world,
             &mut scope,
             &mut drag_opt,
             &mut rpc_opt,
-            true,
-            &mut pending_eink,
         ));
         assert!(matches!(modal, Modal::Reader { .. }));
         assert!(scope.is_some());
         assert!(rpc_opt.is_some());
 
         world.select_tab_by_id("s1", "tab2");
-        pending_eink = false;
         let sync_dirty = sync_reader_modal_scope(
+            &core,
             &mut modal,
             &world,
             &mut scope,
             &mut drag_opt,
             &mut rpc_opt,
-            true,
-            &mut pending_eink,
         );
         assert!(matches!(modal, Modal::None));
         assert!(scope.is_none());
         assert!(drag_opt.is_none());
         assert!(rpc_opt.is_none());
         assert!(sync_dirty);
-        assert!(pending_eink);
+        let _ = pending_eink;
     }
 
     #[test]
@@ -10275,6 +10355,7 @@ mod tests {
             clean_mode: false,
             for_native_export: false,
             user_scrolled: true,
+            deadline: Instant::now() + READER_RPC_TIMEOUT,
         });
         dirty = false;
         apply_terminal_read_message(
@@ -10328,6 +10409,7 @@ mod tests {
             clean_mode: false,
             for_native_export: false,
             user_scrolled: true,
+            deadline: Instant::now() + READER_RPC_TIMEOUT,
         });
         dirty = false;
         apply_terminal_read_message(
@@ -10427,6 +10509,119 @@ mod tests {
             String::from_utf8(out_buf).unwrap(),
             format_shelldeck_reader_open_osc_with_env(&expected_json, false, false)
         );
+    }
+
+    #[test]
+    fn expire_pending_reader_rpc_clears_syncing_badge_and_triggers_export_fallback() {
+        let mut core = CoreClient::dummy_for_tests();
+        core.0.set_skip_rpc_for_tests(false);
+        let mut world = reader_test_world();
+        let mut attached = AttachedTerminal::new(1, 60, 14);
+        attached.process_vt_bytes(b"Local screen content\r\n");
+        let term_rect = Rect::new(0, 1, 60, 14);
+
+        let mut pending_rpc = None;
+        let mut modal = build_reader_modal_state(
+            &core,
+            &world,
+            Some(&attached),
+            term_rect,
+            true,
+            Some(&mut pending_rpc),
+        );
+        let rpc = pending_rpc.as_ref().unwrap().clone();
+        let mut pending_osc = false;
+        let mut dirty = false;
+
+        // Before deadline: remains pending with "syncing…"
+        let before = rpc.deadline - Duration::from_millis(100);
+        expire_pending_reader_rpc(
+            before,
+            &core,
+            &world,
+            &mut modal,
+            &mut pending_rpc,
+            &mut pending_osc,
+            &mut dirty,
+        );
+        assert!(pending_rpc.is_some());
+        assert!(!dirty);
+
+        // At deadline for open Modal::Reader: cancels RPC, clears "syncing…" badge, sets dirty = true
+        expire_pending_reader_rpc(
+            rpc.deadline,
+            &core,
+            &world,
+            &mut modal,
+            &mut pending_rpc,
+            &mut pending_osc,
+            &mut dirty,
+        );
+        assert!(pending_rpc.is_none());
+        assert!(dirty);
+        assert!(!pending_osc);
+        match modal {
+            Modal::Reader {
+                ref doc,
+                ref source_note,
+                ..
+            } => {
+                assert!(source_note.is_none());
+                assert!(doc.source_note.is_none());
+                assert!(!doc.lines.is_empty());
+            }
+            _ => panic!("expected Modal::Reader"),
+        }
+
+        // At deadline for native export (`for_native_export: true`): sets pending_osc = true for local fallback
+        let exp_id = core.request_terminal_read("t1", 450).unwrap();
+        let exp_deadline = Instant::now() + READER_RPC_TIMEOUT;
+        pending_rpc = Some(PendingReaderRpc {
+            request_id: exp_id,
+            terminal: "t1".to_string(),
+            clean_mode: true,
+            for_native_export: true,
+            user_scrolled: false,
+            deadline: exp_deadline,
+        });
+        pending_osc = false;
+        dirty = false;
+        expire_pending_reader_rpc(
+            exp_deadline,
+            &core,
+            &world,
+            &mut Modal::None,
+            &mut pending_rpc,
+            &mut pending_osc,
+            &mut dirty,
+        );
+        assert!(pending_rpc.is_none());
+        assert!(pending_osc);
+
+        // Wrong active terminal on export expiry cancels safely without emitting OSC for wrong tab
+        let stale_id = core.request_terminal_read("t1", 450).unwrap();
+        let stale_deadline = Instant::now() + READER_RPC_TIMEOUT;
+        pending_rpc = Some(PendingReaderRpc {
+            request_id: stale_id,
+            terminal: "t1".to_string(),
+            clean_mode: true,
+            for_native_export: true,
+            user_scrolled: false,
+            deadline: stale_deadline,
+        });
+        world.select_tab_by_id("s1", "tab2");
+        pending_osc = false;
+        expire_pending_reader_rpc(
+            stale_deadline,
+            &core,
+            &world,
+            &mut Modal::None,
+            &mut pending_rpc,
+            &mut pending_osc,
+            &mut dirty,
+        );
+        assert!(pending_rpc.is_none());
+        assert!(!pending_osc);
     }
 
     #[test]
