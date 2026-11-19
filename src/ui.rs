@@ -1122,8 +1122,12 @@ fn tab_pill_style(st: AgentState, is_active: bool, eink_mode: bool) -> Style {
     }
     let base = normal_state_style(st);
     if is_active {
-        base.remove_modifier(Modifier::DIM)
-            .add_modifier(Modifier::BOLD)
+        let active = base.remove_modifier(Modifier::DIM);
+        if matches!(st, AgentState::Working) {
+            active
+        } else {
+            active.add_modifier(Modifier::BOLD)
+        }
     } else {
         base
     }
@@ -1928,17 +1932,15 @@ fn render_bottom_status_bar(
         } else {
             format!(" {} ", quota.agent.display_name())
         };
-        push_clamped_str(
-            buf,
-            &mut x,
-            rect.y,
-            avail_end,
-            &badge_lbl,
+        let badge_style = if !eink_mode && badge_fg == Color::Yellow {
+            Style::default().bg(badge_bg).fg(badge_fg)
+        } else {
             Style::default()
                 .bg(badge_bg)
                 .fg(badge_fg)
-                .add_modifier(Modifier::BOLD),
-        );
+                .add_modifier(Modifier::BOLD)
+        };
+        push_clamped_str(buf, &mut x, rect.y, avail_end, &badge_lbl, badge_style);
 
         if x < avail_end {
             push_clamped_str(buf, &mut x, rect.y, avail_end, " ", base_style);
@@ -2042,14 +2044,15 @@ fn render_bottom_status_bar(
                     }
                 } else {
                     let u_col = quota_remaining_color(m.remaining_percent);
-                    (
-                        Style::default().bg(Color::Reset).fg(u_col),
+                    let pct_st = if u_col == Color::Yellow {
+                        Style::default().bg(Color::Reset).fg(u_col)
+                    } else {
                         Style::default()
                             .bg(Color::Reset)
                             .fg(u_col)
-                            .add_modifier(Modifier::BOLD),
-                        "",
-                    )
+                            .add_modifier(Modifier::BOLD)
+                    };
+                    (Style::default().bg(Color::Reset).fg(u_col), pct_st, "")
                 };
 
                 if bar_w > 0 {
@@ -2217,7 +2220,7 @@ fn render_floating_mod_cross(
                 let border = if dragging {
                     (Color::Cyan, Modifier::BOLD)
                 } else {
-                    (Color::Magenta, Modifier::empty())
+                    (Color::Blue, Modifier::empty())
                 };
                 let mod_st = |active: bool| {
                     if active {
@@ -2262,6 +2265,7 @@ fn render_floating_mod_cross(
                     (3, 3) => Some(("l", ctl_style.0, ctl_style.1)),
                     (3, 6) => Some(("^", pfx_style.0, pfx_style.1)),
                     (3, 7) => Some(("B", pfx_style.0, pfx_style.1)),
+                    (3, 8) => Some((" ", pfx_style.0, Modifier::empty())),
                     (3, 11) => Some(("A", alt_style.0, alt_style.1)),
                     (3, 12) => Some(("l", alt_style.0, alt_style.1)),
                     (3, 13) => Some(("t", alt_style.0, alt_style.1)),
@@ -2429,9 +2433,9 @@ fn render_floating_dpad(
                 let border = if dragging {
                     (Color::Cyan, Modifier::BOLD)
                 } else {
-                    (Color::Cyan, Modifier::empty())
+                    (Color::Blue, Modifier::empty())
                 };
-                (border.0, border.1, Color::Reset, Color::Cyan)
+                (border.0, border.1, Color::Cyan, Color::Green)
             };
 
             let glyph: Option<(&str, Color, Modifier)> = if full_15x7 {
@@ -9310,8 +9314,13 @@ mod tests {
             .modifier
             .contains(Modifier::BOLD | Modifier::UNDERLINED));
         assert_eq!(buf[(mr.x + 6, mr.y + 3)].fg, Color::Cyan);
-        assert_eq!(buf[(mr.x + 5, mr.y)].fg, Color::Magenta);
-        assert_eq!(buf[(dr.x + 5, dr.y)].fg, Color::Cyan);
+        // Interior padding inside `^B ` keeps a clean space while `│ ↑ │` flanks ghost VT text dimmed
+        assert_eq!(buf[(mr.x + 8, mr.y + 3)].symbol(), " ");
+        assert_eq!(buf[(mr.x + 5, mr.y)].fg, Color::Blue);
+        assert_eq!(buf[(dr.x + 5, dr.y)].fg, Color::Blue);
+        assert_eq!(buf[(dr.x + 7, dr.y + 1)].fg, Color::Cyan);
+        assert!(buf[(dr.x + 7, dr.y + 1)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buf[(dr.x + 7, dr.y + 3)].fg, Color::Green);
         // Non-glyph padding cell inside D-Pad arm preserves underlying VT glyph dimmed (semi-transparent)
         let inner_cell = &buf[(dr.x + 6, dr.y + 1)];
         assert_eq!(inner_cell.symbol(), "X");
@@ -9366,6 +9375,61 @@ mod tests {
         assert!(ibuf[(17, 1)]
             .modifier
             .contains(Modifier::REVERSED | Modifier::BOLD));
+
+        // 2b. Avoid `Yellow + BOLD` (`bold_is_bright` ANSI 11 washout on light terminals) across
+        //     active `Working` tabs, Claude badge, and 16-40% quota percentages.
+        world.select_tab_index(1);
+        let claude_mid_quota = AgentQuota {
+            agent: AgentKind::Claude,
+            metrics: vec![QuotaMetric {
+                window_label: "5h".to_string(),
+                remaining_percent: 25.0,
+                detail: None,
+            }],
+        };
+        terminal
+            .draw(|f| {
+                let _ = render_ui_full_with_eink_color(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::None,
+                    None,
+                    false,
+                    None,
+                    false,
+                    Some(&claude_mid_quota),
+                    false,
+                    false,
+                );
+            })
+            .unwrap();
+        let ybuf = terminal.backend().buffer();
+        let yrow0: String = (0..100).map(|x| ybuf[(x, 0)].symbol()).collect();
+        let wrk_x = yrow0[..yrow0.find("2:wrk").unwrap()].chars().count() as u16;
+        assert_eq!(ybuf[(wrk_x, 0)].fg, Color::Yellow);
+        assert!(ybuf[(wrk_x, 0)].modifier.contains(Modifier::UNDERLINED));
+        for y in [0u16, 23u16] {
+            for x in 0..100u16 {
+                let cell = &ybuf[(x, y)];
+                if cell.fg == Color::Yellow {
+                    assert!(
+                        !cell.modifier.contains(Modifier::BOLD),
+                        "Yellow cell at ({x},{y}) ({:?}) must not combine BOLD",
+                        cell.symbol()
+                    );
+                }
+            }
+        }
 
         // 3. Every Modal uses transparent Color::Reset background and zero hardcoded RGB colors
         let modals = [
