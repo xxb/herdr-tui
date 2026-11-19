@@ -1,6 +1,8 @@
 mod core;
 mod keys;
 mod model;
+#[allow(dead_code)]
+mod reader;
 mod ui;
 mod usage;
 #[cfg(test)]
