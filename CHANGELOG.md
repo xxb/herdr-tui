@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.9.0](https://github.com/xxb/herdr-tui/compare/v0.8.0...v0.9.0) (2026-11-19)
+
+
+### ⚠ BREAKING CHANGES
+
+* **ui:** Removed `--light`, `--dark`, `ui.theme`, and the `^b t` shortcut in favor of terminal-native transparent (`Color::Reset`) chrome in Normal mode.
+
+### Features
+
+* **ui:** use transparent line-driven terminal-native chrome in normal mode ([#80](https://github.com/xxb/herdr-tui/issues/80)) ([877d4d2](https://github.com/xxb/herdr-tui/commit/877d4d2a39c685835e22322617a9898db93ae95b)), closes [#79](https://github.com/xxb/herdr-tui/issues/79)
+
 ## [0.8.0](https://github.com/xxb/herdr-tui/compare/v0.7.2...v0.8.0) (2026-11-18)
 
 
