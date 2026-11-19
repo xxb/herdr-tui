@@ -97,7 +97,7 @@ fn extract_fg_command_exe(raw: &str) -> &str {
         return trimmed;
     };
     let first_tok = &trimmed[..ws_idx];
-    if first_tok.contains(['/', '\\', ':']) {
+    if first_tok.contains(':') || first_tok.starts_with("\\\\") {
         let bytes = trimmed.as_bytes();
         for (idx, win) in bytes.windows(4).enumerate() {
             let end = idx + 4;
@@ -142,9 +142,14 @@ fn is_script_runtime_stem(stem: &str) -> bool {
     )
 }
 
-#[cfg(test)]
-pub fn is_known_agent_token(raw: &str) -> bool {
-    exe_stem(extract_fg_command_exe(raw)).is_some_and(|stem| is_known_agent_stem(&stem))
+fn fg_name_stem(raw: &str) -> Option<String> {
+    exe_stem(extract_fg_command_exe(raw))
+}
+
+pub(crate) fn fg_name_is_agent(raw: &str) -> bool {
+    fg_name_stem(raw)
+        .as_deref()
+        .is_some_and(is_known_agent_stem)
 }
 
 impl TerminalInfo {
@@ -240,18 +245,19 @@ impl TerminalInfo {
         }
         // 2. Secondary: live OS foreground executable (`fg_name` or OS-split `fg_argv[0]`,
         // plus `fg_argv[1]` under script runtimes).
-        let fg_cmd_stem = self
-            .fg_name
-            .as_deref()
-            .and_then(|raw| exe_stem(extract_fg_command_exe(raw)));
         let argv0_stem = self.fg_argv.first().and_then(|p| exe_stem(p));
-        if fg_cmd_stem.as_deref().is_some_and(is_known_agent_stem)
+        if self.fg_name.as_deref().is_some_and(fg_name_is_agent)
             || argv0_stem.as_deref().is_some_and(is_known_agent_stem)
         {
             return true;
         }
         let runtime = argv0_stem.as_deref().is_some_and(is_script_runtime_stem)
-            || fg_cmd_stem.as_deref().is_some_and(is_script_runtime_stem);
+            || self
+                .fg_name
+                .as_deref()
+                .and_then(fg_name_stem)
+                .as_deref()
+                .is_some_and(is_script_runtime_stem);
         runtime
             && self
                 .fg_argv
@@ -680,7 +686,7 @@ impl World {
                         EventDisposition::NeedsTerminalRefresh
                     }
                     "status" => {
-                        if data.is_null() {
+                        if data.is_null() || data.get("status").is_some_and(Value::is_null) {
                             let changed = info.status_word.take().is_some()
                                 | info.status_app.take().is_some()
                                 | info.status_msg.take().is_some();
@@ -724,6 +730,10 @@ impl World {
                                 } else {
                                     EventDisposition::Unchanged
                                 }
+                            } else if data.as_object().is_some_and(|o| {
+                                o.contains_key("reported") || o.contains_key("records")
+                            }) {
+                                EventDisposition::Unchanged
                             } else {
                                 EventDisposition::NeedsTerminalRefresh
                             }
@@ -1831,11 +1841,11 @@ mod tests {
             ..Default::default()
         };
         assert!(!fake_proxy.is_agent());
-        assert!(!is_known_agent_token("vim ~/notes/codex"));
-        assert!(!is_known_agent_token("cat /usr/share/doc/agy"));
-        assert!(!is_known_agent_token(
-            r"C:\tools\vim.exe C:\notes\codex.exe"
-        ));
+        assert!(!fg_name_is_agent("vim ~/notes/codex"));
+        assert!(!fg_name_is_agent("cat /usr/share/doc/agy"));
+        assert!(!fg_name_is_agent("/usr/bin/open ~/Downloads/codex.exe"));
+        assert!(!fg_name_is_agent("/usr/bin/less ~/x/claude.exe"));
+        assert!(!fg_name_is_agent(r"C:\tools\vim.exe C:\notes\codex.exe"));
 
         // Permissive OSC 7501 reporter (`status_word`/`status_app`) -> true
         let custom_osc = TerminalInfo {
@@ -1846,13 +1856,14 @@ mod tests {
         };
         assert!(custom_osc.is_agent());
 
-        // Quoted or unquoted Windows paths containing spaces + optional arguments & arg-carrying commands
-        assert!(is_known_agent_token(r"C:\Program Files\codex.exe"));
-        assert!(is_known_agent_token(r"C:\Program Files\codex.exe --resume"));
-        assert!(is_known_agent_token(
-            r#""C:\Program Files\codex.exe" --resume"#
+        // Quoted, UNC, or drive-letter Windows paths containing spaces + optional arguments
+        assert!(fg_name_is_agent(r"C:\Program Files\codex.exe"));
+        assert!(fg_name_is_agent(r"C:\Program Files\codex.exe --resume"));
+        assert!(fg_name_is_agent(
+            r"\\server\share\Program Files\codex.exe --resume"
         ));
-        assert!(is_known_agent_token("agy --resume"));
+        assert!(fg_name_is_agent(r#""C:\Program Files\codex.exe" --resume"#));
+        assert!(fg_name_is_agent("agy --resume"));
         let win_spaced = TerminalInfo {
             address: "t-win-spaced".to_string(),
             fg_name: Some(r"C:\Program Files\nodejs\node.exe".to_string()),
@@ -1922,13 +1933,31 @@ mod tests {
             vec!["node", "/usr/local/bin/claude", "--resume"]
         );
 
-        // Agent exits: status cleared (`null`) while `turn > 0`; foreground returns to `zsh` -> false
+        // Agent exits via `hc` envelope (`{"status": null, "records": ..., "reported": true}`)
+        // while `turn > 0`; foreground returns to `zsh` -> `AppliedInPlace` and `is_agent() == false`.
         let status_cleared = json!({
-            "params": { "type": "status", "terminal": "t1", "data": null }
+            "params": {
+                "type": "status",
+                "terminal": "t1",
+                "data": { "status": null, "records": {}, "reported": true }
+            }
         });
         assert_eq!(
             world.apply_core_event(&status_cleared),
             EventDisposition::AppliedInPlace
+        );
+
+        // Metadata-only status envelope (only `reported` / `records`, no `status` fields) -> `Unchanged`
+        let status_meta_only = json!({
+            "params": {
+                "type": "status",
+                "terminal": "t1",
+                "data": { "records": {}, "reported": true }
+            }
+        });
+        assert_eq!(
+            world.apply_core_event(&status_meta_only),
+            EventDisposition::Unchanged
         );
 
         let fg_shell = json!({
@@ -1936,6 +1965,18 @@ mod tests {
         });
         assert_eq!(
             world.apply_core_event(&fg_shell),
+            EventDisposition::AppliedInPlace
+        );
+        assert!(!world.terminals["t1"].is_agent());
+
+        // Also test bare `data: null` status clearing in-place
+        world.terminals.get_mut("t1").unwrap().status_app = Some("codex".to_string());
+        assert!(world.terminals["t1"].is_agent());
+        let status_bare_null = json!({
+            "params": { "type": "status", "terminal": "t1", "data": null }
+        });
+        assert_eq!(
+            world.apply_core_event(&status_bare_null),
             EventDisposition::AppliedInPlace
         );
         assert!(!world.terminals["t1"].is_agent());

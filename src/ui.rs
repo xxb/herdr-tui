@@ -10520,10 +10520,10 @@ mod tests {
         world.select_tab_index(11);
         assert!(is_active_tab_agent(&world));
         // Full-path + args & Windows-style path + `.exe` suffix still match exact binary stem
-        assert!(crate::model::is_known_agent_token(
+        assert!(crate::model::fg_name_is_agent(
             "/usr/local/bin/claude --model sonnet"
         ));
-        assert!(crate::model::is_known_agent_token(r"C:\tools\CODEX.EXE"));
+        assert!(crate::model::fg_name_is_agent(r"C:\tools\CODEX.EXE"));
 
         // End-to-end render_ui_full_with_eink_color uses is_active_tab_agent(world) in Normal mode
         let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
