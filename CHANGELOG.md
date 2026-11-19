@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.10.0](https://github.com/xxb/herdr-tui/compare/v0.9.0...v0.10.0) (2026-11-19)
+
+
+### Features
+
+* **reader:** add unified built-in reader modal with terminal.read and ShellDeck export ([#86](https://github.com/xxb/herdr-tui/issues/86)) ([ae96ed7](https://github.com/xxb/herdr-tui/commit/ae96ed71527d1b44f694a63bfa00b42b81f5f706))
+* **ui:** italicize agent process rows in normal mode and detect collapsed action summaries ([#84](https://github.com/xxb/herdr-tui/issues/84)) ([356ea58](https://github.com/xxb/herdr-tui/commit/356ea5846b2c2b3e384f3a7d139d085fc4a3605e))
+
 ## [0.9.0](https://github.com/xxb/herdr-tui/compare/v0.8.0...v0.9.0) (2026-11-19)
 
 
