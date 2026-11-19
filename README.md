@@ -40,7 +40,7 @@ A fast, lightweight **multi-tab TUI client** for [`herdr-core` (`hc`)](https://g
 - **Shared Attention (`herdr.seen`)**
   Follows the `herdr.seen=<turn>` label specification so viewing a finished agent in `hct` clears its unread `done` indicator across all connected devices.
 - **Outer Terminal User Variables (`OSC 1337;SetUserVar`)**
-  Exposes the effective `herdr-core` session (`herdr_session`) and currently focused terminal address (`herdr_terminal`) to outer terminals and SSH clients via standard Base64-encoded `OSC 1337;SetUserVar` sequences (with `tmux` and GNU `screen` DCS passthrough), deduplicated on focus changes and cleared on exit.
+  Exposes the effective `herdr-core` session (`herdr_session`) and currently focused terminal address (`herdr_terminal`) to outer terminals and SSH clients via standard Base64-encoded `OSC 1337;SetUserVar` sequences (with `tmux` and GNU `screen` DCS passthrough; nested `tmux` requires `set -g allow-passthrough on`), deduplicated on focus changes and cleared on exit.
 - **Anti-Nesting Guard (防嵌套启动保护)**
   Automatically refuses to launch inside an already active `hc` (`herdr-core` / `hct`), `herdr`, `tmux`, `zellij`, or GNU `screen` session to prevent prefix-key collisions, mouse/OSC 52 clipboard breakage, and terminal feedback loops. Pass `hct --allow-nested` (or set `ui.allow_nested = true` in `config.toml`) to override when needed.
 

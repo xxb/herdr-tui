@@ -363,9 +363,10 @@ fn detect_multiplexer_env() -> (bool, bool) {
     detect_multiplexer_env_with(read_env_lossy)
 }
 
-/// Resolve the effective `herdr-core` session name using the same precedence as
-/// `CoreClient::connect_with_sender`: an explicit `--session` overrides `$HC_SESSION`,
-/// and empty/whitespace values resolve to `None` (default session).
+/// Resolve the effective `herdr-core` session name (`--session` overrides `$HC_SESSION`,
+/// trimming surrounding whitespace and turning empty/whitespace values into `None`).
+/// `main()` passes the resolved value back through `connect_session_arg` to
+/// `CoreClient::connect_with_sender` so `herdr-core` and `herdr_session` always match.
 fn resolve_herdr_session<F: Fn(&str) -> Option<String>>(
     cli_session: Option<&str>,
     env_get: F,
@@ -378,6 +379,19 @@ fn resolve_herdr_session<F: Fn(&str) -> Option<String>>(
         let trimmed = raw.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_string())
     })
+}
+
+fn connect_session_arg<'a>(
+    cli_session: Option<&str>,
+    resolved_session: Option<&'a str>,
+) -> Option<&'a str> {
+    if resolved_session.is_some() {
+        resolved_session
+    } else if cli_session.is_some() {
+        Some("")
+    } else {
+        None
+    }
 }
 
 fn resolve_allow_nested(cli_allow: bool, cli_no_allow: bool, cfg_allow: Option<bool>) -> bool {
@@ -2257,10 +2271,10 @@ fn main() -> Result<()> {
     let eink_interval = resolve_eink_interval(cli.eink_interval_ms, file_cfg.ui.eink_interval_ms);
     let (in_tmux, in_screen) = detect_multiplexer_env();
     let herdr_session = resolve_herdr_session(cli.session.as_deref(), read_env_lossy);
+    let connect_session = connect_session_arg(cli.session.as_deref(), herdr_session.as_deref());
 
     let (app_tx, app_rx) = mpsc::channel::<AppEvent>();
-    let core =
-        CoreClient::connect_with_sender(cli.session.as_deref(), app_tx.clone(), AppEvent::Core)?;
+    let core = CoreClient::connect_with_sender(connect_session, app_tx.clone(), AppEvent::Core)?;
     let snapshot = core.subscribe_events()?;
 
     let mut world = World::default();
@@ -10240,6 +10254,19 @@ mod tests {
         );
         assert_eq!(resolve_herdr_session(None, env_with(Some("   "))), None);
         assert_eq!(resolve_herdr_session(None, env_with(None)), None);
+
+        // `connect_session_arg` forwards trimmed session names to `CoreClient` and overrides
+        // inherited `$HC_SESSION` with `Some("")` when `--session` was explicitly blank.
+        assert_eq!(
+            connect_session_arg(Some("  work  "), Some("work")),
+            Some("work")
+        );
+        assert_eq!(connect_session_arg(Some("   "), None), Some(""));
+        assert_eq!(
+            connect_session_arg(None, Some("from-env")),
+            Some("from-env")
+        );
+        assert_eq!(connect_session_arg(None, None), None);
     }
 
     #[test]
