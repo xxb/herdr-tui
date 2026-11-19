@@ -3838,10 +3838,6 @@ impl ScannedEinkRow {
         self.all_non_space_muted = all_non_space_muted;
         true
     }
-
-    fn trimmed(&self) -> (&str, usize) {
-        (&self.text, 0)
-    }
 }
 
 fn is_structural_box_char(ch: char) -> bool {
@@ -3910,7 +3906,7 @@ fn strip_leading_gutter_bar<'a>(
     trimmed: &'a str,
     trimmed_byte_start: usize,
 ) -> (&'a str, usize, u16) {
-    let default_col = scan.cells[0].col;
+    let default_col = scan.cells.first().map_or(0, |c| c.col);
     let Some(bar_ch) = trimmed.chars().next() else {
         return (trimmed, trimmed_byte_start, default_col);
     };
@@ -4117,9 +4113,9 @@ fn classify_eink_process_row(
     if !scratch.scan_into(screen, r, cols) {
         return false;
     }
-    let (trimmed, trimmed_byte_start) = scratch.trimmed();
+    let trimmed = scratch.text.as_str();
     let (content_trimmed, content_byte_start, content_first_col) =
-        strip_leading_gutter_bar(scratch, trimmed, trimmed_byte_start);
+        strip_leading_gutter_bar(scratch, trimmed, 0usize);
     if trimmed.is_empty() || row_has_box_frame(content_trimmed) {
         return false;
     }

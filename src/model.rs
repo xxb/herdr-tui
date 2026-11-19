@@ -72,15 +72,24 @@ fn parse_fg_argv(v: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn normalized_exe_stem(raw: &str) -> Option<String> {
-    let first_token = raw.split_whitespace().next()?;
-    let bin = first_token
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(first_token);
+fn exe_stem_from_slice(slice: &str) -> Option<String> {
+    let bin = slice.rsplit(['/', '\\']).next().unwrap_or(slice);
     let lower = bin.to_ascii_lowercase();
     let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
     (!stem.is_empty()).then(|| stem.to_string())
+}
+
+fn matches_exe_stem(raw: &str, pred: fn(&str) -> bool) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    trimmed
+        .split_whitespace()
+        .next()
+        .and_then(exe_stem_from_slice)
+        .is_some_and(|stem| pred(&stem))
+        || exe_stem_from_slice(trimmed).is_some_and(|stem| pred(&stem))
 }
 
 fn is_known_agent_stem(stem: &str) -> bool {
@@ -109,7 +118,11 @@ fn is_script_runtime_stem(stem: &str) -> bool {
 }
 
 pub fn is_known_agent_token(raw: &str) -> bool {
-    normalized_exe_stem(raw).is_some_and(|stem| is_known_agent_stem(&stem))
+    matches_exe_stem(raw, is_known_agent_stem)
+}
+
+fn is_script_runtime_token(raw: &str) -> bool {
+    matches_exe_stem(raw, is_script_runtime_stem)
 }
 
 impl TerminalInfo {
@@ -226,13 +239,9 @@ impl TerminalInfo {
         let runtime = self
             .fg_argv
             .first()
-            .and_then(|s| normalized_exe_stem(s))
-            .is_some_and(|stem| is_script_runtime_stem(&stem))
-            || self
-                .fg_name
-                .as_deref()
-                .and_then(normalized_exe_stem)
-                .is_some_and(|stem| is_script_runtime_stem(&stem));
+            .map(String::as_str)
+            .is_some_and(is_script_runtime_token)
+            || self.fg_name.as_deref().is_some_and(is_script_runtime_token);
         runtime
             && self
                 .fg_argv
@@ -1852,6 +1861,20 @@ mod tests {
             ..Default::default()
         };
         assert!(templated.is_agent());
+
+        // Windows paths containing spaces (e.g., `C:\Program Files\codex.exe`) and arg-carrying tokens work
+        assert!(is_known_agent_token(r"C:\Program Files\codex.exe"));
+        assert!(is_known_agent_token("agy --resume"));
+        let win_spaced = TerminalInfo {
+            address: "t-win-spaced".to_string(),
+            fg_name: Some(r"C:\Program Files\nodejs\node.exe".to_string()),
+            fg_argv: vec![
+                r"C:\Program Files\nodejs\node.exe".to_string(),
+                r"C:\Program Files\Claude\claude.exe".to_string(),
+            ],
+            ..Default::default()
+        };
+        assert!(win_spaced.is_agent());
 
         // Script runtime wrapping a known coding-agent entrypoint in `fg_argv[1]` -> true
         let wrapped = TerminalInfo {
