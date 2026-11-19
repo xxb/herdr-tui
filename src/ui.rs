@@ -813,6 +813,23 @@ pub fn render_ui_full(
     )
 }
 
+pub fn is_active_tab_agent(world: &World) -> bool {
+    if crate::usage::detect_focused_agent(world).is_some() {
+        return true;
+    }
+    let Some(addr) = world.active_terminal_address_ref() else {
+        return false;
+    };
+    let Some(info) = world.terminals.get(addr) else {
+        return false;
+    };
+    info.agent_state() != AgentState::None
+        || info
+            .status_app
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn render_ui_full_with_eink_color(
     f: &mut Frame,
@@ -867,6 +884,7 @@ pub fn render_ui_full_with_eink_color(
                 selection,
                 eink_mode,
                 eink_color: effective_eink_color,
+                is_agent_tab: is_active_tab_agent(world),
             },
             term_rect,
         );
@@ -3490,6 +3508,7 @@ struct VtScreenWidget<'a> {
     selection: Option<&'a TerminalSelection>,
     eink_mode: bool,
     eink_color: bool,
+    is_agent_tab: bool,
 }
 
 fn is_braille_char(s: &str) -> bool {
@@ -3594,7 +3613,7 @@ fn rgb_luma(r: u8, g: u8, b: u8) -> u8 {
     ((299u32 * u32::from(r) + 587u32 * u32::from(g) + 114u32 * u32::from(b)) / 1000) as u8
 }
 
-fn is_eink_muted_cell(cell: &vt100::Cell) -> bool {
+pub(crate) fn is_eink_muted_cell(cell: &vt100::Cell) -> bool {
     if cell.dim() {
         return true;
     }
@@ -3918,7 +3937,35 @@ fn classify_status_lead_process_row(
     matches!(marker, "⎿" | "↳") && scan.all_non_space_muted
 }
 
-fn classify_eink_process_row(
+fn is_collapsed_action_summary_row(trimmed: &str) -> bool {
+    const ACTION_NOUNS: &[&str] = &[
+        "actions", "action", "steps", "step", "tools", "tool", "reads", "read", "edits", "edit",
+        "commands", "command", "calls", "call", "files", "file", "searches", "search", "messages",
+        "message", "items", "item",
+    ];
+    let Some(rest) = trimmed
+        .strip_prefix("… ")
+        .or_else(|| trimmed.strip_prefix("... "))
+    else {
+        return false;
+    };
+    let digits = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits == 0 {
+        return false;
+    }
+    let Some(after_more) = rest[digits..].strip_prefix(" more ") else {
+        return false;
+    };
+    ACTION_NOUNS.iter().any(|noun| {
+        after_more.strip_prefix(noun).is_some_and(|tail| {
+            tail.chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+        })
+    })
+}
+
+pub(crate) fn classify_eink_process_row(
     screen: &vt100::Screen,
     r: u16,
     rows: u16,
@@ -3940,6 +3987,9 @@ fn classify_eink_process_row(
     }
     if looks_like_numbered_code_line(content_trimmed) {
         return false;
+    }
+    if is_collapsed_action_summary_row(content_trimmed) {
+        return true;
     }
     if prev_is_process
         && (content_trimmed.starts_with('⎿')
@@ -3965,13 +4015,21 @@ fn classify_eink_process_row(
     classify_status_lead_process_row(&scan, content_trimmed, content_byte_start)
 }
 
-fn detect_eink_process_rows(screen: &vt100::Screen, rows: u16, cols: u16) -> Vec<bool> {
+pub(crate) fn detect_eink_process_rows(screen: &vt100::Screen, rows: u16, cols: u16) -> Vec<bool> {
     let mut out = vec![false; usize::from(rows)];
     let mut prev_wrapped = false;
     let mut prev_is_process = false;
+    let mut in_code_fence = false;
     for r in 0..rows {
-        let is_proc =
-            classify_eink_process_row(screen, r, rows, cols, prev_wrapped, prev_is_process);
+        let row_is_fence = !prev_wrapped && vt_row_trimmed_starts_with_fence(screen, r, cols);
+        if row_is_fence {
+            in_code_fence = !in_code_fence;
+        }
+        let is_proc = if row_is_fence || in_code_fence {
+            false
+        } else {
+            classify_eink_process_row(screen, r, rows, cols, prev_wrapped, prev_is_process)
+        };
         out[usize::from(r)] = is_proc;
         prev_wrapped = screen.row_wrapped(r);
         prev_is_process = is_proc;
@@ -3979,7 +4037,7 @@ fn detect_eink_process_rows(screen: &vt100::Screen, rows: u16, cols: u16) -> Vec
     out
 }
 
-fn vt_row_trimmed_starts_with_fence(screen: &vt100::Screen, r: u16, cols: u16) -> bool {
+pub(crate) fn vt_row_trimmed_starts_with_fence(screen: &vt100::Screen, r: u16, cols: u16) -> bool {
     scan_eink_row_text(screen, r, cols).is_some_and(|scan| {
         let (trimmed, _) = scan.trimmed();
         trimmed
@@ -5128,7 +5186,7 @@ impl Widget for VtScreenWidget<'_> {
         } else {
             None
         };
-        let process_rows = if self.eink_mode {
+        let process_rows = if self.eink_mode || self.is_agent_tab {
             Some(detect_eink_process_rows(self.screen, rows, cols))
         } else {
             None
@@ -5180,6 +5238,22 @@ impl Widget for VtScreenWidget<'_> {
                         .bg(Color::Reset)
                         .fg(Color::Reset)
                         .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                } else if row_is_process {
+                    let mut st = Style::default()
+                        .fg(map_vt_color(cell.fgcolor()))
+                        .bg(map_vt_color(cell.bgcolor()))
+                        .add_modifier(Modifier::ITALIC);
+
+                    if cell.dim() || !is_eink_muted_cell(cell) {
+                        st = st.add_modifier(Modifier::DIM);
+                    }
+                    if cell.underline() {
+                        st = st.add_modifier(Modifier::UNDERLINED);
+                    }
+                    if cell.inverse() {
+                        st = st.add_modifier(Modifier::REVERSED);
+                    }
+                    st
                 } else {
                     let mut st = Style::default()
                         .fg(map_vt_color(cell.fgcolor()))
@@ -6875,6 +6949,7 @@ mod tests {
                     selection: None,
                     eink_mode: false,
                     eink_color: false,
+                    is_agent_tab: false,
                 },
                 f.area(),
             );
@@ -6937,6 +7012,7 @@ mod tests {
                     selection: None,
                     eink_mode: false,
                     eink_color: false,
+                    is_agent_tab: false,
                 },
                 f.area(),
             );
@@ -6973,6 +7049,7 @@ mod tests {
                     selection: None,
                     eink_mode: false,
                     eink_color: false,
+                    is_agent_tab: false,
                 },
                 f.area(),
             );
@@ -7004,6 +7081,7 @@ mod tests {
                     selection: None,
                     eink_mode: false,
                     eink_color: false,
+                    is_agent_tab: false,
                 },
                 f.area(),
             );
@@ -8065,6 +8143,7 @@ mod tests {
                     selection: None,
                     eink_mode: true,
                     eink_color: false,
+                    is_agent_tab: false,
                 },
                 f.area(),
             );
@@ -8290,6 +8369,7 @@ mod tests {
                     selection: None,
                     eink_mode: true,
                     eink_color: false,
+                    is_agent_tab: false,
                 },
                 f.area(),
             );
@@ -8618,6 +8698,7 @@ mod tests {
                     selection: None,
                     eink_mode: true,
                     eink_color: true,
+                    is_agent_tab: false,
                 },
                 f.area(),
             );
@@ -8769,6 +8850,7 @@ mod tests {
                     selection: None,
                     eink_mode: true,
                     eink_color: true,
+                    is_agent_tab: false,
                 },
                 f.area(),
             );
@@ -8844,6 +8926,7 @@ mod tests {
                     selection: None,
                     eink_mode: true,
                     eink_color: true,
+                    is_agent_tab: false,
                 },
                 f.area(),
             );
@@ -8935,6 +9018,7 @@ mod tests {
                         selection: None,
                         eink_mode: true,
                         eink_color,
+                        is_agent_tab: false,
                     },
                     f.area(),
                 );
@@ -9033,6 +9117,7 @@ mod tests {
                         selection: None,
                         eink_mode: true,
                         eink_color: true,
+                        is_agent_tab: false,
                     },
                     f.area(),
                 );
@@ -9091,6 +9176,7 @@ mod tests {
                         selection: None,
                         eink_mode: true,
                         eink_color: false,
+                        is_agent_tab: false,
                     },
                     f.area(),
                 );
@@ -9640,5 +9726,431 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn collapsed_action_summary_and_fenced_code_exclusion_work_in_eink_and_detection() {
+        assert!(is_collapsed_action_summary_row(
+            "… 10 more actions (3 reads, 6 edits, 1 tool) …"
+        ));
+        assert!(is_collapsed_action_summary_row("... 1 more action"));
+        assert!(is_collapsed_action_summary_row("… 2 more steps …"));
+        assert!(is_collapsed_action_summary_row("... 5 more tool uses"));
+        assert!(is_collapsed_action_summary_row("… 3 more tools"));
+        assert!(is_collapsed_action_summary_row("… 1 more read"));
+        assert!(is_collapsed_action_summary_row("… 4 more reads"));
+        assert!(is_collapsed_action_summary_row("… 1 more edit"));
+        assert!(is_collapsed_action_summary_row("… 6 more edits"));
+        assert!(is_collapsed_action_summary_row("… 1 more command"));
+        assert!(is_collapsed_action_summary_row("… 2 more commands"));
+        assert!(is_collapsed_action_summary_row("… 1 more call"));
+        assert!(is_collapsed_action_summary_row("… 7 more calls"));
+        assert!(is_collapsed_action_summary_row("… 1 more file"));
+        assert!(is_collapsed_action_summary_row("… 8 more files"));
+        assert!(is_collapsed_action_summary_row("… 1 more search"));
+        assert!(is_collapsed_action_summary_row("… 2 more searches"));
+        assert!(is_collapsed_action_summary_row("… 1 more message"));
+        assert!(is_collapsed_action_summary_row("… 9 more messages"));
+        assert!(is_collapsed_action_summary_row("… 1 more item"));
+        assert!(is_collapsed_action_summary_row("… 12 more items"));
+
+        assert!(!is_collapsed_action_summary_row("… more actions"));
+        assert!(!is_collapsed_action_summary_row("…10 more actions"));
+        assert!(!is_collapsed_action_summary_row("...10 more actions"));
+        assert!(!is_collapsed_action_summary_row("… 10 more things"));
+        assert!(!is_collapsed_action_summary_row("… 10 more stepping"));
+        assert!(!is_collapsed_action_summary_row("… 10 more actions_logged"));
+
+        let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
+        let rows = 10u16;
+        let cols = 72u16;
+        let mut parser = vt100::Parser::new(nz(rows), nz(cols), 10);
+        parser.process(
+            concat!(
+                "… 10 more actions (3 reads, 6 edits, 1 tool) …\r\n",
+                "... 3 more steps\r\n",
+                "│ … 2 more edits │\r\n",
+                "  42 … 4 more reads\r\n",
+                "```markdown\r\n",
+                "○ Thought for 5.6s\r\n",
+                "… 10 more actions (3 reads, 6 edits, 1 tool) …\r\n",
+                "```\r\n",
+                "● Used Swarm (After fence)\r\n",
+            )
+            .as_bytes(),
+        );
+
+        let detected = detect_eink_process_rows(parser.screen(), rows, cols);
+        assert_eq!(
+            detected,
+            vec![true, true, false, false, false, false, false, false, true, false]
+        );
+
+        let backend = TestBackend::new(cols, rows);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            f.render_widget(
+                VtScreenWidget {
+                    screen: parser.screen(),
+                    selection: None,
+                    eink_mode: true,
+                    eink_color: false,
+                    is_agent_tab: false,
+                },
+                f.area(),
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        // Row 0 & 1: collapsed action summaries render in E-Ink process gray + italic
+        for y in 0..=1u16 {
+            assert_eq!(buf[(0, y)].fg, EINK_INK_PROCESS);
+            assert!(buf[(0, y)].modifier.contains(Modifier::ITALIC));
+        }
+        // Row 5 & 6 inside ``` code fence stay upright EINK_INK (not italicized)
+        assert_eq!(buf[(0, 5)].fg, EINK_INK);
+        assert!(!buf[(0, 5)].modifier.contains(Modifier::ITALIC));
+        assert_eq!(buf[(0, 6)].fg, EINK_INK);
+        assert!(!buf[(0, 6)].modifier.contains(Modifier::ITALIC));
+        // Row 8 after closing fence resumes process italic styling
+        assert_eq!(buf[(0, 8)].fg, EINK_INK_PROCESS);
+        assert!(buf[(0, 8)].modifier.contains(Modifier::ITALIC));
+
+        // Soft-wrapped opening fence line does not double-toggle `in_code_fence`
+        let mut wrap_fence = vt100::Parser::new(nz(6), nz(18), 0);
+        wrap_fence.process(
+            concat!(
+                "```very_long_lang_id\r\n",
+                "○ Thought 1s\r\n",
+                "```\r\n",
+                "● Used Tool\r\n",
+            )
+            .as_bytes(),
+        );
+        assert_eq!(
+            detect_eink_process_rows(wrap_fence.screen(), 6, 18),
+            vec![false, false, false, false, true, false]
+        );
+    }
+
+    #[test]
+    fn normal_mode_agent_tab_italicizes_process_rows_preserving_colors_and_upright_code() {
+        let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
+        let rows = 14u16;
+        let cols = 76u16;
+        let mut parser = vt100::Parser::new(nz(rows), nz(cols), 10);
+        parser.process(
+            concat!(
+                "\x1b[38;2;148;163;184m○ Thought for 5.6s\x1b[0m\r\n",
+                "\x1b[1;32m●\x1b[0m \x1b[1mUsed Swarm\x1b[0m \x1b[90m(Checked status)\x1b[0m\r\n",
+                "  \x1b[2;90m⎿\x1b[0m  \x1b[4;48;2;20;30;40mstep\x1b[0m \x1b[7minv\x1b[0m\r\n",
+                "… 10 more actions (3 reads, 6 edits, 1 tool) …\r\n",
+                "\x1b[1m# Final Answer\x1b[0m\r\n",
+                "- standard bullet\r\n",
+                "• normal list bullet\r\n",
+                "  41   // (esc to interrupt)\r\n",
+                "```rust\r\n",
+                "\x1b[1m● Used Tool (inside fence)\x1b[0m\r\n",
+                "… 4 more steps\r\n",
+                "```\r\n",
+                "● 正式回答正文\r\n",
+            )
+            .as_bytes(),
+        );
+
+        let sel = TerminalSelection {
+            anchor: (0, 0),
+            head: (0, 1),
+            active: true,
+            dragged: true,
+        };
+
+        // 1. Agent tab (`is_agent_tab: true`): process rows are italicized, non-process rows untouched.
+        let mut agent_term = Terminal::new(TestBackend::new(cols, rows)).unwrap();
+        agent_term
+            .draw(|f| {
+                f.render_widget(
+                    VtScreenWidget {
+                        screen: parser.screen(),
+                        selection: Some(&sel),
+                        eink_mode: false,
+                        eink_color: false,
+                        is_agent_tab: true,
+                    },
+                    f.area(),
+                );
+            })
+            .unwrap();
+        let abuf = agent_term.backend().buffer();
+
+        // Selected cells on row 0 still use Normal-mode selection style (REVERSED | BOLD on Reset)
+        assert_eq!(abuf[(0, 0)].symbol(), "○");
+        assert_eq!(abuf[(0, 0)].fg, Color::Reset);
+        assert_eq!(abuf[(0, 0)].bg, Color::Reset);
+        assert!(abuf[(0, 0)]
+            .modifier
+            .contains(Modifier::REVERSED | Modifier::BOLD));
+        assert!(!abuf[(0, 0)].modifier.contains(Modifier::ITALIC));
+
+        // Unselected non-dim muted slate RGB cell on row 0: preserves RGB, adds ITALIC, skips DIM
+        assert_eq!(abuf[(2, 0)].symbol(), "T");
+        assert_eq!(abuf[(2, 0)].fg, Color::Rgb(148, 163, 184));
+        assert_eq!(abuf[(2, 0)].bg, Color::Reset);
+        assert!(abuf[(2, 0)].modifier.contains(Modifier::ITALIC));
+        assert!(!abuf[(2, 0)].modifier.contains(Modifier::BOLD));
+        assert!(!abuf[(2, 0)].modifier.contains(Modifier::DIM));
+
+        // Row 1: `\x1b[1;32m●` preserves ANSI green, drops BOLD, adds ITALIC + DIM
+        assert_eq!(abuf[(0, 1)].symbol(), "●");
+        assert_eq!(abuf[(0, 1)].fg, Color::Indexed(2));
+        assert!(abuf[(0, 1)]
+            .modifier
+            .contains(Modifier::ITALIC | Modifier::DIM));
+        assert!(!abuf[(0, 1)].modifier.contains(Modifier::BOLD));
+
+        // Row 1: `\x1b[1mUsed` (bold Reset fg) drops BOLD, adds ITALIC + DIM
+        assert_eq!(abuf[(2, 1)].symbol(), "U");
+        assert_eq!(abuf[(2, 1)].fg, Color::Reset);
+        assert!(abuf[(2, 1)]
+            .modifier
+            .contains(Modifier::ITALIC | Modifier::DIM));
+        assert!(!abuf[(2, 1)].modifier.contains(Modifier::BOLD));
+
+        // Row 1: `\x1b[90m(Checked status)` (non-dim bright-black idx 8) preserves Indexed(8), adds ITALIC, skips extra DIM
+        let paren_x = 13u16;
+        assert_eq!(abuf[(paren_x, 1)].symbol(), "(");
+        assert_eq!(abuf[(paren_x, 1)].fg, Color::Indexed(8));
+        assert!(abuf[(paren_x, 1)].modifier.contains(Modifier::ITALIC));
+        assert!(!abuf[(paren_x, 1)].modifier.contains(Modifier::DIM));
+
+        // Row 2: explicit SGR 2 `\x1b[2;90m⎿` keeps DIM + ITALIC; `\x1b[4;48;2;20;30;40mstep` preserves bg & UNDERLINED; `\x1b[7minv` preserves REVERSED
+        assert_eq!(abuf[(2, 2)].symbol(), "⎿");
+        assert_eq!(abuf[(2, 2)].fg, Color::Indexed(8));
+        assert!(abuf[(2, 2)]
+            .modifier
+            .contains(Modifier::ITALIC | Modifier::DIM));
+        assert_eq!(abuf[(5, 2)].symbol(), "s");
+        assert_eq!(abuf[(5, 2)].bg, Color::Rgb(20, 30, 40));
+        assert!(abuf[(5, 2)]
+            .modifier
+            .contains(Modifier::ITALIC | Modifier::DIM | Modifier::UNDERLINED));
+        assert_eq!(abuf[(10, 2)].symbol(), "i");
+        assert!(abuf[(10, 2)]
+            .modifier
+            .contains(Modifier::ITALIC | Modifier::DIM | Modifier::REVERSED));
+
+        // Row 3: collapsed action summary `… 10 more actions ...` gets ITALIC + DIM
+        assert_eq!(abuf[(0, 3)].symbol(), "…");
+        assert!(abuf[(0, 3)]
+            .modifier
+            .contains(Modifier::ITALIC | Modifier::DIM));
+
+        // Row 4..7: bold heading, bullets, numbered code stay upright (heading keeps BOLD)
+        assert_eq!(abuf[(0, 4)].symbol(), "#");
+        assert!(abuf[(0, 4)].modifier.contains(Modifier::BOLD));
+        assert!(!abuf[(0, 4)].modifier.contains(Modifier::ITALIC));
+        for y in 5..=7u16 {
+            assert!(
+                !abuf[(2, y)].modifier.contains(Modifier::ITALIC),
+                "row {y} must remain upright"
+            );
+        }
+
+        // Row 8..11: fenced ```rust block stays upright and keeps BOLD on inside-fence text
+        assert!(!abuf[(0, 8)].modifier.contains(Modifier::ITALIC));
+        assert_eq!(abuf[(0, 9)].symbol(), "●");
+        assert!(abuf[(0, 9)].modifier.contains(Modifier::BOLD));
+        assert!(!abuf[(0, 9)].modifier.contains(Modifier::ITALIC));
+        assert!(!abuf[(0, 10)].modifier.contains(Modifier::ITALIC));
+        assert!(!abuf[(0, 11)].modifier.contains(Modifier::ITALIC));
+
+        // Row 12: final assistant prose stays upright
+        assert_eq!(abuf[(0, 12)].symbol(), "●");
+        assert!(!abuf[(0, 12)].modifier.contains(Modifier::ITALIC));
+
+        // 2. Plain shell tab (`is_agent_tab: false`): nothing is italicized and BOLD is preserved.
+        let mut shell_term = Terminal::new(TestBackend::new(cols, rows)).unwrap();
+        shell_term
+            .draw(|f| {
+                f.render_widget(
+                    VtScreenWidget {
+                        screen: parser.screen(),
+                        selection: None,
+                        eink_mode: false,
+                        eink_color: false,
+                        is_agent_tab: false,
+                    },
+                    f.area(),
+                );
+            })
+            .unwrap();
+        let sbuf = shell_term.backend().buffer();
+        for y in 0..rows {
+            for x in 0..cols {
+                assert!(
+                    !sbuf[(x, y)].modifier.contains(Modifier::ITALIC),
+                    "plain shell tab ({x},{y}) must not italicize"
+                );
+            }
+        }
+        assert!(sbuf[(0, 1)].modifier.contains(Modifier::BOLD));
+        assert!(sbuf[(2, 1)].modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn is_active_tab_agent_distinguishes_agents_from_plain_shells_and_drives_normal_render() {
+        let mut world = World::default();
+        assert!(!is_active_tab_agent(&world));
+
+        world.doc.spaces.push(SharedSpace {
+            id: "sp".to_string(),
+            name: "work".to_string(),
+            folder: "/tmp/work".to_string(),
+            tabs: vec![
+                SharedTab {
+                    id: "tab-shell".to_string(),
+                    name: "zsh".to_string(),
+                    root: serde_json::json!({"content": {"terminal": "t-shell"}}),
+                    ..Default::default()
+                },
+                SharedTab {
+                    id: "tab-state".to_string(),
+                    name: "agent-state".to_string(),
+                    root: serde_json::json!({"content": {"terminal": "t-state"}}),
+                    ..Default::default()
+                },
+                SharedTab {
+                    id: "tab-app".to_string(),
+                    name: "custom".to_string(),
+                    root: serde_json::json!({"content": {"terminal": "t-app"}}),
+                    ..Default::default()
+                },
+                SharedTab {
+                    id: "tab-fg".to_string(),
+                    name: "cli".to_string(),
+                    root: serde_json::json!({"content": {"terminal": "t-fg"}}),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        world.terminals.insert(
+            "t-shell".to_string(),
+            TerminalInfo {
+                address: "t-shell".to_string(),
+                fg_name: Some("zsh".to_string()),
+                title: "zsh".to_string(),
+                status_app: Some("   ".to_string()),
+                ..Default::default()
+            },
+        );
+        world.terminals.insert(
+            "t-state".to_string(),
+            TerminalInfo {
+                address: "t-state".to_string(),
+                status_word: Some("working".to_string()),
+                ..Default::default()
+            },
+        );
+        world.terminals.insert(
+            "t-app".to_string(),
+            TerminalInfo {
+                address: "t-app".to_string(),
+                status_app: Some("custom-agent".to_string()),
+                ..Default::default()
+            },
+        );
+        world.terminals.insert(
+            "t-fg".to_string(),
+            TerminalInfo {
+                address: "t-fg".to_string(),
+                fg_name: Some("codex".to_string()),
+                ..Default::default()
+            },
+        );
+
+        world.select_tab_index(0);
+        assert!(!is_active_tab_agent(&world));
+        world.select_tab_index(1);
+        assert!(is_active_tab_agent(&world));
+        world.select_tab_index(2);
+        assert!(is_active_tab_agent(&world));
+        world.select_tab_index(3);
+        assert!(is_active_tab_agent(&world));
+
+        // End-to-end render_ui_full_with_eink_color uses is_active_tab_agent(world) in Normal mode
+        let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
+        // Put genuine leading process marker on row 0
+        let mut proc_parser = vt100::Parser::new(nz(6), nz(60), 0);
+        proc_parser
+            .process(b"\x1b[1m\xe2\x97\x8f Used Swarm\x1b[0m\r\n... 3 more actions\r\nBody prose");
+
+        let mut term = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        // Agent tab (tab 2) -> process rows italicized
+        world.select_tab_index(2);
+        term.draw(|f| {
+            let _ = render_ui_full_with_eink_color(
+                f,
+                &world,
+                Some(proc_parser.screen()),
+                false,
+                24,
+                false,
+                false,
+                false,
+                false,
+                0,
+                None,
+                false,
+                &Modal::None,
+                None,
+                false,
+                None,
+                false,
+                None,
+                false,
+                false,
+            );
+        })
+        .unwrap();
+        let abuf = term.backend().buffer();
+        // Top bar takes row 0, so VT row 0 is y=1, row 1 is y=2, row 2 is y=3
+        assert!(abuf[(0, 1)].modifier.contains(Modifier::ITALIC));
+        assert!(!abuf[(0, 1)].modifier.contains(Modifier::BOLD));
+        assert!(abuf[(0, 2)].modifier.contains(Modifier::ITALIC));
+        assert!(!abuf[(0, 3)].modifier.contains(Modifier::ITALIC));
+
+        // Plain shell tab (tab 0) -> process-like rows stay upright with BOLD intact
+        world.select_tab_index(0);
+        term.draw(|f| {
+            let _ = render_ui_full_with_eink_color(
+                f,
+                &world,
+                Some(proc_parser.screen()),
+                false,
+                24,
+                false,
+                false,
+                false,
+                false,
+                0,
+                None,
+                false,
+                &Modal::None,
+                None,
+                false,
+                None,
+                false,
+                None,
+                false,
+                false,
+            );
+        })
+        .unwrap();
+        let sbuf = term.backend().buffer();
+        assert!(!sbuf[(0, 1)].modifier.contains(Modifier::ITALIC));
+        assert!(sbuf[(0, 1)].modifier.contains(Modifier::BOLD));
+        assert!(!sbuf[(0, 2)].modifier.contains(Modifier::ITALIC));
+        assert!(!sbuf[(0, 3)].modifier.contains(Modifier::ITALIC));
     }
 }
