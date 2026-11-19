@@ -3,7 +3,7 @@
 //! Read-Only Bottom Agent Status Bar, and modal overlays.
 
 use crate::keys::Action;
-use crate::model::{AgentState, SharedSpace, World};
+use crate::model::{AgentState, SharedSpace, TerminalInfo, World};
 use crate::usage::{
     render_eink_progress_bar, render_progress_bar, AgentKind, AgentQuota, QuotaMetric,
 };
@@ -814,42 +814,11 @@ pub fn render_ui_full(
     )
 }
 
-fn is_known_agent_name(raw: &str) -> bool {
-    let Some(first_token) = raw.split_whitespace().next() else {
-        return false;
-    };
-    let bin = first_token
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(first_token);
-    let lower = bin.to_ascii_lowercase();
-    let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
-    matches!(
-        stem,
-        "codex"
-            | "codex-cli"
-            | "claude"
-            | "claude-code"
-            | "opencode"
-            | "antigravity"
-            | "antigravity-cli"
-            | "agy"
-            | "gemini"
-            | "gemini-cli"
-            | "freebuff"
-            | "freebuff-cli"
-    )
-}
-
 pub fn is_active_tab_agent(world: &World) -> bool {
-    let Some(addr) = world.active_terminal_address_ref() else {
-        return false;
-    };
-    let Some(info) = world.terminals.get(addr) else {
-        return false;
-    };
-    info.status_app.as_deref().is_some_and(is_known_agent_name)
-        || info.fg_name.as_deref().is_some_and(is_known_agent_name)
+    world
+        .active_terminal_address_ref()
+        .and_then(|addr| world.terminals.get(addr))
+        .is_some_and(TerminalInfo::is_agent)
 }
 
 pub fn scan_viewport_initial_code_fence(screen: &mut vt100::Screen, max_back: usize) -> bool {
@@ -4042,7 +4011,7 @@ fn classify_status_lead_process_row(
     trimmed: &str,
     trimmed_byte_start: usize,
 ) -> bool {
-    const PROCESS_MARKERS: &[&str] = &["○ ", "● ", "◈ ", "⎿", "↳"];
+    const PROCESS_MARKERS: &[&str] = &["○ ", "● ", "◈ ", "▸ ", "⎿", "↳"];
     const PROCESS_VERBS: &[&str] = &[
         "Used ",
         "Scheduling ",
@@ -4169,6 +4138,9 @@ fn classify_eink_process_row(
             || content_trimmed.starts_with("└ ")
             || (scratch.leading_spaces >= 2 && scratch.all_non_space_muted))
     {
+        return true;
+    }
+    if content_trimmed.starts_with("└ Tip:") && scratch.all_non_space_muted {
         return true;
     }
     if has_tui_process_hint(content_trimmed) {
@@ -8737,6 +8709,7 @@ mod tests {
             seen_turn: seen,
             pinned: false,
             parent: None,
+            ..Default::default()
         };
         world.terminals.insert(
             "term-blocked".to_string(),
@@ -10137,6 +10110,23 @@ mod tests {
             detect_eink_process_rows(wrap_fence.screen(), 6, 18),
             vec![false, false, false, false, true, false]
         );
+
+        // Antigravity `▸ Thought for ...` standalone & muted / follow-up `└ Tip:` hints
+        let mut agy_proc = vt100::Parser::new(nz(5), nz(40), 0);
+        agy_proc.process(
+            concat!(
+                "▸ Thought for 11s\r\n",
+                "  └ Tip: Use native hc read\r\n",
+                "\r\n",
+                "\x1b[2m└ Tip: Standalone muted hint\x1b[0m\r\n",
+                "▸ Note (unrelated prose)",
+            )
+            .as_bytes(),
+        );
+        assert_eq!(
+            detect_eink_process_rows(agy_proc.screen(), 5, 40),
+            vec![true, true, false, true, false]
+        );
     }
 
     #[test]
@@ -10388,6 +10378,18 @@ mod tests {
                     root: serde_json::json!({"content": {"terminal": "t-app-codex"}}),
                     ..Default::default()
                 },
+                SharedTab {
+                    id: "tab-tpl".to_string(),
+                    name: "tpl".to_string(),
+                    root: serde_json::json!({"content": {"terminal": "t-tpl"}}),
+                    ..Default::default()
+                },
+                SharedTab {
+                    id: "tab-wrap".to_string(),
+                    name: "wrap".to_string(),
+                    root: serde_json::json!({"content": {"terminal": "t-wrap"}}),
+                    ..Default::default()
+                },
             ],
             ..Default::default()
         });
@@ -10483,16 +10485,36 @@ mod tests {
                 ..Default::default()
             },
         );
+        world.terminals.insert(
+            "t-tpl".to_string(),
+            TerminalInfo {
+                address: "t-tpl".to_string(),
+                template: Some("review".to_string()),
+                ..Default::default()
+            },
+        );
+        world.terminals.insert(
+            "t-wrap".to_string(),
+            TerminalInfo {
+                address: "t-wrap".to_string(),
+                fg_name: Some("node".to_string()),
+                fg_argv: vec![
+                    "node".to_string(),
+                    "/usr/local/bin/claude".to_string(),
+                    "--resume".to_string(),
+                ],
+                ..Default::default()
+            },
+        );
 
         // Plain shell with OSC title `~/codes/gemini-proxy` and tab/terminal name `claude-notes` must return false
         world.select_tab_index(0);
         assert!(!is_active_tab_agent(&world));
-        // `status_word` alone without known agent `status_app`/`fg_name` must return false
+        // Native `hc` OSC 7501 active status (`status_word` or `status_app`) -> true
         world.select_tab_index(1);
-        assert!(!is_active_tab_agent(&world));
-        // Non-allowlisted `status_app: Some("custom-agent")` -> false
+        assert!(is_active_tab_agent(&world));
         world.select_tab_index(2);
-        assert!(!is_active_tab_agent(&world));
+        assert!(is_active_tab_agent(&world));
         // `fg_name: Some("claude")`, `Some("/usr/local/bin/agy")`, `Some("claude-code")` -> true
         world.select_tab_index(3);
         assert!(is_active_tab_agent(&world));
@@ -10500,7 +10522,7 @@ mod tests {
         assert!(is_active_tab_agent(&world));
         world.select_tab_index(5);
         assert!(is_active_tab_agent(&world));
-        // `turn: 2` without known agent `status_app`/`fg_name` -> false
+        // `turn: 2` without active OSC 7501 status, template, or agent foreground -> false
         world.select_tab_index(6);
         assert!(!is_active_tab_agent(&world));
         // `fg_name: Some("claude-notes")` and `Some("gemini-proxy")` -> false
@@ -10508,14 +10530,20 @@ mod tests {
         assert!(!is_active_tab_agent(&world));
         world.select_tab_index(8);
         assert!(!is_active_tab_agent(&world));
-        // Argument-carrying `fg_name: Some("agy --resume")` and known `status_app: Some("codex")` -> true
+        // Argument-carrying `fg_name`, known `status_app`, `template`, and runtime-wrapped `fg_argv` -> true
         world.select_tab_index(9);
         assert!(is_active_tab_agent(&world));
         world.select_tab_index(10);
         assert!(is_active_tab_agent(&world));
+        world.select_tab_index(11);
+        assert!(is_active_tab_agent(&world));
+        world.select_tab_index(12);
+        assert!(is_active_tab_agent(&world));
         // Full-path + args & Windows-style path + `.exe` suffix still match exact binary stem
-        assert!(is_known_agent_name("/usr/local/bin/claude --model sonnet"));
-        assert!(is_known_agent_name(r"C:\tools\CODEX.EXE"));
+        assert!(crate::model::is_known_agent_token(
+            "/usr/local/bin/claude --model sonnet"
+        ));
+        assert!(crate::model::is_known_agent_token(r"C:\tools\CODEX.EXE"));
 
         // End-to-end render_ui_full_with_eink_color uses is_active_tab_agent(world) in Normal mode
         let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
