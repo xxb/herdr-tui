@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.0](https://github.com/xxb/herdr-tui/compare/v0.11.0...v0.12.0) (2026-11-19)
+
+
+### Features
+
+* **osc:** expose focused herdr-core session via OSC 1337 user vars ([#91](https://github.com/xxb/herdr-tui/issues/91)) ([f69e9c2](https://github.com/xxb/herdr-tui/commit/f69e9c2d9331b29d0e69059d19653dcc87f60bc3))
+
 ## [0.11.0](https://github.com/xxb/herdr-tui/compare/v0.10.0...v0.11.0) (2026-11-19)
 
 
