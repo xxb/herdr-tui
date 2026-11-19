@@ -53,8 +53,6 @@ pub struct TerminalInfo {
     pub status_word: Option<String>,
     pub status_app: Option<String>,
     pub status_msg: Option<String>,
-    pub reported: bool,
-    pub template: Option<String>,
     pub turn: u64,
     pub seen_turn: Option<u64>,
     pub pinned: bool,
@@ -72,24 +70,51 @@ fn parse_fg_argv(v: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn exe_stem_from_slice(slice: &str) -> Option<String> {
-    let bin = slice.rsplit(['/', '\\']).next().unwrap_or(slice);
+fn exe_stem(path: &str) -> Option<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let bin = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
     let lower = bin.to_ascii_lowercase();
     let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
     (!stem.is_empty()).then(|| stem.to_string())
 }
 
-fn matches_exe_stem(raw: &str, pred: fn(&str) -> bool) -> bool {
+fn extract_fg_command_exe(raw: &str) -> &str {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return false;
+        return "";
     }
-    trimmed
-        .split_whitespace()
-        .next()
-        .and_then(exe_stem_from_slice)
-        .is_some_and(|stem| pred(&stem))
-        || exe_stem_from_slice(trimmed).is_some_and(|stem| pred(&stem))
+    if let Some(quote) = trimmed.chars().next().filter(|&c| c == '"' || c == '\'') {
+        let rest = &trimmed[quote.len_utf8()..];
+        return match rest.find(quote) {
+            Some(end) => &rest[..end],
+            None => rest,
+        };
+    }
+    let Some(ws_idx) = trimmed.find(char::is_whitespace) else {
+        return trimmed;
+    };
+    let first_tok = &trimmed[..ws_idx];
+    if first_tok.contains(['/', '\\', ':']) {
+        let bytes = trimmed.as_bytes();
+        for (idx, win) in bytes.windows(4).enumerate() {
+            let end = idx + 4;
+            if win.eq_ignore_ascii_case(b".exe")
+                && trimmed.is_char_boundary(idx)
+                && trimmed.is_char_boundary(end)
+                && (end == trimmed.len()
+                    || trimmed[end..]
+                        .chars()
+                        .next()
+                        .is_some_and(char::is_whitespace))
+            {
+                return &trimmed[..end];
+            }
+        }
+    }
+    first_tok
 }
 
 fn is_known_agent_stem(stem: &str) -> bool {
@@ -117,12 +142,9 @@ fn is_script_runtime_stem(stem: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 pub fn is_known_agent_token(raw: &str) -> bool {
-    matches_exe_stem(raw, is_known_agent_stem)
-}
-
-fn is_script_runtime_token(raw: &str) -> bool {
-    matches_exe_stem(raw, is_script_runtime_stem)
+    exe_stem(extract_fg_command_exe(raw)).is_some_and(|stem| is_known_agent_stem(&stem))
 }
 
 impl TerminalInfo {
@@ -170,8 +192,6 @@ impl TerminalInfo {
             .and_then(|s| s.get("msg"))
             .and_then(Value::as_str)
             .map(String::from);
-        let reported = v.get("reported").and_then(Value::as_bool).unwrap_or(false);
-        let template = v.get("template").and_then(Value::as_str).map(String::from);
         let turn = v.get("turn").and_then(Value::as_u64).unwrap_or(0);
         let seen_turn = v
             .get("labels")
@@ -197,8 +217,6 @@ impl TerminalInfo {
             status_word,
             status_app,
             status_msg,
-            reported,
-            template,
             turn,
             seen_turn,
             pinned,
@@ -207,7 +225,8 @@ impl TerminalInfo {
     }
 
     pub fn is_agent(&self) -> bool {
-        // 1. Primary (`herdr-core` native OSC 7501 status): matches `hc ls` and clears when exiting to a shell.
+        // 1. Primary (`herdr-core` native OSC 7501 status): permissive across OSC 7501 reporters
+        // and cleared automatically by `hc` when exiting back to a shell even if `turn > 0`.
         if self
             .status_word
             .as_deref()
@@ -219,37 +238,28 @@ impl TerminalInfo {
         {
             return true;
         }
-        // 2. Secondary: non-empty launch template or known coding-agent foreground executable/wrapper.
-        if self
-            .template
+        // 2. Secondary: live OS foreground executable (`fg_name` or OS-split `fg_argv[0]`,
+        // plus `fg_argv[1]` under script runtimes).
+        let fg_cmd_stem = self
+            .fg_name
             .as_deref()
-            .is_some_and(|s| !s.trim().is_empty())
+            .and_then(|raw| exe_stem(extract_fg_command_exe(raw)));
+        let argv0_stem = self.fg_argv.first().and_then(|p| exe_stem(p));
+        if fg_cmd_stem.as_deref().is_some_and(is_known_agent_stem)
+            || argv0_stem.as_deref().is_some_and(is_known_agent_stem)
         {
             return true;
         }
-        if self.fg_name.as_deref().is_some_and(is_known_agent_token)
-            || self
-                .fg_argv
-                .first()
-                .map(String::as_str)
-                .is_some_and(is_known_agent_token)
-        {
-            return true;
-        }
-        let runtime = self
-            .fg_argv
-            .first()
-            .map(String::as_str)
-            .is_some_and(is_script_runtime_token)
-            || self.fg_name.as_deref().is_some_and(is_script_runtime_token);
+        let runtime = argv0_stem.as_deref().is_some_and(is_script_runtime_stem)
+            || fg_cmd_stem.as_deref().is_some_and(is_script_runtime_stem);
         runtime
             && self
                 .fg_argv
                 .iter()
                 .skip(1)
                 .find(|s| !s.trim().is_empty())
-                .map(String::as_str)
-                .is_some_and(is_known_agent_token)
+                .and_then(|p| exe_stem(p))
+                .is_some_and(|stem| is_known_agent_stem(&stem))
     }
 
     pub fn effective_cwd(&self) -> &str {
@@ -679,63 +689,34 @@ impl World {
                             } else {
                                 EventDisposition::Unchanged
                             }
-                        } else if let Some(data_obj) = data.as_object() {
-                            let new_reported = data_obj.get("reported").and_then(Value::as_bool);
-                            let status_val = data_obj.get("status");
-                            if status_val.is_some_and(Value::is_null) {
-                                let mut changed = info.status_word.take().is_some()
-                                    | info.status_app.take().is_some()
-                                    | info.status_msg.take().is_some();
-                                if let Some(r) = new_reported.filter(|&r| info.reported != r) {
-                                    info.reported = r;
+                        } else if let Some(st_obj) = data
+                            .get("status")
+                            .and_then(Value::as_object)
+                            .or_else(|| data.as_object())
+                        {
+                            if st_obj.contains_key("state")
+                                || st_obj.contains_key("app")
+                                || st_obj.contains_key("msg")
+                            {
+                                let new_word = st_obj
+                                    .get("state")
+                                    .and_then(Value::as_str)
+                                    .map(String::from);
+                                let new_app =
+                                    st_obj.get("app").and_then(Value::as_str).map(String::from);
+                                let new_msg =
+                                    st_obj.get("msg").and_then(Value::as_str).map(String::from);
+                                let mut changed = false;
+                                if info.status_word != new_word {
+                                    info.status_word = new_word;
                                     changed = true;
                                 }
-                                if changed {
-                                    EventDisposition::AppliedInPlace
-                                } else {
-                                    EventDisposition::Unchanged
+                                if info.status_app != new_app {
+                                    info.status_app = new_app;
+                                    changed = true;
                                 }
-                            } else if let Some(st_obj) = status_val
-                                .and_then(Value::as_object)
-                                .or(Some(data_obj))
-                                .filter(|st| {
-                                    st.contains_key("state")
-                                        || st.contains_key("app")
-                                        || st.contains_key("msg")
-                                        || new_reported.is_some()
-                                })
-                            {
-                                let has_status_fields = st_obj.contains_key("state")
-                                    || st_obj.contains_key("app")
-                                    || st_obj.contains_key("msg");
-                                let mut changed = false;
-                                if has_status_fields {
-                                    let new_word = st_obj
-                                        .get("state")
-                                        .and_then(Value::as_str)
-                                        .map(String::from);
-                                    let new_app =
-                                        st_obj.get("app").and_then(Value::as_str).map(String::from);
-                                    let new_msg =
-                                        st_obj.get("msg").and_then(Value::as_str).map(String::from);
-                                    if info.status_word != new_word {
-                                        info.status_word = new_word;
-                                        changed = true;
-                                    }
-                                    if info.status_app != new_app {
-                                        info.status_app = new_app;
-                                        changed = true;
-                                    }
-                                    if info.status_msg != new_msg {
-                                        info.status_msg = new_msg;
-                                        changed = true;
-                                    }
-                                }
-                                if let Some(r) = new_reported
-                                    .or_else(|| st_obj.get("reported").and_then(Value::as_bool))
-                                    .filter(|&r| info.reported != r)
-                                {
-                                    info.reported = r;
+                                if info.status_msg != new_msg {
+                                    info.status_msg = new_msg;
                                     changed = true;
                                 }
                                 if changed {
@@ -1803,7 +1784,7 @@ mod tests {
 
     #[test]
     fn terminal_info_is_agent_tracks_native_hc_metadata_and_events() {
-        // Parses `reported`, `template`, and `foreground.argv` from `terminal.list` JSON
+        // Parses `foreground.argv` from `terminal.list` JSON (ignoring template so post-exit kept shells aren't pinned)
         let full = TerminalInfo::from_json(&json!({
             "address": "t-meta",
             "state": "live",
@@ -1819,28 +1800,25 @@ mod tests {
             "status": { "state": "working", "app": "claude", "msg": "reading" }
         }))
         .unwrap();
-        assert!(full.reported);
-        assert_eq!(full.template.as_deref(), Some("review"));
         assert_eq!(
             full.fg_argv,
             vec!["node", "/usr/local/bin/claude", "--resume"]
         );
         assert!(full.is_agent());
 
-        // Plain shell with OSC title/tab name heuristic traps and whitespace-only status/template -> false
+        // Plain shell with OSC title/tab name heuristic traps and whitespace-only status -> false
         let plain_shell = TerminalInfo {
             address: "t-shell".to_string(),
             name: Some("claude-notes".to_string()),
             title: "~/codes/gemini-proxy".to_string(),
             fg_name: Some("zsh".to_string()),
             fg_argv: vec!["zsh".to_string()],
-            template: Some("   ".to_string()),
             status_app: Some("   ".to_string()),
             ..Default::default()
         };
         assert!(!plain_shell.is_agent());
 
-        // Non-agent script or misleading fg_name -> false
+        // Non-agent scripts or paths passed as arguments in `fg_name` / `fg_argv` -> false
         let fake_proxy = TerminalInfo {
             address: "t-proxy".to_string(),
             fg_name: Some("claude-notes".to_string()),
@@ -1853,17 +1831,27 @@ mod tests {
             ..Default::default()
         };
         assert!(!fake_proxy.is_agent());
+        assert!(!is_known_agent_token("vim ~/notes/codex"));
+        assert!(!is_known_agent_token("cat /usr/share/doc/agy"));
+        assert!(!is_known_agent_token(
+            r"C:\tools\vim.exe C:\notes\codex.exe"
+        ));
 
-        // Template alone makes it an agent tab (`hc` launch template)
-        let templated = TerminalInfo {
-            address: "t-tpl".to_string(),
-            template: Some("review".to_string()),
+        // Permissive OSC 7501 reporter (`status_word`/`status_app`) -> true
+        let custom_osc = TerminalInfo {
+            address: "t-osc".to_string(),
+            status_app: Some("aider".to_string()),
+            status_word: Some("working".to_string()),
             ..Default::default()
         };
-        assert!(templated.is_agent());
+        assert!(custom_osc.is_agent());
 
-        // Windows paths containing spaces (e.g., `C:\Program Files\codex.exe`) and arg-carrying tokens work
+        // Quoted or unquoted Windows paths containing spaces + optional arguments & arg-carrying commands
         assert!(is_known_agent_token(r"C:\Program Files\codex.exe"));
+        assert!(is_known_agent_token(r"C:\Program Files\codex.exe --resume"));
+        assert!(is_known_agent_token(
+            r#""C:\Program Files\codex.exe" --resume"#
+        ));
         assert!(is_known_agent_token("agy --resume"));
         let win_spaced = TerminalInfo {
             address: "t-win-spaced".to_string(),
@@ -1889,7 +1877,7 @@ mod tests {
         };
         assert!(wrapped.is_agent());
 
-        // `apply_core_event` updates `fg_argv` + `reported` in-place, and when agent exits back to shell
+        // `apply_core_event` updates `fg_argv` in-place, and when agent exits back to shell
         // (`status` cleared -> null even with `turn > 0`), `is_agent()` flips to false.
         let mut world = World::default();
         world.terminals.insert(
@@ -1901,24 +1889,20 @@ mod tests {
                 ..Default::default()
             },
         );
-        // `turn > 0` alone without status/template/agent foreground -> false
+        // `turn > 0` alone without active status or agent foreground -> false
         assert!(!world.terminals["t1"].is_agent());
 
         let status_active = json!({
             "params": {
                 "type": "status",
                 "terminal": "t1",
-                "data": {
-                    "status": { "state": "working", "app": "antigravity" },
-                    "reported": true
-                }
+                "data": { "state": "working", "app": "antigravity" }
             }
         });
         assert_eq!(
             world.apply_core_event(&status_active),
             EventDisposition::AppliedInPlace
         );
-        assert!(world.terminals["t1"].reported);
         assert!(world.terminals["t1"].is_agent());
 
         // Foreground becomes script-wrapped claude
@@ -1938,7 +1922,7 @@ mod tests {
             vec!["node", "/usr/local/bin/claude", "--resume"]
         );
 
-        // Agent exits: status cleared (`null`) while `turn > 0` and `reported` stays true; foreground returns to `zsh`
+        // Agent exits: status cleared (`null`) while `turn > 0`; foreground returns to `zsh` -> false
         let status_cleared = json!({
             "params": { "type": "status", "terminal": "t1", "data": null }
         });
@@ -1946,7 +1930,6 @@ mod tests {
             world.apply_core_event(&status_cleared),
             EventDisposition::AppliedInPlace
         );
-        assert!(world.terminals["t1"].reported);
 
         let fg_shell = json!({
             "params": { "type": "foreground", "terminal": "t1", "data": { "cwd": "/work", "name": "zsh", "argv": ["zsh"] } }

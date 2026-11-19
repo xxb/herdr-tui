@@ -10375,12 +10375,6 @@ mod tests {
                     ..Default::default()
                 },
                 SharedTab {
-                    id: "tab-tpl".to_string(),
-                    name: "tpl".to_string(),
-                    root: serde_json::json!({"content": {"terminal": "t-tpl"}}),
-                    ..Default::default()
-                },
-                SharedTab {
                     id: "tab-wrap".to_string(),
                     name: "wrap".to_string(),
                     root: serde_json::json!({"content": {"terminal": "t-wrap"}}),
@@ -10482,14 +10476,6 @@ mod tests {
             },
         );
         world.terminals.insert(
-            "t-tpl".to_string(),
-            TerminalInfo {
-                address: "t-tpl".to_string(),
-                template: Some("review".to_string()),
-                ..Default::default()
-            },
-        );
-        world.terminals.insert(
             "t-wrap".to_string(),
             TerminalInfo {
                 address: "t-wrap".to_string(),
@@ -10518,7 +10504,7 @@ mod tests {
         assert!(is_active_tab_agent(&world));
         world.select_tab_index(5);
         assert!(is_active_tab_agent(&world));
-        // `turn: 2` without active OSC 7501 status, template, or agent foreground -> false
+        // `turn: 2` without active OSC 7501 status or agent foreground -> false
         world.select_tab_index(6);
         assert!(!is_active_tab_agent(&world));
         // `fg_name: Some("claude-notes")` and `Some("gemini-proxy")` -> false
@@ -10526,14 +10512,12 @@ mod tests {
         assert!(!is_active_tab_agent(&world));
         world.select_tab_index(8);
         assert!(!is_active_tab_agent(&world));
-        // Argument-carrying `fg_name`, known `status_app`, `template`, and runtime-wrapped `fg_argv` -> true
+        // Argument-carrying `fg_name`, known `status_app`, and runtime-wrapped `fg_argv` -> true
         world.select_tab_index(9);
         assert!(is_active_tab_agent(&world));
         world.select_tab_index(10);
         assert!(is_active_tab_agent(&world));
         world.select_tab_index(11);
-        assert!(is_active_tab_agent(&world));
-        world.select_tab_index(12);
         assert!(is_active_tab_agent(&world));
         // Full-path + args & Windows-style path + `.exe` suffix still match exact binary stem
         assert!(crate::model::is_known_agent_token(
