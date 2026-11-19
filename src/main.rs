@@ -1845,6 +1845,7 @@ fn clear_reader_syncing_badge(modal: &mut Modal) -> bool {
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 fn expire_pending_reader_rpc(
     now: Instant,
     core: &CoreClient,
@@ -1852,6 +1853,8 @@ fn expire_pending_reader_rpc(
     modal: &mut Modal,
     pending_rpc: &mut Option<PendingReaderRpc>,
     pending_reader_osc: &mut bool,
+    eink_mode: bool,
+    pending_eink_osc: &mut bool,
     dirty: &mut bool,
 ) {
     if !pending_rpc.as_ref().is_some_and(|rpc| now >= rpc.deadline) {
@@ -1866,6 +1869,9 @@ fn expire_pending_reader_rpc(
         *pending_reader_osc = true;
     } else if clear_reader_syncing_badge(modal) {
         *dirty = true;
+        if eink_mode {
+            *pending_eink_osc = true;
+        }
     }
 }
 
@@ -2082,6 +2088,9 @@ fn apply_terminal_read_message(
         Err(_) => {
             if clear_reader_syncing_badge(modal) {
                 *dirty = true;
+                if eink_mode {
+                    *pending_eink_osc = true;
+                }
             }
         }
     }
@@ -3828,6 +3837,8 @@ fn run_app_loop(
             &mut modal,
             &mut pending_reader_rpc,
             &mut pending_reader_osc,
+            eink_mode,
+            &mut pending_eink_osc,
             &mut dirty,
         );
         if pending_sibling_resize_at.is_some_and(|t| now >= t) {
@@ -3972,6 +3983,8 @@ fn run_app_loop(
                             &mut modal,
                             &mut pending_reader_rpc,
                             &mut pending_reader_osc,
+                            eink_mode,
+                            &mut pending_eink_osc,
                             &mut dirty,
                         );
                         if pending_sibling_resize_at.is_some_and(|t| after >= t) {
@@ -10393,7 +10406,8 @@ mod tests {
             _ => panic!("expected Modal::Reader"),
         }
 
-        // 4. Async Err clears "syncing…" badge without dropping existing content
+        // 4. Async Err clears "syncing…" badge without dropping existing content,
+        //    leaving pending_eink = false when eink_mode == false and setting pending_eink = true when eink_mode == true.
         if let Modal::Reader {
             ref mut doc,
             ref mut source_note,
@@ -10412,6 +10426,7 @@ mod tests {
             deadline: Instant::now() + READER_RPC_TIMEOUT,
         });
         dirty = false;
+        pending_eink = false;
         apply_terminal_read_message(
             12,
             "t1",
@@ -10427,6 +10442,7 @@ mod tests {
             &mut dirty,
         );
         assert!(dirty);
+        assert!(!pending_eink);
         match modal {
             Modal::Reader {
                 ref doc,
@@ -10435,6 +10451,53 @@ mod tests {
                 ..
             } => {
                 assert!(raw_text.contains("async stitched response"));
+                assert!(source_note.is_none());
+                assert!(doc.source_note.is_none());
+            }
+            _ => panic!("expected Modal::Reader"),
+        }
+
+        if let Modal::Reader {
+            ref mut doc,
+            ref mut source_note,
+            ..
+        } = modal
+        {
+            *source_note = Some("syncing…".to_string());
+            doc.source_note = Some("syncing…".to_string());
+        }
+        pending_rpc = Some(PendingReaderRpc {
+            request_id: 14,
+            terminal: "t1".to_string(),
+            clean_mode: false,
+            for_native_export: false,
+            user_scrolled: true,
+            deadline: Instant::now() + READER_RPC_TIMEOUT,
+        });
+        dirty = false;
+        pending_eink = false;
+        apply_terminal_read_message(
+            14,
+            "t1",
+            Err("timeout".to_string()),
+            &world,
+            &mut modal,
+            term_rect,
+            &mut pending_rpc,
+            &mut pending_osc,
+            &mut pending_json,
+            true,
+            &mut pending_eink,
+            &mut dirty,
+        );
+        assert!(dirty);
+        assert!(pending_eink);
+        match modal {
+            Modal::Reader {
+                ref doc,
+                ref source_note,
+                ..
+            } => {
                 assert!(source_note.is_none());
                 assert!(doc.source_note.is_none());
             }
@@ -10531,6 +10594,7 @@ mod tests {
         );
         let rpc = pending_rpc.as_ref().unwrap().clone();
         let mut pending_osc = false;
+        let mut pending_eink = false;
         let mut dirty = false;
 
         // Before deadline: remains pending with "syncing…"
@@ -10542,12 +10606,15 @@ mod tests {
             &mut modal,
             &mut pending_rpc,
             &mut pending_osc,
+            true,
+            &mut pending_eink,
             &mut dirty,
         );
         assert!(pending_rpc.is_some());
         assert!(!dirty);
+        assert!(!pending_eink);
 
-        // At deadline for open Modal::Reader: cancels RPC, clears "syncing…" badge, sets dirty = true
+        // At deadline for open Modal::Reader (eink_mode == false): clears "syncing…" badge, leaves pending_eink == false
         expire_pending_reader_rpc(
             rpc.deadline,
             &core,
@@ -10555,11 +10622,14 @@ mod tests {
             &mut modal,
             &mut pending_rpc,
             &mut pending_osc,
+            false,
+            &mut pending_eink,
             &mut dirty,
         );
         assert!(pending_rpc.is_none());
         assert!(dirty);
         assert!(!pending_osc);
+        assert!(!pending_eink);
         match modal {
             Modal::Reader {
                 ref doc,
@@ -10569,6 +10639,44 @@ mod tests {
                 assert!(source_note.is_none());
                 assert!(doc.source_note.is_none());
                 assert!(!doc.lines.is_empty());
+            }
+            _ => panic!("expected Modal::Reader"),
+        }
+
+        // At deadline for open Modal::Reader (eink_mode == true): clears "syncing…" badge AND sets pending_eink = true
+        let mut eink_modal = build_reader_modal_state(
+            &core,
+            &world,
+            Some(&attached),
+            term_rect,
+            true,
+            Some(&mut pending_rpc),
+        );
+        let eink_rpc = pending_rpc.as_ref().unwrap().clone();
+        dirty = false;
+        pending_eink = false;
+        expire_pending_reader_rpc(
+            eink_rpc.deadline,
+            &core,
+            &world,
+            &mut eink_modal,
+            &mut pending_rpc,
+            &mut pending_osc,
+            true,
+            &mut pending_eink,
+            &mut dirty,
+        );
+        assert!(pending_rpc.is_none());
+        assert!(dirty);
+        assert!(pending_eink);
+        match eink_modal {
+            Modal::Reader {
+                ref doc,
+                ref source_note,
+                ..
+            } => {
+                assert!(source_note.is_none());
+                assert!(doc.source_note.is_none());
             }
             _ => panic!("expected Modal::Reader"),
         }
@@ -10585,6 +10693,7 @@ mod tests {
             deadline: exp_deadline,
         });
         pending_osc = false;
+        pending_eink = false;
         dirty = false;
         expire_pending_reader_rpc(
             exp_deadline,
@@ -10593,10 +10702,13 @@ mod tests {
             &mut Modal::None,
             &mut pending_rpc,
             &mut pending_osc,
+            true,
+            &mut pending_eink,
             &mut dirty,
         );
         assert!(pending_rpc.is_none());
         assert!(pending_osc);
+        assert!(!pending_eink);
 
         // Wrong active terminal on export expiry cancels safely without emitting OSC for wrong tab
         let stale_id = core.request_terminal_read("t1", 450).unwrap();
@@ -10618,6 +10730,8 @@ mod tests {
             &mut Modal::None,
             &mut pending_rpc,
             &mut pending_osc,
+            true,
+            &mut pending_eink,
             &mut dirty,
         );
         assert!(pending_rpc.is_none());
