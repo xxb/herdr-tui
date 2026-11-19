@@ -1045,50 +1045,54 @@ pub fn render_ui_full_with_eink_color_and_fence(
     let mut page_down_rect = None;
     let space_menu_open = matches!(modal, Modal::SpaceMenu);
 
-    let space_bounds = render_top_tabbar(
-        f,
-        top_rect,
-        world,
-        space_menu_open,
-        tab_overview_open,
-        eink_mode,
-        effective_eink_color,
-        &mut hits,
-    );
-    let space_slop_rect = if matches!(modal, Modal::None) && term_rect.height > 0 {
-        space_bounds.and_then(|(sx, send)| {
-            let slop_x = sx.max(term_rect.x);
-            let slop_end = send.min(term_rect.x.saturating_add(term_rect.width));
-            let slop_w = slop_end.saturating_sub(slop_x);
-            let slop_h = if term_rect.height >= 4 { 2 } else { 1 };
-            (slop_w > 0).then_some(Rect {
-                x: slop_x,
-                y: term_rect.y,
-                width: slop_w,
-                height: slop_h,
-            })
-        })
-    } else {
+    let space_slop_rect = if reader_open {
         None
-    };
-    render_bottom_status_bar(
-        f,
-        bottom_rect,
-        if tab_overview_open {
+    } else {
+        let space_bounds = render_top_tabbar(
+            f,
+            top_rect,
+            world,
+            space_menu_open,
+            tab_overview_open,
+            eink_mode,
+            effective_eink_color,
+            &mut hits,
+        );
+        render_bottom_status_bar(
+            f,
+            bottom_rect,
+            if tab_overview_open {
+                None
+            } else {
+                focused_quota
+            },
+            if tab_overview_open {
+                0
+            } else {
+                scrollback_offset
+            },
+            copied_flash,
+            eink_mode,
+            effective_eink_color,
+            &mut hits,
+        );
+        if matches!(modal, Modal::None) && term_rect.height > 0 {
+            space_bounds.and_then(|(sx, send)| {
+                let slop_x = sx.max(term_rect.x);
+                let slop_end = send.min(term_rect.x.saturating_add(term_rect.width));
+                let slop_w = slop_end.saturating_sub(slop_x);
+                let slop_h = if term_rect.height >= 4 { 2 } else { 1 };
+                (slop_w > 0).then_some(Rect {
+                    x: slop_x,
+                    y: term_rect.y,
+                    width: slop_w,
+                    height: slop_h,
+                })
+            })
+        } else {
             None
-        } else {
-            focused_quota
-        },
-        if tab_overview_open {
-            0
-        } else {
-            scrollback_offset
-        },
-        copied_flash,
-        eink_mode,
-        effective_eink_color,
-        &mut hits,
-    );
+        }
+    };
 
     match modal {
         Modal::None => {
@@ -1178,7 +1182,7 @@ pub fn render_ui_full_with_eink_color_and_fence(
             );
         }
         Modal::Reader { doc, scroll, .. } => {
-            render_reader_modal(f, term_rect, doc, *scroll, eink_mode, &mut hits);
+            render_reader_modal(f, area, doc, *scroll, eink_mode, &mut hits);
         }
     }
 
@@ -5545,21 +5549,22 @@ fn render_help_modal(
     }
 }
 
-pub fn reader_body_metrics(term_rect: Rect) -> (Rect, u16, u16) {
-    if term_rect.width == 0 || term_rect.height == 0 {
-        return (Rect::new(term_rect.x, term_rect.y, 0, 0), 0, 0);
+pub fn reader_body_metrics(reader_rect: Rect) -> (Rect, u16, u16) {
+    if reader_rect.width == 0 || reader_rect.height == 0 {
+        return (Rect::new(reader_rect.x, reader_rect.y, 0, 0), 0, 0);
     }
-    let header_h = u16::from(term_rect.height >= 2);
-    let rule_h = u16::from(term_rect.height >= 4);
-    let footer_h = u16::from(term_rect.height >= 3);
-    let body_y = term_rect.y + header_h + rule_h;
-    let body_h = term_rect
+    let header_h = u16::from(reader_rect.height >= 2);
+    let top_rule_h = u16::from(reader_rect.height >= 4);
+    let bottom_rule_h = u16::from(reader_rect.height >= 5);
+    let footer_h = u16::from(reader_rect.height >= 3);
+    let body_y = reader_rect.y + header_h + top_rule_h;
+    let body_h = reader_rect
         .height
-        .saturating_sub(header_h + rule_h + footer_h);
-    let body_rect = Rect::new(term_rect.x, body_y, term_rect.width, body_h);
-    let pad_x = if term_rect.width >= 50 {
+        .saturating_sub(header_h + top_rule_h + bottom_rule_h + footer_h);
+    let body_rect = Rect::new(reader_rect.x, body_y, reader_rect.width, body_h);
+    let pad_x = if reader_rect.width >= 50 {
         2
-    } else if term_rect.width >= 10 {
+    } else if reader_rect.width >= 10 {
         1
     } else {
         0
@@ -5568,8 +5573,8 @@ pub fn reader_body_metrics(term_rect: Rect) -> (Rect, u16, u16) {
     (body_rect, content_width, pad_x)
 }
 
-pub fn reader_initial_scroll(doc: &crate::reader::ReaderDoc, term_rect: Rect) -> (usize, usize) {
-    let (body_rect, content_width, _) = reader_body_metrics(term_rect);
+pub fn reader_initial_scroll(doc: &crate::reader::ReaderDoc, reader_rect: Rect) -> (usize, usize) {
+    let (body_rect, content_width, _) = reader_body_metrics(reader_rect);
     if body_rect.height == 0 || content_width == 0 {
         return (0, 0);
     }
@@ -5599,7 +5604,7 @@ fn render_reader_modal(
             term_rect,
         );
     }
-    // Keep top tab bar hits live above `term_rect`; push `ModalNoop` first so Reader controls take priority.
+    // Full-screen Reader owns `term_rect`; push `ModalNoop` first so Reader controls take priority.
     hits.push(HitRegion {
         rect: term_rect,
         target: HitTarget::ModalNoop,
@@ -5634,6 +5639,16 @@ fn render_reader_modal(
             .bg(Color::Reset)
             .fg(Color::Reset)
             .add_modifier(Modifier::DIM)
+    };
+    let major_rule_style = if eink_mode {
+        Style::default().bg(EINK_PAPER).fg(EINK_INK_MUTED)
+    } else {
+        body_style
+    };
+    let collapsed_rule_style = if eink_mode {
+        Style::default().bg(EINK_PAPER).fg(EINK_INK_PROCESS)
+    } else {
+        dim_chrome_style
     };
     let badge_style = if eink_mode {
         Style::default()
@@ -5757,11 +5772,19 @@ fn render_reader_modal(
         }
     }
 
-    // 2. Hairline divider
+    // 2. Top and bottom frame hairlines
     if term_rect.height >= 4 {
         buf.set_string(
             term_rect.x,
             term_rect.y + 1,
+            "─".repeat(usize::from(term_rect.width)),
+            dim_chrome_style,
+        );
+    }
+    if term_rect.height >= 5 {
+        buf.set_string(
+            term_rect.x,
+            term_rect.y + term_rect.height - 2,
             "─".repeat(usize::from(term_rect.width)),
             dim_chrome_style,
         );
@@ -5793,13 +5816,15 @@ fn render_reader_modal(
                 let rx = body_rect.x + pad_x;
                 match row_kind {
                     crate::reader::ReaderLineKind::Blank => {}
-                    crate::reader::ReaderLineKind::Divider => {
-                        buf.set_string(
-                            rx,
-                            ry,
-                            "─".repeat(usize::from(content_width)),
-                            dim_chrome_style,
-                        );
+                    crate::reader::ReaderLineKind::Divider(div_kind) => {
+                        let (glyph, div_style) = match div_kind {
+                            crate::reader::ReaderDividerKind::Major => ("═", major_rule_style),
+                            crate::reader::ReaderDividerKind::Section => ("─", dim_chrome_style),
+                            crate::reader::ReaderDividerKind::Collapsed => {
+                                ("┄", collapsed_rule_style)
+                            }
+                        };
+                        buf.set_string(rx, ry, glyph.repeat(usize::from(content_width)), div_style);
                     }
                     crate::reader::ReaderLineKind::Text(runs) => {
                         let mut cx = rx;
@@ -10786,7 +10811,7 @@ mod tests {
         }
         raw.push_str("```rust\nlet code_val = 42;\n```\n");
         let agent_doc = crate::reader::build_reader_doc_from_text(&raw, "agy", true, true, None);
-        let (_, max_scroll) = reader_initial_scroll(&agent_doc, Rect::new(0, 1, 100, 28));
+        let (_, max_scroll) = reader_initial_scroll(&agent_doc, Rect::new(0, 0, 100, 30));
         assert!(max_scroll > 0);
         // Scrolled away from anchor shows [ Latest ] hit target
         let modal = Modal::Reader {
@@ -10808,14 +10833,26 @@ mod tests {
             })
             .unwrap();
         let wide_buf = wide_term.backend().buffer();
-        let header: String = (0..100).map(|x| wide_buf[(x, 1)].symbol()).collect();
-        let footer: String = (0..100).map(|x| wide_buf[(x, 28)].symbol()).collect();
+        let header: String = (0..100).map(|x| wide_buf[(x, 0)].symbol()).collect();
+        let top_rule: String = (0..100).map(|x| wide_buf[(x, 1)].symbol()).collect();
+        let bottom_rule: String = (0..100).map(|x| wide_buf[(x, 28)].symbol()).collect();
+        let footer: String = (0..100).map(|x| wide_buf[(x, 29)].symbol()).collect();
         assert!(header.contains("Agent·Clean"));
         assert!(header.contains("1 hidden"));
+        assert!(top_rule.chars().all(|c| c == '─'));
+        assert!(bottom_rule.chars().all(|c| c == '─'));
         assert!(footer.contains("Pg "));
         assert!(footer.contains("[ Latest ]"));
         assert!(!header.contains("Native"));
         assert!(!footer.contains("Export"));
+        assert!(!wide_hits.iter().any(|h| matches!(
+            h.target,
+            HitTarget::SelectTab { .. }
+                | HitTarget::TriggerAction(Action::Detach)
+                | HitTarget::ToggleSpaceMenu
+                | HitTarget::ToggleHelp
+                | HitTarget::NewTab
+        )));
         for target in [
             HitTarget::ModalNoop,
             HitTarget::CancelModal,
@@ -10889,5 +10926,101 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(n_rows.contains("No readable lines"));
+    }
+
+    #[test]
+    fn reader_renders_three_divider_tiers_and_small_heights() {
+        assert_eq!(
+            reader_body_metrics(Rect::new(0, 0, 40, 1)).0,
+            Rect::new(0, 0, 40, 1)
+        );
+        assert_eq!(
+            reader_body_metrics(Rect::new(0, 0, 40, 2)).0,
+            Rect::new(0, 1, 40, 1)
+        );
+        assert_eq!(
+            reader_body_metrics(Rect::new(0, 0, 40, 3)).0,
+            Rect::new(0, 1, 40, 1)
+        );
+        assert_eq!(
+            reader_body_metrics(Rect::new(0, 0, 40, 4)).0,
+            Rect::new(0, 2, 40, 1)
+        );
+        assert_eq!(
+            reader_body_metrics(Rect::new(0, 0, 40, 5)).0,
+            Rect::new(0, 2, 40, 1)
+        );
+        assert_eq!(
+            reader_body_metrics(Rect::new(0, 0, 40, 24)).0,
+            Rect::new(0, 2, 40, 20)
+        );
+
+        let world = World::default();
+        let multi = concat!(
+            "> Turn 1\n",
+            "▸ Thought for 1s\n",
+            "Alpha.\n",
+            "---\n",
+            "Beta.\n",
+            "> Turn 2\n",
+            "Gamma.\n"
+        );
+        let doc = crate::reader::build_reader_doc_from_text(multi, "agy", true, true, None);
+        let modal = Modal::Reader {
+            doc,
+            scroll: 0,
+            raw_text: multi.to_string(),
+            source_note: None,
+        };
+
+        for eink in [false, true] {
+            let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+            term.draw(|f| {
+                let _ = render_ui_full_with_eink_color(
+                    f, &world, None, false, 24, false, false, false, false, 0, None, false, &modal,
+                    None, false, None, false, None, eink, false,
+                );
+            })
+            .unwrap();
+            let buf = term.backend().buffer();
+            if eink {
+                assert_strict_eink_buffer(buf);
+            }
+            let row_text = |y: u16| -> String { (0..60).map(|x| buf[(x, y)].symbol()).collect() };
+            assert!(row_text(1).chars().all(|c| c == '─'));
+            assert!(row_text(18).chars().all(|c| c == '─'));
+
+            let find_body_row = |glyph: &str| -> u16 {
+                (2..18)
+                    .find(|&y| {
+                        buf[(0, y)].symbol() == " "
+                            && buf[(1, y)].symbol() == " "
+                            && (2..58).all(|x| buf[(x, y)].symbol() == glyph)
+                            && buf[(58, y)].symbol() == " "
+                            && buf[(59, y)].symbol() == " "
+                    })
+                    .unwrap_or_else(|| panic!("missing divider '{glyph}' (eink={eink})"))
+            };
+            let major_y = find_body_row("═");
+            let section_y = find_body_row("─");
+            let collapsed_y = find_body_row("┄");
+
+            let major_cell = &buf[(2, major_y)];
+            let section_cell = &buf[(2, section_y)];
+            let collapsed_cell = &buf[(2, collapsed_y)];
+            if eink {
+                assert_eq!(major_cell.bg, EINK_PAPER);
+                assert_eq!(major_cell.fg, EINK_INK_MUTED);
+                assert_eq!(section_cell.fg, EINK_INK_MUTED);
+                assert_eq!(collapsed_cell.fg, EINK_INK_PROCESS);
+                assert!(!collapsed_cell.modifier.contains(Modifier::DIM));
+            } else {
+                assert_eq!(major_cell.bg, Color::Reset);
+                assert_eq!(major_cell.fg, Color::Reset);
+                assert!(!major_cell.modifier.contains(Modifier::DIM));
+                assert!(section_cell.modifier.contains(Modifier::DIM));
+                assert!(collapsed_cell.modifier.contains(Modifier::DIM));
+            }
+        }
     }
 }

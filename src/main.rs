@@ -2545,6 +2545,7 @@ fn execute_action_full(
     scrollback_offset: &mut usize,
     modal: &mut Modal,
     term_rect: Rect,
+    reader_rect: Rect,
     eink_mode: &mut bool,
     eink_color: &mut bool,
     force_clear: &mut bool,
@@ -2683,7 +2684,7 @@ fn execute_action_full(
                     core,
                     world,
                     attached,
-                    term_rect,
+                    reader_rect,
                     true,
                     pending_reader_rpc,
                 );
@@ -2691,8 +2692,8 @@ fn execute_action_full(
         }
         Action::PageUp => {
             if matches!(modal, Modal::Reader { .. }) {
-                let step = reader_page_step(term_rect) as isize;
-                if move_reader_scroll(modal, term_rect, ReaderScrollMove::Delta(-step)) {
+                let step = reader_page_step(reader_rect) as isize;
+                if move_reader_scroll(modal, reader_rect, ReaderScrollMove::Delta(-step)) {
                     if let Some(slot) = pending_reader_rpc {
                         set_reader_user_scrolled(slot, true);
                     }
@@ -2710,8 +2711,8 @@ fn execute_action_full(
         }
         Action::PageDown => {
             if matches!(modal, Modal::Reader { .. }) {
-                let step = reader_page_step(term_rect) as isize;
-                if move_reader_scroll(modal, term_rect, ReaderScrollMove::Delta(step)) {
+                let step = reader_page_step(reader_rect) as isize;
+                if move_reader_scroll(modal, reader_rect, ReaderScrollMove::Delta(step)) {
                     if let Some(slot) = pending_reader_rpc {
                         set_reader_user_scrolled(slot, true);
                     }
@@ -3936,7 +3937,7 @@ fn run_app_loop(
                             result,
                             world,
                             &mut modal,
-                            term_rect,
+                            area,
                             &mut pending_reader_rpc,
                             &mut dirty,
                         );
@@ -3975,13 +3976,7 @@ fn run_app_loop(
                             page_tap = None;
                             reader_drag = None;
                             cur_size = (w, h);
-                            let next_term_rect = compute_terminal_rect(
-                                Rect::new(0, 0, w, h),
-                                *sidebar_open,
-                                sidebar_width,
-                                touch_mode,
-                            );
-                            clamp_reader_scroll_on_resize(&mut modal, next_term_rect);
+                            clamp_reader_scroll_on_resize(&mut modal, Rect::new(0, 0, w, h));
                             pending_sibling_resize_at =
                                 Some(Instant::now() + SIBLING_RESIZE_DEBOUNCE);
                             need_sync_terminals = true;
@@ -4059,8 +4054,7 @@ fn run_app_loop(
                                     match target {
                                         HitTarget::ModalNoop => {
                                             if matches!(modal, Modal::Reader { .. }) {
-                                                let (body_rect, _, _) =
-                                                    reader_body_metrics(term_rect);
+                                                let (body_rect, _, _) = reader_body_metrics(area);
                                                 if is_in_rect(Some(body_rect), mx, my) {
                                                     reader_drag = Some(my);
                                                 }
@@ -4082,9 +4076,8 @@ fn run_app_loop(
                                                 HitTarget::ReaderJumpLatest
                                                     | HitTarget::ReaderToggleClean
                                             );
-                                            let (_, changed) = handle_reader_mouse_hit(
-                                                target, &mut modal, term_rect,
-                                            );
+                                            let (_, changed) =
+                                                handle_reader_mouse_hit(target, &mut modal, area);
                                             if changed {
                                                 set_reader_user_scrolled(
                                                     &mut pending_reader_rpc,
@@ -4149,6 +4142,7 @@ fn run_app_loop(
                                                 &mut scrollback_offset,
                                                 &mut modal,
                                                 term_rect,
+                                                area,
                                                 &mut eink_mode,
                                                 &mut eink_color,
                                                 &mut force_clear,
@@ -4314,6 +4308,7 @@ fn run_app_loop(
                                                 &mut scrollback_offset,
                                                 &mut modal,
                                                 term_rect,
+                                                area,
                                                 &mut eink_mode,
                                                 &mut eink_color,
                                                 &mut force_clear,
@@ -4417,7 +4412,7 @@ fn run_app_loop(
                                         &mut reader_drag,
                                         mev.row,
                                         &mut modal,
-                                        term_rect,
+                                        area,
                                         eink_mode,
                                     ) {
                                         set_reader_user_scrolled(&mut pending_reader_rpc, true);
@@ -4548,6 +4543,7 @@ fn run_app_loop(
                                                     &mut scrollback_offset,
                                                     &mut modal,
                                                     term_rect,
+                                                    area,
                                                     &mut eink_mode,
                                                     &mut eink_color,
                                                     &mut force_clear,
@@ -4714,11 +4710,11 @@ fn run_app_loop(
                                 } else if matches!(modal, Modal::Reader { .. })
                                     && dpad_drag.is_none()
                                     && !selection.as_ref().is_some_and(|s| s.active)
-                                    && mev.row >= term_rect.y
-                                    && mev.row < term_rect.y.saturating_add(term_rect.height)
+                                    && mev.row >= area.y
+                                    && mev.row < area.y.saturating_add(area.height)
                                 {
                                     horiz_wheel.record_viewport_vertical_wheel(wheel_now);
-                                    if handle_reader_wheel(true, &mut modal, term_rect, eink_mode) {
+                                    if handle_reader_wheel(true, &mut modal, area, eink_mode) {
                                         set_reader_user_scrolled(&mut pending_reader_rpc, true);
                                         dirty = true;
                                     }
@@ -4858,12 +4854,11 @@ fn run_app_loop(
                                 } else if matches!(modal, Modal::Reader { .. })
                                     && dpad_drag.is_none()
                                     && !selection.as_ref().is_some_and(|s| s.active)
-                                    && mev.row >= term_rect.y
-                                    && mev.row < term_rect.y.saturating_add(term_rect.height)
+                                    && mev.row >= area.y
+                                    && mev.row < area.y.saturating_add(area.height)
                                 {
                                     horiz_wheel.record_viewport_vertical_wheel(wheel_now);
-                                    if handle_reader_wheel(false, &mut modal, term_rect, eink_mode)
-                                    {
+                                    if handle_reader_wheel(false, &mut modal, area, eink_mode) {
                                         set_reader_user_scrolled(&mut pending_reader_rpc, true);
                                         dirty = true;
                                     }
@@ -4987,6 +4982,7 @@ fn run_app_loop(
                                 &mut scrollback_offset,
                                 &mut modal,
                                 term_rect,
+                                area,
                                 &mut eink_mode,
                                 &mut eink_color,
                                 &mut force_clear,
@@ -5274,6 +5270,7 @@ fn handle_shortcut_in_tab_overview(
     scrollback_offset: &mut usize,
     modal: &mut Modal,
     term_rect: Rect,
+    reader_rect: Rect,
     eink_mode: &mut bool,
     eink_color: &mut bool,
     force_clear: &mut bool,
@@ -5305,6 +5302,7 @@ fn handle_shortcut_in_tab_overview(
                     scrollback_offset,
                     modal,
                     term_rect,
+                    reader_rect,
                     eink_mode,
                     eink_color,
                     force_clear,
@@ -5336,6 +5334,7 @@ fn handle_shortcut_in_tab_overview(
                 scrollback_offset,
                 modal,
                 term_rect,
+                reader_rect,
                 eink_mode,
                 eink_color,
                 force_clear,
@@ -5419,6 +5418,7 @@ fn handle_key_event_with_eink(
         scrollback_offset,
         modal,
         term_rect,
+        term_rect,
         eink_mode,
         &mut eink_color,
         force_clear,
@@ -5440,6 +5440,7 @@ fn handle_key_event_full(
     scrollback_offset: &mut usize,
     modal: &mut Modal,
     term_rect: Rect,
+    reader_rect: Rect,
     eink_mode: &mut bool,
     eink_color: &mut bool,
     force_clear: &mut bool,
@@ -5596,6 +5597,7 @@ fn handle_key_event_full(
                     scrollback_offset,
                     modal,
                     term_rect,
+                    reader_rect,
                     eink_mode,
                     eink_color,
                     force_clear,
@@ -5646,6 +5648,7 @@ fn handle_key_event_full(
                 scrollback_offset,
                 modal,
                 term_rect,
+                reader_rect,
                 eink_mode,
                 eink_color,
                 force_clear,
@@ -5725,6 +5728,7 @@ fn handle_key_event_full(
                     scrollback_offset,
                     modal,
                     term_rect,
+                    reader_rect,
                     eink_mode,
                     eink_color,
                     force_clear,
@@ -5850,6 +5854,7 @@ fn handle_key_event_full(
                     scrollback_offset,
                     modal,
                     term_rect,
+                    reader_rect,
                     eink_mode,
                     eink_color,
                     force_clear,
@@ -5862,7 +5867,7 @@ fn handle_key_event_full(
             let no_ctrl_alt = !kev
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
-            let step = reader_page_step(term_rect) as isize;
+            let step = reader_page_step(reader_rect) as isize;
             let page_mv = match kev.code {
                 KeyCode::PageUp | KeyCode::BackTab => Some(ReaderScrollMove::Delta(-step)),
                 KeyCode::Char('b') if no_ctrl_alt => Some(ReaderScrollMove::Delta(-step)),
@@ -5876,7 +5881,7 @@ fn handle_key_event_full(
                 _ => None,
             };
             if let Some(mv) = page_mv {
-                let changed = move_reader_scroll(modal, term_rect, mv);
+                let changed = move_reader_scroll(modal, reader_rect, mv);
                 if let Some(slot) = pending_reader_rpc {
                     if matches!(mv, ReaderScrollMove::Latest) {
                         set_reader_user_scrolled(slot, false);
@@ -5894,7 +5899,7 @@ fn handle_key_event_full(
                 _ => None,
             };
             if let Some(delta) = line_delta {
-                if move_reader_scroll(modal, term_rect, ReaderScrollMove::Delta(delta)) {
+                if move_reader_scroll(modal, reader_rect, ReaderScrollMove::Delta(delta)) {
                     if let Some(slot) = pending_reader_rpc {
                         set_reader_user_scrolled(slot, true);
                     }
@@ -5915,7 +5920,7 @@ fn handle_key_event_full(
                     }
                 }
                 KeyCode::Tab | KeyCode::Char('f' | 'c') if no_ctrl_alt => {
-                    if toggle_reader_clean_mode(modal, term_rect) {
+                    if toggle_reader_clean_mode(modal, reader_rect) {
                         if let Some(slot) = pending_reader_rpc {
                             set_reader_user_scrolled(slot, false);
                         }
@@ -5930,7 +5935,7 @@ fn handle_key_event_full(
                         core,
                         world,
                         attached,
-                        term_rect,
+                        reader_rect,
                         clean_mode,
                         pending_reader_rpc,
                     );
@@ -5954,6 +5959,7 @@ fn handle_key_event_full(
             scrollback_offset,
             modal,
             term_rect,
+            reader_rect,
             eink_mode,
             eink_color,
             force_clear,
@@ -8370,6 +8376,7 @@ mod tests {
                 &mut scrollback_offset,
                 modal,
                 term_rect,
+                term_rect,
                 eink_mode,
                 eink_color,
                 force_clear,
@@ -8388,6 +8395,7 @@ mod tests {
                 &mut alt_active,
                 &mut scrollback_offset,
                 modal,
+                term_rect,
                 term_rect,
                 eink_mode,
                 eink_color,
@@ -9299,6 +9307,7 @@ mod tests {
                 &mut scrollback_offset,
                 &mut modal,
                 term_rect,
+                term_rect,
                 &mut eink_mode,
                 &mut eink_color,
                 &mut force_clear,
@@ -9327,6 +9336,7 @@ mod tests {
                 &mut alt_active,
                 &mut scrollback_offset,
                 &mut modal,
+                term_rect,
                 term_rect,
                 &mut eink_mode,
                 &mut eink_color,
@@ -9464,6 +9474,7 @@ mod tests {
                     &mut alt_active,
                     &mut scrollback_offset,
                     &mut modal,
+                    term_rect,
                     term_rect,
                     &mut eink_mode,
                     &mut eink_color,
@@ -9764,6 +9775,7 @@ mod tests {
             &mut sidebar_open,
             &mut scrollback_offset,
             &mut modal,
+            term_rect,
             term_rect,
             &mut eink_mode,
             &mut eink_color,
@@ -10478,5 +10490,94 @@ mod tests {
             let clear_start = leave_str.len() - expected_clear.len();
             assert!(show_idx < clear_start);
         }
+    }
+
+    #[test]
+    fn reader_modal_uses_fullscreen_reader_rect_even_when_term_rect_is_smaller() {
+        let core = CoreClient::dummy_for_tests();
+        let mut world = reader_test_world();
+        let mut attached = AttachedTerminal::new(1, 60, 28);
+        let mut payload = String::from("> Turn 1\r\n");
+        for i in 1..=35 {
+            payload.push_str(&format!("Turn 1 paragraph {i:02}.\r\n\r\n"));
+        }
+        payload.push_str("> Turn 2\r\n");
+        for i in 1..=8 {
+            payload.push_str(&format!("Turn 2 paragraph {i:02}.\r\n\r\n"));
+        }
+        attached.process_vt_bytes(payload.as_bytes());
+
+        let term_rect = Rect::new(0, 1, 60, 10);
+        let reader_rect = Rect::new(0, 0, 60, 30);
+        let mut sidebar_open = false;
+        let mut prefix_active = false;
+        let mut ctrl_active = false;
+        let mut alt_active = false;
+        let mut scrollback_offset = 0;
+        let mut modal = Modal::None;
+        let mut eink_mode = false;
+        let mut eink_color = false;
+        let mut force_clear = false;
+
+        // Open Reader via Action::OpenBookReader -> initial scroll uses `reader_rect`
+        assert!(!execute_action_full(
+            Action::OpenBookReader,
+            &core,
+            &mut world,
+            Some(&attached),
+            "ctrl+b",
+            &mut sidebar_open,
+            &mut scrollback_offset,
+            &mut modal,
+            term_rect,
+            reader_rect,
+            &mut eink_mode,
+            &mut eink_color,
+            &mut force_clear,
+            None,
+        )
+        .unwrap());
+
+        let (doc_clone, open_scroll) = match modal {
+            Modal::Reader {
+                ref doc, scroll, ..
+            } => (doc.clone(), scroll),
+            _ => panic!("expected Modal::Reader"),
+        };
+        let (expected_init_full, max_full) = reader_initial_scroll(&doc_clone, reader_rect);
+        let (expected_init_term, max_term) = reader_initial_scroll(&doc_clone, term_rect);
+        assert!(max_full < max_term);
+        assert_eq!(open_scroll, expected_init_full);
+        assert_ne!(expected_init_full, expected_init_term);
+
+        // PageDown / PageUp in Reader step by full `reader_page_step(reader_rect)`
+        move_reader_scroll(&mut modal, reader_rect, ReaderScrollMove::Top);
+        handle_key_event_full(
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            &core,
+            &mut world,
+            Some(&attached),
+            "ctrl+b",
+            &mut sidebar_open,
+            &mut prefix_active,
+            &mut ctrl_active,
+            &mut alt_active,
+            &mut scrollback_offset,
+            &mut modal,
+            term_rect,
+            reader_rect,
+            &mut eink_mode,
+            &mut eink_color,
+            &mut force_clear,
+            None,
+        )
+        .unwrap();
+        let after_pgdn = match modal {
+            Modal::Reader { scroll, .. } => scroll,
+            _ => panic!("expected Modal::Reader"),
+        };
+        let expected_step = reader_page_step(reader_rect).min(max_full);
+        assert_eq!(after_pgdn, expected_step);
+        assert!(after_pgdn > reader_page_step(term_rect));
     }
 }
