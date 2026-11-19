@@ -38,7 +38,6 @@ pub enum HitTarget {
     ReaderPageUp,
     ReaderPageDown,
     ReaderToggleClean,
-    ReaderExportNative,
     ReaderJumpLatest,
     ConfirmCloseYes { tab_id: String },
     SubmitPrompt,
@@ -5483,7 +5482,7 @@ fn render_help_modal(
         Line::from("  Page Up / Down           ^b PgUp / PgDn / Shift+PgUp (or in [ ? ])"),
         Line::from("  E-Ink Mode / Redraw      ^b e (E-Ink) / ^b r (clean redraw)"),
         Line::from("  Kaleido Color Accent     ^b E (95% mono + 5% overprint accents)"),
-        Line::from("  Book Reader / Export     ^b v / ^b B (OSC) or Tap [ 📖 Reader ]"),
+        Line::from("  Built-In Reader          ^b v          or  Tap [ 📖 Reader ]"),
         Line::from("  Detach (keep running)    ^b q / ^b d   or  Ctrl+\\ / Tap [ ⏏ ]"),
         Line::from(""),
         Line::from(Span::styled(
@@ -5693,8 +5692,6 @@ fn render_reader_modal(
             "[ ✕ ]"
         };
         push_right_btn(close_lbl, close_style, HitTarget::CancelModal);
-        let export_lbl = if compact { "[ ↗ ]" } else { "[ ↗ Native ]" };
-        push_right_btn(export_lbl, btn_style, HitTarget::ReaderExportNative);
         if doc.is_agent {
             let mode_lbl = match (doc.clean_mode, compact) {
                 (true, false) => "[ Full ]",
@@ -5905,9 +5902,9 @@ fn render_reader_modal(
 
         if term_rect.width >= 72 && fx + 6 < dn_x {
             let hint = if doc.is_agent {
-                "  j/k · PgUp/Dn · c Full/Clean · l Latest · r Refresh · s Export · q Close"
+                "  j/k · PgUp/Dn · c Full/Clean · l Latest · r Refresh · q Close"
             } else {
-                "  j/k · PgUp/Dn · l Latest · r Refresh · s Export · q Close"
+                "  j/k · PgUp/Dn · l Latest · r Refresh · q Close"
             };
             let rem = usize::from(dn_x.saturating_sub(fx));
             let clipped = truncate_to_width(hint, rem);
@@ -10817,11 +10814,12 @@ mod tests {
         assert!(header.contains("1 hidden"));
         assert!(footer.contains("Pg "));
         assert!(footer.contains("[ Latest ]"));
+        assert!(!header.contains("Native"));
+        assert!(!footer.contains("Export"));
         for target in [
             HitTarget::ModalNoop,
             HitTarget::CancelModal,
             HitTarget::ReaderToggleClean,
-            HitTarget::ReaderExportNative,
             HitTarget::ReaderPageUp,
             HitTarget::ReaderPageDown,
             HitTarget::ReaderJumpLatest,
@@ -10875,7 +10873,7 @@ mod tests {
             .any(|h| h.target == HitTarget::ReaderToggleClean));
         assert!(narrow_hits
             .iter()
-            .any(|h| h.target == HitTarget::ReaderExportNative));
+            .any(|h| h.target == HitTarget::CancelModal));
         assert!(narrow_hits
             .iter()
             .any(|h| h.target == HitTarget::ReaderPageUp));

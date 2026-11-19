@@ -1,4 +1,4 @@
-//! Lightweight `terminal.read`-first reader extraction, reflow, wrapping, and ShellDeck export.
+//! Lightweight `terminal.read`-first reader extraction, reflow, and wrapping.
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -7,7 +7,6 @@ pub const AGENT_MAX_TURNS: usize = 3;
 pub const FULL_MAX_SCAN_ROWS: usize = 420;
 pub const SHELL_MAX_SCAN_ROWS: usize = 260;
 pub const SHELL_MAX_CLEAN_LINES: usize = 200;
-pub const MAX_SHELLDECK_JSON_BYTES: usize = 48_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -16,16 +15,6 @@ pub enum ReaderRunStyle {
     Bold = 1,
     Muted = 2,
     Code = 3,
-}
-
-impl ReaderRunStyle {
-    pub fn to_shelldeck_code(self) -> u8 {
-        match self {
-            Self::Body | Self::Code => 0,
-            Self::Bold => 1,
-            Self::Muted => 2,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -507,7 +496,8 @@ fn is_reflowable_prose(line: &RawLine) -> bool {
         && !is_markdown_heading(s)
         && !is_bullet_or_list(trimmed)
         && !is_agent_user_prompt(s)
-        && !(trimmed == ">" || trimmed.starts_with("> "))
+        && trimmed != ">"
+        && !trimmed.starts_with("> ")
         && !(trimmed.starts_with('|') && (trimmed.ends_with('|') || trimmed.contains(" | ")))
 }
 
@@ -1097,227 +1087,8 @@ pub fn wrap_reader_doc(doc: &ReaderDoc, content_width: u16) -> WrappedReaderView
     }
 }
 
-#[derive(serde::Serialize)]
-struct ShellDeckLine {
-    r: Vec<(String, u8)>,
-}
-
-#[derive(serde::Serialize)]
-struct ShellDeckPayload<'a> {
-    v: u8,
-    title: &'a str,
-    anchor: usize,
-    lines: Vec<ShellDeckLine>,
-}
-
 fn is_fence_line(line: &ReaderLineKind) -> bool {
     matches!(line, ReaderLineKind::Text(runs) if runs.iter().map(|(t, _)| t.as_str()).collect::<String>().trim_start().starts_with("```"))
-}
-
-fn clip_str_utf8_bytes(s: &str, max_bytes: usize) -> String {
-    if s.len() <= max_bytes {
-        return s.to_string();
-    }
-    let ellipsis = "…";
-    let cap = max_bytes.saturating_sub(ellipsis.len());
-    let mut end = cap.min(s.len());
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    if max_bytes < ellipsis.len() {
-        s[..end].to_string()
-    } else {
-        format!("{}{ellipsis}", &s[..end])
-    }
-}
-
-fn truncate_shelldeck_runs_to_bytes(
-    runs: &[(String, u8)],
-    max_raw_bytes: usize,
-) -> Vec<(String, u8)> {
-    let total_bytes: usize = runs.iter().map(|(t, _)| t.len()).sum();
-    if total_bytes <= max_raw_bytes {
-        return runs.to_vec();
-    }
-    let ellipsis = "…";
-    let mut budget = max_raw_bytes.saturating_sub(ellipsis.len());
-    let mut out: Vec<(String, u8)> = Vec::new();
-    for (text, style) in runs {
-        if text.len() <= budget {
-            out.push((text.clone(), *style));
-            budget -= text.len();
-        } else {
-            let mut end = budget.min(text.len());
-            while end > 0 && !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            if end > 0 {
-                out.push((format!("{}{ellipsis}", &text[..end]), *style));
-            } else if max_raw_bytes >= ellipsis.len() {
-                if let Some((last_txt, _)) = out.last_mut() {
-                    last_txt.push_str(ellipsis);
-                } else {
-                    out.push((ellipsis.to_string(), *style));
-                }
-            }
-            break;
-        }
-    }
-    out
-}
-
-/// Serialize a [`ReaderDoc`] into ShellDeck v1 JSON strictly bounded to [`MAX_SHELLDECK_JSON_BYTES`]
-/// with balanced ``` code fence parity.
-pub fn format_reader_doc_json(doc: &ReaderDoc) -> String {
-    let title_owned = clip_str_utf8_bytes(&doc.title, 1024);
-    let title = title_owned.as_str();
-    let converted: Vec<ShellDeckLine> = doc
-        .lines
-        .iter()
-        .map(|l| match l {
-            ReaderLineKind::Text(runs) => ShellDeckLine {
-                r: runs
-                    .iter()
-                    .map(|(t, s)| (t.clone(), s.to_shelldeck_code()))
-                    .collect(),
-            },
-            ReaderLineKind::Blank => ShellDeckLine { r: Vec::new() },
-            ReaderLineKind::Divider => ShellDeckLine {
-                r: vec![("────────".to_string(), 2)],
-            },
-        })
-        .collect();
-    let build = |start_idx: usize| -> String {
-        let inside = doc.lines[..start_idx]
-            .iter()
-            .filter(|l| is_fence_line(l))
-            .count()
-            % 2
-            == 1;
-        let mut lines_out = Vec::with_capacity(converted.len() - start_idx + usize::from(inside));
-        if inside {
-            lines_out.push(ShellDeckLine {
-                r: vec![("```".to_string(), 0)],
-            });
-        }
-        for l in &converted[start_idx..] {
-            lines_out.push(ShellDeckLine { r: l.r.clone() });
-        }
-        let anchor = if lines_out.is_empty() {
-            0
-        } else if doc.anchor_line >= start_idx {
-            ((doc.anchor_line - start_idx) + usize::from(inside)).min(lines_out.len() - 1)
-        } else {
-            usize::from(inside).min(lines_out.len() - 1)
-        };
-        serde_json::to_string(&ShellDeckPayload {
-            v: 1,
-            title,
-            anchor,
-            lines: lines_out,
-        })
-        .unwrap_or_else(|_| "{}".to_string())
-    };
-    let full = build(0);
-    if full.len() <= MAX_SHELLDECK_JSON_BYTES {
-        return full;
-    }
-
-    let mut best = if doc.lines.len() <= 1 {
-        full
-    } else {
-        let (mut lo, mut hi, mut cur_best) =
-            (1usize, doc.lines.len() - 1, build(doc.lines.len() - 1));
-        while lo <= hi {
-            let mid = lo + (hi - lo) / 2;
-            let cand = build(mid);
-            if cand.len() <= MAX_SHELLDECK_JSON_BYTES {
-                cur_best = cand;
-                hi = mid.saturating_sub(1);
-                if mid == 0 {
-                    break;
-                }
-            } else {
-                lo = mid + 1;
-            }
-        }
-        cur_best
-    };
-
-    if best.len() <= MAX_SHELLDECK_JSON_BYTES {
-        return best;
-    }
-
-    // Even the single surviving line (plus optional synthetic opening fence) exceeded MAX_SHELLDECK_JSON_BYTES:
-    // binary-search a char-safe byte prefix on the line runs while preserving fence parity.
-    let last_idx = converted.len().saturating_sub(1);
-    let inside = doc.lines[..last_idx]
-        .iter()
-        .filter(|l| is_fence_line(l))
-        .count()
-        % 2
-        == 1;
-    let last_runs = converted
-        .get(last_idx)
-        .map(|l| l.r.as_slice())
-        .unwrap_or(&[]);
-    let total_run_bytes: usize = last_runs.iter().map(|(t, _)| t.len()).sum();
-
-    let build_truncated = |raw_cap: usize| -> String {
-        let mut lines_out = Vec::with_capacity(3);
-        if inside {
-            lines_out.push(ShellDeckLine {
-                r: vec![("```".to_string(), 0)],
-            });
-        }
-        let trunc_runs = truncate_shelldeck_runs_to_bytes(last_runs, raw_cap);
-        let trunc_is_fence = trunc_runs
-            .iter()
-            .map(|(t, _)| t.as_str())
-            .collect::<String>()
-            .trim_start()
-            .starts_with("```");
-        lines_out.push(ShellDeckLine { r: trunc_runs });
-        if (usize::from(inside) + usize::from(trunc_is_fence)) % 2 == 1 {
-            lines_out.push(ShellDeckLine {
-                r: vec![("```".to_string(), 0)],
-            });
-        }
-        let anchor = usize::from(inside).min(lines_out.len().saturating_sub(1));
-        serde_json::to_string(&ShellDeckPayload {
-            v: 1,
-            title,
-            anchor,
-            lines: lines_out,
-        })
-        .unwrap_or_else(|_| "{}".to_string())
-    };
-
-    let mut lo = 0usize;
-    let mut hi = total_run_bytes;
-    best = build_truncated(0);
-    while lo <= hi {
-        let mid = lo + (hi - lo) / 2;
-        let cand = build_truncated(mid);
-        if cand.len() <= MAX_SHELLDECK_JSON_BYTES {
-            best = cand;
-            lo = mid + 1;
-        } else if mid == 0 {
-            break;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    if best.len() <= MAX_SHELLDECK_JSON_BYTES {
-        return best;
-    }
-    serde_json::to_string(&ShellDeckPayload {
-        v: 1,
-        title: "",
-        anchor: 0,
-        lines: Vec::new(),
-    })
-    .unwrap_or_else(|_| "{}".to_string())
 }
 
 #[cfg(test)]
@@ -1526,165 +1297,8 @@ mod tests {
     }
 
     #[test]
-    fn shelldeck_json_v1_caps_48kb_and_screen_fallback_restores_scrollback() {
-        let mut huge_lines = vec![ReaderLineKind::Text(vec![(
-            "```rust".to_string(),
-            ReaderRunStyle::Body,
-        )])];
-        for i in 0..800 {
-            huge_lines.push(ReaderLineKind::Text(vec![(
-                format!("// {i:04} 0123456789abcdef0123456789abcdef0123456789abcdef"),
-                ReaderRunStyle::Code,
-            )]));
-        }
-        huge_lines.push(ReaderLineKind::Text(vec![(
-            "```".to_string(),
-            ReaderRunStyle::Body,
-        )]));
-        let doc = ReaderDoc {
-            title: "big".to_string(),
-            is_agent: true,
-            clean_mode: true,
-            source_note: None,
-            lines: huge_lines,
-            anchor_line: 801,
-            hidden_process_lines: 0,
-        };
-        let json = format_reader_doc_json(&doc);
-        assert!(json.len() <= MAX_SHELLDECK_JSON_BYTES);
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["v"], 1);
-        assert_eq!(
-            parsed["lines"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|l| l["r"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|r| r[0].as_str().unwrap())
-                    .collect::<String>()
-                    .trim_start()
-                    .starts_with("```"))
-                .count()
-                % 2,
-            0
-        );
-
-        let schema_doc = ReaderDoc {
-            title: "schema".to_string(),
-            is_agent: true,
-            clean_mode: true,
-            source_note: None,
-            lines: vec![
-                ReaderLineKind::Text(vec![("# H".to_string(), ReaderRunStyle::Bold)]),
-                ReaderLineKind::Blank,
-                ReaderLineKind::Divider,
-                ReaderLineKind::Text(vec![
-                    ("b".to_string(), ReaderRunStyle::Body),
-                    ("m".to_string(), ReaderRunStyle::Muted),
-                ]),
-                ReaderLineKind::Text(vec![("c".to_string(), ReaderRunStyle::Code)]),
-            ],
-            anchor_line: 3,
-            hidden_process_lines: 0,
-        };
-        let schema: serde_json::Value =
-            serde_json::from_str(&format_reader_doc_json(&schema_doc)).unwrap();
-        assert_eq!(schema["lines"][0]["r"][0][1], 1);
-        assert_eq!(schema["lines"][1]["r"].as_array().unwrap().len(), 0);
-        assert_eq!(schema["lines"][2]["r"][0][0], "────────");
-        assert_eq!(schema["lines"][2]["r"][0][1], 2);
-        assert_eq!(schema["lines"][3]["r"][0][1], 0);
-        assert_eq!(schema["lines"][3]["r"][1][1], 2);
-        assert_eq!(schema["lines"][4]["r"][0][1], 0);
-
-        let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
-        let mut parser = vt100::Parser::new(nz(4), nz(10), 40);
-        parser.process("中文连续文本测试换行\r\nrow2\r\nrow3\r\nrow4\r\nrow5".as_bytes());
-        parser.screen_mut().set_scrollback(2);
-        let plain = extract_plain_text_from_screen(parser.screen_mut(), 40);
-        assert_eq!(parser.screen().scrollback(), 2);
-        assert!(plain.contains("中文连续文本测试换行"));
-    }
-
-    #[test]
-    fn shelldeck_json_enforces_48kb_cap_on_oversized_single_line_and_huge_title() {
-        let single_line = ReaderDoc {
-            title: "t".repeat(100_000),
-            is_agent: false,
-            clean_mode: false,
-            source_note: None,
-            lines: vec![ReaderLineKind::Text(vec![
-                ("中".repeat(40_000), ReaderRunStyle::Body),
-                ("\"\\".repeat(5_000), ReaderRunStyle::Code),
-            ])],
-            anchor_line: 0,
-            hidden_process_lines: 0,
-        };
-        let bounded = format_reader_doc_json(&single_line);
-        assert!(
-            bounded.len() <= MAX_SHELLDECK_JSON_BYTES,
-            "single oversized line + title blew 48KB cap: {} bytes",
-            bounded.len()
-        );
-        let parsed: serde_json::Value = serde_json::from_str(&bounded).unwrap();
-        assert_eq!(parsed["v"], 1);
-        assert!(parsed["title"].as_str().unwrap().ends_with('…'));
-        let rendered_line: String = parsed["lines"][0]["r"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|r| r[0].as_str().unwrap())
-            .collect();
-        assert!(rendered_line.ends_with('…'));
-
-        // Multi-line doc where the final line alone exceeds 48KB inside an open code fence
-        let mut fenced_lines = vec![ReaderLineKind::Text(vec![(
-            "```rust".to_string(),
-            ReaderRunStyle::Code,
-        )])];
-        fenced_lines.push(ReaderLineKind::Text(vec![(
-            "old line".to_string(),
-            ReaderRunStyle::Code,
-        )]));
-        fenced_lines.push(ReaderLineKind::Text(vec![(
-            "x".repeat(100_000),
-            ReaderRunStyle::Code,
-        )]));
-        let fenced_doc = ReaderDoc {
-            title: "fenced".to_string(),
-            is_agent: true,
-            clean_mode: true,
-            source_note: None,
-            lines: fenced_lines,
-            anchor_line: 2,
-            hidden_process_lines: 0,
-        };
-        let bounded_fenced = format_reader_doc_json(&fenced_doc);
-        assert!(bounded_fenced.len() <= MAX_SHELLDECK_JSON_BYTES);
-        let parsed_fenced: serde_json::Value = serde_json::from_str(&bounded_fenced).unwrap();
-        let fence_count = parsed_fenced["lines"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|l| {
-                l["r"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|r| r[0].as_str().unwrap())
-                    .collect::<String>()
-                    .trim_start()
-                    .starts_with("```")
-            })
-            .count();
-        assert_eq!(fence_count % 2, 0);
-    }
-
-    #[test]
-    fn screen_fallback_unwraps_titled_and_indented_colored_box_borders_with_cjk_join() {
+    fn screen_fallback_restores_scrollback_and_unwraps_titled_and_indented_colored_boxes_with_cjk_join(
+    ) {
         let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
         let mut parser = vt100::Parser::new(nz(4), nz(10), 40);
         parser.process("┌────────┐\r\n".as_bytes());
@@ -1697,21 +1311,7 @@ mod tests {
         let plain = extract_plain_text_from_screen(parser.screen_mut(), 40);
         assert_eq!(parser.screen().scrollback(), 2);
         let doc = build_reader_doc_from_text(&plain, "agy-1", true, true, None);
-        let json_str = format_reader_doc_json(&doc);
-        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        let lines: Vec<String> = parsed["lines"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|l| {
-                l["r"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|r| r[0].as_str().unwrap())
-                    .collect()
-            })
-            .collect();
+        let lines: Vec<String> = doc.lines.iter().map(line_text).collect();
         assert!(
             lines.iter().any(|s| s == "中文连续文本测试换行"),
             "plain={plain:?}, lines={lines:?}"
