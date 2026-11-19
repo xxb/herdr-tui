@@ -48,6 +48,7 @@ pub struct TerminalInfo {
     pub cwd: String,
     pub fg_cwd: Option<String>,
     pub fg_name: Option<String>,
+    pub fg_argv: Vec<String>,
     pub title: String,
     pub status_word: Option<String>,
     pub status_app: Option<String>,
@@ -56,6 +57,99 @@ pub struct TerminalInfo {
     pub seen_turn: Option<u64>,
     pub pinned: bool,
     pub parent: Option<String>,
+}
+
+fn parse_fg_argv(v: Option<&Value>) -> Vec<String> {
+    v.and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn exe_stem(path: &str) -> Option<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let bin = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+    let lower = bin.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
+    (!stem.is_empty()).then(|| stem.to_string())
+}
+
+fn extract_fg_command_exe(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "";
+    }
+    if let Some(quote) = trimmed.chars().next().filter(|&c| c == '"' || c == '\'') {
+        let rest = &trimmed[quote.len_utf8()..];
+        return match rest.find(quote) {
+            Some(end) => &rest[..end],
+            None => rest,
+        };
+    }
+    let Some(ws_idx) = trimmed.find(char::is_whitespace) else {
+        return trimmed;
+    };
+    let first_tok = &trimmed[..ws_idx];
+    if first_tok.contains(':') || first_tok.starts_with("\\\\") {
+        let bytes = trimmed.as_bytes();
+        for (idx, win) in bytes.windows(4).enumerate() {
+            let end = idx + 4;
+            if win.eq_ignore_ascii_case(b".exe")
+                && trimmed.is_char_boundary(idx)
+                && trimmed.is_char_boundary(end)
+                && (end == trimmed.len()
+                    || trimmed[end..]
+                        .chars()
+                        .next()
+                        .is_some_and(char::is_whitespace))
+            {
+                return &trimmed[..end];
+            }
+        }
+    }
+    first_tok
+}
+
+fn is_known_agent_stem(stem: &str) -> bool {
+    matches!(
+        stem,
+        "codex"
+            | "codex-cli"
+            | "claude"
+            | "claude-code"
+            | "opencode"
+            | "antigravity"
+            | "antigravity-cli"
+            | "agy"
+            | "gemini"
+            | "gemini-cli"
+            | "freebuff"
+            | "freebuff-cli"
+    )
+}
+
+fn is_script_runtime_stem(stem: &str) -> bool {
+    matches!(
+        stem,
+        "node" | "nodejs" | "bun" | "deno" | "python" | "python3" | "npx" | "uvx"
+    )
+}
+
+fn fg_name_stem(raw: &str) -> Option<String> {
+    exe_stem(extract_fg_command_exe(raw))
+}
+
+pub(crate) fn fg_name_is_agent(raw: &str) -> bool {
+    fg_name_stem(raw)
+        .as_deref()
+        .is_some_and(is_known_agent_stem)
 }
 
 impl TerminalInfo {
@@ -82,6 +176,7 @@ impl TerminalInfo {
             .and_then(|f| f.get("name"))
             .and_then(Value::as_str)
             .map(String::from);
+        let fg_argv = parse_fg_argv(v.get("foreground").and_then(|f| f.get("argv")));
         let title = v
             .get("title")
             .and_then(Value::as_str)
@@ -122,6 +217,7 @@ impl TerminalInfo {
             cwd,
             fg_cwd,
             fg_name,
+            fg_argv,
             title,
             status_word,
             status_app,
@@ -131,6 +227,45 @@ impl TerminalInfo {
             pinned,
             parent,
         })
+    }
+
+    pub fn is_agent(&self) -> bool {
+        // 1. Primary (`herdr-core` native OSC 7501 status): permissive across OSC 7501 reporters
+        // and cleared automatically by `hc` when exiting back to a shell even if `turn > 0`.
+        if self
+            .status_word
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+            || self
+                .status_app
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+        {
+            return true;
+        }
+        // 2. Secondary: live OS foreground executable (`fg_name` or OS-split `fg_argv[0]`,
+        // plus `fg_argv[1]` under script runtimes).
+        let argv0_stem = self.fg_argv.first().and_then(|p| exe_stem(p));
+        if self.fg_name.as_deref().is_some_and(fg_name_is_agent)
+            || argv0_stem.as_deref().is_some_and(is_known_agent_stem)
+        {
+            return true;
+        }
+        let runtime = argv0_stem.as_deref().is_some_and(is_script_runtime_stem)
+            || self
+                .fg_name
+                .as_deref()
+                .and_then(fg_name_stem)
+                .as_deref()
+                .is_some_and(is_script_runtime_stem);
+        runtime
+            && self
+                .fg_argv
+                .iter()
+                .skip(1)
+                .find(|s| !s.trim().is_empty())
+                .and_then(|p| exe_stem(p))
+                .is_some_and(|stem| is_known_agent_stem(&stem))
     }
 
     pub fn effective_cwd(&self) -> &str {
@@ -440,8 +575,11 @@ impl World {
                 match ev_type {
                     "foreground" => {
                         if data.is_null() {
-                            let changed =
-                                info.fg_cwd.take().is_some() | info.fg_name.take().is_some();
+                            let had_argv = !info.fg_argv.is_empty();
+                            info.fg_argv.clear();
+                            let changed = info.fg_cwd.take().is_some()
+                                | info.fg_name.take().is_some()
+                                | had_argv;
                             if changed {
                                 EventDisposition::AppliedInPlace
                             } else {
@@ -451,6 +589,7 @@ impl World {
                             let new_cwd = data.get("cwd").and_then(Value::as_str).map(String::from);
                             let new_name =
                                 data.get("name").and_then(Value::as_str).map(String::from);
+                            let new_argv = parse_fg_argv(data.get("argv"));
                             let mut changed = false;
                             if info.fg_cwd != new_cwd {
                                 info.fg_cwd = new_cwd;
@@ -458,6 +597,10 @@ impl World {
                             }
                             if info.fg_name != new_name {
                                 info.fg_name = new_name;
+                                changed = true;
+                            }
+                            if info.fg_argv != new_argv {
+                                info.fg_argv = new_argv;
                                 changed = true;
                             }
                             if changed {
@@ -543,7 +686,7 @@ impl World {
                         EventDisposition::NeedsTerminalRefresh
                     }
                     "status" => {
-                        if data.is_null() {
+                        if data.is_null() || data.get("status").is_some_and(Value::is_null) {
                             let changed = info.status_word.take().is_some()
                                 | info.status_app.take().is_some()
                                 | info.status_msg.take().is_some();
@@ -587,6 +730,10 @@ impl World {
                                 } else {
                                     EventDisposition::Unchanged
                                 }
+                            } else if data.as_object().is_some_and(|o| {
+                                o.contains_key("reported") || o.contains_key("records")
+                            }) {
+                                EventDisposition::Unchanged
                             } else {
                                 EventDisposition::NeedsTerminalRefresh
                             }
@@ -1643,5 +1790,205 @@ mod tests {
         assert!(world.reconcile_doc_in_place());
         assert!(world.doc.spaces[0].tabs.is_empty());
         assert!(world.should_exit_when_empty());
+    }
+
+    #[test]
+    fn terminal_info_is_agent_tracks_native_hc_metadata_and_events() {
+        // Parses `foreground.argv` from `terminal.list` JSON (ignoring template so post-exit kept shells aren't pinned)
+        let full = TerminalInfo::from_json(&json!({
+            "address": "t-meta",
+            "state": "live",
+            "cwd": "/work",
+            "reported": true,
+            "template": "review",
+            "turn": 4,
+            "foreground": {
+                "cwd": "/work/sub",
+                "name": "node",
+                "argv": ["node", "/usr/local/bin/claude", "--resume"]
+            },
+            "status": { "state": "working", "app": "claude", "msg": "reading" }
+        }))
+        .unwrap();
+        assert_eq!(
+            full.fg_argv,
+            vec!["node", "/usr/local/bin/claude", "--resume"]
+        );
+        assert!(full.is_agent());
+
+        // Plain shell with OSC title/tab name heuristic traps and whitespace-only status -> false
+        let plain_shell = TerminalInfo {
+            address: "t-shell".to_string(),
+            name: Some("claude-notes".to_string()),
+            title: "~/codes/gemini-proxy".to_string(),
+            fg_name: Some("zsh".to_string()),
+            fg_argv: vec!["zsh".to_string()],
+            status_app: Some("   ".to_string()),
+            ..Default::default()
+        };
+        assert!(!plain_shell.is_agent());
+
+        // Non-agent scripts or paths passed as arguments in `fg_name` / `fg_argv` -> false
+        let fake_proxy = TerminalInfo {
+            address: "t-proxy".to_string(),
+            fg_name: Some("claude-notes".to_string()),
+            fg_argv: vec![
+                "python3".to_string(),
+                "server.py".to_string(),
+                "--app".to_string(),
+                "codex".to_string(),
+            ],
+            ..Default::default()
+        };
+        assert!(!fake_proxy.is_agent());
+        assert!(!fg_name_is_agent("vim ~/notes/codex"));
+        assert!(!fg_name_is_agent("cat /usr/share/doc/agy"));
+        assert!(!fg_name_is_agent("/usr/bin/open ~/Downloads/codex.exe"));
+        assert!(!fg_name_is_agent("/usr/bin/less ~/x/claude.exe"));
+        assert!(!fg_name_is_agent(r"C:\tools\vim.exe C:\notes\codex.exe"));
+
+        // Permissive OSC 7501 reporter (`status_word`/`status_app`) -> true
+        let custom_osc = TerminalInfo {
+            address: "t-osc".to_string(),
+            status_app: Some("aider".to_string()),
+            status_word: Some("working".to_string()),
+            ..Default::default()
+        };
+        assert!(custom_osc.is_agent());
+
+        // Quoted, UNC, or drive-letter Windows paths containing spaces + optional arguments
+        assert!(fg_name_is_agent(r"C:\Program Files\codex.exe"));
+        assert!(fg_name_is_agent(r"C:\Program Files\codex.exe --resume"));
+        assert!(fg_name_is_agent(
+            r"\\server\share\Program Files\codex.exe --resume"
+        ));
+        assert!(fg_name_is_agent(r#""C:\Program Files\codex.exe" --resume"#));
+        assert!(fg_name_is_agent("agy --resume"));
+        let win_spaced = TerminalInfo {
+            address: "t-win-spaced".to_string(),
+            fg_name: Some(r"C:\Program Files\nodejs\node.exe".to_string()),
+            fg_argv: vec![
+                r"C:\Program Files\nodejs\node.exe".to_string(),
+                r"C:\Program Files\Claude\claude.exe".to_string(),
+            ],
+            ..Default::default()
+        };
+        assert!(win_spaced.is_agent());
+
+        // Script runtime wrapping a known coding-agent entrypoint in `fg_argv[1]` -> true
+        let wrapped = TerminalInfo {
+            address: "t-wrap".to_string(),
+            fg_name: Some("node".to_string()),
+            fg_argv: vec![
+                "/usr/bin/node".to_string(),
+                "/usr/local/bin/claude".to_string(),
+                "--resume".to_string(),
+            ],
+            ..Default::default()
+        };
+        assert!(wrapped.is_agent());
+
+        // `apply_core_event` updates `fg_argv` in-place, and when agent exits back to shell
+        // (`status` cleared -> null even with `turn > 0`), `is_agent()` flips to false.
+        let mut world = World::default();
+        world.terminals.insert(
+            "t1".to_string(),
+            TerminalInfo {
+                address: "t1".to_string(),
+                state: "live".to_string(),
+                turn: 3,
+                ..Default::default()
+            },
+        );
+        // `turn > 0` alone without active status or agent foreground -> false
+        assert!(!world.terminals["t1"].is_agent());
+
+        let status_active = json!({
+            "params": {
+                "type": "status",
+                "terminal": "t1",
+                "data": { "state": "working", "app": "antigravity" }
+            }
+        });
+        assert_eq!(
+            world.apply_core_event(&status_active),
+            EventDisposition::AppliedInPlace
+        );
+        assert!(world.terminals["t1"].is_agent());
+
+        // Foreground becomes script-wrapped claude
+        let fg_wrapped = json!({
+            "params": {
+                "type": "foreground",
+                "terminal": "t1",
+                "data": { "cwd": "/work", "name": "node", "argv": ["node", "/usr/local/bin/claude", "--resume"] }
+            }
+        });
+        assert_eq!(
+            world.apply_core_event(&fg_wrapped),
+            EventDisposition::AppliedInPlace
+        );
+        assert_eq!(
+            world.terminals["t1"].fg_argv,
+            vec!["node", "/usr/local/bin/claude", "--resume"]
+        );
+
+        // Agent exits via `hc` envelope (`{"status": null, "records": ..., "reported": true}`)
+        // while `turn > 0`; foreground returns to `zsh` -> `AppliedInPlace` and `is_agent() == false`.
+        let status_cleared = json!({
+            "params": {
+                "type": "status",
+                "terminal": "t1",
+                "data": { "status": null, "records": {}, "reported": true }
+            }
+        });
+        assert_eq!(
+            world.apply_core_event(&status_cleared),
+            EventDisposition::AppliedInPlace
+        );
+
+        // Metadata-only status envelope (only `reported` / `records`, no `status` fields) -> `Unchanged`
+        let status_meta_only = json!({
+            "params": {
+                "type": "status",
+                "terminal": "t1",
+                "data": { "records": {}, "reported": true }
+            }
+        });
+        assert_eq!(
+            world.apply_core_event(&status_meta_only),
+            EventDisposition::Unchanged
+        );
+
+        let fg_shell = json!({
+            "params": { "type": "foreground", "terminal": "t1", "data": { "cwd": "/work", "name": "zsh", "argv": ["zsh"] } }
+        });
+        assert_eq!(
+            world.apply_core_event(&fg_shell),
+            EventDisposition::AppliedInPlace
+        );
+        assert!(!world.terminals["t1"].is_agent());
+
+        // Also test bare `data: null` status clearing in-place
+        world.terminals.get_mut("t1").unwrap().status_app = Some("codex".to_string());
+        assert!(world.terminals["t1"].is_agent());
+        let status_bare_null = json!({
+            "params": { "type": "status", "terminal": "t1", "data": null }
+        });
+        assert_eq!(
+            world.apply_core_event(&status_bare_null),
+            EventDisposition::AppliedInPlace
+        );
+        assert!(!world.terminals["t1"].is_agent());
+
+        // Foreground cleared (`null`) clears `fg_argv` too
+        let fg_null = json!({
+            "params": { "type": "foreground", "terminal": "t1", "data": null }
+        });
+        assert_eq!(
+            world.apply_core_event(&fg_null),
+            EventDisposition::AppliedInPlace
+        );
+        assert!(world.terminals["t1"].fg_argv.is_empty());
     }
 }

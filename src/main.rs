@@ -18,12 +18,13 @@ use crate::model::{AgentState, EventDisposition, World};
 #[cfg(test)]
 use crate::ui::capture_eink_screen_snapshot;
 use crate::ui::{
-    capture_eink_screen_snapshot_with_color, collect_fuzzy_items, collect_overview_items,
-    compute_terminal_rect, find_hit_target, is_in_rect, is_on_dpad_disc,
+    capture_eink_screen_snapshot_with_color_and_fence, collect_fuzzy_items, collect_overview_items,
+    compute_terminal_rect, find_hit_target, is_active_tab_agent, is_in_rect, is_on_dpad_disc,
     overview_selection_after_query_change, overview_selection_for_index,
-    render_ui_full_with_eink_color, resolve_dpad_disc_rect, resolve_fuzzy_selection,
-    resolve_mod_cross_rect, resolve_overview_selection, EinkScreenSnapshot, HitRegion, HitTarget,
-    Modal, OverviewItem, OverviewSelection, PromptKind, TerminalSelection,
+    render_ui_full_with_eink_color_and_fence, resolve_dpad_disc_rect, resolve_fuzzy_selection,
+    resolve_mod_cross_rect, resolve_overview_selection, scan_viewport_initial_code_fence,
+    EinkScreenSnapshot, HitRegion, HitTarget, Modal, OverviewItem, OverviewSelection, PromptKind,
+    TerminalSelection,
 };
 use crate::usage::UsageTracker;
 use anyhow::Result;
@@ -460,7 +461,10 @@ struct AttachedTerminal {
     scroll_top: u16,
     main_scroll_top: u16,
     vt_seq: u64,
+    cached_viewport_fence: Option<(u64, usize, u16, u16, bool)>,
 }
+
+const VIEWPORT_FENCE_LOOKBACK: usize = 200;
 
 fn non_zero_u16(v: u16) -> std::num::NonZeroU16 {
     std::num::NonZeroU16::new(v).unwrap_or(std::num::NonZeroU16::MIN)
@@ -485,6 +489,7 @@ impl AttachedTerminal {
             scroll_top: 0,
             main_scroll_top: 0,
             vt_seq: 0,
+            cached_viewport_fence: None,
         }
     }
 
@@ -494,7 +499,21 @@ impl AttachedTerminal {
         self.scroll_top = 0;
         self.main_scroll_top = 0;
         self.dropped_wide_at_margin = false;
+        self.cached_viewport_fence = None;
         self.parser.set_size(non_zero_u16(rows), non_zero_u16(cols));
+    }
+
+    fn viewport_initial_code_fence(&mut self, scrollback_offset: usize) -> bool {
+        let key = (self.vt_seq, scrollback_offset, self.cols, self.rows);
+        if let Some((k_seq, k_sb, k_cols, k_rows, cached)) = self.cached_viewport_fence {
+            if (k_seq, k_sb, k_cols, k_rows) == key {
+                return cached;
+            }
+        }
+        let val =
+            scan_viewport_initial_code_fence(self.parser.screen_mut(), VIEWPORT_FENCE_LOOKBACK);
+        self.cached_viewport_fence = Some((key.0, key.1, key.2, key.3, val));
+        val
     }
 
     fn process_vt_bytes(&mut self, payload: &[u8]) {
@@ -3007,11 +3026,13 @@ fn promote_due_pty_dirty_with_color(
         if let Some(att) = active_addr.and_then(|a| attached_map.get_mut(a)) {
             att.parser.screen_mut().set_scrollback(*scrollback_offset);
             *scrollback_offset = att.parser.screen().scrollback();
-            let snap = capture_eink_screen_snapshot_with_color(
+            let initial_in_code_fence = att.viewport_initial_code_fence(*scrollback_offset);
+            let snap = capture_eink_screen_snapshot_with_color_and_fence(
                 att.parser.screen(),
                 term_rect,
                 *scrollback_offset,
                 eink_color,
+                initial_in_code_fence,
             );
             if last_eink_snap
                 .as_ref()
@@ -3027,6 +3048,25 @@ fn promote_due_pty_dirty_with_color(
     }
     *dirty = true;
     eink_pacer.on_promoted_or_drawn();
+}
+
+fn capture_selection_snapshot(
+    att: &AttachedTerminal,
+    compute_fence: bool,
+) -> (vt100::Screen, u64, bool) {
+    let mut scr = att.parser.screen().clone();
+    let sb = scr.scrollback();
+    let initial_fence = if compute_fence {
+        att.cached_viewport_fence
+            .filter(|(seq, cached_sb, cols, rows, _)| {
+                (*seq, *cached_sb, *cols, *rows) == (att.vt_seq, sb, att.cols, att.rows)
+            })
+            .map(|(_, _, _, _, val)| val)
+            .unwrap_or_else(|| scan_viewport_initial_code_fence(&mut scr, VIEWPORT_FENCE_LOOKBACK))
+    } else {
+        false
+    };
+    (scr, att.vt_seq, initial_fence)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3112,6 +3152,7 @@ fn run_app_loop(
     let mut selection: Option<TerminalSelection> = None;
     let mut selection_screen: Option<vt100::Screen> = None;
     let mut selection_vt_seq: Option<u64> = None;
+    let mut selection_initial_fence = false;
     let mut clipboard_buffer = String::new();
     let mut copied_until: Option<Instant> = None;
     let mut pending_sibling_resize_at: Option<Instant> = None;
@@ -3834,9 +3875,17 @@ fn run_app_loop(
                                             if sel.update_drag(term_rect, mev.column, mev.row) {
                                                 if sel.is_non_empty() && selection_screen.is_none()
                                                 {
-                                                    selection_screen = active_att
-                                                        .map(|a| a.parser.screen().clone());
-                                                    selection_vt_seq = active_att.map(|a| a.vt_seq);
+                                                    if let Some(att) = active_att {
+                                                        let (scr, vt_seq, init_fence) =
+                                                            capture_selection_snapshot(
+                                                                att,
+                                                                eink_mode
+                                                                    || is_active_tab_agent(world),
+                                                            );
+                                                        selection_screen = Some(scr);
+                                                        selection_vt_seq = Some(vt_seq);
+                                                        selection_initial_fence = init_fence;
+                                                    }
                                                 }
                                                 dirty = true;
                                             }
@@ -3846,9 +3895,16 @@ fn run_app_loop(
                                 } else if let Some(ref mut sel) = selection {
                                     if sel.update_drag(term_rect, mev.column, mev.row) {
                                         if sel.is_non_empty() && selection_screen.is_none() {
-                                            selection_screen =
-                                                active_att.map(|a| a.parser.screen().clone());
-                                            selection_vt_seq = active_att.map(|a| a.vt_seq);
+                                            if let Some(att) = active_att {
+                                                let (scr, vt_seq, init_fence) =
+                                                    capture_selection_snapshot(
+                                                        att,
+                                                        eink_mode || is_active_tab_agent(world),
+                                                    );
+                                                selection_screen = Some(scr);
+                                                selection_vt_seq = Some(vt_seq);
+                                                selection_initial_fence = init_fence;
+                                            }
                                         }
                                         dirty = true;
                                     }
@@ -4543,14 +4599,34 @@ fn run_app_loop(
         }
         prev_active_agent_state = cur_agent;
 
+        if selection_screen.is_none() {
+            selection_initial_fence = false;
+        }
+
         if dirty {
-            let active_att = active_addr.as_ref().and_then(|a| attached_map.get(a));
-            let scr_ref = if selection.as_ref().is_some_and(|s| s.active) {
-                selection_screen
-                    .as_ref()
-                    .or_else(|| active_att.map(|a| a.parser.screen()))
+            let use_selection_screen =
+                selection.as_ref().is_some_and(|s| s.active) && selection_screen.is_some();
+            let initial_in_code_fence = if (eink_mode || is_active_tab_agent(world))
+                && !matches!(modal, Modal::TabOverview { .. })
+            {
+                if use_selection_screen {
+                    selection_initial_fence
+                } else if let Some(att) = active_addr.as_ref().and_then(|a| attached_map.get_mut(a))
+                {
+                    att.viewport_initial_code_fence(scrollback_offset)
+                } else {
+                    false
+                }
             } else {
-                active_att.map(|a| a.parser.screen())
+                false
+            };
+            let scr_ref = if use_selection_screen {
+                selection_screen.as_ref()
+            } else {
+                active_addr
+                    .as_ref()
+                    .and_then(|a| attached_map.get(a))
+                    .map(|a| a.parser.screen())
             };
             let copied_flash = copied_until.is_some();
             let mod_dragging = dpad_drag.as_ref().is_some_and(|d| d.is_mod && d.moved);
@@ -4560,8 +4636,9 @@ fn run_app_loop(
                 terminal.clear()?;
                 force_clear = false;
             }
+            let mut geom_eink_snapshot = None;
             terminal.draw(|f| {
-                let geom = render_ui_full_with_eink_color(
+                let geom = render_ui_full_with_eink_color_and_fence(
                     f,
                     world,
                     scr_ref,
@@ -4582,6 +4659,7 @@ fn run_app_loop(
                     focused_quota.as_ref(),
                     eink_mode,
                     eink_color,
+                    initial_in_code_fence,
                 );
                 last_hits = geom.hits;
                 last_mod_rect = geom.mod_rect;
@@ -4589,6 +4667,7 @@ fn run_app_loop(
                 last_space_slop_rect = geom.space_slop_rect;
                 last_page_up_rect = geom.page_up_rect;
                 last_page_down_rect = geom.page_down_rect;
+                geom_eink_snapshot = geom.eink_snapshot;
             })?;
             if pending_eink_osc {
                 if eink_mode {
@@ -4604,23 +4683,8 @@ fn run_app_loop(
             last_draw_at = Some(Instant::now());
             prev_drawn_addr = active_addr.clone();
             prev_modal_open = !matches!(modal, Modal::None);
-            last_eink_snap = if eink_mode && matches!(modal, Modal::None) && selection.is_none() {
-                active_addr.as_ref().and_then(|addr| {
-                    attached_map.get(addr).map(|att| {
-                        (
-                            addr.clone(),
-                            capture_eink_screen_snapshot_with_color(
-                                att.parser.screen(),
-                                term_rect,
-                                scrollback_offset,
-                                eink_color,
-                            ),
-                        )
-                    })
-                })
-            } else {
-                None
-            };
+            last_eink_snap = geom_eink_snapshot
+                .and_then(|snap| active_addr.as_ref().map(|addr| (addr.clone(), snap)));
             if !first_frame_drawn {
                 first_frame_drawn = true;
                 need_sync_terminals = true;
@@ -8741,6 +8805,96 @@ mod tests {
         assert!(
             reader_pos > end_sync_pos,
             "reader-open OSC must be emitted strictly after EndSynchronizedUpdate"
+        );
+    }
+
+    #[test]
+    fn attached_terminal_caches_viewport_fence_across_seq_scrollback_and_resize() {
+        let mut att = AttachedTerminal::new(1, 40, 4);
+        att.process_vt_bytes(
+            b"```rust\r\nline1\r\nline2\r\nline3\r\n\xe2\x97\x8b Thought for 1s\r\n",
+        );
+        assert!(att.viewport_initial_code_fence(0));
+        assert_eq!(
+            att.cached_viewport_fence,
+            Some((att.vt_seq, 0, 40, 4, true))
+        );
+
+        // Calling again with same key uses cache (even if cached entry were inspected directly)
+        let saved_seq = att.vt_seq;
+        assert!(att.viewport_initial_code_fence(0));
+        assert_eq!(att.vt_seq, saved_seq);
+
+        // Capture selection snapshot preserves `initial_in_code_fence = true`
+        let (_scr, seq, init_fence) = capture_selection_snapshot(&att, true);
+        assert_eq!(seq, saved_seq);
+        assert!(init_fence);
+
+        // Scrolling back to show the opening ``` line changes cache key and returns false
+        att.parser.screen_mut().set_scrollback(2);
+        assert!(!att.viewport_initial_code_fence(2));
+        assert_eq!(
+            att.cached_viewport_fence,
+            Some((saved_seq, 2, 40, 4, false))
+        );
+
+        // Closing the fence and scrolling it above the viewport via new PTY bytes increments `vt_seq`
+        // and updates cached result to false
+        att.parser.screen_mut().set_scrollback(0);
+        att.process_vt_bytes(b"```\r\nafter1\r\nafter2\r\nafter3\r\n");
+        assert!(!att.viewport_initial_code_fence(0));
+        assert_ne!(att.vt_seq, saved_seq);
+
+        // Resize clears `cached_viewport_fence`
+        att.resize(50, 5);
+        assert_eq!(att.cached_viewport_fence, None);
+
+        // E-Ink snapshot pacing detects pure fence flip (`initial_in_code_fence` false -> true)
+        // even when visible viewport cells are identical
+        let term_rect = Rect::new(0, 1, 40, 4);
+        let mut att2 = AttachedTerminal::new(2, term_rect.width, term_rect.height);
+        att2.process_vt_bytes(
+            b"```rust\r\n```\r\nline1\r\nline2\r\nline3\r\n\xe2\x97\x8b Thought for 1s",
+        );
+        assert!(!att2.viewport_initial_code_fence(0));
+        let snap_outside = capture_eink_screen_snapshot_with_color_and_fence(
+            att2.parser.screen(),
+            term_rect,
+            0,
+            false,
+            false,
+        );
+        let mut att3 = AttachedTerminal::new(3, term_rect.width, term_rect.height);
+        att3.process_vt_bytes(b"```rust\r\nline1\r\nline2\r\nline3\r\n\xe2\x97\x8b Thought for 1s");
+        let mut map = BTreeMap::new();
+        map.insert("t1".to_string(), att3);
+        let now = Instant::now();
+        let mut pty_dirty = true;
+        let mut pacer = EinkInputPacer::default();
+        let mut dirty = false;
+        let mut last_draw_at = Some(now - Duration::from_secs(1));
+        let mut sb = 0usize;
+        let last_snap = Some(("t1".to_string(), snap_outside));
+        promote_due_pty_dirty_with_color(
+            true,
+            false,
+            Duration::from_millis(250),
+            now,
+            &mut pty_dirty,
+            &mut pacer,
+            &mut dirty,
+            &mut last_draw_at,
+            &last_snap,
+            Some("t1"),
+            &mut map,
+            term_rect,
+            &mut sb,
+            &Modal::None,
+            &None,
+        );
+        assert!(
+            dirty,
+            "fence state flip must promote dirty instead of zero-diff elision"
         );
     }
 }
