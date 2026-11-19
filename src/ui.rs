@@ -340,13 +340,19 @@ fn fuzzy_subsequence(hay: &str, needle: &str) -> bool {
 }
 
 fn normal_state_style(state: AgentState) -> Style {
-    let base = Style::default().bg(Color::Reset);
+    let base = Style::default()
+        .bg(Color::Reset)
+        .remove_modifier(Modifier::BOLD | Modifier::DIM);
     match state {
-        AgentState::Blocked => base.fg(Color::Red).add_modifier(Modifier::BOLD),
+        AgentState::Blocked => base.fg(Color::Red),
         AgentState::Working => base.fg(Color::Yellow),
-        AgentState::Done => base.fg(Color::Green).add_modifier(Modifier::BOLD),
+        AgentState::Done => base.fg(Color::Green),
         AgentState::Idle => base.fg(Color::Cyan),
-        AgentState::None => base.fg(Color::Reset).add_modifier(Modifier::DIM),
+        AgentState::None => Style::default()
+            .bg(Color::Reset)
+            .fg(Color::Reset)
+            .remove_modifier(Modifier::BOLD)
+            .add_modifier(Modifier::DIM),
     }
 }
 
@@ -1120,16 +1126,19 @@ fn tab_pill_style(st: AgentState, is_active: bool, eink_mode: bool) -> Style {
             }
         };
     }
-    let base = normal_state_style(st);
     if is_active {
-        let active = base.remove_modifier(Modifier::DIM);
-        if matches!(st, AgentState::Working) {
-            active
+        let ul_col = if matches!(st, AgentState::Blocked) {
+            Color::Red
         } else {
-            active.add_modifier(Modifier::BOLD)
-        }
+            Color::Cyan
+        };
+        Style::default()
+            .bg(Color::Reset)
+            .fg(Color::Reset)
+            .add_modifier(Modifier::BOLD)
+            .underline_color(ul_col)
     } else {
-        base
+        normal_state_style(st)
     }
 }
 
@@ -1372,10 +1381,7 @@ fn draw_touchbar_pill(
         let gloss_style = if eink_mode {
             Style::default().bg(EINK_PAPER).fg(EINK_INK)
         } else if emphasized {
-            Style::default()
-                .bg(Color::Reset)
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
+            Style::default().bg(Color::Reset).fg(Color::Cyan)
         } else {
             Style::default()
                 .bg(Color::Reset)
@@ -1389,6 +1395,8 @@ fn draw_touchbar_pill(
         let pill_style = if emphasized {
             let ul_col = if eink_mode {
                 EINK_INK
+            } else if let Some(ul) = style.underline_color.filter(|&c| c != Color::Reset) {
+                ul
             } else if style.fg == Some(Color::Red) {
                 Color::Red
             } else {
@@ -1465,10 +1473,7 @@ fn render_top_tabbar(
                 .fg(EINK_INK)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default()
-                .bg(Color::Reset)
-                .fg(Color::Red)
-                .add_modifier(Modifier::BOLD)
+            Style::default().bg(Color::Reset).fg(Color::Red)
         };
         draw_touchbar_pill(buf, x, rect, detach_lbl, dstyle, false, eink_mode);
         hits.push(HitRegion {
@@ -1543,14 +1548,11 @@ fn render_top_tabbar(
                 .fg(EINK_INK)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default()
-                .bg(Color::Reset)
-                .fg(if space_menu_open {
-                    Color::Cyan
-                } else {
-                    Color::Magenta
-                })
-                .add_modifier(Modifier::BOLD)
+            Style::default().bg(Color::Reset).fg(if space_menu_open {
+                Color::Cyan
+            } else {
+                Color::Magenta
+            })
         };
         draw_touchbar_pill(buf, x, rect, &space_lbl, style, space_menu_open, eink_mode);
         if eink_mode
@@ -1626,10 +1628,7 @@ fn render_top_tabbar(
                 .fg(EINK_INK)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default()
-                .bg(Color::Reset)
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
+            Style::default().bg(Color::Reset).fg(Color::Cyan)
         };
 
         let mut drew_any = false;
@@ -1746,13 +1745,11 @@ fn render_top_tabbar(
         } else if tab_overview_open {
             Style::default()
                 .bg(Color::Reset)
-                .fg(Color::Cyan)
+                .fg(Color::Reset)
                 .add_modifier(Modifier::BOLD)
+                .underline_color(Color::Cyan)
         } else {
-            Style::default()
-                .bg(Color::Reset)
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD)
+            Style::default().bg(Color::Reset).fg(Color::Green)
         };
         draw_touchbar_pill(buf, x, rect, plus_lbl, pstyle, tab_overview_open, eink_mode);
         hits.push(HitRegion {
@@ -1932,13 +1929,13 @@ fn render_bottom_status_bar(
         } else {
             format!(" {} ", quota.agent.display_name())
         };
-        let badge_style = if !eink_mode && badge_fg == Color::Yellow {
-            Style::default().bg(badge_bg).fg(badge_fg)
-        } else {
+        let badge_style = if eink_mode {
             Style::default()
                 .bg(badge_bg)
                 .fg(badge_fg)
                 .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().bg(badge_bg).fg(badge_fg)
         };
         push_clamped_str(buf, &mut x, rect.y, avail_end, &badge_lbl, badge_style);
 
@@ -2044,15 +2041,8 @@ fn render_bottom_status_bar(
                     }
                 } else {
                     let u_col = quota_remaining_color(m.remaining_percent);
-                    let pct_st = if u_col == Color::Yellow {
-                        Style::default().bg(Color::Reset).fg(u_col)
-                    } else {
-                        Style::default()
-                            .bg(Color::Reset)
-                            .fg(u_col)
-                            .add_modifier(Modifier::BOLD)
-                    };
-                    (Style::default().bg(Color::Reset).fg(u_col), pct_st, "")
+                    let pct_st = Style::default().bg(Color::Reset).fg(u_col);
+                    (pct_st, pct_st, "")
                 };
 
                 if bar_w > 0 {
@@ -2100,10 +2090,7 @@ fn render_bottom_status_bar(
                         .fg(EINK_PAPER)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default()
-                        .bg(Color::Reset)
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD)
+                    Style::default().bg(Color::Reset).fg(Color::Green)
                 },
             );
             rx += cw;
@@ -2125,7 +2112,7 @@ fn render_bottom_status_bar(
                     Style::default()
                         .bg(Color::Reset)
                         .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                        .add_modifier(Modifier::UNDERLINED)
                 },
             );
             hits.push(HitRegion {
@@ -2218,15 +2205,15 @@ fn render_floating_mod_cross(
                 )
             } else {
                 let border = if dragging {
-                    (Color::Cyan, Modifier::BOLD)
+                    (Color::Cyan, Modifier::empty())
                 } else {
-                    (Color::Blue, Modifier::empty())
+                    (Color::Magenta, Modifier::empty())
                 };
                 let mod_st = |active: bool| {
                     if active {
-                        (Color::Cyan, Modifier::BOLD | Modifier::UNDERLINED)
+                        (Color::Green, Modifier::UNDERLINED)
                     } else {
-                        (Color::Magenta, Modifier::BOLD)
+                        (Color::Reset, Modifier::empty())
                     }
                 };
                 (
@@ -2265,7 +2252,11 @@ fn render_floating_mod_cross(
                     (3, 3) => Some(("l", ctl_style.0, ctl_style.1)),
                     (3, 6) => Some(("^", pfx_style.0, pfx_style.1)),
                     (3, 7) => Some(("B", pfx_style.0, pfx_style.1)),
-                    (3, 8) => Some((" ", pfx_style.0, Modifier::empty())),
+                    (3, 8) => Some((
+                        " ",
+                        if eink_mode { eink_fg } else { Color::Reset },
+                        Modifier::empty(),
+                    )),
                     (3, 11) => Some(("A", alt_style.0, alt_style.1)),
                     (3, 12) => Some(("l", alt_style.0, alt_style.1)),
                     (3, 13) => Some(("t", alt_style.0, alt_style.1)),
@@ -2427,15 +2418,29 @@ fn render_floating_dpad(
             } else {
                 (Color::Reset, EINK_INK)
             };
-            let (b_fg, b_mod, a_fg, p_fg) = if eink_mode {
-                (eink_fg, Modifier::empty(), eink_fg, eink_fg)
+            let (b_fg, b_mod, a_fg, a_mod, p_fg, p_mod) = if eink_mode {
+                (
+                    eink_fg,
+                    Modifier::empty(),
+                    eink_fg,
+                    Modifier::BOLD,
+                    eink_fg,
+                    Modifier::BOLD,
+                )
             } else {
                 let border = if dragging {
-                    (Color::Cyan, Modifier::BOLD)
+                    (Color::Cyan, Modifier::empty())
                 } else {
-                    (Color::Blue, Modifier::empty())
+                    (Color::Magenta, Modifier::empty())
                 };
-                (border.0, border.1, Color::Cyan, Color::Green)
+                (
+                    border.0,
+                    border.1,
+                    Color::Green,
+                    Modifier::empty(),
+                    Color::Green,
+                    Modifier::UNDERLINED,
+                )
             };
 
             let glyph: Option<(&str, Color, Modifier)> = if full_15x7 {
@@ -2446,7 +2451,7 @@ fn render_floating_dpad(
                     (0, 9) => Some(("╮", b_fg, b_mod)),
                     // Row 1: Up label
                     (1, 5) | (1, 9) => Some(("│", b_fg, b_mod)),
-                    (1, 7) => Some(("↑", a_fg, Modifier::BOLD)),
+                    (1, 7) => Some(("↑", a_fg, a_mod)),
                     // Row 2: top of Left / Center / Right
                     (2, 0) | (2, 10) => Some(("╭", b_fg, b_mod)),
                     (2, 4) | (2, 14) => Some(("╮", b_fg, b_mod)),
@@ -2457,9 +2462,9 @@ fn render_floating_dpad(
                     (3, 0) | (3, 4) | (3, 5) | (3, 9) | (3, 10) | (3, 14) => {
                         Some(("│", b_fg, b_mod))
                     }
-                    (3, 2) => Some(("←", a_fg, Modifier::BOLD)),
-                    (3, 7) => Some(("⎘", p_fg, Modifier::BOLD)),
-                    (3, 12) => Some(("→", a_fg, Modifier::BOLD)),
+                    (3, 2) => Some(("←", a_fg, a_mod)),
+                    (3, 7) => Some(("⎘", p_fg, p_mod)),
+                    (3, 12) => Some(("→", a_fg, a_mod)),
                     // Row 4: bottom of Left / Center / Right
                     (4, 0) | (4, 10) => Some(("╰", b_fg, b_mod)),
                     (4, 4) | (4, 14) => Some(("╯", b_fg, b_mod)),
@@ -2468,7 +2473,7 @@ fn render_floating_dpad(
                     (4, 1..=3) | (4, 6..=8) | (4, 11..=13) => Some(("─", b_fg, b_mod)),
                     // Row 5: Down label
                     (5, 5) | (5, 9) => Some(("│", b_fg, b_mod)),
-                    (5, 7) => Some(("↓", a_fg, Modifier::BOLD)),
+                    (5, 7) => Some(("↓", a_fg, a_mod)),
                     // Row 6: bottom of Down box
                     (6, 5) => Some(("╰", b_fg, b_mod)),
                     (6, 6..=8) => Some(("─", b_fg, b_mod)),
@@ -2476,15 +2481,15 @@ fn render_floating_dpad(
                     _ => None,
                 }
             } else if dy == up_label_y && dx == center_label_x {
-                Some(("↑", a_fg, Modifier::BOLD))
+                Some(("↑", a_fg, a_mod))
             } else if dy == down_label_y && dx == center_label_x {
-                Some(("↓", a_fg, Modifier::BOLD))
+                Some(("↓", a_fg, a_mod))
             } else if dy == mid_label_y && dx == left_label_x {
-                Some(("←", a_fg, Modifier::BOLD))
+                Some(("←", a_fg, a_mod))
             } else if dy == mid_label_y && dx == center_label_x {
-                Some(("⎘", p_fg, Modifier::BOLD))
+                Some(("⎘", p_fg, p_mod))
             } else if dy == mid_label_y && dx == right_label_x {
-                Some(("→", a_fg, Modifier::BOLD))
+                Some(("→", a_fg, a_mod))
             } else {
                 None
             };
@@ -2957,10 +2962,20 @@ fn render_space_menu_modal(
             buf.set_string(inner.x, y + 1, pad_to_width(&row2, w), r2_style);
         }
         if is_active {
-            let accent = if eink_mode { EINK_PAPER } else { Color::Cyan };
-            buf.set_string(inner.x, y, "▍", r1_style.fg(accent));
-            if use_two_row {
-                buf.set_string(inner.x, y + 1, "▍", r2_style.fg(accent));
+            if eink_mode {
+                buf.set_string(inner.x, y, "▍", r1_style.fg(EINK_PAPER));
+                if use_two_row {
+                    buf.set_string(inner.x, y + 1, "▍", r2_style.fg(EINK_PAPER));
+                }
+            } else {
+                let bar_style = Style::default()
+                    .bg(Color::Reset)
+                    .fg(Color::Cyan)
+                    .remove_modifier(Modifier::BOLD | Modifier::DIM);
+                buf.set_string(inner.x, y, "▍", bar_style);
+                if use_two_row {
+                    buf.set_string(inner.x, y + 1, "▍", bar_style);
+                }
             }
         }
         if inner.x + dot_x < inner.x + inner.width {
@@ -3012,7 +3027,7 @@ fn render_space_menu_modal(
             Style::default()
                 .bg(Color::Reset)
                 .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                .add_modifier(Modifier::UNDERLINED)
         },
     );
     hits.push(HitRegion {
@@ -3092,10 +3107,14 @@ fn render_tab_overview_page(
             col_x,
             content_y,
             pad_to_width(&left_hdr, cw),
-            Style::default()
-                .bg(page_bg)
-                .fg(if eink_mode { EINK_INK } else { Color::Magenta })
-                .add_modifier(Modifier::BOLD),
+            if eink_mode {
+                Style::default()
+                    .bg(page_bg)
+                    .fg(EINK_INK)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().bg(Color::Reset).fg(Color::Magenta)
+            },
         );
         if left_hdr.width() + 2 + right_hdr.width() <= cw {
             let rx = col_x + col_w - right_hdr.width() as u16;
@@ -3128,10 +3147,14 @@ fn render_tab_overview_page(
                 col_x,
                 filter_y,
                 &prompt_prefix,
-                Style::default()
-                    .bg(input_bg)
-                    .fg(if eink_mode { EINK_INK } else { Color::Cyan })
-                    .add_modifier(Modifier::BOLD),
+                if eink_mode {
+                    Style::default()
+                        .bg(input_bg)
+                        .fg(EINK_INK)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().bg(input_bg).fg(Color::Cyan)
+                },
             );
         }
         let rem_w = cw.saturating_sub(pw as usize);
@@ -3259,19 +3282,14 @@ fn render_tab_overview_page(
         match item {
             OverviewItem::NewTab { cwd } => {
                 let r1_title = format!(" {marker} + New Tab");
-                let r1_fg = if eink_mode {
-                    if is_sel {
-                        EINK_PAPER
-                    } else {
-                        EINK_INK
-                    }
+                let r1_style = if eink_mode {
+                    Style::default()
+                        .bg(row_bg)
+                        .fg(if is_sel { EINK_PAPER } else { EINK_INK })
+                        .add_modifier(Modifier::BOLD)
                 } else {
-                    Color::Green
+                    Style::default().bg(Color::Reset).fg(Color::Green)
                 };
-                let r1_style = Style::default()
-                    .bg(row_bg)
-                    .fg(r1_fg)
-                    .add_modifier(Modifier::BOLD);
                 let r2_style = if eink_mode {
                     Style::default()
                         .bg(row_bg)
@@ -3288,17 +3306,23 @@ fn render_tab_overview_page(
                     let hx = col_x + col_w - hint.width() as u16;
                     buf.set_string(hx, y, hint, r2_style);
                 }
+                let bar_style = if eink_mode {
+                    r1_style.fg(EINK_PAPER)
+                } else {
+                    Style::default()
+                        .bg(Color::Reset)
+                        .fg(Color::Cyan)
+                        .remove_modifier(Modifier::BOLD | Modifier::DIM)
+                };
                 if is_sel {
-                    let bar_fg = if eink_mode { EINK_PAPER } else { Color::Cyan };
-                    buf.set_string(col_x, y, "▍", r1_style.fg(bar_fg));
+                    buf.set_string(col_x, y, "▍", bar_style);
                 }
                 if use_two_row {
                     let short_cwd = shorten_home_path(cwd);
                     let r2_text = format!("     new…  {short_cwd}");
                     buf.set_string(col_x, y + 1, pad_to_width(&r2_text, cw), r2_style);
                     if is_sel {
-                        let bar_fg = if eink_mode { EINK_PAPER } else { Color::Cyan };
-                        buf.set_string(col_x, y + 1, "▍", r2_style.fg(bar_fg));
+                        buf.set_string(col_x, y + 1, "▍", bar_style);
                     }
                 }
                 hits.push(HitRegion {
@@ -3370,7 +3394,6 @@ fn render_tab_overview_page(
                 } else {
                     normal_state_style(*state)
                 };
-                let accent_fg = if eink_mode { EINK_PAPER } else { Color::Cyan };
                 buf.set_string(col_x, y, pad_to_width(&r1_text, cw), r1_style);
                 if sym_x + (sym.width() as u16) <= col_w {
                     buf.set_string(col_x + sym_x, y, sym, st_style);
@@ -3392,8 +3415,16 @@ fn render_tab_overview_page(
                         buf.set_string(bx, y, &badge, badge_style);
                     }
                 }
+                let bar_style = if eink_mode {
+                    r1_style.fg(EINK_PAPER)
+                } else {
+                    Style::default()
+                        .bg(Color::Reset)
+                        .fg(Color::Cyan)
+                        .remove_modifier(Modifier::BOLD | Modifier::DIM)
+                };
                 if is_sel {
-                    buf.set_string(col_x, y, "▍", r1_style.fg(accent_fg));
+                    buf.set_string(col_x, y, "▍", bar_style);
                 }
                 if use_two_row {
                     let short_cwd = shorten_home_path(cwd);
@@ -3404,7 +3435,7 @@ fn render_tab_overview_page(
                     };
                     buf.set_string(col_x, y + 1, pad_to_width(&r2_text, cw), r2_style);
                     if is_sel {
-                        buf.set_string(col_x, y + 1, "▍", r2_style.fg(accent_fg));
+                        buf.set_string(col_x, y + 1, "▍", bar_style);
                     }
                 }
                 hits.push(HitRegion {
@@ -5247,10 +5278,7 @@ fn draw_modal_close_button(
                     .fg(EINK_INK)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default()
-                    .bg(Color::Reset)
-                    .fg(Color::Red)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().bg(Color::Reset).fg(Color::Red)
             },
         );
         hits.push(HitRegion {
@@ -5429,9 +5457,11 @@ fn render_help_modal(
 
     let mut lines = vec![Line::from(Span::styled(
         "  Touch Quick Actions (Tap to execute):",
-        Style::default()
-            .fg(if eink_mode { EINK_INK } else { Color::Cyan })
-            .add_modifier(Modifier::BOLD),
+        if eink_mode {
+            Style::default().fg(EINK_INK).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Cyan)
+        },
     ))];
     for _ in 0..=btn_rows_count {
         lines.push(Line::from(""));
@@ -5439,9 +5469,11 @@ fn render_help_modal(
     lines.extend([
         Line::from(Span::styled(
             "  Keyboard & Touch Shortcuts:",
-            Style::default()
-                .fg(if eink_mode { EINK_INK } else { Color::Magenta })
-                .add_modifier(Modifier::BOLD),
+            if eink_mode {
+                Style::default().fg(EINK_INK).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Magenta)
+            },
         )),
         Line::from("  Top Bar [ ⏏ ]            Detach hct (keep sessions running) (^b q)"),
         Line::from("  Top Bar [ ▾ Space ]      Open Space popover menu / + New Space"),
@@ -5510,7 +5542,7 @@ fn render_help_modal(
             Style::default()
                 .bg(Color::Reset)
                 .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                .add_modifier(Modifier::UNDERLINED)
         };
         buf.set_string(bx, by, lbl, bstyle);
         hits.push(HitRegion {
@@ -5584,7 +5616,7 @@ fn render_confirm_close_modal(
                     Style::default()
                         .bg(Color::Reset)
                         .fg(Color::Red)
-                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                        .add_modifier(Modifier::UNDERLINED)
                 },
             );
             hits.push(HitRegion {
@@ -5689,7 +5721,7 @@ fn render_prompt_modal(
                     Style::default()
                         .bg(Color::Reset)
                         .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                        .add_modifier(Modifier::UNDERLINED)
                 },
             );
             hits.push(HitRegion {
@@ -5777,10 +5809,7 @@ fn render_fuzzy_modal(
             .fg(EINK_INK)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default()
-            .bg(Color::Reset)
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
+        Style::default().bg(Color::Reset).fg(Color::Cyan)
     });
     f.render_widget(prompt, chunks[0]);
 
@@ -5826,16 +5855,12 @@ fn render_fuzzy_modal(
             } else {
                 let base_row = Style::default().bg(Color::Reset).fg(Color::Reset);
                 let marker_style = if is_sel {
-                    base_row.fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    base_row.fg(Color::Cyan)
                 } else {
                     base_row
                 };
                 let sym_style = normal_state_style(it.state);
-                let space_style = if is_sel {
-                    base_row.fg(Color::Cyan).add_modifier(Modifier::BOLD)
-                } else {
-                    base_row.fg(Color::Cyan)
-                };
+                let space_style = base_row.fg(Color::Cyan);
                 let tab_style = if is_sel {
                     base_row.add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
                 } else {
@@ -7204,7 +7229,7 @@ mod tests {
         let plus_byte = row0.find(" + ").expect("expected trailing [ + ] pill");
         let plus_x = row0[..plus_byte].chars().count() as u16;
         assert_eq!(buf[(plus_x, 0)].bg, Color::Reset);
-        assert_eq!(buf[(plus_x, 0)].fg, Color::Cyan);
+        assert_eq!(buf[(plus_x, 0)].fg, Color::Reset);
         assert_eq!(buf[(plus_x, 0)].underline_color, Color::Cyan);
         assert!(buf[(plus_x, 0)]
             .modifier
@@ -9115,6 +9140,17 @@ mod tests {
             );
         }
 
+        fn assert_no_bold_on_ansi_color(cell: &ratatui::buffer::Cell, ctx: &str) {
+            if cell.fg != Color::Reset {
+                assert!(
+                    !cell.modifier.contains(Modifier::BOLD),
+                    "{ctx} ({:?}, fg={:?}) must not combine BOLD with chromatic ANSI color",
+                    cell.symbol(),
+                    cell.fg
+                );
+            }
+        }
+
         let mut world = World::default();
         world.doc.spaces.push(SharedSpace {
             id: "space-1".to_string(),
@@ -9253,15 +9289,18 @@ mod tests {
                 buf[(x, 0)].underline_color,
                 &format!("top bar col {x} ul"),
             );
+            assert_no_bold_on_ansi_color(&buf[(x, 0)], &format!("top bar col {x}"));
             assert_eq!(
                 buf[(x, 23)].bg,
                 Color::Reset,
                 "bottom bar col {x} bg must be Reset"
             );
             assert_terminal_native_color(buf[(x, 23)].fg, &format!("bottom bar col {x} fg"));
+            assert_no_bold_on_ansi_color(&buf[(x, 23)], &format!("bottom bar col {x}"));
         }
         let row0: String = (0..100).map(|x| buf[(x, 0)].symbol()).collect();
         let active_x = row0[..row0.find("4:idl").unwrap()].chars().count() as u16;
+        assert_eq!(buf[(active_x, 0)].fg, Color::Reset);
         assert!(buf[(active_x, 0)]
             .modifier
             .contains(Modifier::BOLD | Modifier::UNDERLINED));
@@ -9305,28 +9344,68 @@ mod tests {
                         let cell = &buf[(r.x + dx, r.y + dy)];
                         assert_eq!(cell.bg, Color::Reset, "{name} ({dx},{dy}) bg must be Reset");
                         assert_terminal_native_color(cell.fg, &format!("{name} ({dx},{dy}) fg"));
+                        assert_no_bold_on_ansi_color(cell, &format!("{name} ({dx},{dy})"));
                     }
                 }
             }
         }
-        assert_eq!(buf[(mr.x + 1, mr.y + 3)].fg, Color::Cyan);
+        assert_eq!(buf[(mr.x + 1, mr.y + 3)].fg, Color::Green);
         assert!(buf[(mr.x + 1, mr.y + 3)]
             .modifier
-            .contains(Modifier::BOLD | Modifier::UNDERLINED));
-        assert_eq!(buf[(mr.x + 6, mr.y + 3)].fg, Color::Cyan);
+            .contains(Modifier::UNDERLINED));
+        assert!(!buf[(mr.x + 1, mr.y + 3)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buf[(mr.x + 6, mr.y + 3)].fg, Color::Green);
         // Interior padding inside `^B ` keeps a clean space while `│ ↑ │` flanks ghost VT text dimmed
         assert_eq!(buf[(mr.x + 8, mr.y + 3)].symbol(), " ");
-        assert_eq!(buf[(mr.x + 5, mr.y)].fg, Color::Blue);
-        assert_eq!(buf[(dr.x + 5, dr.y)].fg, Color::Blue);
-        assert_eq!(buf[(dr.x + 7, dr.y + 1)].fg, Color::Cyan);
-        assert!(buf[(dr.x + 7, dr.y + 1)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buf[(mr.x + 5, mr.y)].fg, Color::Magenta);
+        assert_eq!(buf[(dr.x + 5, dr.y)].fg, Color::Magenta);
+        assert_eq!(buf[(dr.x + 7, dr.y + 1)].fg, Color::Green);
+        assert!(!buf[(dr.x + 7, dr.y + 1)].modifier.contains(Modifier::BOLD));
         assert_eq!(buf[(dr.x + 7, dr.y + 3)].fg, Color::Green);
+        assert!(buf[(dr.x + 7, dr.y + 3)]
+            .modifier
+            .contains(Modifier::UNDERLINED));
         // Non-glyph padding cell inside D-Pad arm preserves underlying VT glyph dimmed (semi-transparent)
         let inner_cell = &buf[(dr.x + 6, dr.y + 1)];
         assert_eq!(inner_cell.symbol(), "X");
         assert_eq!(inner_cell.bg, Color::Reset);
         assert_eq!(inner_cell.fg, Color::Reset);
         assert!(inner_cell.modifier.contains(Modifier::DIM));
+
+        // 1b. Dragging shifts BOTH `--touch` cross borders from Magenta to Cyan without colliding with glyphs
+        terminal
+            .draw(|f| {
+                let _ = render_ui_full_with_eink_color(
+                    f,
+                    &world,
+                    Some(parser.screen()),
+                    false,
+                    24,
+                    true,
+                    true,
+                    true,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::None,
+                    None,
+                    true,
+                    None,
+                    true,
+                    None,
+                    false,
+                    false,
+                );
+            })
+            .unwrap();
+        let dbuf = terminal.backend().buffer();
+        assert_eq!(dbuf[(mr.x + 5, mr.y)].fg, Color::Cyan);
+        assert_eq!(dbuf[(dr.x + 5, dr.y)].fg, Color::Cyan);
+        assert_eq!(dbuf[(mr.x + 1, mr.y + 3)].fg, Color::Green);
+        assert_eq!(dbuf[(dr.x + 7, dr.y + 1)].fg, Color::Green);
+        assert_no_bold_on_ansi_color(&dbuf[(mr.x + 5, mr.y)], "drag mod border");
+        assert_no_bold_on_ansi_color(&dbuf[(dr.x + 5, dr.y)], "drag dpad border");
 
         // 2. Idle bottom bar (`focused_quota = None, copied_flash = false, scrollback_offset = 0`)
         //    must be 100% transparent (`bg == Color::Reset`, `fg == Color::Reset`, empty modifiers).
@@ -9376,8 +9455,8 @@ mod tests {
             .modifier
             .contains(Modifier::REVERSED | Modifier::BOLD));
 
-        // 2b. Avoid `Yellow + BOLD` (`bold_is_bright` ANSI 11 washout on light terminals) across
-        //     active `Working` tabs, Claude badge, and 16-40% quota percentages.
+        // 2b. Avoid combining `BOLD` with ANY chromatic ANSI foreground (`bold_is_bright` safety)
+        //     while keeping EVERY active tab (`Working`, `Blocked`, etc.) `BOLD + UNDERLINED`.
         world.select_tab_index(1);
         let claude_mid_quota = AgentQuota {
             agent: AgentKind::Claude,
@@ -9416,20 +9495,53 @@ mod tests {
         let ybuf = terminal.backend().buffer();
         let yrow0: String = (0..100).map(|x| ybuf[(x, 0)].symbol()).collect();
         let wrk_x = yrow0[..yrow0.find("2:wrk").unwrap()].chars().count() as u16;
-        assert_eq!(ybuf[(wrk_x, 0)].fg, Color::Yellow);
-        assert!(ybuf[(wrk_x, 0)].modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(ybuf[(wrk_x, 0)].fg, Color::Reset);
+        assert!(ybuf[(wrk_x, 0)]
+            .modifier
+            .contains(Modifier::BOLD | Modifier::UNDERLINED));
+        assert_eq!(ybuf[(wrk_x, 0)].underline_color, Color::Cyan);
         for y in [0u16, 23u16] {
             for x in 0..100u16 {
-                let cell = &ybuf[(x, y)];
-                if cell.fg == Color::Yellow {
-                    assert!(
-                        !cell.modifier.contains(Modifier::BOLD),
-                        "Yellow cell at ({x},{y}) ({:?}) must not combine BOLD",
-                        cell.symbol()
-                    );
-                }
+                assert_no_bold_on_ansi_color(&ybuf[(x, y)], &format!("yellow/bar cell ({x},{y})"));
             }
         }
+
+        // Active `Blocked` tab retains `BOLD + UNDERLINED` on `Color::Reset` with `Red` underline
+        world.select_tab_index(0);
+        terminal
+            .draw(|f| {
+                let _ = render_ui_full_with_eink_color(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::None,
+                    None,
+                    false,
+                    None,
+                    false,
+                    None,
+                    false,
+                    false,
+                );
+            })
+            .unwrap();
+        let bbuf = terminal.backend().buffer();
+        let brow0: String = (0..100).map(|x| bbuf[(x, 0)].symbol()).collect();
+        let blk_x = brow0[..brow0.find("1:blk").unwrap()].chars().count() as u16;
+        assert_eq!(bbuf[(blk_x, 0)].fg, Color::Reset);
+        assert!(bbuf[(blk_x, 0)]
+            .modifier
+            .contains(Modifier::BOLD | Modifier::UNDERLINED));
+        assert_eq!(bbuf[(blk_x, 0)].underline_color, Color::Red);
 
         // 3. Every Modal uses transparent Color::Reset background and zero hardcoded RGB colors
         let modals = [
@@ -9474,6 +9586,7 @@ mod tests {
                         cell.underline_color,
                         &format!("modal {modal:?} ({x},{y}) ul"),
                     );
+                    assert_no_bold_on_ansi_color(cell, &format!("modal {modal:?} ({x},{y})"));
                 }
             }
         }
