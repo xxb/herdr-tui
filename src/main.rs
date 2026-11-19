@@ -1773,19 +1773,60 @@ fn current_reader_scope(world: &World) -> ReaderScope {
     )
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingReaderRpc {
+    request_id: u64,
+    terminal: String,
+    clean_mode: bool,
+    for_native_export: bool,
+    user_scrolled: bool,
+}
+
+struct ReaderActionOut<'a> {
+    pending_osc: &'a mut bool,
+    pending_rpc: &'a mut Option<PendingReaderRpc>,
+}
+
+impl ReaderActionOut<'_> {
+    fn reborrow(&mut self) -> ReaderActionOut<'_> {
+        ReaderActionOut {
+            pending_osc: self.pending_osc,
+            pending_rpc: self.pending_rpc,
+        }
+    }
+}
+
+fn set_reader_user_scrolled(pending_rpc: &mut Option<PendingReaderRpc>, scrolled: bool) {
+    if let Some(ref mut rpc) = *pending_rpc {
+        if !rpc.for_native_export {
+            rpc.user_scrolled = scrolled;
+        }
+    }
+}
+
+fn clear_non_export_reader_rpc(pending_rpc: &mut Option<PendingReaderRpc>) {
+    if pending_rpc
+        .as_ref()
+        .is_some_and(|rpc| !rpc.for_native_export)
+    {
+        *pending_rpc = None;
+    }
+}
+
 fn sync_reader_modal_scope(
     modal: &mut Modal,
     world: &World,
     reader_open_scope: &mut Option<ReaderScope>,
     reader_drag: &mut Option<u16>,
+    pending_reader_rpc: &mut Option<PendingReaderRpc>,
     eink_mode: bool,
     pending_eink_osc: &mut bool,
-    dirty: &mut bool,
-) {
+) -> bool {
     if !matches!(modal, Modal::Reader { .. }) {
         *reader_open_scope = None;
         *reader_drag = None;
-        return;
+        clear_non_export_reader_rpc(pending_reader_rpc);
+        return false;
     }
     let cur = current_reader_scope(world);
     let missing_term = cur
@@ -1795,55 +1836,56 @@ fn sync_reader_modal_scope(
     match *reader_open_scope {
         None if !missing_term => {
             *reader_open_scope = Some(cur);
+            false
         }
-        Some(ref opened) if opened == &cur && !missing_term => {}
+        Some(ref opened) if opened == &cur && !missing_term => false,
         _ => {
             *modal = Modal::None;
             *reader_open_scope = None;
             *reader_drag = None;
-            *dirty = true;
+            clear_non_export_reader_rpc(pending_reader_rpc);
             if eink_mode {
                 *pending_eink_osc = true;
             }
+            true
         }
     }
 }
 
-/// Fetch clean reader source text from `herdr-core` `terminal.read`, falling back to local VT screen.
-fn fetch_reader_source_for_terminal(
-    core: Option<&CoreClient>,
-    world: &World,
-    addr: &str,
-    attached: Option<&AttachedTerminal>,
-) -> Option<(String, bool, String, Option<String>)> {
-    let is_agent = world
-        .terminals
-        .get(addr)
-        .is_some_and(crate::model::TerminalInfo::is_agent);
-    let tab_title = world
-        .active_space()
-        .map(|s| world.tab_display_name(s, world.active_tab_index()))
-        .unwrap_or_else(|| addr.to_string());
-    let read_lines = if is_agent {
+fn format_read_source_note(res: &crate::core::TerminalReadResult) -> Option<String> {
+    let why = res.why.as_deref().map(str::trim).filter(|w| !w.is_empty());
+    let prefix = if res.how == "screen" {
+        Some("screen")
+    } else if !res.complete {
+        Some("partial")
+    } else {
+        None
+    };
+    match (prefix, why) {
+        (Some(p), Some(w)) => Some(format!("{p} · {w}")),
+        (Some(p), None) => Some(p.to_string()),
+        (None, Some(w)) => Some(w.to_string()),
+        (None, None) => None,
+    }
+}
+
+fn reader_line_budget(is_agent: bool) -> usize {
+    if is_agent {
         450
     } else {
         crate::reader::SHELL_MAX_CLEAN_LINES
-    };
-    if let Some(res) = core.and_then(|c| c.read_terminal(addr, read_lines).ok()) {
-        let source_note = (res.how == "screen")
-            .then(|| res.why.as_ref().map(|w| format!("live · {w}")))
-            .flatten();
-        return Some((tab_title, is_agent, res.text, source_note));
     }
-    let att = attached?;
-    let max_rows = if is_agent {
-        crate::reader::AGENT_MAX_SCAN_ROWS
-    } else {
-        crate::reader::SHELL_MAX_SCAN_ROWS
-    };
-    let mut scr = att.parser.screen().clone();
-    let plain = crate::reader::extract_plain_text_from_screen(&mut scr, max_rows);
-    Some((tab_title, is_agent, plain, None))
+}
+
+fn reader_tab_meta(world: &World, addr: Option<&str>) -> (String, bool) {
+    let is_agent = addr
+        .and_then(|a| world.terminals.get(a))
+        .is_some_and(crate::model::TerminalInfo::is_agent);
+    let title = world
+        .active_space()
+        .map(|s| world.tab_display_name(s, world.active_tab_index()))
+        .unwrap_or_else(|| addr.unwrap_or("reader").to_string());
+    (title, is_agent)
 }
 
 fn build_reader_modal_state(
@@ -1852,28 +1894,37 @@ fn build_reader_modal_state(
     attached: Option<&AttachedTerminal>,
     term_rect: Rect,
     clean_mode: bool,
+    pending_reader_rpc: Option<&mut Option<PendingReaderRpc>>,
 ) -> Modal {
-    let (tab_title, is_agent, raw_text, source_note) = match world.active_terminal_address() {
-        Some(addr) => fetch_reader_source_for_terminal(Some(core), world, &addr, attached)
-            .unwrap_or_else(|| {
-                let is_agent = world
-                    .terminals
-                    .get(&addr)
-                    .is_some_and(crate::model::TerminalInfo::is_agent);
-                let title = world
-                    .active_space()
-                    .map(|s| world.tab_display_name(s, world.active_tab_index()))
-                    .unwrap_or_else(|| addr.clone());
-                (title, is_agent, String::new(), None)
-            }),
-        None => {
-            let title = world
-                .active_space()
-                .map(|s| world.tab_display_name(s, world.active_tab_index()))
-                .unwrap_or_else(|| "reader".to_string());
-            (title, false, String::new(), None)
-        }
+    let active_addr = world.active_terminal_address();
+    let (tab_title, is_agent) = reader_tab_meta(world, active_addr.as_deref());
+    let max_rows = if is_agent {
+        crate::reader::AGENT_MAX_SCAN_ROWS
+    } else {
+        crate::reader::SHELL_MAX_SCAN_ROWS
     };
+    let raw_text = attached
+        .map(|att| {
+            let mut scr = att.parser.screen().clone();
+            crate::reader::extract_plain_text_from_screen(&mut scr, max_rows)
+        })
+        .unwrap_or_default();
+
+    let dispatched_id = active_addr
+        .as_deref()
+        .and_then(|addr| core.request_terminal_read(addr, reader_line_budget(is_agent)));
+    if let Some(slot) = pending_reader_rpc {
+        *slot = dispatched_id
+            .zip(active_addr)
+            .map(|(request_id, terminal)| PendingReaderRpc {
+                request_id,
+                terminal,
+                clean_mode,
+                for_native_export: false,
+                user_scrolled: false,
+            });
+    }
+    let source_note = dispatched_id.map(|_| "syncing…".to_string());
     let doc = crate::reader::build_reader_doc_from_text(
         &raw_text,
         &tab_title,
@@ -1891,9 +1942,103 @@ fn build_reader_modal_state(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn apply_terminal_read_message(
+    request_id: u64,
+    terminal: &str,
+    result: std::result::Result<crate::core::TerminalReadResult, String>,
+    world: &World,
+    modal: &mut Modal,
+    term_rect: Rect,
+    pending_reader_rpc: &mut Option<PendingReaderRpc>,
+    pending_reader_osc: &mut bool,
+    pending_reader_json: &mut Option<String>,
+    eink_mode: bool,
+    pending_eink_osc: &mut bool,
+    dirty: &mut bool,
+) {
+    let matches_pending = pending_reader_rpc
+        .as_ref()
+        .is_some_and(|p| p.request_id == request_id && p.terminal == terminal);
+    if !matches_pending {
+        return;
+    }
+    let pending = pending_reader_rpc.take().expect("checked above");
+    if world.active_terminal_address().as_deref() != Some(terminal) {
+        return;
+    }
+    if pending.for_native_export {
+        match result {
+            Ok(res) => {
+                let (tab_title, is_agent) = reader_tab_meta(world, Some(terminal));
+                let note = format_read_source_note(&res);
+                let doc = crate::reader::build_reader_doc_from_text(
+                    &res.text,
+                    &tab_title,
+                    is_agent,
+                    pending.clean_mode,
+                    note,
+                );
+                *pending_reader_json = Some(crate::reader::format_reader_doc_json(&doc));
+                *pending_reader_osc = true;
+            }
+            Err(_) => {
+                *pending_reader_json = None;
+                *pending_reader_osc = true;
+            }
+        }
+        return;
+    }
+
+    let Modal::Reader {
+        ref mut doc,
+        ref mut scroll,
+        ref mut raw_text,
+        ref mut source_note,
+    } = *modal
+    else {
+        return;
+    };
+    match result {
+        Ok(res) => {
+            let prev_len = doc.lines.len();
+            let text_changed = *raw_text != res.text;
+            let clean_mode = doc.clean_mode;
+            let (tab_title, is_agent) = reader_tab_meta(world, Some(terminal));
+            let note = format_read_source_note(&res);
+            *doc = crate::reader::build_reader_doc_from_text(
+                &res.text,
+                &tab_title,
+                is_agent,
+                clean_mode,
+                note.clone(),
+            );
+            *raw_text = res.text;
+            *source_note = note;
+            let (initial, max_scroll) = reader_initial_scroll(doc, term_rect);
+            if pending.user_scrolled {
+                *scroll = (*scroll).min(max_scroll);
+            } else {
+                *scroll = initial;
+            }
+            *dirty = true;
+            if eink_mode && (text_changed || doc.lines.len() != prev_len) {
+                *pending_eink_osc = true;
+            }
+        }
+        Err(_) => {
+            if source_note.as_deref() == Some("syncing…") {
+                *source_note = None;
+                doc.source_note = None;
+                *dirty = true;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn emit_shelldeck_reader_osc_with_env<W: Write>(
     out: &mut W,
-    core: Option<&CoreClient>,
+    precomputed_json: Option<&str>,
     world: &World,
     modal: &Modal,
     active_addr: Option<&String>,
@@ -1901,22 +2046,24 @@ fn emit_shelldeck_reader_osc_with_env<W: Write>(
     in_tmux: bool,
     in_screen: bool,
 ) -> Result<()> {
-    let json = if let Modal::Reader { ref doc, .. } = *modal {
+    let json = if let Some(raw_json) = precomputed_json {
+        Some(raw_json.to_string())
+    } else if let Modal::Reader { ref doc, .. } = *modal {
         Some(crate::reader::format_reader_doc_json(doc))
     } else if let Some(addr) = active_addr {
-        let attached = attached_map.get(addr);
-        fetch_reader_source_for_terminal(core, world, addr, attached).map(
-            |(tab_title, is_agent, raw_text, source_note)| {
-                let doc = crate::reader::build_reader_doc_from_text(
-                    &raw_text,
-                    &tab_title,
-                    is_agent,
-                    true,
-                    source_note,
-                );
-                crate::reader::format_reader_doc_json(&doc)
-            },
-        )
+        attached_map.get_mut(addr).map(|att| {
+            let (tab_title, is_agent) = reader_tab_meta(world, Some(addr));
+            let max_rows = if is_agent {
+                crate::reader::AGENT_MAX_SCAN_ROWS
+            } else {
+                crate::reader::SHELL_MAX_SCAN_ROWS
+            };
+            let plain =
+                crate::reader::extract_plain_text_from_screen(att.parser.screen_mut(), max_rows);
+            let doc =
+                crate::reader::build_reader_doc_from_text(&plain, &tab_title, is_agent, true, None);
+            crate::reader::format_reader_doc_json(&doc)
+        })
     } else {
         None
     };
@@ -1933,7 +2080,7 @@ fn emit_shelldeck_reader_osc_with_env<W: Write>(
 fn flush_pending_reader_osc_with_env<W: Write>(
     out: &mut W,
     pending_reader_osc: &mut bool,
-    core: Option<&CoreClient>,
+    pending_reader_json: &mut Option<String>,
     world: &World,
     modal: &Modal,
     active_addr: Option<&String>,
@@ -1941,10 +2088,11 @@ fn flush_pending_reader_osc_with_env<W: Write>(
     in_tmux: bool,
     in_screen: bool,
 ) -> Result<()> {
+    let precomputed = pending_reader_json.take();
     if *pending_reader_osc {
         emit_shelldeck_reader_osc_with_env(
             out,
-            core,
+            precomputed.as_deref(),
             world,
             modal,
             active_addr,
@@ -1960,7 +2108,7 @@ fn flush_pending_reader_osc_with_env<W: Write>(
 fn flush_pending_reader_osc<W: Write>(
     out: &mut W,
     pending_reader_osc: &mut bool,
-    core: &CoreClient,
+    pending_reader_json: &mut Option<String>,
     world: &World,
     modal: &Modal,
     active_addr: Option<&String>,
@@ -1972,7 +2120,7 @@ fn flush_pending_reader_osc<W: Write>(
         flush_pending_reader_osc_with_env(
             out,
             pending_reader_osc,
-            Some(core),
+            pending_reader_json,
             world,
             modal,
             active_addr,
@@ -2464,7 +2612,7 @@ fn execute_action_full(
     eink_color: &mut bool,
     force_clear: &mut bool,
     pending_eink_osc: &mut bool,
-    pending_reader_osc: Option<&mut bool>,
+    mut reader_out: Option<ReaderActionOut<'_>>,
 ) -> Result<bool> {
     match action {
         Action::Detach => return Ok(true),
@@ -2599,28 +2747,59 @@ fn execute_action_full(
         Action::OpenBookReader => {
             if matches!(modal, Modal::Reader { .. }) {
                 *modal = Modal::None;
+                if let Some(ref mut out) = reader_out {
+                    clear_non_export_reader_rpc(out.pending_rpc);
+                }
             } else {
-                *modal = build_reader_modal_state(core, world, attached, term_rect, true);
+                *modal = build_reader_modal_state(
+                    core,
+                    world,
+                    attached,
+                    term_rect,
+                    true,
+                    reader_out.as_mut().map(|out| &mut *out.pending_rpc),
+                );
             }
             if *eink_mode {
                 *pending_eink_osc = true;
             }
         }
         Action::ExportNativeBookReader => {
-            if let Some(flag) = pending_reader_osc {
-                *flag = true;
+            if let Some(out) = reader_out {
+                if matches!(modal, Modal::Reader { .. }) {
+                    *out.pending_osc = true;
+                } else if let Some(addr) = world.active_terminal_address() {
+                    let (_, is_agent) = reader_tab_meta(world, Some(&addr));
+                    if let Some(request_id) =
+                        core.request_terminal_read(&addr, reader_line_budget(is_agent))
+                    {
+                        *out.pending_rpc = Some(PendingReaderRpc {
+                            request_id,
+                            terminal: addr,
+                            clean_mode: true,
+                            for_native_export: true,
+                            user_scrolled: false,
+                        });
+                    } else {
+                        *out.pending_osc = true;
+                    }
+                }
             }
         }
         Action::PageUp => {
             if matches!(modal, Modal::Reader { .. }) {
                 let step = reader_page_step(term_rect) as isize;
-                step_reader_modal_scroll(
+                if step_reader_modal_scroll(
                     modal,
                     term_rect,
                     ReaderScrollMove::Delta(-step),
                     *eink_mode,
                     pending_eink_osc,
-                );
+                ) {
+                    if let Some(ref mut out) = reader_out {
+                        set_reader_user_scrolled(out.pending_rpc, true);
+                    }
+                }
             } else if attached.is_some_and(|a| a.parser.screen().alternate_screen())
                 && *scrollback_offset == 0
             {
@@ -2635,13 +2814,17 @@ fn execute_action_full(
         Action::PageDown => {
             if matches!(modal, Modal::Reader { .. }) {
                 let step = reader_page_step(term_rect) as isize;
-                step_reader_modal_scroll(
+                if step_reader_modal_scroll(
                     modal,
                     term_rect,
                     ReaderScrollMove::Delta(step),
                     *eink_mode,
                     pending_eink_osc,
-                );
+                ) {
+                    if let Some(ref mut out) = reader_out {
+                        set_reader_user_scrolled(out.pending_rpc, true);
+                    }
+                }
             } else if attached.is_some_and(|a| a.parser.screen().alternate_screen())
                 && *scrollback_offset == 0
             {
@@ -3555,6 +3738,8 @@ fn run_app_loop(
     let mut last_eink_snap: Option<(String, EinkScreenSnapshot)> = None;
     let mut pending_eink_osc = eink_mode;
     let mut pending_reader_osc = false;
+    let mut pending_reader_rpc: Option<PendingReaderRpc> = None;
+    let mut pending_reader_json: Option<String> = None;
     let mut reader_drag: Option<u16> = None;
     let mut reader_open_scope: Option<ReaderScope> = None;
     let mut prev_drawn_addr: Option<String> = None;
@@ -3822,12 +4007,33 @@ fn run_app_loop(
                                 modal = Modal::None;
                                 reader_open_scope = None;
                                 reader_drag = None;
+                                clear_non_export_reader_rpc(&mut pending_reader_rpc);
                                 if eink_mode {
                                     pending_eink_osc = true;
                                 }
                             }
                         }
                         pending_lifecycle_sync = true;
+                    }
+                    CoreMessage::TerminalRead {
+                        request_id,
+                        terminal,
+                        result,
+                    } => {
+                        apply_terminal_read_message(
+                            request_id,
+                            &terminal,
+                            result,
+                            world,
+                            &mut modal,
+                            term_rect,
+                            &mut pending_reader_rpc,
+                            &mut pending_reader_osc,
+                            &mut pending_reader_json,
+                            eink_mode,
+                            &mut pending_eink_osc,
+                            &mut dirty,
+                        );
                     }
                     CoreMessage::Event(ev) => match world.apply_core_event(&ev) {
                         EventDisposition::Unchanged => {}
@@ -3966,6 +4172,11 @@ fn run_app_loop(
                                         | HitTarget::ReaderToggleClean
                                         | HitTarget::ReaderExportNative
                                         | HitTarget::ReaderJumpLatest => {
+                                            let is_reset_scroll = matches!(
+                                                target,
+                                                HitTarget::ReaderJumpLatest
+                                                    | HitTarget::ReaderToggleClean
+                                            );
                                             let (_, changed) = handle_reader_mouse_hit(
                                                 target,
                                                 &mut modal,
@@ -3975,6 +4186,10 @@ fn run_app_loop(
                                                 &mut pending_reader_osc,
                                             );
                                             if changed {
+                                                set_reader_user_scrolled(
+                                                    &mut pending_reader_rpc,
+                                                    !is_reset_scroll,
+                                                );
                                                 dirty = true;
                                             }
                                         }
@@ -4016,6 +4231,7 @@ fn run_app_loop(
                                         }
                                         HitTarget::TriggerAction(act) => {
                                             modal = Modal::None;
+                                            clear_non_export_reader_rpc(&mut pending_reader_rpc);
                                             prefix_active = false;
                                             ctrl_active = false;
                                             alt_active = false;
@@ -4033,7 +4249,10 @@ fn run_app_loop(
                                                 &mut eink_color,
                                                 &mut force_clear,
                                                 &mut pending_eink_osc,
-                                                Some(&mut pending_reader_osc),
+                                                Some(ReaderActionOut {
+                                                    pending_osc: &mut pending_reader_osc,
+                                                    pending_rpc: &mut pending_reader_rpc,
+                                                }),
                                             )? {
                                                 flush_credits(
                                                     core,
@@ -4199,7 +4418,10 @@ fn run_app_loop(
                                                 &mut eink_color,
                                                 &mut force_clear,
                                                 &mut pending_eink_osc,
-                                                Some(&mut pending_reader_osc),
+                                                Some(ReaderActionOut {
+                                                    pending_osc: &mut pending_reader_osc,
+                                                    pending_rpc: &mut pending_reader_rpc,
+                                                }),
                                             )? {
                                                 KeyOutcome::Quit => {
                                                     flush_credits(
@@ -4303,6 +4525,7 @@ fn run_app_loop(
                                         eink_mode,
                                         &mut pending_eink_osc,
                                     ) {
+                                        set_reader_user_scrolled(&mut pending_reader_rpc, true);
                                         dirty = true;
                                     }
                                 } else if let Some(ref tap) = page_tap {
@@ -4434,7 +4657,10 @@ fn run_app_loop(
                                                     &mut eink_color,
                                                     &mut force_clear,
                                                     &mut pending_eink_osc,
-                                                    Some(&mut pending_reader_osc),
+                                                    Some(ReaderActionOut {
+                                                        pending_osc: &mut pending_reader_osc,
+                                                        pending_rpc: &mut pending_reader_rpc,
+                                                    }),
                                                 )? {
                                                     KeyOutcome::Quit => {
                                                         flush_credits(
@@ -4613,6 +4839,7 @@ fn run_app_loop(
                                         eink_mode,
                                         &mut pending_eink_osc,
                                     ) {
+                                        set_reader_user_scrolled(&mut pending_reader_rpc, true);
                                         dirty = true;
                                     }
                                 } else if matches!(modal, Modal::TabOverview { .. })
@@ -4762,6 +4989,7 @@ fn run_app_loop(
                                         eink_mode,
                                         &mut pending_eink_osc,
                                     ) {
+                                        set_reader_user_scrolled(&mut pending_reader_rpc, true);
                                         dirty = true;
                                     }
                                 } else if matches!(modal, Modal::TabOverview { .. })
@@ -4888,7 +5116,10 @@ fn run_app_loop(
                                 &mut eink_color,
                                 &mut force_clear,
                                 &mut pending_eink_osc,
-                                Some(&mut pending_reader_osc),
+                                Some(ReaderActionOut {
+                                    pending_osc: &mut pending_reader_osc,
+                                    pending_rpc: &mut pending_reader_rpc,
+                                }),
                             )? {
                                 KeyOutcome::Quit => {
                                     flush_credits(
@@ -5022,15 +5253,17 @@ fn run_app_loop(
                 }
             }
         }
-        sync_reader_modal_scope(
+        if sync_reader_modal_scope(
             &mut modal,
             world,
             &mut reader_open_scope,
             &mut reader_drag,
+            &mut pending_reader_rpc,
             eink_mode,
             &mut pending_eink_osc,
-            &mut dirty,
-        );
+        ) {
+            dirty = true;
+        }
 
         if let Some(att) = active_addr.as_ref().and_then(|a| attached_map.get_mut(a)) {
             att.parser.screen_mut().set_scrollback(scrollback_offset);
@@ -5182,7 +5415,7 @@ fn run_app_loop(
         flush_pending_reader_osc(
             terminal.backend_mut(),
             &mut pending_reader_osc,
-            core,
+            &mut pending_reader_json,
             world,
             &modal,
             active_addr.as_ref(),
@@ -5206,7 +5439,7 @@ fn handle_shortcut_in_tab_overview(
     eink_color: &mut bool,
     force_clear: &mut bool,
     pending_eink_osc: &mut bool,
-    mut pending_reader_osc: Option<&mut bool>,
+    mut reader_out: Option<ReaderActionOut<'_>>,
 ) -> Result<KeyOutcome> {
     match action {
         Action::Detach => {
@@ -5238,7 +5471,7 @@ fn handle_shortcut_in_tab_overview(
                     eink_color,
                     force_clear,
                     pending_eink_osc,
-                    pending_reader_osc.as_deref_mut(),
+                    reader_out.as_mut().map(ReaderActionOut::reborrow),
                 )? {
                     return Ok(KeyOutcome::Quit);
                 }
@@ -5270,7 +5503,7 @@ fn handle_shortcut_in_tab_overview(
                 eink_color,
                 force_clear,
                 pending_eink_osc,
-                pending_reader_osc,
+                reader_out,
             )? {
                 return Ok(KeyOutcome::Quit);
             }
@@ -5379,7 +5612,7 @@ fn handle_key_event_full(
     eink_color: &mut bool,
     force_clear: &mut bool,
     pending_eink_osc: &mut bool,
-    pending_reader_osc: Option<&mut bool>,
+    mut reader_out: Option<ReaderActionOut<'_>>,
 ) -> Result<KeyOutcome> {
     let mut ui_changed = false;
     if *ctrl_active {
@@ -5536,7 +5769,7 @@ fn handle_key_event_full(
                     eink_color,
                     force_clear,
                     pending_eink_osc,
-                    pending_reader_osc,
+                    reader_out,
                 );
             }
             if matches!(modal, Modal::SpaceMenu | Modal::Help) {
@@ -5569,6 +5802,9 @@ fn handle_key_event_full(
                         | Action::PageDown
                 ) {
                     *modal = Modal::None;
+                    if let Some(ref mut out) = reader_out {
+                        clear_non_export_reader_rpc(out.pending_rpc);
+                    }
                 }
             }
             if execute_action_full(
@@ -5585,7 +5821,7 @@ fn handle_key_event_full(
                 eink_color,
                 force_clear,
                 pending_eink_osc,
-                pending_reader_osc,
+                reader_out,
             )? {
                 return Ok(KeyOutcome::Quit);
             }
@@ -5665,7 +5901,7 @@ fn handle_key_event_full(
                     eink_color,
                     force_clear,
                     pending_eink_osc,
-                    pending_reader_osc,
+                    reader_out,
                 );
             }
             return Ok(KeyOutcome::UiChanged);
@@ -5774,6 +6010,9 @@ fn handle_key_event_full(
         Modal::Reader { .. } => {
             if let Some(action) = match_direct_action(&kev) {
                 *modal = Modal::None;
+                if let Some(ref mut out) = reader_out {
+                    clear_non_export_reader_rpc(out.pending_rpc);
+                }
                 if *eink_mode {
                     *pending_eink_osc = true;
                 }
@@ -5791,7 +6030,7 @@ fn handle_key_event_full(
                     eink_color,
                     force_clear,
                     pending_eink_osc,
-                    pending_reader_osc,
+                    reader_out,
                 )? {
                     return Ok(KeyOutcome::Quit);
                 }
@@ -5814,7 +6053,15 @@ fn handle_key_event_full(
                 _ => None,
             };
             if let Some(mv) = page_mv {
-                step_reader_modal_scroll(modal, term_rect, mv, *eink_mode, pending_eink_osc);
+                let changed =
+                    step_reader_modal_scroll(modal, term_rect, mv, *eink_mode, pending_eink_osc);
+                if let Some(ref mut out) = reader_out {
+                    if matches!(mv, ReaderScrollMove::Latest) {
+                        set_reader_user_scrolled(out.pending_rpc, false);
+                    } else if changed {
+                        set_reader_user_scrolled(out.pending_rpc, true);
+                    }
+                }
                 return Ok(KeyOutcome::UiChanged);
             }
             let line_delta = match kev.code {
@@ -5825,25 +6072,40 @@ fn handle_key_event_full(
                 _ => None,
             };
             if let Some(delta) = line_delta {
-                move_reader_scroll(modal, term_rect, ReaderScrollMove::Delta(delta));
+                if move_reader_scroll(modal, term_rect, ReaderScrollMove::Delta(delta)) {
+                    if let Some(ref mut out) = reader_out {
+                        set_reader_user_scrolled(out.pending_rpc, true);
+                    }
+                }
                 return Ok(KeyOutcome::UiChanged);
             }
             match kev.code {
                 KeyCode::Esc | KeyCode::Char('q' | 'v') if no_ctrl_alt => {
                     *modal = Modal::None;
+                    if let Some(ref mut out) = reader_out {
+                        clear_non_export_reader_rpc(out.pending_rpc);
+                    }
                     if *eink_mode {
                         *pending_eink_osc = true;
                     }
                 }
                 KeyCode::Char('c') if kev.modifiers.contains(KeyModifiers::CONTROL) => {
                     *modal = Modal::None;
+                    if let Some(ref mut out) = reader_out {
+                        clear_non_export_reader_rpc(out.pending_rpc);
+                    }
                     if *eink_mode {
                         *pending_eink_osc = true;
                     }
                 }
                 KeyCode::Tab | KeyCode::Char('f' | 'c') if no_ctrl_alt => {
-                    if toggle_reader_clean_mode(modal, term_rect) && *eink_mode {
-                        *pending_eink_osc = true;
+                    if toggle_reader_clean_mode(modal, term_rect) {
+                        if let Some(ref mut out) = reader_out {
+                            set_reader_user_scrolled(out.pending_rpc, false);
+                        }
+                        if *eink_mode {
+                            *pending_eink_osc = true;
+                        }
                     }
                 }
                 KeyCode::Char('r') if no_ctrl_alt => {
@@ -5851,14 +6113,21 @@ fn handle_key_event_full(
                         Modal::Reader { ref doc, .. } => doc.clean_mode,
                         _ => true,
                     };
-                    *modal = build_reader_modal_state(core, world, attached, term_rect, clean_mode);
+                    *modal = build_reader_modal_state(
+                        core,
+                        world,
+                        attached,
+                        term_rect,
+                        clean_mode,
+                        reader_out.as_mut().map(|out| &mut *out.pending_rpc),
+                    );
                     if *eink_mode {
                         *pending_eink_osc = true;
                     }
                 }
                 KeyCode::Char('s') if no_ctrl_alt => {
-                    if let Some(flag) = pending_reader_osc {
-                        *flag = true;
+                    if let Some(out) = reader_out {
+                        *out.pending_osc = true;
                     }
                 }
                 _ => {}
@@ -5884,7 +6153,7 @@ fn handle_key_event_full(
             eink_color,
             force_clear,
             pending_eink_osc,
-            pending_reader_osc,
+            reader_out,
         )? {
             return Ok(KeyOutcome::Quit);
         }
@@ -9244,6 +9513,7 @@ mod tests {
         let mut force_clear = false;
         let mut pending_eink_osc = false;
         let mut pending_reader_osc = false;
+        let mut pending_reader_rpc: Option<PendingReaderRpc> = None;
 
         let ctrl_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
         for key in [
@@ -9267,13 +9537,17 @@ mod tests {
                 &mut eink_color,
                 &mut force_clear,
                 &mut pending_eink_osc,
-                Some(&mut pending_reader_osc),
+                Some(ReaderActionOut {
+                    pending_osc: &mut pending_reader_osc,
+                    pending_rpc: &mut pending_reader_rpc,
+                }),
             )
             .unwrap();
             assert_eq!(out, KeyOutcome::UiChanged);
         }
         assert!(matches!(modal, Modal::Reader { .. }));
         assert!(!pending_reader_osc);
+        assert!(pending_reader_rpc.is_none());
         assert!(pending_eink_osc);
 
         pending_eink_osc = false;
@@ -9298,7 +9572,10 @@ mod tests {
                 &mut eink_color,
                 &mut force_clear,
                 &mut pending_eink_osc,
-                Some(&mut pending_reader_osc),
+                Some(ReaderActionOut {
+                    pending_osc: &mut pending_reader_osc,
+                    pending_rpc: &mut pending_reader_rpc,
+                }),
             )
             .unwrap();
             assert_eq!(out, KeyOutcome::UiChanged);
@@ -9417,10 +9694,11 @@ mod tests {
         execute!(buf, EndSynchronizedUpdate).unwrap();
         let active_addr = "t1".to_string();
         let mut pending_reader_osc = true;
+        let mut pending_reader_json = None;
         flush_pending_reader_osc_with_env(
             &mut buf,
             &mut pending_reader_osc,
-            None,
+            &mut pending_reader_json,
             &world,
             &Modal::None,
             Some(&active_addr),
@@ -9460,10 +9738,11 @@ mod tests {
         };
         let mut buf: Vec<u8> = Vec::new();
         let mut pending = true;
+        let mut pending_json = None;
         flush_pending_reader_osc_with_env(
             &mut buf,
             &mut pending,
-            None,
+            &mut pending_json,
             &world,
             &modal,
             Some(&active_addr),
@@ -9504,7 +9783,15 @@ mod tests {
         let mut force_clear = false;
         let mut pending_eink_osc = false;
         let mut pending_reader_osc = false;
-        let mut modal = build_reader_modal_state(&core, &world, Some(&attached), term_rect, true);
+        let mut pending_reader_rpc: Option<PendingReaderRpc> = None;
+        let mut modal = build_reader_modal_state(
+            &core,
+            &world,
+            Some(&attached),
+            term_rect,
+            true,
+            Some(&mut pending_reader_rpc),
+        );
 
         let initial_scroll = match modal {
             Modal::Reader {
@@ -9537,7 +9824,10 @@ mod tests {
                     &mut eink_color,
                     &mut force_clear,
                     &mut pending_eink_osc,
-                    Some(&mut pending_reader_osc),
+                    Some(ReaderActionOut {
+                        pending_osc: &mut pending_reader_osc,
+                        pending_rpc: &mut pending_reader_rpc,
+                    }),
                 )
                 .unwrap()
             };
@@ -9624,12 +9914,26 @@ mod tests {
 
         // Close via Ctrl+c and direct Alt+Right
         world.select_tab_by_id("s1", "tab1");
-        modal = build_reader_modal_state(&core, &world, Some(&attached), term_rect, true);
+        modal = build_reader_modal_state(
+            &core,
+            &world,
+            Some(&attached),
+            term_rect,
+            true,
+            Some(&mut pending_reader_rpc),
+        );
         send_key!(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(matches!(modal, Modal::None));
         assert!(!pending_reader_osc);
 
-        modal = build_reader_modal_state(&core, &world, Some(&attached), term_rect, true);
+        modal = build_reader_modal_state(
+            &core,
+            &world,
+            Some(&attached),
+            term_rect,
+            true,
+            Some(&mut pending_reader_rpc),
+        );
         send_key!(KeyCode::Right, KeyModifiers::ALT);
         assert!(matches!(modal, Modal::None));
         assert_eq!(world.active_tab_index(), 1);
@@ -9646,7 +9950,8 @@ mod tests {
         }
         attached.process_vt_bytes(payload.as_bytes());
         let small_rect = Rect::new(0, 1, 60, 12);
-        let mut modal = build_reader_modal_state(&core, &world, Some(&attached), small_rect, true);
+        let mut modal =
+            build_reader_modal_state(&core, &world, Some(&attached), small_rect, true, None);
         move_reader_scroll(&mut modal, small_rect, ReaderScrollMove::Top);
 
         let mut pending_eink = false;
@@ -9730,35 +10035,398 @@ mod tests {
         // Scope sync captures initial scope, stays open while unchanged, closes on tab switch
         let mut scope = None;
         let mut drag_opt = Some(5u16);
-        let mut sync_dirty = false;
-        sync_reader_modal_scope(
+        let mut rpc_opt = Some(PendingReaderRpc {
+            request_id: 77,
+            terminal: "t1".to_string(),
+            clean_mode: true,
+            for_native_export: false,
+            user_scrolled: false,
+        });
+        assert!(!sync_reader_modal_scope(
             &mut modal,
             &world,
             &mut scope,
             &mut drag_opt,
+            &mut rpc_opt,
             true,
             &mut pending_eink,
-            &mut sync_dirty,
-        );
+        ));
         assert!(matches!(modal, Modal::Reader { .. }));
         assert!(scope.is_some());
+        assert!(rpc_opt.is_some());
 
         world.select_tab_by_id("s1", "tab2");
         pending_eink = false;
-        sync_reader_modal_scope(
+        let sync_dirty = sync_reader_modal_scope(
             &mut modal,
             &world,
             &mut scope,
             &mut drag_opt,
+            &mut rpc_opt,
             true,
             &mut pending_eink,
-            &mut sync_dirty,
         );
         assert!(matches!(modal, Modal::None));
         assert!(scope.is_none());
         assert!(drag_opt.is_none());
+        assert!(rpc_opt.is_none());
         assert!(sync_dirty);
         assert!(pending_eink);
+    }
+
+    #[test]
+    fn format_read_source_note_handles_complete_screen_and_partial_why_combinations() {
+        use crate::core::TerminalReadResult;
+
+        assert_eq!(
+            format_read_source_note(&TerminalReadResult {
+                text: String::new(),
+                complete: true,
+                how: "stitched".to_string(),
+                why: None,
+            }),
+            None
+        );
+        assert_eq!(
+            format_read_source_note(&TerminalReadResult {
+                text: String::new(),
+                complete: true,
+                how: "screen".to_string(),
+                why: None,
+            })
+            .as_deref(),
+            Some("screen")
+        );
+        assert_eq!(
+            format_read_source_note(&TerminalReadResult {
+                text: String::new(),
+                complete: false,
+                how: "screen".to_string(),
+                why: Some("working".to_string()),
+            })
+            .as_deref(),
+            Some("screen · working")
+        );
+        assert_eq!(
+            format_read_source_note(&TerminalReadResult {
+                text: String::new(),
+                complete: false,
+                how: "stitched".to_string(),
+                why: Some("blocked".to_string()),
+            })
+            .as_deref(),
+            Some("partial · blocked")
+        );
+        assert_eq!(
+            format_read_source_note(&TerminalReadResult {
+                text: String::new(),
+                complete: false,
+                how: "stitched".to_string(),
+                why: None,
+            })
+            .as_deref(),
+            Some("partial")
+        );
+    }
+
+    #[test]
+    fn async_terminal_read_upgrades_modal_preserves_scroll_and_clears_syncing_on_error() {
+        use crate::core::TerminalReadResult;
+
+        let mut core = CoreClient::dummy_for_tests();
+        core.0.set_skip_rpc_for_tests(false);
+        let mut world = reader_test_world();
+        let mut attached = AttachedTerminal::new(1, 60, 14);
+        attached.process_vt_bytes(b"Local fallback line\r\n");
+        let term_rect = Rect::new(0, 1, 60, 14);
+
+        // 0. Action::OpenBookReader opens immediately with local fallback + "syncing…" + in-flight PendingReaderRpc
+        let mut sidebar_open = false;
+        let mut scrollback_offset = 0;
+        let mut modal = Modal::None;
+        let mut eink_mode = true;
+        let mut eink_color = false;
+        let mut force_clear = false;
+        let mut pending_eink = false;
+        let mut pending_osc = false;
+        let mut pending_rpc: Option<PendingReaderRpc> = None;
+        execute_action_full(
+            Action::OpenBookReader,
+            &core,
+            &mut world,
+            Some(&attached),
+            "ctrl+b",
+            &mut sidebar_open,
+            &mut scrollback_offset,
+            &mut modal,
+            term_rect,
+            &mut eink_mode,
+            &mut eink_color,
+            &mut force_clear,
+            &mut pending_eink,
+            Some(ReaderActionOut {
+                pending_osc: &mut pending_osc,
+                pending_rpc: &mut pending_rpc,
+            }),
+        )
+        .unwrap();
+        let rpc_open = pending_rpc
+            .as_ref()
+            .expect("async request registered")
+            .clone();
+        assert!(!rpc_open.for_native_export);
+        assert_eq!(rpc_open.terminal, "t1");
+        match modal {
+            Modal::Reader {
+                ref doc,
+                ref source_note,
+                ..
+            } => {
+                assert_eq!(source_note.as_deref(), Some("syncing…"));
+                assert_eq!(doc.source_note.as_deref(), Some("syncing…"));
+            }
+            _ => panic!("expected Modal::Reader"),
+        }
+
+        // 1. Stale or wrong-terminal responses are ignored
+        let mut pending_json = None;
+        let mut dirty = false;
+
+        apply_terminal_read_message(
+            rpc_open.request_id.wrapping_sub(1),
+            "t1",
+            Ok(TerminalReadResult {
+                text: "stale".to_string(),
+                complete: true,
+                how: "stitched".to_string(),
+                why: None,
+            }),
+            &world,
+            &mut modal,
+            term_rect,
+            &mut pending_rpc,
+            &mut pending_osc,
+            &mut pending_json,
+            true,
+            &mut pending_eink,
+            &mut dirty,
+        );
+        assert!(!dirty);
+        assert_eq!(
+            pending_rpc.as_ref().unwrap().request_id,
+            rpc_open.request_id
+        );
+
+        // Toggle Full mode while RPC is still in-flight; arriving reply preserves user's Full choice
+        assert!(toggle_reader_clean_mode(&mut modal, term_rect));
+        pending_eink = false;
+
+        // 2. Matching async Ok upgrades raw_text, preserves user's Full mode (`clean_mode: false`),
+        //    and applies complete/why source_note while anchoring to latest when `!user_scrolled`.
+        let mut rich = String::from("> prompt\n\u{25cb} Thought for 1s\n");
+        for i in 1..=25 {
+            rich.push_str(&format!("Paragraph {i}: async stitched response.\n\n"));
+        }
+        apply_terminal_read_message(
+            rpc_open.request_id,
+            "t1",
+            Ok(TerminalReadResult {
+                text: rich.clone(),
+                complete: false,
+                how: "stitched".to_string(),
+                why: None,
+            }),
+            &world,
+            &mut modal,
+            term_rect,
+            &mut pending_rpc,
+            &mut pending_osc,
+            &mut pending_json,
+            true,
+            &mut pending_eink,
+            &mut dirty,
+        );
+        assert!(dirty);
+        assert!(pending_eink);
+        assert!(pending_rpc.is_none());
+        let expected_anchor = match modal {
+            Modal::Reader {
+                ref doc,
+                scroll,
+                ref source_note,
+                ..
+            } => {
+                assert!(!doc.clean_mode);
+                assert_eq!(source_note.as_deref(), Some("partial"));
+                assert_eq!(doc.source_note.as_deref(), Some("partial"));
+                assert!(scroll > 0);
+                scroll
+            }
+            _ => panic!("expected Modal::Reader"),
+        };
+
+        // 3. When user scrolled away (`user_scrolled: true`), async upgrade preserves scroll (clamped)
+        if let Modal::Reader { ref mut scroll, .. } = modal {
+            *scroll = 7;
+        }
+        pending_rpc = Some(PendingReaderRpc {
+            request_id: 11,
+            terminal: "t1".to_string(),
+            clean_mode: false,
+            for_native_export: false,
+            user_scrolled: true,
+        });
+        dirty = false;
+        apply_terminal_read_message(
+            11,
+            "t1",
+            Ok(TerminalReadResult {
+                text: rich,
+                complete: true,
+                how: "stitched".to_string(),
+                why: None,
+            }),
+            &world,
+            &mut modal,
+            term_rect,
+            &mut pending_rpc,
+            &mut pending_osc,
+            &mut pending_json,
+            false,
+            &mut pending_eink,
+            &mut dirty,
+        );
+        assert!(dirty);
+        assert_ne!(expected_anchor, 7);
+        match modal {
+            Modal::Reader {
+                ref doc,
+                scroll,
+                ref source_note,
+                ..
+            } => {
+                assert_eq!(scroll, 7);
+                assert!(source_note.is_none());
+                assert!(doc.source_note.is_none());
+            }
+            _ => panic!("expected Modal::Reader"),
+        }
+
+        // 4. Async Err clears "syncing…" badge without dropping existing content
+        if let Modal::Reader {
+            ref mut doc,
+            ref mut source_note,
+            ..
+        } = modal
+        {
+            *source_note = Some("syncing…".to_string());
+            doc.source_note = Some("syncing…".to_string());
+        }
+        pending_rpc = Some(PendingReaderRpc {
+            request_id: 12,
+            terminal: "t1".to_string(),
+            clean_mode: false,
+            for_native_export: false,
+            user_scrolled: true,
+        });
+        dirty = false;
+        apply_terminal_read_message(
+            12,
+            "t1",
+            Err("timeout".to_string()),
+            &world,
+            &mut modal,
+            term_rect,
+            &mut pending_rpc,
+            &mut pending_osc,
+            &mut pending_json,
+            false,
+            &mut pending_eink,
+            &mut dirty,
+        );
+        assert!(dirty);
+        match modal {
+            Modal::Reader {
+                ref doc,
+                ref raw_text,
+                ref source_note,
+                ..
+            } => {
+                assert!(raw_text.contains("async stitched response"));
+                assert!(source_note.is_none());
+                assert!(doc.source_note.is_none());
+            }
+            _ => panic!("expected Modal::Reader"),
+        }
+
+        // 5. Async native ShellDeck export outside Modal::Reader dispatches RPC cleanly and flushes exact OSC 777
+        let mut attached_map = BTreeMap::new();
+        modal = Modal::None;
+        pending_osc = false;
+        pending_rpc = None;
+        execute_action_full(
+            Action::ExportNativeBookReader,
+            &core,
+            &mut world,
+            Some(&attached),
+            "ctrl+b",
+            &mut sidebar_open,
+            &mut scrollback_offset,
+            &mut modal,
+            term_rect,
+            &mut eink_mode,
+            &mut eink_color,
+            &mut force_clear,
+            &mut pending_eink,
+            Some(ReaderActionOut {
+                pending_osc: &mut pending_osc,
+                pending_rpc: &mut pending_rpc,
+            }),
+        )
+        .unwrap();
+        assert!(!pending_osc);
+        let export_rpc = pending_rpc.as_ref().expect("export rpc registered").clone();
+        assert!(export_rpc.for_native_export);
+        apply_terminal_read_message(
+            export_rpc.request_id,
+            "t1",
+            Ok(TerminalReadResult {
+                text: "> q\nExported answer line".to_string(),
+                complete: true,
+                how: "stitched".to_string(),
+                why: None,
+            }),
+            &world,
+            &mut Modal::None,
+            term_rect,
+            &mut pending_rpc,
+            &mut pending_osc,
+            &mut pending_json,
+            false,
+            &mut pending_eink,
+            &mut dirty,
+        );
+        assert!(pending_osc);
+        let expected_json = pending_json.clone().expect("precomputed json populated");
+        let mut out_buf = Vec::new();
+        flush_pending_reader_osc_with_env(
+            &mut out_buf,
+            &mut pending_osc,
+            &mut pending_json,
+            &world,
+            &Modal::None,
+            Some(&"t1".to_string()),
+            &mut attached_map,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(!pending_osc);
+        assert!(pending_json.is_none());
+        assert_eq!(
+            String::from_utf8(out_buf).unwrap(),
+            format_shelldeck_reader_open_osc_with_env(&expected_json, false, false)
+        );
     }
 
     #[test]

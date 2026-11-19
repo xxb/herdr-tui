@@ -24,11 +24,18 @@ pub enum CoreMessage {
         #[allow(dead_code)]
         reason: Value,
     },
+    /// Asynchronous completion of a `terminal.read` JSON-RPC request.
+    TerminalRead {
+        request_id: u64,
+        terminal: String,
+        result: std::result::Result<TerminalReadResult, String>,
+    },
     /// The connection to `herdr-core` was lost.
     Disconnected,
 }
 
 type PendingRpcMap = HashMap<u64, (String, Sender<Value>)>;
+type PendingAsyncReadMap = HashMap<u64, String>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalReadResult {
@@ -77,10 +84,75 @@ pub struct CoreClient {
     writer: Arc<Mutex<BufWriter<ChildStdin>>>,
     next_id: AtomicU64,
     pending: Arc<Mutex<PendingRpcMap>>,
+    pending_async_reads: Arc<Mutex<PendingAsyncReadMap>>,
     events_channel: Arc<Mutex<Option<u32>>>,
     last_pty_input: Mutex<Option<LastPtyInput>>,
     #[cfg(test)]
     skip_rpc_for_tests: bool,
+}
+
+fn format_rpc_error(err: &Value) -> String {
+    let msg = err
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown RPC error");
+    let kind = err
+        .get("data")
+        .and_then(|d| d.get("kind"))
+        .and_then(Value::as_str)
+        .unwrap_or("error");
+    format!("{kind}: {msg}")
+}
+
+fn handle_rpc_reply_value<T, F>(
+    val: Value,
+    pending: &Mutex<PendingRpcMap>,
+    pending_async_reads: &Mutex<PendingAsyncReadMap>,
+    events_channel: &Mutex<Option<u32>>,
+    msg_tx: &Sender<T>,
+    wrap: &F,
+) where
+    F: Fn(CoreMessage) -> T,
+{
+    if let Some(id) = val.get("id").and_then(Value::as_u64) {
+        if let Some((method, tx)) = pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id)
+        {
+            // Register the event stream channel immediately on the reader thread
+            // before reading subsequent frames so early event frames are never
+            // misclassified as TerminalData.
+            if method == "events.subscribe" {
+                if let Some(sub_ch) = val
+                    .get("result")
+                    .and_then(|r| r.get("channel"))
+                    .and_then(Value::as_u64)
+                {
+                    *events_channel.lock().unwrap_or_else(|e| e.into_inner()) = Some(sub_ch as u32);
+                }
+            }
+            let _ = tx.send(val);
+        } else if let Some(terminal) = pending_async_reads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id)
+        {
+            let result = if let Some(err) = val.get("error") {
+                Err(format_rpc_error(err))
+            } else {
+                TerminalReadResult::from_value(val.get("result").unwrap_or(&Value::Null))
+                    .map_err(|e| e.to_string())
+            };
+            let _ = msg_tx.send(wrap(CoreMessage::TerminalRead {
+                request_id: id,
+                terminal,
+                result,
+            }));
+        }
+    } else if val.get("method").is_some() {
+        let _ = msg_tx.send(wrap(CoreMessage::Event(val)));
+    }
 }
 
 fn find_core_binary() -> PathBuf {
@@ -158,11 +230,14 @@ impl CoreClient {
 
         let writer = Arc::new(Mutex::new(BufWriter::with_capacity(16 * 1024, stdin)));
         let pending: Arc<Mutex<PendingRpcMap>> = Arc::new(Mutex::new(HashMap::new()));
+        let pending_async_reads: Arc<Mutex<PendingAsyncReadMap>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let events_channel: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
 
         {
             let writer_clone = writer.clone();
             let pending_clone = pending.clone();
+            let pending_async_clone = pending_async_reads.clone();
             let events_ch_clone = events_channel.clone();
 
             std::thread::spawn(move || {
@@ -170,32 +245,14 @@ impl CoreClient {
                 while let Ok(Some((ch, kind, payload))) = wire::read_frame(&mut reader) {
                     if ch == 0 && kind == wire::DATA {
                         if let Ok(val) = serde_json::from_slice::<Value>(&payload) {
-                            if let Some(id) = val.get("id").and_then(Value::as_u64) {
-                                if let Some((method, tx)) = pending_clone
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .remove(&id)
-                                {
-                                    // Register the event stream channel immediately on the reader thread
-                                    // before reading subsequent frames so early event frames are never
-                                    // misclassified as TerminalData.
-                                    if method == "events.subscribe" {
-                                        if let Some(sub_ch) = val
-                                            .get("result")
-                                            .and_then(|r| r.get("channel"))
-                                            .and_then(Value::as_u64)
-                                        {
-                                            *events_ch_clone
-                                                .lock()
-                                                .unwrap_or_else(|e| e.into_inner()) =
-                                                Some(sub_ch as u32);
-                                        }
-                                    }
-                                    let _ = tx.send(val);
-                                }
-                            } else if val.get("method").is_some() {
-                                let _ = msg_tx.send(wrap(CoreMessage::Event(val)));
-                            }
+                            handle_rpc_reply_value(
+                                val,
+                                &pending_clone,
+                                &pending_async_clone,
+                                &events_ch_clone,
+                                &msg_tx,
+                                &wrap,
+                            );
                         }
                         continue;
                     }
@@ -250,6 +307,7 @@ impl CoreClient {
             writer,
             next_id: AtomicU64::new(1),
             pending,
+            pending_async_reads,
             events_channel,
             last_pty_input: Mutex::new(None),
             #[cfg(test)]
@@ -318,16 +376,7 @@ impl CoreClient {
         })?;
 
         if let Some(err) = reply.get("error") {
-            let msg = err
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown RPC error");
-            let kind = err
-                .get("data")
-                .and_then(|d| d.get("kind"))
-                .and_then(Value::as_str)
-                .unwrap_or("error");
-            bail!("{kind}: {msg}");
+            bail!("{}", format_rpc_error(err));
         }
 
         Ok(reply.get("result").cloned().unwrap_or(Value::Null))
@@ -430,18 +479,42 @@ impl CoreClient {
             .unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Read clean terminal text and capture completeness metadata via `terminal.read`.
-    pub fn read_terminal(&self, terminal: &str, lines: usize) -> Result<TerminalReadResult> {
+    /// Send an asynchronous `terminal.read` JSON-RPC request without blocking the UI thread.
+    /// Returns the assigned request ID when dispatched, so the reader thread delivers
+    /// `CoreMessage::TerminalRead` once `herdr-core` replies.
+    pub fn request_terminal_read(&self, terminal: &str, lines: usize) -> Option<u64> {
         #[cfg(test)]
         if self.skip_rpc_for_tests {
-            bail!("dummy test core has no RPC endpoint");
+            return None;
         }
-        let result = self.call_timeout(
-            "terminal.read",
-            json!({ "terminal": terminal, "lines": lines }),
-            Duration::from_secs(3),
-        )?;
-        TerminalReadResult::from_value(&result)
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "terminal.read",
+            "params": { "terminal": terminal, "lines": lines },
+        });
+        let bytes = serde_json::to_vec(&req).ok()?;
+        {
+            let mut map = self
+                .pending_async_reads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if map.len() >= 64 {
+                if let Some(&oldest_id) = map.keys().min() {
+                    map.remove(&oldest_id);
+                }
+            }
+            map.insert(id, terminal.to_string());
+        }
+        if self.send_frame(0, wire::DATA, &bytes).is_err() {
+            self.pending_async_reads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
+            return None;
+        }
+        Some(id)
     }
 
     /// Resize an attached terminal channel.
@@ -450,6 +523,11 @@ impl CoreClient {
         payload[0..2].copy_from_slice(&cols.to_le_bytes());
         payload[2..4].copy_from_slice(&rows.to_le_bytes());
         let _ = self.send_frame(channel, wire::RESIZE, &payload);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_skip_rpc_for_tests(&mut self, skip: bool) {
+        self.skip_rpc_for_tests = skip;
     }
 
     #[cfg(test)]
@@ -467,6 +545,7 @@ impl CoreClient {
             writer: Arc::new(Mutex::new(BufWriter::new(stdin))),
             next_id: AtomicU64::new(1),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            pending_async_reads: Arc::new(Mutex::new(HashMap::new())),
             events_channel: Arc::new(Mutex::new(None)),
             last_pty_input: Mutex::new(None),
             skip_rpc_for_tests: true,
@@ -534,5 +613,95 @@ mod tests {
 
         let invalid = json!({ "complete": true, "how": "screen" });
         assert!(TerminalReadResult::from_value(&invalid).is_err());
+    }
+
+    #[test]
+    fn async_terminal_read_dispatches_non_blocking_request_and_handles_ok_and_error_replies() {
+        let mut core = CoreClient::dummy_for_tests();
+        assert_eq!(core.request_terminal_read("t1", 200), None);
+
+        // Enable real frame sending against dummy stdin sink to verify non-blocking dispatch + reply routing.
+        core.0.skip_rpc_for_tests = false;
+        let id_ok = core
+            .request_terminal_read("t1", 450)
+            .expect("non-blocking request_terminal_read returns id immediately");
+        let id_err = core
+            .request_terminal_read("t2", 200)
+            .expect("second request returns unique ascending id");
+        assert!(id_err > id_ok);
+
+        let (tx, rx) = mpsc::channel();
+        let events_ch = Mutex::new(None);
+        handle_rpc_reply_value(
+            json!({
+                "jsonrpc": "2.0",
+                "id": id_ok,
+                "result": {
+                    "text": "> hi\nanswer",
+                    "complete": false,
+                    "how": "screen",
+                    "why": "working"
+                }
+            }),
+            &core.pending,
+            &core.pending_async_reads,
+            &events_ch,
+            &tx,
+            &|m| m,
+        );
+        handle_rpc_reply_value(
+            json!({
+                "jsonrpc": "2.0",
+                "id": id_err,
+                "error": {
+                    "message": "terminal vanished",
+                    "data": { "kind": "not_found" }
+                }
+            }),
+            &core.pending,
+            &core.pending_async_reads,
+            &events_ch,
+            &tx,
+            &|m| m,
+        );
+        // Unknown ID does not emit any message
+        handle_rpc_reply_value(
+            json!({ "jsonrpc": "2.0", "id": 99999, "result": {} }),
+            &core.pending,
+            &core.pending_async_reads,
+            &events_ch,
+            &tx,
+            &|m| m,
+        );
+
+        match rx.try_recv().unwrap() {
+            CoreMessage::TerminalRead {
+                request_id,
+                terminal,
+                result: Ok(res),
+            } => {
+                assert_eq!(request_id, id_ok);
+                assert_eq!(terminal, "t1");
+                assert_eq!(res.text, "> hi\nanswer");
+                assert!(!res.complete);
+                assert_eq!(res.how, "screen");
+                assert_eq!(res.why.as_deref(), Some("working"));
+            }
+            other => panic!("unexpected msg: {other:?}"),
+        }
+        match rx.try_recv().unwrap() {
+            CoreMessage::TerminalRead {
+                request_id,
+                terminal,
+                result: Err(err),
+            } => {
+                assert_eq!(request_id, id_err);
+                assert_eq!(terminal, "t2");
+                assert_eq!(err, "not_found: terminal vanished");
+            }
+            other => panic!("unexpected msg: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err());
+        assert!(core.pending_async_reads.lock().unwrap().is_empty());
     }
 }

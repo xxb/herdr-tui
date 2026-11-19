@@ -188,7 +188,11 @@ fn clean_box_and_rule_line(raw: &str, in_code_fence: bool) -> Option<RawKind> {
         return Some(RawKind::Blank);
     }
     if !in_code_fence && trimmed.chars().all(is_box_or_rule_char) {
-        return is_horizontal_rule(trimmed).then_some(RawKind::Divider);
+        return Some(if is_horizontal_rule(trimmed) {
+            RawKind::Divider
+        } else {
+            RawKind::Blank
+        });
     }
     let has_vert_edges = trimmed.starts_with(['│', '┃', '║'])
         && trimmed.ends_with(['│', '┃', '║'])
@@ -211,7 +215,7 @@ fn clean_box_and_rule_line(raw: &str, in_code_fence: bool) -> Option<RawKind> {
             || (trimmed.starts_with(['╰', '└', '┗', '╚'])
                 && trimmed.ends_with(['╯', '┘', '┛', '╝'])))
     {
-        s = trimmed.trim_matches(is_box_or_rule_char);
+        s = trimmed.trim_matches(is_box_or_rule_char).trim();
     }
     let rem = s.trim();
     if rem.is_empty() {
@@ -1110,8 +1114,63 @@ fn is_fence_line(line: &ReaderLineKind) -> bool {
     matches!(line, ReaderLineKind::Text(runs) if runs.iter().map(|(t, _)| t.as_str()).collect::<String>().trim_start().starts_with("```"))
 }
 
-/// Serialize a [`ReaderDoc`] into ShellDeck v1 JSON bounded to [`MAX_SHELLDECK_JSON_BYTES`] with fence parity.
+fn clip_str_utf8_bytes(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let ellipsis = "…";
+    let cap = max_bytes.saturating_sub(ellipsis.len());
+    let mut end = cap.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    if max_bytes < ellipsis.len() {
+        s[..end].to_string()
+    } else {
+        format!("{}{ellipsis}", &s[..end])
+    }
+}
+
+fn truncate_shelldeck_runs_to_bytes(
+    runs: &[(String, u8)],
+    max_raw_bytes: usize,
+) -> Vec<(String, u8)> {
+    let total_bytes: usize = runs.iter().map(|(t, _)| t.len()).sum();
+    if total_bytes <= max_raw_bytes {
+        return runs.to_vec();
+    }
+    let ellipsis = "…";
+    let mut budget = max_raw_bytes.saturating_sub(ellipsis.len());
+    let mut out: Vec<(String, u8)> = Vec::new();
+    for (text, style) in runs {
+        if text.len() <= budget {
+            out.push((text.clone(), *style));
+            budget -= text.len();
+        } else {
+            let mut end = budget.min(text.len());
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            if end > 0 {
+                out.push((format!("{}{ellipsis}", &text[..end]), *style));
+            } else if max_raw_bytes >= ellipsis.len() {
+                if let Some((last_txt, _)) = out.last_mut() {
+                    last_txt.push_str(ellipsis);
+                } else {
+                    out.push((ellipsis.to_string(), *style));
+                }
+            }
+            break;
+        }
+    }
+    out
+}
+
+/// Serialize a [`ReaderDoc`] into ShellDeck v1 JSON strictly bounded to [`MAX_SHELLDECK_JSON_BYTES`]
+/// with balanced ``` code fence parity.
 pub fn format_reader_doc_json(doc: &ReaderDoc) -> String {
+    let title_owned = clip_str_utf8_bytes(&doc.title, 1024);
+    let title = title_owned.as_str();
     let converted: Vec<ShellDeckLine> = doc
         .lines
         .iter()
@@ -1153,30 +1212,103 @@ pub fn format_reader_doc_json(doc: &ReaderDoc) -> String {
         };
         serde_json::to_string(&ShellDeckPayload {
             v: 1,
-            title: &doc.title,
+            title,
             anchor,
             lines: lines_out,
         })
         .unwrap_or_else(|_| "{}".to_string())
     };
     let full = build(0);
-    if full.len() <= MAX_SHELLDECK_JSON_BYTES || doc.lines.len() <= 1 {
+    if full.len() <= MAX_SHELLDECK_JSON_BYTES {
         return full;
     }
-    let (mut lo, mut hi, mut best) = (1usize, doc.lines.len() - 1, build(doc.lines.len() - 1));
+
+    let mut best = if doc.lines.len() <= 1 {
+        full
+    } else {
+        let (mut lo, mut hi, mut cur_best) =
+            (1usize, doc.lines.len() - 1, build(doc.lines.len() - 1));
+        while lo <= hi {
+            let mid = lo + (hi - lo) / 2;
+            let cand = build(mid);
+            if cand.len() <= MAX_SHELLDECK_JSON_BYTES {
+                cur_best = cand;
+                hi = mid.saturating_sub(1);
+                if mid == 0 {
+                    break;
+                }
+            } else {
+                lo = mid + 1;
+            }
+        }
+        cur_best
+    };
+
+    if best.len() <= MAX_SHELLDECK_JSON_BYTES {
+        return best;
+    }
+
+    // Even the single surviving line (plus optional synthetic opening fence) exceeded MAX_SHELLDECK_JSON_BYTES:
+    // binary-search a char-safe byte prefix on the line runs while preserving fence parity.
+    let last_idx = converted.len().saturating_sub(1);
+    let inside = doc.lines[..last_idx]
+        .iter()
+        .filter(|l| is_fence_line(l))
+        .count()
+        % 2
+        == 1;
+    let last_runs = converted
+        .get(last_idx)
+        .map(|l| l.r.as_slice())
+        .unwrap_or(&[]);
+    let total_run_bytes: usize = last_runs.iter().map(|(t, _)| t.len()).sum();
+
+    let build_truncated = |raw_cap: usize| -> String {
+        let mut lines_out = Vec::with_capacity(3);
+        if inside {
+            lines_out.push(ShellDeckLine {
+                r: vec![("```".to_string(), 0)],
+            });
+        }
+        let trunc_runs = truncate_shelldeck_runs_to_bytes(last_runs, raw_cap);
+        let trunc_is_fence = trunc_runs
+            .iter()
+            .map(|(t, _)| t.as_str())
+            .collect::<String>()
+            .trim_start()
+            .starts_with("```");
+        lines_out.push(ShellDeckLine { r: trunc_runs });
+        if (usize::from(inside) + usize::from(trunc_is_fence)) % 2 == 1 {
+            lines_out.push(ShellDeckLine {
+                r: vec![("```".to_string(), 0)],
+            });
+        }
+        let anchor = usize::from(inside).min(lines_out.len().saturating_sub(1));
+        serde_json::to_string(&ShellDeckPayload {
+            v: 1,
+            title,
+            anchor,
+            lines: lines_out,
+        })
+        .unwrap_or_else(|_| "{}".to_string())
+    };
+
+    let mut lo = 0usize;
+    let mut hi = total_run_bytes;
+    best = build_truncated(0);
     while lo <= hi {
         let mid = lo + (hi - lo) / 2;
-        let cand = build(mid);
+        let cand = build_truncated(mid);
         if cand.len() <= MAX_SHELLDECK_JSON_BYTES {
             best = cand;
-            hi = mid.saturating_sub(1);
-            if mid == 0 {
-                break;
-            }
-        } else {
             lo = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid - 1;
         }
     }
+    debug_assert!(best.len() <= MAX_SHELLDECK_JSON_BYTES);
     best
 }
 
@@ -1467,5 +1599,137 @@ mod tests {
         let plain = extract_plain_text_from_screen(parser.screen_mut(), 40);
         assert_eq!(parser.screen().scrollback(), 2);
         assert!(plain.contains("中文连续文本测试换行"));
+    }
+
+    #[test]
+    fn shelldeck_json_enforces_48kb_cap_on_oversized_single_line_and_huge_title() {
+        let single_line = ReaderDoc {
+            title: "t".repeat(100_000),
+            is_agent: false,
+            clean_mode: false,
+            source_note: None,
+            lines: vec![ReaderLineKind::Text(vec![
+                ("中".repeat(40_000), ReaderRunStyle::Body),
+                ("\"\\".repeat(5_000), ReaderRunStyle::Code),
+            ])],
+            anchor_line: 0,
+            hidden_process_lines: 0,
+        };
+        let bounded = format_reader_doc_json(&single_line);
+        assert!(
+            bounded.len() <= MAX_SHELLDECK_JSON_BYTES,
+            "single oversized line + title blew 48KB cap: {} bytes",
+            bounded.len()
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&bounded).unwrap();
+        assert_eq!(parsed["v"], 1);
+        assert!(parsed["title"].as_str().unwrap().ends_with('…'));
+        let rendered_line: String = parsed["lines"][0]["r"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r[0].as_str().unwrap())
+            .collect();
+        assert!(rendered_line.ends_with('…'));
+
+        // Multi-line doc where the final line alone exceeds 48KB inside an open code fence
+        let mut fenced_lines = vec![ReaderLineKind::Text(vec![(
+            "```rust".to_string(),
+            ReaderRunStyle::Code,
+        )])];
+        fenced_lines.push(ReaderLineKind::Text(vec![(
+            "old line".to_string(),
+            ReaderRunStyle::Code,
+        )]));
+        fenced_lines.push(ReaderLineKind::Text(vec![(
+            "x".repeat(100_000),
+            ReaderRunStyle::Code,
+        )]));
+        let fenced_doc = ReaderDoc {
+            title: "fenced".to_string(),
+            is_agent: true,
+            clean_mode: true,
+            source_note: None,
+            lines: fenced_lines,
+            anchor_line: 2,
+            hidden_process_lines: 0,
+        };
+        let bounded_fenced = format_reader_doc_json(&fenced_doc);
+        assert!(bounded_fenced.len() <= MAX_SHELLDECK_JSON_BYTES);
+        let parsed_fenced: serde_json::Value = serde_json::from_str(&bounded_fenced).unwrap();
+        let fence_count = parsed_fenced["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|l| {
+                l["r"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| r[0].as_str().unwrap())
+                    .collect::<String>()
+                    .trim_start()
+                    .starts_with("```")
+            })
+            .count();
+        assert_eq!(fence_count % 2, 0);
+    }
+
+    #[test]
+    fn screen_fallback_unwraps_titled_and_indented_colored_box_borders_with_cjk_join() {
+        let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
+        let mut parser = vt100::Parser::new(nz(4), nz(10), 40);
+        parser.process("┌────────┐\r\n".as_bytes());
+        parser.process("\x1b[2m思考过程\x1b[0m\r\n".as_bytes());
+        parser.process("└────────┘\r\n".as_bytes());
+        parser.process("中文连续文本测试换行\r\n\r\n".as_bytes());
+        parser.process("正文已完成".as_bytes());
+        parser.screen_mut().set_scrollback(2);
+
+        let plain = extract_plain_text_from_screen(parser.screen_mut(), 40);
+        assert_eq!(parser.screen().scrollback(), 2);
+        let doc = build_reader_doc_from_text(&plain, "agy-1", true, true, None);
+        let json_str = format_reader_doc_json(&doc);
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let lines: Vec<String> = parsed["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| {
+                l["r"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| r[0].as_str().unwrap())
+                    .collect()
+            })
+            .collect();
+        assert!(
+            lines.iter().any(|s| s == "中文连续文本测试换行"),
+            "plain={plain:?}, lines={lines:?}"
+        );
+        assert!(lines.iter().any(|s| s == "正文已完成"));
+        assert!(!lines.iter().any(|s| s.contains('┌') || s.contains('└')));
+
+        let mut boxed = vt100::Parser::new(nz(6), nz(80), 20);
+        boxed.process("╭─── Summary ───╮\r\n".as_bytes());
+        boxed.process(
+            "\x1b[2C\x1b[90m│\x1b[0m \x1b[1m# 结论\x1b[0m \x1b[90m│\x1b[0m\r\n".as_bytes(),
+        );
+        boxed.process("Body line.".as_bytes());
+        let boxed_plain = extract_plain_text_from_screen(boxed.screen_mut(), 40);
+        let boxed_doc = build_reader_doc_from_text(&boxed_plain, "small", true, true, None);
+        let boxed_lines: Vec<String> = boxed_doc.lines.iter().map(line_text).collect();
+        assert!(boxed_lines.iter().any(|s| s == "Summary"));
+        assert!(boxed_lines.iter().any(|s| s == "# 结论"));
+        let heading = boxed_doc
+            .lines
+            .iter()
+            .find(|l| line_text(l) == "# 结论")
+            .unwrap();
+        assert!(matches!(
+            heading,
+            ReaderLineKind::Text(runs) if runs.iter().any(|(_, st)| *st == ReaderRunStyle::Bold)
+        ));
     }
 }
