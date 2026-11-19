@@ -814,22 +814,68 @@ pub fn render_ui_full(
 }
 
 pub fn is_active_tab_agent(world: &World) -> bool {
-    if crate::usage::detect_focused_agent(world).is_some() {
-        return true;
-    }
     let Some(addr) = world.active_terminal_address_ref() else {
         return false;
     };
     let Some(info) = world.terminals.get(addr) else {
         return false;
     };
-    info.agent_state() != AgentState::None
+    info.status_app
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty())
+        || info.agent_state() != AgentState::None
         || info
-            .status_app
+            .fg_name
             .as_deref()
-            .is_some_and(|s| !s.trim().is_empty())
+            .and_then(crate::usage::detect_agent_from_str)
+            .is_some()
 }
 
+pub fn scan_viewport_initial_code_fence(screen: &mut vt100::Screen, max_back: usize) -> bool {
+    if max_back == 0 {
+        return false;
+    }
+    let orig_sb = screen.scrollback();
+    let total_sb = screen.scrollback_len();
+    let lookback = total_sb.saturating_sub(orig_sb).min(max_back);
+    if lookback == 0 {
+        return false;
+    }
+
+    struct ScrollbackRestore<'a>(&'a mut vt100::Screen, usize);
+    impl Drop for ScrollbackRestore<'_> {
+        fn drop(&mut self) {
+            self.0.set_scrollback(self.1);
+        }
+    }
+
+    let guard = ScrollbackRestore(screen, orig_sb);
+    let (rows_nz, cols_nz) = guard.0.size();
+    let rows = usize::from(rows_nz.get());
+    let cols = cols_nz.get();
+    if rows == 0 || cols == 0 {
+        return false;
+    }
+
+    let mut in_code_fence = false;
+    let mut prev_wrapped = false;
+    let mut remaining = lookback;
+    while remaining > 0 {
+        let take = remaining.min(rows);
+        guard.0.set_scrollback(orig_sb + remaining);
+        for r in 0..take {
+            let r_u16 = r as u16;
+            if !prev_wrapped && vt_row_trimmed_starts_with_fence(guard.0, r_u16, cols) {
+                in_code_fence = !in_code_fence;
+            }
+            prev_wrapped = guard.0.row_wrapped(r_u16);
+        }
+        remaining -= take;
+    }
+    in_code_fence
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn render_ui_full_with_eink_color(
     f: &mut Frame,
@@ -852,6 +898,55 @@ pub fn render_ui_full_with_eink_color(
     focused_quota: Option<&AgentQuota>,
     eink_mode: bool,
     eink_color: bool,
+) -> UiGeometry {
+    render_ui_full_with_eink_color_and_fence(
+        f,
+        world,
+        screen,
+        sidebar_open,
+        sidebar_width,
+        touch_mode,
+        prefix_active,
+        ctrl_active,
+        alt_active,
+        scrollback_offset,
+        selection,
+        copied_flash,
+        modal,
+        mod_pos,
+        mod_dragging,
+        dpad_pos,
+        dpad_dragging,
+        focused_quota,
+        eink_mode,
+        eink_color,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_ui_full_with_eink_color_and_fence(
+    f: &mut Frame,
+    world: &World,
+    screen: Option<&vt100::Screen>,
+    sidebar_open: bool,
+    sidebar_width: u16,
+    touch_mode: bool,
+    prefix_active: bool,
+    ctrl_active: bool,
+    alt_active: bool,
+    scrollback_offset: usize,
+    selection: Option<&TerminalSelection>,
+    copied_flash: bool,
+    modal: &Modal,
+    mod_pos: Option<(u16, u16)>,
+    mod_dragging: bool,
+    dpad_pos: Option<(u16, u16)>,
+    dpad_dragging: bool,
+    focused_quota: Option<&AgentQuota>,
+    eink_mode: bool,
+    eink_color: bool,
+    initial_in_code_fence: bool,
 ) -> UiGeometry {
     let effective_eink_color = eink_mode && eink_color;
     let area = f.area();
@@ -885,6 +980,7 @@ pub fn render_ui_full_with_eink_color(
                 eink_mode,
                 eink_color: effective_eink_color,
                 is_agent_tab: is_active_tab_agent(world),
+                initial_in_code_fence,
             },
             term_rect,
         );
@@ -3509,6 +3605,7 @@ struct VtScreenWidget<'a> {
     eink_mode: bool,
     eink_color: bool,
     is_agent_tab: bool,
+    initial_in_code_fence: bool,
 }
 
 fn is_braille_char(s: &str) -> bool {
@@ -3662,9 +3759,27 @@ impl ScannedEinkRow {
 }
 
 fn scan_eink_row_text(screen: &vt100::Screen, r: u16, cols: u16) -> Option<ScannedEinkRow> {
-    let mut text = String::with_capacity(usize::from(cols));
-    let mut cells = Vec::with_capacity(usize::from(cols));
-    for c in 0..cols {
+    let first_col = (0..cols).find(|&c| {
+        screen.cell(r, c).is_some_and(|cell| {
+            !cell.is_wide_continuation()
+                && cell.has_contents()
+                && !matches!(cell.contents(), "" | " ")
+        })
+    })?;
+    let last_col = (first_col..cols)
+        .rfind(|&c| {
+            screen.cell(r, c).is_some_and(|cell| {
+                !cell.is_wide_continuation()
+                    && cell.has_contents()
+                    && !matches!(cell.contents(), "" | " ")
+            })
+        })
+        .unwrap_or(first_col);
+    let span = usize::from(last_col - first_col + 1);
+    let mut text = String::with_capacity(span);
+    let mut cells = Vec::with_capacity(span);
+    let mut all_non_space_muted = true;
+    for c in first_col..=last_col {
         let Some(cell) = screen.cell(r, c) else {
             continue;
         };
@@ -3681,6 +3796,9 @@ fn scan_eink_row_text(screen: &vt100::Screen, r: u16, cols: u16) -> Option<Scann
         let byte_start = text.len();
         text.push_str(sym);
         let is_muted = !is_space && is_eink_muted_cell(cell);
+        if !is_space && !is_muted {
+            all_non_space_muted = false;
+        }
         cells.push(ScannedEinkCell {
             col: c,
             byte_start,
@@ -3688,19 +3806,13 @@ fn scan_eink_row_text(screen: &vt100::Screen, r: u16, cols: u16) -> Option<Scann
             is_muted,
         });
     }
-    let first_idx = cells.iter().position(|c| !c.is_space)?;
-    let last_idx = cells.iter().rposition(|c| !c.is_space).unwrap_or(first_idx);
-    let leading_spaces = cells[first_idx].col;
-    let all_non_space_muted = cells[first_idx..=last_idx]
-        .iter()
-        .filter(|c| !c.is_space)
-        .all(|c| c.is_muted);
+    let last_idx = cells.len().checked_sub(1)?;
     Some(ScannedEinkRow {
         text,
         cells,
-        first_idx,
+        first_idx: 0,
         last_idx,
-        leading_spaces,
+        leading_spaces: first_col,
         all_non_space_muted,
     })
 }
@@ -4016,10 +4128,19 @@ pub(crate) fn classify_eink_process_row(
 }
 
 pub(crate) fn detect_eink_process_rows(screen: &vt100::Screen, rows: u16, cols: u16) -> Vec<bool> {
+    detect_eink_process_rows_with_fence(screen, rows, cols, false)
+}
+
+fn detect_eink_process_rows_with_fence(
+    screen: &vt100::Screen,
+    rows: u16,
+    cols: u16,
+    initial_in_code_fence: bool,
+) -> Vec<bool> {
     let mut out = vec![false; usize::from(rows)];
     let mut prev_wrapped = false;
     let mut prev_is_process = false;
-    let mut in_code_fence = false;
+    let mut in_code_fence = initial_in_code_fence;
     for r in 0..rows {
         let row_is_fence = !prev_wrapped && vt_row_trimmed_starts_with_fence(screen, r, cols);
         if row_is_fence {
@@ -4038,12 +4159,40 @@ pub(crate) fn detect_eink_process_rows(screen: &vt100::Screen, rows: u16, cols: 
 }
 
 pub(crate) fn vt_row_trimmed_starts_with_fence(screen: &vt100::Screen, r: u16, cols: u16) -> bool {
-    scan_eink_row_text(screen, r, cols).is_some_and(|scan| {
-        let (trimmed, _) = scan.trimmed();
-        trimmed
-            .trim_start_matches(['│', '┃', '║', ' '])
-            .starts_with("```")
-    })
+    let mut backticks = 0u8;
+    for c in 0..cols {
+        let Some(cell) = screen.cell(r, c) else {
+            continue;
+        };
+        if cell.is_wide_continuation() {
+            continue;
+        }
+        let sym = if cell.has_contents() {
+            cell.contents()
+        } else {
+            " "
+        };
+        if sym.is_empty() {
+            if backticks > 0 {
+                return false;
+            }
+            continue;
+        }
+        for ch in sym.chars() {
+            if backticks == 0 && matches!(ch, '│' | '┃' | '║' | ' ') {
+                continue;
+            }
+            if ch == '`' {
+                backticks += 1;
+                if backticks == 3 {
+                    return true;
+                }
+            } else {
+                return false;
+            }
+        }
+    }
+    false
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5187,7 +5336,12 @@ impl Widget for VtScreenWidget<'_> {
             None
         };
         let process_rows = if self.eink_mode || self.is_agent_tab {
-            Some(detect_eink_process_rows(self.screen, rows, cols))
+            Some(detect_eink_process_rows_with_fence(
+                self.screen,
+                rows,
+                cols,
+                self.initial_in_code_fence,
+            ))
         } else {
             None
         };
@@ -5238,35 +5392,26 @@ impl Widget for VtScreenWidget<'_> {
                         .bg(Color::Reset)
                         .fg(Color::Reset)
                         .add_modifier(Modifier::REVERSED | Modifier::BOLD)
-                } else if row_is_process {
-                    let mut st = Style::default()
-                        .fg(map_vt_color(cell.fgcolor()))
-                        .bg(map_vt_color(cell.bgcolor()))
-                        .add_modifier(Modifier::ITALIC);
-
-                    if cell.dim() || !is_eink_muted_cell(cell) {
-                        st = st.add_modifier(Modifier::DIM);
-                    }
-                    if cell.underline() {
-                        st = st.add_modifier(Modifier::UNDERLINED);
-                    }
-                    if cell.inverse() {
-                        st = st.add_modifier(Modifier::REVERSED);
-                    }
-                    st
                 } else {
                     let mut st = Style::default()
                         .fg(map_vt_color(cell.fgcolor()))
                         .bg(map_vt_color(cell.bgcolor()));
 
-                    if cell.bold() {
-                        st = st.add_modifier(Modifier::BOLD);
+                    if row_is_process {
+                        st = st.add_modifier(Modifier::ITALIC);
+                        if !is_eink_muted_cell(cell) {
+                            st = st.add_modifier(Modifier::DIM);
+                        }
+                    } else {
+                        if cell.bold() {
+                            st = st.add_modifier(Modifier::BOLD);
+                        }
+                        if cell.italic() {
+                            st = st.add_modifier(Modifier::ITALIC);
+                        }
                     }
                     if cell.dim() {
                         st = st.add_modifier(Modifier::DIM);
-                    }
-                    if cell.italic() {
-                        st = st.add_modifier(Modifier::ITALIC);
                     }
                     if cell.underline() {
                         st = st.add_modifier(Modifier::UNDERLINED);
@@ -6950,6 +7095,7 @@ mod tests {
                     eink_mode: false,
                     eink_color: false,
                     is_agent_tab: false,
+                    initial_in_code_fence: false,
                 },
                 f.area(),
             );
@@ -7013,6 +7159,7 @@ mod tests {
                     eink_mode: false,
                     eink_color: false,
                     is_agent_tab: false,
+                    initial_in_code_fence: false,
                 },
                 f.area(),
             );
@@ -7050,6 +7197,7 @@ mod tests {
                     eink_mode: false,
                     eink_color: false,
                     is_agent_tab: false,
+                    initial_in_code_fence: false,
                 },
                 f.area(),
             );
@@ -7082,6 +7230,7 @@ mod tests {
                     eink_mode: false,
                     eink_color: false,
                     is_agent_tab: false,
+                    initial_in_code_fence: false,
                 },
                 f.area(),
             );
@@ -8144,6 +8293,7 @@ mod tests {
                     eink_mode: true,
                     eink_color: false,
                     is_agent_tab: false,
+                    initial_in_code_fence: false,
                 },
                 f.area(),
             );
@@ -8370,6 +8520,7 @@ mod tests {
                     eink_mode: true,
                     eink_color: false,
                     is_agent_tab: false,
+                    initial_in_code_fence: false,
                 },
                 f.area(),
             );
@@ -8699,6 +8850,7 @@ mod tests {
                     eink_mode: true,
                     eink_color: true,
                     is_agent_tab: false,
+                    initial_in_code_fence: false,
                 },
                 f.area(),
             );
@@ -8851,6 +9003,7 @@ mod tests {
                     eink_mode: true,
                     eink_color: true,
                     is_agent_tab: false,
+                    initial_in_code_fence: false,
                 },
                 f.area(),
             );
@@ -8927,6 +9080,7 @@ mod tests {
                     eink_mode: true,
                     eink_color: true,
                     is_agent_tab: false,
+                    initial_in_code_fence: false,
                 },
                 f.area(),
             );
@@ -9019,6 +9173,7 @@ mod tests {
                         eink_mode: true,
                         eink_color,
                         is_agent_tab: false,
+                        initial_in_code_fence: false,
                     },
                     f.area(),
                 );
@@ -9118,6 +9273,7 @@ mod tests {
                         eink_mode: true,
                         eink_color: true,
                         is_agent_tab: false,
+                        initial_in_code_fence: false,
                     },
                     f.area(),
                 );
@@ -9177,6 +9333,7 @@ mod tests {
                         eink_mode: true,
                         eink_color: false,
                         is_agent_tab: false,
+                        initial_in_code_fence: false,
                     },
                     f.area(),
                 );
@@ -9762,13 +9919,14 @@ mod tests {
         assert!(!is_collapsed_action_summary_row("… 10 more actions_logged"));
 
         let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
-        let rows = 10u16;
+        let rows = 11u16;
         let cols = 72u16;
         let mut parser = vt100::Parser::new(nz(rows), nz(cols), 10);
         parser.process(
             concat!(
                 "… 10 more actions (3 reads, 6 edits, 1 tool) …\r\n",
                 "... 3 more steps\r\n",
+                "▎ … 10 more actions (3 reads, 6 edits, 1 tool) …\r\n",
                 "│ … 2 more edits │\r\n",
                 "  42 … 4 more reads\r\n",
                 "```markdown\r\n",
@@ -9783,7 +9941,7 @@ mod tests {
         let detected = detect_eink_process_rows(parser.screen(), rows, cols);
         assert_eq!(
             detected,
-            vec![true, true, false, false, false, false, false, false, true, false]
+            vec![true, true, true, false, false, false, false, false, false, true, false]
         );
 
         let backend = TestBackend::new(cols, rows);
@@ -9796,25 +9954,31 @@ mod tests {
                     eink_mode: true,
                     eink_color: false,
                     is_agent_tab: false,
+                    initial_in_code_fence: false,
                 },
                 f.area(),
             );
         })
         .unwrap();
         let buf = term.backend().buffer();
-        // Row 0 & 1: collapsed action summaries render in E-Ink process gray + italic
+        // Row 0..=2: collapsed action summaries (including open diff gutter `▎`) render in E-Ink process gray + italic
         for y in 0..=1u16 {
             assert_eq!(buf[(0, y)].fg, EINK_INK_PROCESS);
             assert!(buf[(0, y)].modifier.contains(Modifier::ITALIC));
         }
-        // Row 5 & 6 inside ``` code fence stay upright EINK_INK (not italicized)
-        assert_eq!(buf[(0, 5)].fg, EINK_INK);
-        assert!(!buf[(0, 5)].modifier.contains(Modifier::ITALIC));
+        assert_eq!(buf[(2, 2)].fg, EINK_INK_PROCESS);
+        assert!(buf[(2, 2)].modifier.contains(Modifier::ITALIC));
+        // Row 3: closed box table card `│ … 2 more edits │` stays upright EINK_INK
+        assert_eq!(buf[(2, 3)].fg, EINK_INK);
+        assert!(!buf[(2, 3)].modifier.contains(Modifier::ITALIC));
+        // Row 6 & 7 inside ``` code fence stay upright EINK_INK (not italicized)
         assert_eq!(buf[(0, 6)].fg, EINK_INK);
         assert!(!buf[(0, 6)].modifier.contains(Modifier::ITALIC));
-        // Row 8 after closing fence resumes process italic styling
-        assert_eq!(buf[(0, 8)].fg, EINK_INK_PROCESS);
-        assert!(buf[(0, 8)].modifier.contains(Modifier::ITALIC));
+        assert_eq!(buf[(0, 7)].fg, EINK_INK);
+        assert!(!buf[(0, 7)].modifier.contains(Modifier::ITALIC));
+        // Row 9 after closing fence resumes process italic styling
+        assert_eq!(buf[(0, 9)].fg, EINK_INK_PROCESS);
+        assert!(buf[(0, 9)].modifier.contains(Modifier::ITALIC));
 
         // Soft-wrapped opening fence line does not double-toggle `in_code_fence`
         let mut wrap_fence = vt100::Parser::new(nz(6), nz(18), 0);
@@ -9854,6 +10018,7 @@ mod tests {
                 "… 4 more steps\r\n",
                 "```\r\n",
                 "● 正式回答正文\r\n",
+                "Body prose \x1b[2m(dim note)\x1b[0m",
             )
             .as_bytes(),
         );
@@ -9876,6 +10041,7 @@ mod tests {
                         eink_mode: false,
                         eink_color: false,
                         is_agent_tab: true,
+                        initial_in_code_fence: false,
                     },
                     f.area(),
                 );
@@ -9964,9 +10130,15 @@ mod tests {
         assert!(!abuf[(0, 10)].modifier.contains(Modifier::ITALIC));
         assert!(!abuf[(0, 11)].modifier.contains(Modifier::ITALIC));
 
-        // Row 12: final assistant prose stays upright
+        // Row 12 & 13: final assistant prose stays upright and preserves SGR 2 DIM on `(dim note)`
         assert_eq!(abuf[(0, 12)].symbol(), "●");
         assert!(!abuf[(0, 12)].modifier.contains(Modifier::ITALIC));
+        assert_eq!(abuf[(0, 13)].symbol(), "B");
+        assert!(!abuf[(0, 13)].modifier.contains(Modifier::ITALIC));
+        assert!(!abuf[(0, 13)].modifier.contains(Modifier::DIM));
+        assert_eq!(abuf[(11, 13)].symbol(), "(");
+        assert!(abuf[(11, 13)].modifier.contains(Modifier::DIM));
+        assert!(!abuf[(11, 13)].modifier.contains(Modifier::ITALIC));
 
         // 2. Plain shell tab (`is_agent_tab: false`): nothing is italicized and BOLD is preserved.
         let mut shell_term = Terminal::new(TestBackend::new(cols, rows)).unwrap();
@@ -9979,6 +10151,7 @@ mod tests {
                         eink_mode: false,
                         eink_color: false,
                         is_agent_tab: false,
+                        initial_in_code_fence: false,
                     },
                     f.area(),
                 );
@@ -10009,7 +10182,7 @@ mod tests {
             tabs: vec![
                 SharedTab {
                     id: "tab-shell".to_string(),
-                    name: "zsh".to_string(),
+                    name: "claude-notes".to_string(),
                     root: serde_json::json!({"content": {"terminal": "t-shell"}}),
                     ..Default::default()
                 },
@@ -10031,6 +10204,12 @@ mod tests {
                     root: serde_json::json!({"content": {"terminal": "t-fg"}}),
                     ..Default::default()
                 },
+                SharedTab {
+                    id: "tab-done".to_string(),
+                    name: "done-tab".to_string(),
+                    root: serde_json::json!({"content": {"terminal": "t-done"}}),
+                    ..Default::default()
+                },
             ],
             ..Default::default()
         });
@@ -10038,8 +10217,9 @@ mod tests {
             "t-shell".to_string(),
             TerminalInfo {
                 address: "t-shell".to_string(),
+                name: Some("claude-notes".to_string()),
                 fg_name: Some("zsh".to_string()),
-                title: "zsh".to_string(),
+                title: "~/codes/gemini-proxy".to_string(),
                 status_app: Some("   ".to_string()),
                 ..Default::default()
             },
@@ -10064,11 +10244,21 @@ mod tests {
             "t-fg".to_string(),
             TerminalInfo {
                 address: "t-fg".to_string(),
-                fg_name: Some("codex".to_string()),
+                fg_name: Some("claude".to_string()),
+                ..Default::default()
+            },
+        );
+        world.terminals.insert(
+            "t-done".to_string(),
+            TerminalInfo {
+                address: "t-done".to_string(),
+                turn: 2,
+                seen_turn: Some(1),
                 ..Default::default()
             },
         );
 
+        // Plain shell with OSC title `~/codes/gemini-proxy` and tab/terminal name `claude-notes` must return false
         world.select_tab_index(0);
         assert!(!is_active_tab_agent(&world));
         world.select_tab_index(1);
@@ -10076,6 +10266,8 @@ mod tests {
         world.select_tab_index(2);
         assert!(is_active_tab_agent(&world));
         world.select_tab_index(3);
+        assert!(is_active_tab_agent(&world));
+        world.select_tab_index(4);
         assert!(is_active_tab_agent(&world));
 
         // End-to-end render_ui_full_with_eink_color uses is_active_tab_agent(world) in Normal mode
@@ -10152,5 +10344,141 @@ mod tests {
         assert!(sbuf[(0, 1)].modifier.contains(Modifier::BOLD));
         assert!(!sbuf[(0, 2)].modifier.contains(Modifier::ITALIC));
         assert!(!sbuf[(0, 3)].modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn scan_viewport_initial_code_fence_tracks_scrolled_fences_and_restores_scrollback() {
+        let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
+        let rows = 5u16;
+        let cols = 50u16;
+
+        // 1. Fence opened and closed above viewport -> initial_in_code_fence == false
+        let mut closed_parser = vt100::Parser::new(nz(rows), nz(cols), 30);
+        closed_parser.process(
+            concat!(
+                "```rust\r\n",
+                "fn old() {}\r\n",
+                "```\r\n",
+                "line a\r\n",
+                "line b\r\n",
+                "line c\r\n",
+                "line d\r\n",
+                "● Used Tool\r\n",
+            )
+            .as_bytes(),
+        );
+        assert!(!scan_viewport_initial_code_fence(
+            closed_parser.screen_mut(),
+            50
+        ));
+        assert_eq!(closed_parser.screen().scrollback(), 0);
+
+        // 2. Fence opened above row 0 and closes mid-viewport -> keeps interior upright, resumes after ```
+        let mut open_parser = vt100::Parser::new(nz(rows), nz(cols), 30);
+        open_parser.process(
+            concat!(
+                "  │ ```rust\r\n",
+                "let a = 1;\r\n",
+                "let b = 2;\r\n",
+                "let c = 3;\r\n",
+                "let d = 4;\r\n",
+                "○ Thought for 1s\r\n",
+                "… 10 more actions\r\n",
+                "```\r\n",
+                "● Used Tool\r\n",
+            )
+            .as_bytes(),
+        );
+        assert!(vt_row_trimmed_starts_with_fence(
+            open_parser.screen(),
+            2,
+            cols
+        ));
+        assert!(!vt_row_trimmed_starts_with_fence(
+            open_parser.screen(),
+            3,
+            cols
+        ));
+        assert!(scan_viewport_initial_code_fence(
+            open_parser.screen_mut(),
+            50
+        ));
+        assert_eq!(open_parser.screen().scrollback(), 0);
+
+        // When scrolled up 2 lines, scan checks only rows above the scrolled window and restores scrollback=2
+        open_parser.screen_mut().set_scrollback(2);
+        assert_eq!(open_parser.screen().scrollback(), 2);
+        assert!(scan_viewport_initial_code_fence(
+            open_parser.screen_mut(),
+            50
+        ));
+        assert_eq!(open_parser.screen().scrollback(), 2);
+        open_parser.screen_mut().set_scrollback(0);
+
+        // End-to-end render_ui_full_with_eink_color_and_fence respects scrolled opening fence
+        let mut world = World::default();
+        world.doc.spaces.push(SharedSpace {
+            id: "sp".to_string(),
+            name: "work".to_string(),
+            folder: "/tmp/work".to_string(),
+            tabs: vec![SharedTab {
+                id: "tab-agent".to_string(),
+                name: "agent".to_string(),
+                root: serde_json::json!({"content": {"terminal": "t-agent"}}),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        world.terminals.insert(
+            "t-agent".to_string(),
+            TerminalInfo {
+                address: "t-agent".to_string(),
+                fg_name: Some("claude".to_string()),
+                ..Default::default()
+            },
+        );
+        let init_fence = scan_viewport_initial_code_fence(open_parser.screen_mut(), 200);
+        assert!(init_fence);
+
+        let mut term = Terminal::new(TestBackend::new(cols, rows + 2)).unwrap();
+        term.draw(|f| {
+            let _ = render_ui_full_with_eink_color_and_fence(
+                f,
+                &world,
+                Some(open_parser.screen()),
+                false,
+                24,
+                false,
+                false,
+                false,
+                false,
+                0,
+                None,
+                false,
+                &Modal::None,
+                None,
+                false,
+                None,
+                false,
+                None,
+                false,
+                false,
+                init_fence,
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        // Top bar is y=0; live screen rows 0..5 are at y=1..=5:
+        // y=1 (`○ Thought for 1s`) & y=2 (`… 10 more actions`) are inside the scrolled-off fence -> upright
+        assert_eq!(buf[(0, 1)].symbol(), "○");
+        assert!(!buf[(0, 1)].modifier.contains(Modifier::ITALIC));
+        assert_eq!(buf[(0, 2)].symbol(), "…");
+        assert!(!buf[(0, 2)].modifier.contains(Modifier::ITALIC));
+        // y=3 (` ``` `) closes fence -> upright
+        assert_eq!(buf[(0, 3)].symbol(), "`");
+        assert!(!buf[(0, 3)].modifier.contains(Modifier::ITALIC));
+        // y=4 (`● Used Tool`) after closing fence -> italicized
+        assert_eq!(buf[(0, 4)].symbol(), "●");
+        assert!(buf[(0, 4)].modifier.contains(Modifier::ITALIC));
     }
 }

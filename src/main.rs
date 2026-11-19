@@ -19,11 +19,12 @@ use crate::model::{AgentState, EventDisposition, World};
 use crate::ui::capture_eink_screen_snapshot;
 use crate::ui::{
     capture_eink_screen_snapshot_with_color, collect_fuzzy_items, collect_overview_items,
-    compute_terminal_rect, find_hit_target, is_in_rect, is_on_dpad_disc,
+    compute_terminal_rect, find_hit_target, is_active_tab_agent, is_in_rect, is_on_dpad_disc,
     overview_selection_after_query_change, overview_selection_for_index,
-    render_ui_full_with_eink_color, resolve_dpad_disc_rect, resolve_fuzzy_selection,
-    resolve_mod_cross_rect, resolve_overview_selection, EinkScreenSnapshot, HitRegion, HitTarget,
-    Modal, OverviewItem, OverviewSelection, PromptKind, TerminalSelection,
+    render_ui_full_with_eink_color_and_fence, resolve_dpad_disc_rect, resolve_fuzzy_selection,
+    resolve_mod_cross_rect, resolve_overview_selection, scan_viewport_initial_code_fence,
+    EinkScreenSnapshot, HitRegion, HitTarget, Modal, OverviewItem, OverviewSelection, PromptKind,
+    TerminalSelection,
 };
 use crate::usage::UsageTracker;
 use anyhow::Result;
@@ -4544,14 +4545,36 @@ fn run_app_loop(
         prev_active_agent_state = cur_agent;
 
         if dirty {
-            let active_att = active_addr.as_ref().and_then(|a| attached_map.get(a));
-            let scr_ref = if selection.as_ref().is_some_and(|s| s.active) {
-                selection_screen
+            let initial_in_code_fence = if (eink_mode || is_active_tab_agent(world))
+                && !matches!(modal, Modal::TabOverview { .. })
+            {
+                const VIEWPORT_FENCE_LOOKBACK: usize = 200;
+                let mut_scr = selection
                     .as_ref()
-                    .or_else(|| active_att.map(|a| a.parser.screen()))
+                    .filter(|s| s.active)
+                    .and(selection_screen.as_mut())
+                    .or_else(|| {
+                        active_addr
+                            .as_ref()
+                            .and_then(|a| attached_map.get_mut(a))
+                            .map(|a| a.parser.screen_mut())
+                    });
+                mut_scr.is_some_and(|scr| {
+                    scan_viewport_initial_code_fence(scr, VIEWPORT_FENCE_LOOKBACK)
+                })
             } else {
-                active_att.map(|a| a.parser.screen())
+                false
             };
+            let scr_ref = selection
+                .as_ref()
+                .filter(|s| s.active)
+                .and(selection_screen.as_ref())
+                .or_else(|| {
+                    active_addr
+                        .as_ref()
+                        .and_then(|a| attached_map.get(a))
+                        .map(|a| a.parser.screen())
+                });
             let copied_flash = copied_until.is_some();
             let mod_dragging = dpad_drag.as_ref().is_some_and(|d| d.is_mod && d.moved);
             let dpad_dragging = dpad_drag.as_ref().is_some_and(|d| !d.is_mod && d.moved);
@@ -4561,7 +4584,7 @@ fn run_app_loop(
                 force_clear = false;
             }
             terminal.draw(|f| {
-                let geom = render_ui_full_with_eink_color(
+                let geom = render_ui_full_with_eink_color_and_fence(
                     f,
                     world,
                     scr_ref,
@@ -4582,6 +4605,7 @@ fn run_app_loop(
                     focused_quota.as_ref(),
                     eink_mode,
                     eink_color,
+                    initial_in_code_fence,
                 );
                 last_hits = geom.hits;
                 last_mod_rect = geom.mod_rect;
