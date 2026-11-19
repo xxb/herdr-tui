@@ -339,20 +339,27 @@ fn fuzzy_subsequence(hay: &str, needle: &str) -> bool {
     true
 }
 
-fn normal_state_style(state: AgentState) -> Style {
-    let base = Style::default()
-        .bg(Color::Reset)
-        .remove_modifier(Modifier::BOLD | Modifier::DIM);
+fn normal_state_fg(state: AgentState) -> Color {
     match state {
-        AgentState::Blocked => base.fg(Color::Red),
-        AgentState::Working => base.fg(Color::Yellow),
-        AgentState::Done => base.fg(Color::Green),
-        AgentState::Idle => base.fg(Color::Cyan),
-        AgentState::None => Style::default()
+        AgentState::Blocked => Color::Red,
+        AgentState::Working => Color::Yellow,
+        AgentState::Done => Color::Green,
+        AgentState::Idle => Color::Cyan,
+        AgentState::None => Color::Reset,
+    }
+}
+
+fn normal_state_style(state: AgentState) -> Style {
+    match normal_state_fg(state) {
+        Color::Reset => Style::default()
             .bg(Color::Reset)
             .fg(Color::Reset)
             .remove_modifier(Modifier::BOLD)
             .add_modifier(Modifier::DIM),
+        fg => Style::default()
+            .bg(Color::Reset)
+            .fg(fg)
+            .remove_modifier(Modifier::BOLD | Modifier::DIM),
     }
 }
 
@@ -1127,10 +1134,9 @@ fn tab_pill_style(st: AgentState, is_active: bool, eink_mode: bool) -> Style {
         };
     }
     if is_active {
-        let ul_col = if matches!(st, AgentState::Blocked) {
-            Color::Red
-        } else {
-            Color::Cyan
+        let ul_col = match normal_state_fg(st) {
+            Color::Reset => Color::Cyan,
+            fg => fg,
         };
         Style::default()
             .bg(Color::Reset)
@@ -1354,6 +1360,15 @@ fn draw_touchbar_pill(
         return;
     }
     let lw = label.width() as u16;
+    let accent_col = if eink_mode {
+        EINK_INK
+    } else if let Some(ul) = style.underline_color.filter(|&c| c != Color::Reset) {
+        ul
+    } else if style.fg == Some(Color::Red) {
+        Color::Red
+    } else {
+        Color::Cyan
+    };
     if rect.height >= 3 && lw > 0 {
         // 3-row keycap pill:
         // - Row 0 (`rect.y`): subtle top hairline (`▔`)
@@ -1364,12 +1379,19 @@ fn draw_touchbar_pill(
         } else if emphasized {
             (
                 style.fg(Color::Reset).remove_modifier(Modifier::DIM),
-                style.fg(Color::Cyan).remove_modifier(Modifier::DIM),
+                style
+                    .fg(accent_col)
+                    .remove_modifier(Modifier::BOLD | Modifier::DIM),
             )
         } else {
             (
-                style.fg(Color::Cyan).remove_modifier(Modifier::DIM),
-                style.fg(Color::Reset).add_modifier(Modifier::DIM),
+                style
+                    .fg(accent_col)
+                    .remove_modifier(Modifier::BOLD | Modifier::DIM),
+                style
+                    .fg(Color::Reset)
+                    .remove_modifier(Modifier::BOLD)
+                    .add_modifier(Modifier::DIM),
             )
         };
         let top_line = "▔".repeat(lw as usize);
@@ -1381,7 +1403,7 @@ fn draw_touchbar_pill(
         let gloss_style = if eink_mode {
             Style::default().bg(EINK_PAPER).fg(EINK_INK)
         } else if emphasized {
-            Style::default().bg(Color::Reset).fg(Color::Cyan)
+            Style::default().bg(Color::Reset).fg(accent_col)
         } else {
             Style::default()
                 .bg(Color::Reset)
@@ -1393,18 +1415,9 @@ fn draw_touchbar_pill(
         buf.set_string(x, rect.y + 1, &bot_line, gloss_style);
     } else {
         let pill_style = if emphasized {
-            let ul_col = if eink_mode {
-                EINK_INK
-            } else if let Some(ul) = style.underline_color.filter(|&c| c != Color::Reset) {
-                ul
-            } else if style.fg == Some(Color::Red) {
-                Color::Red
-            } else {
-                Color::Cyan
-            };
             style
                 .add_modifier(Modifier::UNDERLINED)
-                .underline_color(ul_col)
+                .underline_color(accent_col)
         } else {
             style
         };
@@ -9499,12 +9512,49 @@ mod tests {
         assert!(ybuf[(wrk_x, 0)]
             .modifier
             .contains(Modifier::BOLD | Modifier::UNDERLINED));
-        assert_eq!(ybuf[(wrk_x, 0)].underline_color, Color::Cyan);
+        assert_eq!(ybuf[(wrk_x, 0)].underline_color, Color::Yellow);
         for y in [0u16, 23u16] {
             for x in 0..100u16 {
                 assert_no_bold_on_ansi_color(&ybuf[(x, y)], &format!("yellow/bar cell ({x},{y})"));
             }
         }
+
+        // Active `Done` tab renders `BOLD + UNDERLINED` on `Color::Reset` with `Green` underline
+        world.select_tab_index(2);
+        terminal
+            .draw(|f| {
+                let _ = render_ui_full_with_eink_color(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::None,
+                    None,
+                    false,
+                    None,
+                    false,
+                    None,
+                    false,
+                    false,
+                );
+            })
+            .unwrap();
+        let gbuf = terminal.backend().buffer();
+        let grow0: String = (0..100).map(|x| gbuf[(x, 0)].symbol()).collect();
+        let don_x = grow0[..grow0.find("3:don").unwrap()].chars().count() as u16;
+        assert_eq!(gbuf[(don_x, 0)].fg, Color::Reset);
+        assert!(gbuf[(don_x, 0)]
+            .modifier
+            .contains(Modifier::BOLD | Modifier::UNDERLINED));
+        assert_eq!(gbuf[(don_x, 0)].underline_color, Color::Green);
 
         // Active `Blocked` tab retains `BOLD + UNDERLINED` on `Color::Reset` with `Red` underline
         world.select_tab_index(0);
