@@ -2065,6 +2065,7 @@ fn apply_terminal_read_message(
             let clean_mode = doc.clean_mode;
             let (tab_title, is_agent) = reader_tab_meta(world, Some(terminal));
             let note = format_read_source_note(&res);
+            let badge_changed = *source_note != note || doc.source_note != note;
             *doc = crate::reader::build_reader_doc_from_text(
                 &res.text,
                 &tab_title,
@@ -2081,7 +2082,7 @@ fn apply_terminal_read_message(
                 *scroll = initial;
             }
             *dirty = true;
-            if eink_mode && (text_changed || doc.lines.len() != prev_len) {
+            if eink_mode && (text_changed || doc.lines.len() != prev_len || badge_changed) {
                 *pending_eink_osc = true;
             }
         }
@@ -10503,6 +10504,149 @@ mod tests {
             }
             _ => panic!("expected Modal::Reader"),
         }
+
+        // 4b. Byte-identical Ok reply that changes badge ("syncing…" -> None or "screen · working")
+        //     must still set BOTH dirty and pending_eink in E-Ink mode.
+        let cur_text = match modal {
+            Modal::Reader { ref raw_text, .. } => raw_text.clone(),
+            _ => panic!("expected Modal::Reader"),
+        };
+        if let Modal::Reader {
+            ref mut doc,
+            ref mut source_note,
+            ..
+        } = modal
+        {
+            *source_note = Some("syncing…".to_string());
+            doc.source_note = Some("syncing…".to_string());
+        }
+        pending_rpc = Some(PendingReaderRpc {
+            request_id: 15,
+            terminal: "t1".to_string(),
+            clean_mode: false,
+            for_native_export: false,
+            user_scrolled: true,
+            deadline: Instant::now() + READER_RPC_TIMEOUT,
+        });
+        dirty = false;
+        pending_eink = false;
+        apply_terminal_read_message(
+            15,
+            "t1",
+            Ok(TerminalReadResult {
+                text: cur_text.clone(),
+                complete: true,
+                how: "stitched".to_string(),
+                why: None,
+            }),
+            &world,
+            &mut modal,
+            term_rect,
+            &mut pending_rpc,
+            &mut pending_osc,
+            &mut pending_json,
+            true,
+            &mut pending_eink,
+            &mut dirty,
+        );
+        assert!(dirty);
+        assert!(pending_eink);
+        match modal {
+            Modal::Reader {
+                ref doc,
+                ref source_note,
+                ..
+            } => {
+                assert!(source_note.is_none());
+                assert!(doc.source_note.is_none());
+            }
+            _ => panic!("expected Modal::Reader"),
+        }
+
+        if let Modal::Reader {
+            ref mut doc,
+            ref mut source_note,
+            ..
+        } = modal
+        {
+            *source_note = Some("syncing…".to_string());
+            doc.source_note = Some("syncing…".to_string());
+        }
+        pending_rpc = Some(PendingReaderRpc {
+            request_id: 16,
+            terminal: "t1".to_string(),
+            clean_mode: false,
+            for_native_export: false,
+            user_scrolled: true,
+            deadline: Instant::now() + READER_RPC_TIMEOUT,
+        });
+        dirty = false;
+        pending_eink = false;
+        apply_terminal_read_message(
+            16,
+            "t1",
+            Ok(TerminalReadResult {
+                text: cur_text.clone(),
+                complete: false,
+                how: "screen".to_string(),
+                why: Some("working".to_string()),
+            }),
+            &world,
+            &mut modal,
+            term_rect,
+            &mut pending_rpc,
+            &mut pending_osc,
+            &mut pending_json,
+            true,
+            &mut pending_eink,
+            &mut dirty,
+        );
+        assert!(dirty);
+        assert!(pending_eink);
+        match modal {
+            Modal::Reader {
+                ref doc,
+                ref source_note,
+                ..
+            } => {
+                assert_eq!(source_note.as_deref(), Some("screen · working"));
+                assert_eq!(doc.source_note.as_deref(), Some("screen · working"));
+            }
+            _ => panic!("expected Modal::Reader"),
+        }
+
+        // Identical text AND identical badge avoids redundant E-Ink refresh OSC
+        pending_rpc = Some(PendingReaderRpc {
+            request_id: 17,
+            terminal: "t1".to_string(),
+            clean_mode: false,
+            for_native_export: false,
+            user_scrolled: true,
+            deadline: Instant::now() + READER_RPC_TIMEOUT,
+        });
+        dirty = false;
+        pending_eink = false;
+        apply_terminal_read_message(
+            17,
+            "t1",
+            Ok(TerminalReadResult {
+                text: cur_text,
+                complete: false,
+                how: "screen".to_string(),
+                why: Some("working".to_string()),
+            }),
+            &world,
+            &mut modal,
+            term_rect,
+            &mut pending_rpc,
+            &mut pending_osc,
+            &mut pending_json,
+            true,
+            &mut pending_eink,
+            &mut dirty,
+        );
+        assert!(dirty);
+        assert!(!pending_eink);
 
         // 5. Async native ShellDeck export outside Modal::Reader dispatches RPC cleanly and flushes exact OSC 777
         let mut attached_map = BTreeMap::new();
