@@ -17,11 +17,39 @@ pub enum ReaderRunStyle {
     Code = 3,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReaderDividerKind {
+    /// Major boundary between conversation turns or shell command blocks (`═`).
+    Major,
+    /// In-content Markdown section horizontal rule (`─`).
+    Section,
+    /// Omitted intermediate AI process rows collapsed in Clean mode (`┄`).
+    Collapsed,
+}
+
+impl ReaderDividerKind {
+    fn rank(self) -> u8 {
+        match self {
+            Self::Collapsed => 0,
+            Self::Section => 1,
+            Self::Major => 2,
+        }
+    }
+
+    fn merge(self, other: Self) -> Self {
+        if self.rank() >= other.rank() {
+            self
+        } else {
+            other
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReaderLineKind {
     Text(Vec<(String, ReaderRunStyle)>),
     Blank,
-    Divider,
+    Divider(ReaderDividerKind),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,7 +141,7 @@ pub fn extract_plain_text_from_screen(screen: &mut vt100::Screen, max_rows: usiz
 enum RawKind {
     Text(String),
     Blank,
-    Divider,
+    Divider(ReaderDividerKind),
 }
 
 #[derive(Clone)]
@@ -131,8 +159,8 @@ impl RawLine {
         Self::meta(RawKind::Blank)
     }
 
-    fn divider() -> Self {
-        Self::meta(RawKind::Divider)
+    fn divider(kind: ReaderDividerKind) -> Self {
+        Self::meta(RawKind::Divider(kind))
     }
 
     fn meta(kind: RawKind) -> Self {
@@ -149,7 +177,7 @@ impl RawLine {
     fn text(&self) -> &str {
         match &self.kind {
             RawKind::Text(s) => s,
-            RawKind::Blank | RawKind::Divider => "",
+            RawKind::Blank | RawKind::Divider(_) => "",
         }
     }
 }
@@ -178,7 +206,7 @@ fn clean_box_and_rule_line(raw: &str, in_code_fence: bool) -> Option<RawKind> {
     }
     if !in_code_fence && trimmed.chars().all(is_box_or_rule_char) {
         return Some(if is_horizontal_rule(trimmed) {
-            RawKind::Divider
+            RawKind::Divider(ReaderDividerKind::Section)
         } else {
             RawKind::Blank
         });
@@ -211,7 +239,10 @@ fn clean_box_and_rule_line(raw: &str, in_code_fence: bool) -> Option<RawKind> {
         return Some(RawKind::Blank);
     }
     if !in_code_fence && rem.chars().all(is_box_or_rule_char) {
-        return is_horizontal_rule(rem).then_some(RawKind::Divider);
+        return is_horizontal_rule(rem).then_some(RawKind::Divider(ReaderDividerKind::Section));
+    }
+    if !in_code_fence && rem.len() >= 3 && rem.bytes().all(|b| b == b'-') {
+        return Some(RawKind::Divider(ReaderDividerKind::Section));
     }
     Some(RawKind::Text(s.to_string()))
 }
@@ -548,7 +579,7 @@ fn cap_lines_preserving_fences(
     let mut lead = 0usize;
     while kept
         .get(lead)
-        .is_some_and(|l| matches!(l, ReaderLineKind::Blank | ReaderLineKind::Divider))
+        .is_some_and(|l| matches!(l, ReaderLineKind::Blank | ReaderLineKind::Divider(_)))
     {
         lead += 1;
     }
@@ -588,12 +619,21 @@ fn normalize_and_style(
                     need_blank = false;
                 }
             }
-            RawKind::Divider => {
-                let prev_div = matches!(staged.last().map(|l| &l.kind), Some(RawKind::Divider))
-                    || (staged.len() >= 2
-                        && matches!(staged.last().map(|l| &l.kind), Some(RawKind::Blank))
-                        && matches!(staged[staged.len() - 2].kind, RawKind::Divider));
-                if prev_div {
+            RawKind::Divider(kind) => {
+                let prev_div_idx = match staged.last().map(|l| &l.kind) {
+                    Some(RawKind::Divider(_)) => Some(staged.len() - 1),
+                    Some(RawKind::Blank)
+                        if staged.len() >= 2
+                            && matches!(staged[staged.len() - 2].kind, RawKind::Divider(_)) =>
+                    {
+                        Some(staged.len() - 2)
+                    }
+                    _ => None,
+                };
+                if let Some(idx) = prev_div_idx {
+                    if let RawKind::Divider(prev_kind) = staged[idx].kind {
+                        staged[idx].kind = RawKind::Divider(prev_kind.merge(kind));
+                    }
                     need_blank = true;
                     continue;
                 }
@@ -602,7 +642,7 @@ fn normalize_and_style(
                 {
                     staged.push(RawLine::blank());
                 }
-                staged.push(item);
+                staged.push(RawLine::divider(kind));
                 need_blank = true;
             }
             RawKind::Text(ref s) => {
@@ -644,13 +684,13 @@ fn normalize_and_style(
 
     while staged
         .first()
-        .is_some_and(|l| matches!(l.kind, RawKind::Blank | RawKind::Divider))
+        .is_some_and(|l| matches!(l.kind, RawKind::Blank | RawKind::Divider(_)))
     {
         staged.remove(0);
     }
     while staged
         .last()
-        .is_some_and(|l| matches!(l.kind, RawKind::Blank | RawKind::Divider))
+        .is_some_and(|l| matches!(l.kind, RawKind::Blank | RawKind::Divider(_)))
     {
         staged.pop();
     }
@@ -664,7 +704,7 @@ fn normalize_and_style(
         .enumerate()
         .map(|(i, l)| match &l.kind {
             RawKind::Blank => ReaderLineKind::Blank,
-            RawKind::Divider => ReaderLineKind::Divider,
+            RawKind::Divider(kind) => ReaderLineKind::Divider(*kind),
             RawKind::Text(s) => {
                 if l.is_turn_start {
                     last_turn = Some(i);
@@ -791,14 +831,14 @@ pub fn build_reader_doc_from_text(
         for line in parsed {
             match &line.kind {
                 RawKind::Blank => with_div.push(line),
-                RawKind::Divider => {
+                RawKind::Divider(_) => {
                     has_output = false;
                     with_div.push(line);
                 }
                 RawKind::Text(_) => {
                     if line.is_shell_prompt {
                         if has_output {
-                            with_div.push(RawLine::divider());
+                            with_div.push(RawLine::divider(ReaderDividerKind::Major));
                         }
                         has_output = false;
                     } else {
@@ -831,7 +871,18 @@ pub fn build_reader_doc_from_text(
     }
 
     if !clean_mode {
-        let (lines, last_turn, body_after, _) = normalize_and_style(parsed, true, false);
+        let mut parsed_full = Vec::with_capacity(parsed.len() + 8);
+        let mut saw_text = false;
+        for line in parsed {
+            if matches!(line.kind, RawKind::Text(_)) {
+                if line.is_turn_start && saw_text {
+                    parsed_full.push(RawLine::divider(ReaderDividerKind::Major));
+                }
+                saw_text = true;
+            }
+            parsed_full.push(line);
+        }
+        let (lines, last_turn, body_after, _) = normalize_and_style(parsed_full, true, false);
         let (lines, [last_turn, body_after, _]) =
             cap_lines_preserving_fences(lines, FULL_MAX_SCAN_ROWS, [last_turn, body_after, None]);
         let anchor_line = body_after.or(last_turn).unwrap_or_else(|| {
@@ -852,7 +903,7 @@ pub fn build_reader_doc_from_text(
     }
 
     while parsed.last().is_some_and(|l| {
-        matches!(l.kind, RawKind::Blank | RawKind::Divider) || is_trailing_chrome(l)
+        matches!(l.kind, RawKind::Blank | RawKind::Divider(_)) || is_trailing_chrome(l)
     }) {
         parsed.pop();
     }
@@ -892,14 +943,19 @@ pub fn build_reader_doc_from_text(
                     collapsed.push(line);
                 }
             }
-            RawKind::Divider => {
+            RawKind::Divider(kind) => {
                 pending_div = false;
-                collapsed.push(line);
+                collapsed.push(RawLine::divider(kind.merge(ReaderDividerKind::Collapsed)));
             }
             RawKind::Text(_) => {
-                if pending_div {
+                if line.is_turn_start {
                     if saw_text {
-                        collapsed.push(RawLine::divider());
+                        collapsed.push(RawLine::divider(ReaderDividerKind::Major));
+                    }
+                    pending_div = false;
+                } else if pending_div {
+                    if saw_text {
+                        collapsed.push(RawLine::divider(ReaderDividerKind::Collapsed));
                     }
                     pending_div = false;
                 }
@@ -1014,7 +1070,7 @@ pub fn wrap_reader_doc(doc: &ReaderDoc, content_width: u16) -> WrappedReaderView
         }
         match line {
             ReaderLineKind::Blank => rows.push(ReaderLineKind::Blank),
-            ReaderLineKind::Divider => rows.push(ReaderLineKind::Divider),
+            ReaderLineKind::Divider(kind) => rows.push(ReaderLineKind::Divider(*kind)),
             ReaderLineKind::Text(runs) => {
                 let is_code = runs.iter().any(|(_, s)| *s == ReaderRunStyle::Code);
                 let (prefix, avail_w) = if is_code && max_w >= 6 {
@@ -1099,7 +1155,9 @@ mod tests {
         match line {
             ReaderLineKind::Text(runs) => runs.iter().map(|(t, _)| t.as_str()).collect(),
             ReaderLineKind::Blank => String::new(),
-            ReaderLineKind::Divider => "────────".to_string(),
+            ReaderLineKind::Divider(ReaderDividerKind::Major) => "════════".to_string(),
+            ReaderLineKind::Divider(ReaderDividerKind::Section) => "────────".to_string(),
+            ReaderLineKind::Divider(ReaderDividerKind::Collapsed) => "┄┄┄┄┄┄┄┄".to_string(),
         }
     }
 
@@ -1160,7 +1218,12 @@ mod tests {
             .iter()
             .any(|t| t == "Soft wrapped English words join cleanly."));
         assert!(texts.iter().any(|t| t == "- bullet stays separate"));
-        assert!(doc.lines.contains(&ReaderLineKind::Divider));
+        assert!(doc
+            .lines
+            .contains(&ReaderLineKind::Divider(ReaderDividerKind::Major)));
+        assert!(doc
+            .lines
+            .contains(&ReaderLineKind::Divider(ReaderDividerKind::Collapsed)));
 
         let heading_idx = texts.iter().position(|t| t == "## 结论").unwrap();
         assert_eq!(doc.anchor_line, heading_idx);
@@ -1245,8 +1308,55 @@ mod tests {
             ReaderLineKind::Text(vec![("100% passed".to_string(), ReaderRunStyle::Body)])
         );
         assert!(
-            doc.lines[prompt_idx - 1] == ReaderLineKind::Divider
-                || doc.lines[prompt_idx - 2] == ReaderLineKind::Divider
+            doc.lines[prompt_idx - 1] == ReaderLineKind::Divider(ReaderDividerKind::Major)
+                || doc.lines[prompt_idx - 2] == ReaderLineKind::Divider(ReaderDividerKind::Major)
+        );
+    }
+
+    #[test]
+    fn semantic_divider_hierarchy_and_dedup_precedence() {
+        let multi_turn = concat!(
+            "> Turn A\n",
+            "▸ Thought for 1s\n",
+            "First answer.\n",
+            "---\n",
+            "Second section.\n",
+            "● Trailing tool call\n",
+            "> Turn B\n",
+            "Final reply.\n"
+        );
+        let clean = build_reader_doc_from_text(multi_turn, "agy", true, true, None);
+        let dividers: Vec<ReaderDividerKind> = clean
+            .lines
+            .iter()
+            .filter_map(|l| match l {
+                ReaderLineKind::Divider(k) => Some(*k),
+                _ => None,
+            })
+            .collect();
+        // Turn A internal collapsed process -> Collapsed; Markdown --- -> Section;
+        // Trailing tool call right before > Turn B merges into a single Major divider.
+        assert_eq!(
+            dividers,
+            vec![
+                ReaderDividerKind::Collapsed,
+                ReaderDividerKind::Section,
+                ReaderDividerKind::Major,
+            ]
+        );
+
+        let full = build_reader_doc_from_text(multi_turn, "agy", true, false, None);
+        let full_dividers: Vec<ReaderDividerKind> = full
+            .lines
+            .iter()
+            .filter_map(|l| match l {
+                ReaderLineKind::Divider(k) => Some(*k),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            full_dividers,
+            vec![ReaderDividerKind::Section, ReaderDividerKind::Major]
         );
     }
 
