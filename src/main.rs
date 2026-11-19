@@ -4636,6 +4636,7 @@ fn run_app_loop(
                 terminal.clear()?;
                 force_clear = false;
             }
+            let mut geom_eink_snapshot = None;
             terminal.draw(|f| {
                 let geom = render_ui_full_with_eink_color_and_fence(
                     f,
@@ -4666,6 +4667,7 @@ fn run_app_loop(
                 last_space_slop_rect = geom.space_slop_rect;
                 last_page_up_rect = geom.page_up_rect;
                 last_page_down_rect = geom.page_down_rect;
+                geom_eink_snapshot = geom.eink_snapshot;
             })?;
             if pending_eink_osc {
                 if eink_mode {
@@ -4681,24 +4683,8 @@ fn run_app_loop(
             last_draw_at = Some(Instant::now());
             prev_drawn_addr = active_addr.clone();
             prev_modal_open = !matches!(modal, Modal::None);
-            last_eink_snap = if eink_mode && matches!(modal, Modal::None) && selection.is_none() {
-                active_addr.as_ref().and_then(|addr| {
-                    attached_map.get(addr).map(|att| {
-                        (
-                            addr.clone(),
-                            capture_eink_screen_snapshot_with_color_and_fence(
-                                att.parser.screen(),
-                                term_rect,
-                                scrollback_offset,
-                                eink_color,
-                                initial_in_code_fence,
-                            ),
-                        )
-                    })
-                })
-            } else {
-                None
-            };
+            last_eink_snap = geom_eink_snapshot
+                .and_then(|snap| active_addr.as_ref().map(|addr| (addr.clone(), snap)));
             if !first_frame_drawn {
                 first_frame_drawn = true;
                 need_sync_terminals = true;

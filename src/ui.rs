@@ -387,6 +387,7 @@ pub struct UiGeometry {
     pub space_slop_rect: Option<Rect>,
     pub page_up_rect: Option<Rect>,
     pub page_down_rect: Option<Rect>,
+    pub eink_snapshot: Option<EinkScreenSnapshot>,
 }
 
 pub fn is_in_rect(rect: Option<Rect>, col: u16, row: u16) -> bool {
@@ -813,12 +814,14 @@ pub fn render_ui_full(
     )
 }
 
-fn is_known_agent_binary_name(fg_name: &str) -> bool {
-    let trimmed = fg_name.trim();
-    if trimmed.is_empty() {
+fn is_known_agent_name(raw: &str) -> bool {
+    let Some(first_token) = raw.split_whitespace().next() else {
         return false;
-    }
-    let bin = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+    };
+    let bin = first_token
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(first_token);
     let lower = bin.to_ascii_lowercase();
     let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
     matches!(
@@ -845,13 +848,8 @@ pub fn is_active_tab_agent(world: &World) -> bool {
     let Some(info) = world.terminals.get(addr) else {
         return false;
     };
-    info.status_app
-        .as_deref()
-        .is_some_and(|s| !s.trim().is_empty())
-        || info
-            .fg_name
-            .as_deref()
-            .is_some_and(is_known_agent_binary_name)
+    info.status_app.as_deref().is_some_and(is_known_agent_name)
+        || info.fg_name.as_deref().is_some_and(is_known_agent_name)
 }
 
 pub fn scan_viewport_initial_code_fence(screen: &mut vt100::Screen, max_back: usize) -> bool {
@@ -992,18 +990,43 @@ pub fn render_ui_full_with_eink_color_and_fence(
     };
 
     let tab_overview_open = matches!(modal, Modal::TabOverview { .. });
+    let mut eink_snapshot = None;
 
     if tab_overview_open {
         // TabOverview owns the full terminal viewport; avoid painting stale background VT cells.
     } else if let Some(scr) = screen {
+        let (scr_cols, scr_rows) = {
+            let (r, c) = scr.size();
+            (c.get(), r.get())
+        };
+        let (rows, cols) = vt_render_dims((scr_cols, scr_rows), term_rect);
+        let (diff_rows, process_rows) = compute_eink_row_annotations(
+            scr,
+            rows,
+            cols,
+            eink_mode && effective_eink_color,
+            eink_mode || is_active_tab_agent(world),
+            initial_in_code_fence,
+        );
+        if eink_mode && matches!(modal, Modal::None) && selection.is_none() {
+            eink_snapshot = Some(build_eink_screen_snapshot(
+                scr,
+                rows,
+                cols,
+                scrollback_offset,
+                effective_eink_color,
+                diff_rows.as_deref(),
+                process_rows.as_deref(),
+            ));
+        }
         f.render_widget(
-            VtScreenWidget {
+            ResolvedVtScreenWidget {
                 screen: scr,
                 selection,
                 eink_mode,
                 eink_color: effective_eink_color,
-                is_agent_tab: is_active_tab_agent(world),
-                initial_in_code_fence,
+                diff_rows: diff_rows.as_deref(),
+                process_rows: process_rows.as_deref(),
             },
             term_rect,
         );
@@ -1184,6 +1207,7 @@ pub fn render_ui_full_with_eink_color_and_fence(
         space_slop_rect,
         page_up_rect,
         page_down_rect,
+        eink_snapshot,
     }
 }
 
@@ -3622,6 +3646,7 @@ fn render_tab_overview_page(
     }
 }
 
+#[cfg(test)]
 struct VtScreenWidget<'a> {
     screen: &'a vt100::Screen,
     selection: Option<&'a TerminalSelection>,
@@ -3629,6 +3654,15 @@ struct VtScreenWidget<'a> {
     eink_color: bool,
     is_agent_tab: bool,
     initial_in_code_fence: bool,
+}
+
+struct ResolvedVtScreenWidget<'a> {
+    screen: &'a vt100::Screen,
+    selection: Option<&'a TerminalSelection>,
+    eink_mode: bool,
+    eink_color: bool,
+    diff_rows: Option<&'a [Option<EinkDiffRowHighlight>]>,
+    process_rows: Option<&'a [bool]>,
 }
 
 fn is_braille_char(s: &str) -> bool {
@@ -3764,8 +3798,6 @@ struct ScannedEinkCell {
 struct ScannedEinkRow {
     text: String,
     cells: Vec<ScannedEinkCell>,
-    first_idx: usize,
-    last_idx: usize,
     leading_spaces: u16,
     all_non_space_muted: bool,
 }
@@ -3776,8 +3808,6 @@ impl ScannedEinkRow {
         Self {
             text: String::with_capacity(cap),
             cells: Vec::with_capacity(cap),
-            first_idx: 0,
-            last_idx: 0,
             leading_spaces: 0,
             all_non_space_muted: true,
         }
@@ -3832,23 +3862,16 @@ impl ScannedEinkRow {
                 is_muted,
             });
         }
-        let Some(last_idx) = self.cells.len().checked_sub(1) else {
+        if self.cells.is_empty() {
             return false;
-        };
-        self.first_idx = 0;
-        self.last_idx = last_idx;
+        }
         self.leading_spaces = first_col;
         self.all_non_space_muted = all_non_space_muted;
         true
     }
 
     fn trimmed(&self) -> (&str, usize) {
-        let start = self.cells[self.first_idx].byte_start;
-        let end = self
-            .cells
-            .get(self.last_idx + 1)
-            .map_or(self.text.len(), |c| c.byte_start);
-        (&self.text[start..end], start)
+        (&self.text, 0)
     }
 }
 
@@ -3918,7 +3941,7 @@ fn strip_leading_gutter_bar<'a>(
     trimmed: &'a str,
     trimmed_byte_start: usize,
 ) -> (&'a str, usize, u16) {
-    let default_col = scan.cells[scan.first_idx].col;
+    let default_col = scan.cells[0].col;
     let Some(bar_ch) = trimmed.chars().next() else {
         return (trimmed, trimmed_byte_start, default_col);
     };
@@ -3936,7 +3959,8 @@ fn strip_leading_gutter_bar<'a>(
         return (trimmed, trimmed_byte_start, default_col);
     }
     let inner_byte_start = trimmed_byte_start + bar_ch.len_utf8() + (after_bar.len() - inner.len());
-    let inner_col = scan.cells[scan.first_idx..=scan.last_idx]
+    let inner_col = scan
+        .cells
         .iter()
         .find(|cell| cell.byte_start == inner_byte_start)
         .map_or(default_col, |cell| cell.col);
@@ -4002,7 +4026,7 @@ fn has_muted_parenthetical_tail(scan: &ScannedEinkRow, rest: &str, rest_byte: us
     }
     let paren_byte = rest_byte + rel_paren + 1;
     let mut count = 0usize;
-    for cell in &scan.cells[scan.first_idx..=scan.last_idx] {
+    for cell in &scan.cells {
         if cell.byte_start >= paren_byte && !cell.is_space {
             if !cell.is_muted {
                 return false;
@@ -5263,31 +5287,33 @@ pub fn capture_eink_screen_snapshot_with_color(
     )
 }
 
-pub fn capture_eink_screen_snapshot_with_color_and_fence(
+fn compute_eink_row_annotations(
     screen: &vt100::Screen,
-    area: Rect,
+    rows: u16,
+    cols: u16,
+    compute_diff: bool,
+    compute_process: bool,
+    initial_in_code_fence: bool,
+) -> (Option<Vec<Option<EinkDiffRowHighlight>>>, Option<Vec<bool>>) {
+    let diff_rows = compute_diff.then(|| detect_eink_diff_rows(screen, rows, cols));
+    let process_rows = compute_process
+        .then(|| detect_eink_process_rows_with_fence(screen, rows, cols, initial_in_code_fence));
+    (diff_rows, process_rows)
+}
+
+fn build_eink_screen_snapshot(
+    screen: &vt100::Screen,
+    rows: u16,
+    cols: u16,
     scrollback_offset: usize,
     eink_color: bool,
-    initial_in_code_fence: bool,
+    diff_rows: Option<&[Option<EinkDiffRowHighlight>]>,
+    process_rows: Option<&[bool]>,
 ) -> EinkScreenSnapshot {
-    let (scr_cols, scr_rows) = {
-        let (r, c) = screen.size();
-        (c.get(), r.get())
-    };
-    let (rows, cols) = vt_render_dims((scr_cols, scr_rows), area);
-    let diff_rows = if eink_color {
-        Some(detect_eink_diff_rows(screen, rows, cols))
-    } else {
-        None
-    };
-    let process_rows =
-        detect_eink_process_rows_with_fence(screen, rows, cols, initial_in_code_fence);
     let mut cells = Vec::with_capacity(usize::from(rows) * usize::from(cols));
     for r in 0..rows {
-        let row_diff = diff_rows
-            .as_ref()
-            .and_then(|rows_vec| rows_vec[usize::from(r)]);
-        let row_is_process = process_rows[usize::from(r)];
+        let row_diff = diff_rows.and_then(|rows_vec| rows_vec[usize::from(r)]);
+        let row_is_process = process_rows.is_some_and(|rows_vec| rows_vec[usize::from(r)]);
         let mut c = 0;
         while c < cols {
             let Some(cell) = screen.cell(r, c) else {
@@ -5359,6 +5385,31 @@ pub fn capture_eink_screen_snapshot_with_color_and_fence(
     }
 }
 
+pub fn capture_eink_screen_snapshot_with_color_and_fence(
+    screen: &vt100::Screen,
+    area: Rect,
+    scrollback_offset: usize,
+    eink_color: bool,
+    initial_in_code_fence: bool,
+) -> EinkScreenSnapshot {
+    let (scr_cols, scr_rows) = {
+        let (r, c) = screen.size();
+        (c.get(), r.get())
+    };
+    let (rows, cols) = vt_render_dims((scr_cols, scr_rows), area);
+    let (diff_rows, process_rows) =
+        compute_eink_row_annotations(screen, rows, cols, eink_color, true, initial_in_code_fence);
+    build_eink_screen_snapshot(
+        screen,
+        rows,
+        cols,
+        scrollback_offset,
+        eink_color,
+        diff_rows.as_deref(),
+        process_rows.as_deref(),
+    )
+}
+
 /// Resolve how many rows and columns of the vt100 screen to paint into `area`.
 ///
 /// The screen and the viewport are expected to agree: `term_rect` is what
@@ -5378,162 +5429,186 @@ fn vt_render_dims(screen: (u16, u16), area: Rect) -> (u16, u16) {
     (area.height.min(scr_rows), area.width.min(scr_cols))
 }
 
-impl Widget for VtScreenWidget<'_> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        if self.eink_mode {
-            for y in area.y..area.y.saturating_add(area.height) {
-                for x in area.x..area.x.saturating_add(area.width) {
-                    if let Some(dst) = buf.cell_mut((x, y)) {
-                        dst.reset();
-                        dst.set_symbol(" ");
-                        dst.set_bg(EINK_PAPER);
-                        dst.set_fg(EINK_INK);
-                    }
+#[allow(clippy::too_many_arguments)]
+fn render_vt_screen_with_rows(
+    screen: &vt100::Screen,
+    selection: Option<&TerminalSelection>,
+    eink_mode: bool,
+    eink_color: bool,
+    diff_rows: Option<&[Option<EinkDiffRowHighlight>]>,
+    process_rows: Option<&[bool]>,
+    area: Rect,
+    buf: &mut Buffer,
+) {
+    if eink_mode {
+        for y in area.y..area.y.saturating_add(area.height) {
+            for x in area.x..area.x.saturating_add(area.width) {
+                if let Some(dst) = buf.cell_mut((x, y)) {
+                    dst.reset();
+                    dst.set_symbol(" ");
+                    dst.set_bg(EINK_PAPER);
+                    dst.set_fg(EINK_INK);
                 }
             }
         }
+    }
+    let (scr_cols, scr_rows) = {
+        let (r, c) = screen.size();
+        (c.get(), r.get())
+    };
+    let (rows, cols) = vt_render_dims((scr_cols, scr_rows), area);
+    let active_sel = selection.filter(|s| s.is_non_empty());
+    let sel_bounds = active_sel.map(|s| s.normalized());
+
+    for r in 0..rows {
+        let row_diff = diff_rows.and_then(|rows_vec| rows_vec[usize::from(r)]);
+        let row_is_process = process_rows.is_some_and(|rows_vec| rows_vec[usize::from(r)]);
+        let row_in_sel = sel_bounds.is_some_and(|((sr, _), (er, _))| r >= sr && r <= er);
+        let mut c = 0;
+        while c < cols {
+            let Some(cell) = screen.cell(r, c) else {
+                c += 1;
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                c += 1;
+                continue;
+            }
+            let x = area.x + c;
+            let y = area.y + r;
+            let is_wide = cell.is_wide();
+            let selected = row_in_sel
+                && active_sel
+                    .is_some_and(|sel| sel.contains(r, c) || (is_wide && sel.contains(r, c + 1)));
+
+            let style = if eink_mode {
+                let (fg_col, bg_col, mods) = if eink_color {
+                    resolve_eink_vt_colors_and_mods_with_diff(
+                        cell,
+                        selected,
+                        c,
+                        row_diff,
+                        row_is_process,
+                    )
+                } else {
+                    resolve_eink_vt_colors_and_mods(cell, selected, row_is_process)
+                };
+                Style::default().fg(fg_col).bg(bg_col).add_modifier(mods)
+            } else if selected {
+                Style::default()
+                    .bg(Color::Reset)
+                    .fg(Color::Reset)
+                    .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else {
+                let mut st = Style::default()
+                    .fg(map_vt_color(cell.fgcolor()))
+                    .bg(map_vt_color(cell.bgcolor()));
+
+                if row_is_process {
+                    st = st.add_modifier(Modifier::ITALIC);
+                    if !is_eink_muted_cell(cell) {
+                        st = st.add_modifier(Modifier::DIM);
+                    }
+                } else {
+                    if cell.bold() {
+                        st = st.add_modifier(Modifier::BOLD);
+                    }
+                    if cell.italic() {
+                        st = st.add_modifier(Modifier::ITALIC);
+                    }
+                }
+                if cell.dim() {
+                    st = st.add_modifier(Modifier::DIM);
+                }
+                if cell.underline() {
+                    st = st.add_modifier(Modifier::UNDERLINED);
+                }
+                if cell.inverse() {
+                    st = st.add_modifier(Modifier::REVERSED);
+                }
+                st
+            };
+
+            let raw_sym = if cell.has_contents() {
+                cell.contents()
+            } else {
+                ""
+            };
+            if is_wide {
+                if c + 1 >= cols {
+                    if let Some(dst) = buf.cell_mut((x, y)) {
+                        dst.reset();
+                        dst.set_symbol(" ");
+                        dst.set_style(style);
+                    }
+                    c += 1;
+                } else {
+                    if let Some(dst) = buf.cell_mut((x, y)) {
+                        dst.reset();
+                        let sym = if raw_sym.width() == 2 { raw_sym } else { " " };
+                        dst.set_symbol(sym);
+                        dst.set_style(style);
+                    }
+                    if let Some(dst_next) = buf.cell_mut((x + 1, y)) {
+                        dst_next.reset();
+                        dst_next.set_style(style);
+                    }
+                    c += 2;
+                }
+            } else {
+                let sym = normalized_narrow_vt_symbol(screen, r, c, rows, cols, raw_sym, eink_mode);
+                if let Some(dst) = buf.cell_mut((x, y)) {
+                    dst.reset();
+                    dst.set_symbol(sym);
+                    dst.set_style(style);
+                }
+                c += 1;
+            }
+        }
+    }
+}
+
+impl Widget for ResolvedVtScreenWidget<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        render_vt_screen_with_rows(
+            self.screen,
+            self.selection,
+            self.eink_mode,
+            self.eink_color,
+            self.diff_rows,
+            self.process_rows,
+            area,
+            buf,
+        );
+    }
+}
+
+#[cfg(test)]
+impl Widget for VtScreenWidget<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
         let (scr_cols, scr_rows) = {
             let (r, c) = self.screen.size();
             (c.get(), r.get())
         };
         let (rows, cols) = vt_render_dims((scr_cols, scr_rows), area);
-        let diff_rows = if self.eink_mode && self.eink_color {
-            Some(detect_eink_diff_rows(self.screen, rows, cols))
-        } else {
-            None
-        };
-        let process_rows = if self.eink_mode || self.is_agent_tab {
-            Some(detect_eink_process_rows_with_fence(
-                self.screen,
-                rows,
-                cols,
-                self.initial_in_code_fence,
-            ))
-        } else {
-            None
-        };
-        let active_sel = self.selection.filter(|s| s.is_non_empty());
-        let sel_bounds = active_sel.map(|s| s.normalized());
-
-        for r in 0..rows {
-            let row_diff = diff_rows
-                .as_ref()
-                .and_then(|rows_vec| rows_vec[usize::from(r)]);
-            let row_is_process = process_rows
-                .as_ref()
-                .is_some_and(|rows_vec| rows_vec[usize::from(r)]);
-            let row_in_sel = sel_bounds.is_some_and(|((sr, _), (er, _))| r >= sr && r <= er);
-            let mut c = 0;
-            while c < cols {
-                let Some(cell) = self.screen.cell(r, c) else {
-                    c += 1;
-                    continue;
-                };
-                if cell.is_wide_continuation() {
-                    c += 1;
-                    continue;
-                }
-                let x = area.x + c;
-                let y = area.y + r;
-                let is_wide = cell.is_wide();
-                let selected = row_in_sel
-                    && active_sel.is_some_and(|sel| {
-                        sel.contains(r, c) || (is_wide && sel.contains(r, c + 1))
-                    });
-
-                let style = if self.eink_mode {
-                    let (fg_col, bg_col, mods) = if self.eink_color {
-                        resolve_eink_vt_colors_and_mods_with_diff(
-                            cell,
-                            selected,
-                            c,
-                            row_diff,
-                            row_is_process,
-                        )
-                    } else {
-                        resolve_eink_vt_colors_and_mods(cell, selected, row_is_process)
-                    };
-                    Style::default().fg(fg_col).bg(bg_col).add_modifier(mods)
-                } else if selected {
-                    Style::default()
-                        .bg(Color::Reset)
-                        .fg(Color::Reset)
-                        .add_modifier(Modifier::REVERSED | Modifier::BOLD)
-                } else {
-                    let mut st = Style::default()
-                        .fg(map_vt_color(cell.fgcolor()))
-                        .bg(map_vt_color(cell.bgcolor()));
-
-                    if row_is_process {
-                        st = st.add_modifier(Modifier::ITALIC);
-                        if !is_eink_muted_cell(cell) {
-                            st = st.add_modifier(Modifier::DIM);
-                        }
-                    } else {
-                        if cell.bold() {
-                            st = st.add_modifier(Modifier::BOLD);
-                        }
-                        if cell.italic() {
-                            st = st.add_modifier(Modifier::ITALIC);
-                        }
-                    }
-                    if cell.dim() {
-                        st = st.add_modifier(Modifier::DIM);
-                    }
-                    if cell.underline() {
-                        st = st.add_modifier(Modifier::UNDERLINED);
-                    }
-                    if cell.inverse() {
-                        st = st.add_modifier(Modifier::REVERSED);
-                    }
-                    st
-                };
-
-                let raw_sym = if cell.has_contents() {
-                    cell.contents()
-                } else {
-                    ""
-                };
-                if is_wide {
-                    if c + 1 >= cols {
-                        if let Some(dst) = buf.cell_mut((x, y)) {
-                            dst.reset();
-                            dst.set_symbol(" ");
-                            dst.set_style(style);
-                        }
-                        c += 1;
-                    } else {
-                        if let Some(dst) = buf.cell_mut((x, y)) {
-                            dst.reset();
-                            let sym = if raw_sym.width() == 2 { raw_sym } else { " " };
-                            dst.set_symbol(sym);
-                            dst.set_style(style);
-                        }
-                        if let Some(dst_next) = buf.cell_mut((x + 1, y)) {
-                            dst_next.reset();
-                            dst_next.set_style(style);
-                        }
-                        c += 2;
-                    }
-                } else {
-                    let sym = normalized_narrow_vt_symbol(
-                        self.screen,
-                        r,
-                        c,
-                        rows,
-                        cols,
-                        raw_sym,
-                        self.eink_mode,
-                    );
-                    if let Some(dst) = buf.cell_mut((x, y)) {
-                        dst.reset();
-                        dst.set_symbol(sym);
-                        dst.set_style(style);
-                    }
-                    c += 1;
-                }
-            }
-        }
+        let (diff_rows, process_rows) = compute_eink_row_annotations(
+            self.screen,
+            rows,
+            cols,
+            self.eink_mode && self.eink_color,
+            self.eink_mode || self.is_agent_tab,
+            self.initial_in_code_fence,
+        );
+        render_vt_screen_with_rows(
+            self.screen,
+            self.selection,
+            self.eink_mode,
+            self.eink_color,
+            diff_rows.as_deref(),
+            process_rows.as_deref(),
+            area,
+            buf,
+        );
     }
 }
 
@@ -10301,6 +10376,18 @@ mod tests {
                     root: serde_json::json!({"content": {"terminal": "t-fg-proxy"}}),
                     ..Default::default()
                 },
+                SharedTab {
+                    id: "tab-fg-agy-args".to_string(),
+                    name: "agy-args".to_string(),
+                    root: serde_json::json!({"content": {"terminal": "t-fg-agy-args"}}),
+                    ..Default::default()
+                },
+                SharedTab {
+                    id: "tab-app-codex".to_string(),
+                    name: "codex-app".to_string(),
+                    root: serde_json::json!({"content": {"terminal": "t-app-codex"}}),
+                    ..Default::default()
+                },
             ],
             ..Default::default()
         });
@@ -10380,16 +10467,32 @@ mod tests {
                 ..Default::default()
             },
         );
+        world.terminals.insert(
+            "t-fg-agy-args".to_string(),
+            TerminalInfo {
+                address: "t-fg-agy-args".to_string(),
+                fg_name: Some("agy --resume".to_string()),
+                ..Default::default()
+            },
+        );
+        world.terminals.insert(
+            "t-app-codex".to_string(),
+            TerminalInfo {
+                address: "t-app-codex".to_string(),
+                status_app: Some("codex".to_string()),
+                ..Default::default()
+            },
+        );
 
         // Plain shell with OSC title `~/codes/gemini-proxy` and tab/terminal name `claude-notes` must return false
         world.select_tab_index(0);
         assert!(!is_active_tab_agent(&world));
-        // `status_word` alone without `status_app` or agent `fg_name` must return false
+        // `status_word` alone without known agent `status_app`/`fg_name` must return false
         world.select_tab_index(1);
         assert!(!is_active_tab_agent(&world));
-        // `status_app: Some("custom-agent")` -> true
+        // Non-allowlisted `status_app: Some("custom-agent")` -> false
         world.select_tab_index(2);
-        assert!(is_active_tab_agent(&world));
+        assert!(!is_active_tab_agent(&world));
         // `fg_name: Some("claude")`, `Some("/usr/local/bin/agy")`, `Some("claude-code")` -> true
         world.select_tab_index(3);
         assert!(is_active_tab_agent(&world));
@@ -10397,7 +10500,7 @@ mod tests {
         assert!(is_active_tab_agent(&world));
         world.select_tab_index(5);
         assert!(is_active_tab_agent(&world));
-        // `turn: 2` without `status_app`/`fg_name` -> false
+        // `turn: 2` without known agent `status_app`/`fg_name` -> false
         world.select_tab_index(6);
         assert!(!is_active_tab_agent(&world));
         // `fg_name: Some("claude-notes")` and `Some("gemini-proxy")` -> false
@@ -10405,8 +10508,14 @@ mod tests {
         assert!(!is_active_tab_agent(&world));
         world.select_tab_index(8);
         assert!(!is_active_tab_agent(&world));
-        // Windows-style path + `.exe` suffix still matches exact binary stem
-        assert!(is_known_agent_binary_name(r"C:\tools\CODEX.EXE"));
+        // Argument-carrying `fg_name: Some("agy --resume")` and known `status_app: Some("codex")` -> true
+        world.select_tab_index(9);
+        assert!(is_active_tab_agent(&world));
+        world.select_tab_index(10);
+        assert!(is_active_tab_agent(&world));
+        // Full-path + args & Windows-style path + `.exe` suffix still match exact binary stem
+        assert!(is_known_agent_name("/usr/local/bin/claude --model sonnet"));
+        assert!(is_known_agent_name(r"C:\tools\CODEX.EXE"));
 
         // End-to-end render_ui_full_with_eink_color uses is_active_tab_agent(world) in Normal mode
         let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
@@ -10416,8 +10525,8 @@ mod tests {
             .process(b"\x1b[1m\xe2\x97\x8f Used Swarm\x1b[0m\r\n... 3 more actions\r\nBody prose");
 
         let mut term = Terminal::new(TestBackend::new(60, 8)).unwrap();
-        // Agent tab (tab 2) -> process rows italicized
-        world.select_tab_index(2);
+        // Agent tab (tab 10: status_app="codex") -> process rows italicized
+        world.select_tab_index(10);
         term.draw(|f| {
             let _ = render_ui_full_with_eink_color(
                 f,
@@ -10640,5 +10749,105 @@ mod tests {
         assert!(snap_outside.cells[0].mods.contains(Modifier::ITALIC));
         assert_eq!(snap_inside.cells[0].fg, EINK_INK);
         assert!(!snap_inside.cells[0].mods.contains(Modifier::ITALIC));
+
+        // `render_ui_full_with_eink_color_and_fence` reuses its draw-pass row annotations to emit
+        // an identical `UiGeometry::eink_snapshot` in E-Ink mode without a second viewport scan,
+        // and omits it outside E-Ink mode or while a modal/selection is active.
+        let mut normal_geom = None;
+        term.draw(|f| {
+            normal_geom = Some(render_ui_full_with_eink_color_and_fence(
+                f,
+                &world,
+                Some(open_parser.screen()),
+                false,
+                24,
+                false,
+                false,
+                false,
+                false,
+                0,
+                None,
+                false,
+                &Modal::None,
+                None,
+                false,
+                None,
+                false,
+                None,
+                false,
+                false,
+                init_fence,
+            ));
+        })
+        .unwrap();
+        assert!(normal_geom.unwrap().eink_snapshot.is_none());
+
+        let mut eink_geom = None;
+        term.draw(|f| {
+            eink_geom = Some(render_ui_full_with_eink_color_and_fence(
+                f,
+                &world,
+                Some(open_parser.screen()),
+                false,
+                24,
+                false,
+                false,
+                false,
+                false,
+                0,
+                None,
+                false,
+                &Modal::None,
+                None,
+                false,
+                None,
+                false,
+                None,
+                true,
+                true,
+                init_fence,
+            ));
+        })
+        .unwrap();
+        let eink_geom = eink_geom.unwrap();
+        assert_eq!(
+            eink_geom.eink_snapshot,
+            Some(capture_eink_screen_snapshot_with_color_and_fence(
+                open_parser.screen(),
+                eink_geom.term_rect,
+                0,
+                true,
+                init_fence,
+            ))
+        );
+
+        let mut help_geom = None;
+        term.draw(|f| {
+            help_geom = Some(render_ui_full_with_eink_color_and_fence(
+                f,
+                &world,
+                Some(open_parser.screen()),
+                false,
+                24,
+                false,
+                false,
+                false,
+                false,
+                0,
+                None,
+                false,
+                &Modal::Help,
+                None,
+                false,
+                None,
+                false,
+                None,
+                true,
+                true,
+                init_fence,
+            ));
+        })
+        .unwrap();
+        assert!(help_geom.unwrap().eink_snapshot.is_none());
     }
 }
