@@ -398,6 +398,7 @@ pub struct UiGeometry {
     pub page_up_rect: Option<Rect>,
     pub page_down_rect: Option<Rect>,
     pub eink_snapshot: Option<EinkScreenSnapshot>,
+    pub hidden_cursor_pos: Option<(u16, u16)>,
 }
 
 pub fn is_in_rect(rect: Option<Rect>, col: u16, row: u16) -> bool {
@@ -971,6 +972,7 @@ pub fn render_ui_full_with_eink_color_and_fence(
     let tab_overview_open = matches!(modal, Modal::TabOverview { .. });
     let reader_open = matches!(modal, Modal::Reader { .. });
     let mut eink_snapshot = None;
+    let mut hidden_cursor_pos = None;
 
     if tab_overview_open || reader_open {
         // Full-viewport pages own the terminal viewport; avoid painting stale background VT cells.
@@ -1010,13 +1012,17 @@ pub fn render_ui_full_with_eink_color_and_fence(
             },
             term_rect,
         );
-        if matches!(modal, Modal::None) && scrollback_offset == 0 && !scr.hide_cursor() {
+        if matches!(modal, Modal::None) && scrollback_offset == 0 {
             let (row, col) = scr.cursor_position();
             let clamped_col = col.min(term_rect.width.saturating_sub(1));
             let cx = term_rect.x.saturating_add(clamped_col);
             let cy = term_rect.y.saturating_add(row);
             if cx < term_rect.x + term_rect.width && cy < term_rect.y + term_rect.height {
-                f.set_cursor_position((cx, cy));
+                if !scr.hide_cursor() {
+                    f.set_cursor_position((cx, cy));
+                } else {
+                    hidden_cursor_pos = Some((cx, cy));
+                }
             }
         }
     } else {
@@ -1195,6 +1201,7 @@ pub fn render_ui_full_with_eink_color_and_fence(
         page_up_rect,
         page_down_rect,
         eink_snapshot,
+        hidden_cursor_pos,
     }
 }
 
@@ -11022,5 +11029,172 @@ mod tests {
                 assert!(collapsed_cell.modifier.contains(Modifier::DIM));
             }
         }
+    }
+
+    #[test]
+    fn hidden_cursor_reports_live_position_without_showing_hardware_cursor() {
+        let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
+        let mut world = World::default();
+        world.doc.spaces.push(SharedSpace {
+            id: "s1".to_string(),
+            name: "work".to_string(),
+            folder: String::new(),
+            tabs: vec![crate::model::make_single_terminal_tab(
+                "t1", "claude", "term-1",
+            )],
+            rest: Default::default(),
+        });
+        world.terminals.insert(
+            "term-1".to_string(),
+            TerminalInfo {
+                address: "term-1".to_string(),
+                fg_name: Some("claude".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let cols = 40u16;
+        let rows = 8u16;
+        let mut parser = vt100::Parser::new(nz(rows), nz(cols), 10);
+        // Visible cursor at (row 0, col 4)
+        parser.process(b"\x1b[1;1H> hello\x1b[1;5H");
+
+        let mut term = Terminal::new(TestBackend::new(cols, rows + 2)).unwrap();
+        let mut vis_geom = None;
+        term.draw(|f| {
+            vis_geom = Some(render_ui_full_with_eink_color_and_fence(
+                f,
+                &world,
+                Some(parser.screen()),
+                false,
+                24,
+                false,
+                false,
+                false,
+                false,
+                0,
+                None,
+                false,
+                &Modal::None,
+                None,
+                false,
+                None,
+                false,
+                None,
+                false,
+                false,
+                false,
+            ));
+        })
+        .unwrap();
+        let vis_geom = vis_geom.unwrap();
+        assert_eq!(vis_geom.hidden_cursor_pos, None);
+        term.backend_mut()
+            .assert_cursor_position((vis_geom.term_rect.x + 4, vis_geom.term_rect.y));
+
+        // Software-cursor TUI hides hardware cursor (`CSI ? 25 l`) during a mid-line edit
+        term.set_cursor_position((0, 0)).unwrap();
+        parser.process(b"\x1b[?25l\x1b[1;1H> heXllo\x1b[1;7H");
+        let mut hid_geom = None;
+        term.draw(|f| {
+            hid_geom = Some(render_ui_full_with_eink_color_and_fence(
+                f,
+                &world,
+                Some(parser.screen()),
+                false,
+                24,
+                false,
+                false,
+                false,
+                false,
+                0,
+                None,
+                false,
+                &Modal::None,
+                None,
+                false,
+                None,
+                false,
+                None,
+                false,
+                false,
+                false,
+            ));
+        })
+        .unwrap();
+        let hid_geom = hid_geom.unwrap();
+        assert_eq!(
+            hid_geom.hidden_cursor_pos,
+            Some((hid_geom.term_rect.x + 6, hid_geom.term_rect.y))
+        );
+        // Ratatui frame cursor was not set (TestBackend::pos stays at (0, 0), hardware cursor hidden)
+        term.backend_mut().assert_cursor_position((0, 0));
+
+        // Modal open or non-zero scrollback suppresses hidden_cursor_pos
+        let mut modal_geom = None;
+        term.draw(|f| {
+            modal_geom = Some(render_ui_full_with_eink_color_and_fence(
+                f,
+                &world,
+                Some(parser.screen()),
+                false,
+                24,
+                false,
+                false,
+                false,
+                false,
+                0,
+                None,
+                false,
+                &Modal::Help,
+                None,
+                false,
+                None,
+                false,
+                None,
+                false,
+                false,
+                false,
+            ));
+        })
+        .unwrap();
+        assert_eq!(modal_geom.unwrap().hidden_cursor_pos, None);
+
+        // Scrollback offset > 0 suppresses hidden_cursor_pos
+        let mut sb_parser = vt100::Parser::new(nz(rows), nz(cols), 20);
+        for i in 0..15 {
+            sb_parser.process(format!("line {i}\r\n").as_bytes());
+        }
+        sb_parser.process(b"\x1b[?25l\x1b[1;5H");
+        sb_parser.screen_mut().set_scrollback(2);
+        assert_eq!(sb_parser.screen().scrollback(), 2);
+        let mut sb_geom = None;
+        term.draw(|f| {
+            sb_geom = Some(render_ui_full_with_eink_color_and_fence(
+                f,
+                &world,
+                Some(sb_parser.screen()),
+                false,
+                24,
+                false,
+                false,
+                false,
+                false,
+                2,
+                None,
+                false,
+                &Modal::None,
+                None,
+                false,
+                None,
+                false,
+                None,
+                false,
+                false,
+                false,
+            ));
+        })
+        .unwrap();
+        assert_eq!(sb_geom.unwrap().hidden_cursor_pos, None);
     }
 }

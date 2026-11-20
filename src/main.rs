@@ -60,7 +60,8 @@ const SCROLLBACK_LINES: usize = 2000;
 const ATTACH_HISTORY_LINES: usize = SCROLLBACK_LINES;
 const MAX_EVENTS_PER_TICK: usize = 512;
 const CREDIT_FLUSH_THRESHOLD_BYTES: usize = 16 * 1024;
-const SIBLING_RESIZE_DEBOUNCE: Duration = Duration::from_millis(80);
+const SYNC_UPDATE_TIMEOUT: Duration = Duration::from_millis(80);
+const SYNC_UPDATE_MAX_BYTES: usize = 256 * 1024;
 const ATTACH_RETRY_DELAY: Duration = Duration::from_millis(250);
 const CLIPBOARD_READ_TIMEOUT: Duration = Duration::from_millis(200);
 const HORIZ_WHEEL_QUIET_GAP: Duration = Duration::from_millis(180);
@@ -468,6 +469,7 @@ struct GraphemeState {
     ascii_keycap_base: bool,
     after_zwj: bool,
     suppress_zero_width: bool,
+    mode_2027_disabled: bool,
 }
 
 impl GraphemeState {
@@ -486,7 +488,7 @@ impl GraphemeState {
             match UnicodeWidthChar::width(ch) {
                 Some(2) => Self {
                     cluster_cols: 2,
-                    prev_emoji_symbol: true,
+                    prev_emoji_symbol: is_emoji_symbol_width2(ch),
                     ..Self::default()
                 },
                 Some(1) => Self {
@@ -498,6 +500,20 @@ impl GraphemeState {
             }
         }
     }
+
+    fn reset_cluster(&mut self) {
+        let mode_2027_disabled = self.mode_2027_disabled;
+        *self = Self {
+            mode_2027_disabled,
+            ..Self::default()
+        };
+    }
+
+    fn set_from_char(&mut self, ch: char) {
+        let mode_2027_disabled = self.mode_2027_disabled;
+        *self = Self::from_char(ch);
+        self.mode_2027_disabled = mode_2027_disabled;
+    }
 }
 
 struct AttachedTerminal {
@@ -505,9 +521,14 @@ struct AttachedTerminal {
     parser: vt100::Parser,
     cols: u16,
     rows: u16,
+    client_cols: u16,
+    client_rows: u16,
     utf8_tail: Vec<u8>,
     sanitize_ctrl_str: Option<ControlStringKind>,
     feed_ctrl_str: Option<ControlStringKind>,
+    sync_ctrl_str: Option<ControlStringKind>,
+    sync_update_started: Option<Instant>,
+    sync_update_buf: Vec<u8>,
     grapheme: GraphemeState,
     autowrap: bool,
     saved_autowrap: bool,
@@ -527,15 +548,31 @@ fn non_zero_u16(v: u16) -> std::num::NonZeroU16 {
 }
 
 impl AttachedTerminal {
+    #[allow(dead_code)]
     fn new(channel: u32, cols: u16, rows: u16) -> Self {
+        Self::new_with_client_size(channel, cols, rows, cols, rows)
+    }
+
+    fn new_with_client_size(
+        channel: u32,
+        cols: u16,
+        rows: u16,
+        client_cols: u16,
+        client_rows: u16,
+    ) -> Self {
         Self {
             channel,
             parser: vt100::Parser::new(non_zero_u16(rows), non_zero_u16(cols), SCROLLBACK_LINES),
             cols,
             rows,
+            client_cols,
+            client_rows,
             utf8_tail: Vec::new(),
             sanitize_ctrl_str: None,
             feed_ctrl_str: None,
+            sync_ctrl_str: None,
+            sync_update_started: None,
+            sync_update_buf: Vec::new(),
             grapheme: GraphemeState::default(),
             autowrap: true,
             saved_autowrap: true,
@@ -550,6 +587,7 @@ impl AttachedTerminal {
     }
 
     fn resize(&mut self, cols: u16, rows: u16) {
+        let _ = self.flush_sync_update();
         self.cols = cols;
         self.rows = rows;
         self.scroll_top = 0;
@@ -572,7 +610,50 @@ impl AttachedTerminal {
         val
     }
 
+    fn sync_update_deadline(&self) -> Option<Instant> {
+        self.sync_update_started.map(|t| t + SYNC_UPDATE_TIMEOUT)
+    }
+
+    fn flush_sync_update(&mut self) -> bool {
+        self.flush_sync_update_with_tail(&[])
+    }
+
+    fn flush_sync_update_with_tail(&mut self, tail: &[u8]) -> bool {
+        self.sync_update_started = None;
+        let buf = std::mem::take(&mut self.sync_update_buf);
+        if buf.is_empty() && tail.is_empty() {
+            return false;
+        }
+        if !buf.is_empty() {
+            self.feed_sanitized_bytes(&buf);
+        }
+        if !tail.is_empty() {
+            self.feed_sanitized_bytes(tail);
+        }
+        self.vt_seq = self.vt_seq.wrapping_add(1);
+        true
+    }
+
+    fn append_sync_bytes(&mut self, bytes: &[u8]) -> bool {
+        if bytes.is_empty() {
+            return false;
+        }
+        if self.sync_update_buf.len().saturating_add(bytes.len()) >= SYNC_UPDATE_MAX_BYTES {
+            return self.flush_sync_update_with_tail(bytes);
+        }
+        self.sync_update_buf.extend_from_slice(bytes);
+        false
+    }
+
+    #[cfg(test)]
     fn process_vt_bytes(&mut self, payload: &[u8]) {
+        let _ = self.process_vt_bytes_at(payload, Instant::now());
+    }
+
+    /// Process incoming VT bytes, buffering Mode 2026 (`CSI ? 2026 h` .. `l`) frames
+    /// until closed so intermediate cursor jumps are never rendered mid-frame.
+    /// Returns `true` when at least one chunk was committed to the VT parser.
+    fn process_vt_bytes_at(&mut self, payload: &[u8], now: Instant) -> bool {
         let clean = sanitize_vt_stream(
             payload,
             &mut self.utf8_tail,
@@ -580,10 +661,135 @@ impl AttachedTerminal {
             &mut self.grapheme,
         );
         if clean.is_empty() {
-            return;
+            return false;
         }
-        self.feed_sanitized_bytes(&clean);
-        self.vt_seq = self.vt_seq.wrapping_add(1);
+        if self.sync_update_started.is_none()
+            && self.sync_ctrl_str.is_none()
+            && !clean.contains(&0x1b)
+        {
+            self.feed_sanitized_bytes(&clean);
+            self.vt_seq = self.vt_seq.wrapping_add(1);
+            return true;
+        }
+
+        let mut seg_start = 0usize;
+        let mut i = 0usize;
+        let mut committed = false;
+
+        while i < clean.len() {
+            if let Some(kind) = self.sync_ctrl_str {
+                let b = clean[i];
+                if (kind == ControlStringKind::Osc && b == 0x07) || b == 0x18 || b == 0x1a {
+                    self.sync_ctrl_str = None;
+                    i += 1;
+                    continue;
+                }
+                if b == 0x1b {
+                    self.sync_ctrl_str = None;
+                    if i + 1 < clean.len() && clean[i + 1] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                } else {
+                    i += 1;
+                    continue;
+                }
+            }
+
+            if clean[i] == 0x1b && i + 1 < clean.len() {
+                let next = clean[i + 1];
+                if next == b']' {
+                    self.sync_ctrl_str = Some(ControlStringKind::Osc);
+                    i += 2;
+                    continue;
+                }
+                if matches!(next, b'P' | b'X' | b'^' | b'_') {
+                    self.sync_ctrl_str = Some(ControlStringKind::StOnly);
+                    i += 2;
+                    continue;
+                }
+                if next == b'[' {
+                    let param_start = i + 2;
+                    let mut p = param_start;
+                    while p < clean.len() && (0x30..=0x3F).contains(&clean[p]) {
+                        p += 1;
+                    }
+                    let param_end = p;
+                    while p < clean.len() && (0x20..=0x2F).contains(&clean[p]) {
+                        p += 1;
+                    }
+                    let inter_end = p;
+                    if p < clean.len() && (0x40..=0x7E).contains(&clean[p]) {
+                        let params = &clean[param_start..param_end];
+                        let intermediates = &clean[param_end..inter_end];
+                        let final_byte = clean[p];
+                        if intermediates.is_empty()
+                            && params.starts_with(b"?")
+                            && (final_byte == b'h' || final_byte == b'l')
+                            && params[1..].split(|&c| c == b';').any(|seg| seg == b"2026")
+                        {
+                            if final_byte == b'h' && self.sync_update_started.is_none() {
+                                if seg_start < i {
+                                    self.feed_sanitized_bytes(&clean[seg_start..i]);
+                                    self.vt_seq = self.vt_seq.wrapping_add(1);
+                                    committed = true;
+                                }
+                                self.sync_update_started = Some(now);
+                                if self.append_sync_bytes(&clean[i..=p]) {
+                                    committed = true;
+                                }
+                                seg_start = p + 1;
+                            } else if final_byte == b'l' && self.sync_update_started.is_some() {
+                                if self.flush_sync_update_with_tail(&clean[seg_start..=p]) {
+                                    committed = true;
+                                }
+                                seg_start = p + 1;
+                            }
+                        } else if params.is_empty()
+                            && intermediates == b"!"
+                            && final_byte == b'p'
+                            && self.sync_update_started.is_some()
+                        {
+                            if self.flush_sync_update_with_tail(&clean[seg_start..=p]) {
+                                committed = true;
+                            }
+                            seg_start = p + 1;
+                        }
+                        i = p + 1;
+                        continue;
+                    }
+                    i = p;
+                    continue;
+                }
+
+                let mut e = i + 1;
+                while e < clean.len() && (0x20..=0x2F).contains(&clean[e]) {
+                    e += 1;
+                }
+                if e < clean.len() && (0x30..=0x7E).contains(&clean[e]) {
+                    if e == i + 1 && clean[e] == b'c' && self.sync_update_started.is_some() {
+                        if self.flush_sync_update_with_tail(&clean[seg_start..=e]) {
+                            committed = true;
+                        }
+                        seg_start = e + 1;
+                    }
+                    i = e + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+
+        if self.sync_update_started.is_some() {
+            if self.append_sync_bytes(&clean[seg_start..]) {
+                committed = true;
+            }
+        } else if seg_start < clean.len() {
+            self.feed_sanitized_bytes(&clean[seg_start..]);
+            self.vt_seq = self.vt_seq.wrapping_add(1);
+            committed = true;
+        }
+        committed
     }
 
     fn clamp_pending_wrap(&mut self) {
@@ -721,55 +927,170 @@ impl AttachedTerminal {
                                     if plain_start < i {
                                         self.parser.process(&clean[plain_start..i]);
                                     }
-                                    let was_alt = self.parser.screen().alternate_screen();
-                                    for seg in params[1..].split(|&c| c == b';') {
-                                        match seg {
-                                            b"7" => {
-                                                self.clamp_pending_wrap();
-                                                self.autowrap = set;
-                                                self.dropped_wide_at_margin = false;
-                                            }
-                                            b"6" => {
-                                                self.dropped_wide_at_margin = false;
-                                            }
-                                            b"1048" => {
-                                                if set {
-                                                    if !self.autowrap {
-                                                        self.clamp_pending_wrap();
+                                    let translates_dec_mode = params[1..]
+                                        .split(|&c| c == b';')
+                                        .any(|seg| matches!(seg, b"1047" | b"1048"));
+                                    if translates_dec_mode {
+                                        for seg in params[1..].split(|&c| c == b';') {
+                                            let was_alt = self.parser.screen().alternate_screen();
+                                            match seg {
+                                                b"7" => {
+                                                    self.clamp_pending_wrap();
+                                                    self.autowrap = set;
+                                                    self.dropped_wide_at_margin = false;
+                                                    self.parser.process(if set {
+                                                        b"\x1b[?7h"
+                                                    } else {
+                                                        b"\x1b[?7l"
+                                                    });
+                                                }
+                                                b"6" => {
+                                                    self.dropped_wide_at_margin = false;
+                                                    self.parser.process(if set {
+                                                        b"\x1b[?6h"
+                                                    } else {
+                                                        b"\x1b[?6l"
+                                                    });
+                                                }
+                                                b"1048" => {
+                                                    if set {
+                                                        if !self.autowrap {
+                                                            self.clamp_pending_wrap();
+                                                        }
+                                                        self.saved_autowrap = self.autowrap;
+                                                        self.dropped_wide_at_margin = false;
+                                                        self.parser.process(b"\x1b7");
+                                                    } else {
+                                                        self.autowrap = self.saved_autowrap;
+                                                        self.dropped_wide_at_margin = false;
+                                                        self.parser.process(b"\x1b8");
                                                     }
-                                                    self.saved_autowrap = self.autowrap;
-                                                } else {
-                                                    self.autowrap = self.saved_autowrap;
                                                 }
-                                                self.dropped_wide_at_margin = false;
-                                            }
-                                            b"47" | b"1047" => {
-                                                if set && !was_alt {
-                                                    self.main_scroll_top = self.scroll_top;
-                                                    self.scroll_top = 0;
-                                                } else if !set && was_alt {
-                                                    self.scroll_top = self.main_scroll_top;
-                                                }
-                                                self.dropped_wide_at_margin = false;
-                                            }
-                                            b"1049" => {
-                                                if set && !was_alt {
-                                                    if !self.autowrap {
-                                                        self.clamp_pending_wrap();
+                                                b"47" => {
+                                                    if set && !was_alt {
+                                                        self.main_scroll_top = self.scroll_top;
+                                                        self.scroll_top = 0;
+                                                    } else if !set && was_alt {
+                                                        self.scroll_top = self.main_scroll_top;
                                                     }
-                                                    self.alt_saved_autowrap = self.autowrap;
-                                                    self.main_scroll_top = self.scroll_top;
-                                                    self.scroll_top = 0;
-                                                } else if !set && was_alt {
-                                                    self.autowrap = self.alt_saved_autowrap;
-                                                    self.scroll_top = self.main_scroll_top;
+                                                    self.dropped_wide_at_margin = false;
+                                                    self.parser.process(if set {
+                                                        b"\x1b[?47h"
+                                                    } else {
+                                                        b"\x1b[?47l"
+                                                    });
                                                 }
-                                                self.dropped_wide_at_margin = false;
+                                                b"1047" => {
+                                                    if set && !was_alt {
+                                                        let (row, col) =
+                                                            self.parser.screen().cursor_position();
+                                                        let cols = self
+                                                            .parser
+                                                            .screen()
+                                                            .size()
+                                                            .1
+                                                            .get()
+                                                            .max(1);
+                                                        let c = col.min(cols - 1);
+                                                        self.main_scroll_top = self.scroll_top;
+                                                        self.scroll_top = 0;
+                                                        let seq = format!(
+                                                            "\x1b[?47h\x1b[{};{}H",
+                                                            row + 1,
+                                                            c + 1
+                                                        );
+                                                        self.parser.process(seq.as_bytes());
+                                                    } else if !set && was_alt {
+                                                        let (row, col) =
+                                                            self.parser.screen().cursor_position();
+                                                        let cols = self
+                                                            .parser
+                                                            .screen()
+                                                            .size()
+                                                            .1
+                                                            .get()
+                                                            .max(1);
+                                                        let c = col.min(cols - 1);
+                                                        self.scroll_top = self.main_scroll_top;
+                                                        let seq = format!(
+                                                            "\x1b[2J\x1b[?47l\x1b[{};{}H",
+                                                            row + 1,
+                                                            c + 1
+                                                        );
+                                                        self.parser.process(seq.as_bytes());
+                                                    }
+                                                    self.dropped_wide_at_margin = false;
+                                                }
+                                                b"1049" => {
+                                                    if set && !was_alt {
+                                                        if !self.autowrap {
+                                                            self.clamp_pending_wrap();
+                                                        }
+                                                        self.alt_saved_autowrap = self.autowrap;
+                                                        self.main_scroll_top = self.scroll_top;
+                                                        self.scroll_top = 0;
+                                                    } else if !set && was_alt {
+                                                        self.autowrap = self.alt_saved_autowrap;
+                                                        self.scroll_top = self.main_scroll_top;
+                                                    }
+                                                    self.dropped_wide_at_margin = false;
+                                                    self.parser.process(if set {
+                                                        b"\x1b[?1049h"
+                                                    } else {
+                                                        b"\x1b[?1049l"
+                                                    });
+                                                }
+                                                other if !other.is_empty() => {
+                                                    let mut seq =
+                                                        Vec::with_capacity(other.len() + 4);
+                                                    seq.extend_from_slice(b"\x1b[?");
+                                                    seq.extend_from_slice(other);
+                                                    seq.push(final_byte);
+                                                    self.parser.process(&seq);
+                                                }
+                                                _ => {}
                                             }
-                                            _ => {}
                                         }
+                                    } else {
+                                        let was_alt = self.parser.screen().alternate_screen();
+                                        for seg in params[1..].split(|&c| c == b';') {
+                                            match seg {
+                                                b"7" => {
+                                                    self.clamp_pending_wrap();
+                                                    self.autowrap = set;
+                                                    self.dropped_wide_at_margin = false;
+                                                }
+                                                b"6" => {
+                                                    self.dropped_wide_at_margin = false;
+                                                }
+                                                b"47" => {
+                                                    if set && !was_alt {
+                                                        self.main_scroll_top = self.scroll_top;
+                                                        self.scroll_top = 0;
+                                                    } else if !set && was_alt {
+                                                        self.scroll_top = self.main_scroll_top;
+                                                    }
+                                                    self.dropped_wide_at_margin = false;
+                                                }
+                                                b"1049" => {
+                                                    if set && !was_alt {
+                                                        if !self.autowrap {
+                                                            self.clamp_pending_wrap();
+                                                        }
+                                                        self.alt_saved_autowrap = self.autowrap;
+                                                        self.main_scroll_top = self.scroll_top;
+                                                        self.scroll_top = 0;
+                                                    } else if !set && was_alt {
+                                                        self.autowrap = self.alt_saved_autowrap;
+                                                        self.scroll_top = self.main_scroll_top;
+                                                    }
+                                                    self.dropped_wide_at_margin = false;
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                        self.parser.process(&clean[i..=p]);
                                     }
-                                    self.parser.process(&clean[i..=p]);
                                     i = p + 1;
                                     plain_start = i;
                                     continue;
@@ -789,23 +1110,25 @@ impl AttachedTerminal {
                                 continue;
                             } else if params.iter().all(|&c| c.is_ascii_digit() || c == b';') {
                                 match final_byte {
-                                    // CBT (`CSI Ps Z` — Cursor Backward Tabulation)
+                                    // CBT (`CSI Ps Z` — Cursor Backward Tabulation; explicit `0` is a no-op)
                                     b'Z' => {
                                         if plain_start < i {
                                             self.parser.process(&clean[plain_start..i]);
                                         }
                                         self.dropped_wide_at_margin = false;
                                         let count =
-                                            parse_csi_param_default(params, 0, 1).clamp(1, 512);
-                                        let cols = self.parser.screen().size().1.get().max(1);
-                                        let (_, col) = self.parser.screen().cursor_position();
-                                        let mut target = col.min(cols - 1);
-                                        for _ in 0..count {
-                                            target =
-                                                if target == 0 { 0 } else { (target - 1) & !7 };
+                                            parse_csi_param_explicit_zero(params, 0, 1).min(512);
+                                        if count > 0 {
+                                            let cols = self.parser.screen().size().1.get().max(1);
+                                            let (_, col) = self.parser.screen().cursor_position();
+                                            let mut target = col.min(cols - 1);
+                                            for _ in 0..count {
+                                                target =
+                                                    if target == 0 { 0 } else { (target - 1) & !7 };
+                                            }
+                                            let seq = format!("\x1b[{}G", target + 1);
+                                            self.parser.process(seq.as_bytes());
                                         }
-                                        let seq = format!("\x1b[{}G", target + 1);
-                                        self.parser.process(seq.as_bytes());
                                         i = p + 1;
                                         plain_start = i;
                                         continue;
@@ -1091,6 +1414,20 @@ fn parse_csi_param_default(params: &[u8], index: usize, default: usize) -> usize
         .unwrap_or(default)
 }
 
+fn parse_csi_param_explicit_zero(params: &[u8], index: usize, default: usize) -> usize {
+    std::str::from_utf8(params)
+        .ok()
+        .and_then(|s| s.split(';').nth(index))
+        .and_then(|s| {
+            if s.is_empty() {
+                Some(default)
+            } else {
+                s.parse::<usize>().ok()
+            }
+        })
+        .unwrap_or(default)
+}
+
 /// Emulate DECSTR (`CSI ! p` — Soft Terminal Reset), which `herdr-core` emits on attach replay
 /// and `vt100` otherwise ignores as `unhandled_csi`. Resets SGR, cursor/keypad/origin modes,
 /// scroll margins (`DECSTBM`), cursor visibility, and saved-cursor state (`DECSC`) while
@@ -1184,10 +1521,35 @@ fn is_ascii_keycap_base(b: u8) -> bool {
 }
 
 fn is_emoji_symbol_width1(ch: char) -> bool {
-    !ch.is_ascii()
-        && ch >= '\u{2000}'
-        && !matches!(ch, '\u{1F1E6}'..='\u{1F1FF}')
+    matches!(
+        ch,
+        '\u{00A9}'
+            | '\u{00AE}'
+            | '\u{203C}'
+            | '\u{2049}'
+            | '\u{2122}'
+            | '\u{2139}'
+            | '\u{2194}'..='\u{21AA}'
+            | '\u{231A}'..='\u{23FA}'
+            | '\u{24C2}'
+            | '\u{25AA}'..='\u{25FE}'
+            | '\u{2600}'..='\u{27BF}'
+            | '\u{2934}'..='\u{2935}'
+            | '\u{2B05}'..='\u{2B55}'
+            | '\u{3030}'
+            | '\u{303D}'
+            | '\u{3297}'
+            | '\u{3299}'
+            | '\u{1F000}'..='\u{1FAFF}'
+    ) && !matches!(ch, '\u{1F1E6}'..='\u{1F1FF}')
         && UnicodeWidthChar::width(ch) == Some(1)
+}
+
+fn is_emoji_symbol_width2(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{2300}'..='\u{27BF}' | '\u{2B00}'..='\u{2BFF}' | '\u{1F000}'..='\u{1FAFF}'
+    ) && UnicodeWidthChar::width(ch) == Some(2)
 }
 
 fn is_skin_tone_modifier(ch: char) -> bool {
@@ -1229,23 +1591,28 @@ fn sanitize_vt_stream<'a>(
     }
 
     let has_esc = slice.contains(&0x1b);
-    if ctrl_str.is_none()
-        && !grapheme.after_zwj
-        && !grapheme.suppress_zero_width
+    let can_fast_path = ctrl_str.is_none()
         && !has_esc
-        && !has_special_grapheme_bytes(slice)
-    {
-        let last_ch = last_utf8_char(slice);
-        if last_ch.and_then(UnicodeWidthChar::width) != Some(0) {
-            *grapheme = last_ch.map_or_else(GraphemeState::default, GraphemeState::from_char);
-            return match combined {
-                Cow::Borrowed(b) => Cow::Borrowed(&b[..valid_len]),
-                Cow::Owned(mut v) => {
-                    v.truncate(valid_len);
-                    Cow::Owned(v)
-                }
-            };
+        && ((grapheme.mode_2027_disabled && !slice.windows(3).any(|w| w == b"\xef\xb8\x8f"))
+            || (!grapheme.mode_2027_disabled
+                && !grapheme.after_zwj
+                && !grapheme.suppress_zero_width
+                && !has_special_grapheme_bytes(slice)
+                && last_utf8_char(slice).and_then(UnicodeWidthChar::width) != Some(0)));
+    if can_fast_path {
+        if !grapheme.mode_2027_disabled {
+            match last_utf8_char(slice) {
+                Some(ch) => grapheme.set_from_char(ch),
+                None => grapheme.reset_cluster(),
+            }
         }
+        return match combined {
+            Cow::Borrowed(b) => Cow::Borrowed(&b[..valid_len]),
+            Cow::Owned(mut v) => {
+                v.truncate(valid_len);
+                Cow::Owned(v)
+            }
+        };
     }
 
     let mut out = Vec::with_capacity(slice.len());
@@ -1274,7 +1641,7 @@ fn sanitize_vt_stream<'a>(
         }
 
         if has_esc && slice[i] == 0x1b && i + 1 < slice.len() {
-            *grapheme = GraphemeState::default();
+            grapheme.reset_cluster();
             let next = slice[i + 1];
             if next == b']' {
                 *ctrl_str = Some(ControlStringKind::Osc);
@@ -1308,11 +1675,19 @@ fn sanitize_vt_stream<'a>(
                             i = p + 1;
                             continue;
                         }
+                        if params.starts_with(b"?") && (final_byte == b'h' || final_byte == b'l') {
+                            for seg in params[1..].split(|&c| c == b';') {
+                                if seg == b"2027" {
+                                    grapheme.mode_2027_disabled = final_byte == b'l';
+                                }
+                            }
+                        }
                         if params.iter().all(|&b| b.is_ascii_digit() || b == b';') {
                             match final_byte {
-                                // CHT (`CSI n I` — Cursor Forward Tabulation) -> `n` HT (`\t`) stops
+                                // CHT (`CSI n I` — Cursor Forward Tabulation; explicit `0` is a no-op)
                                 b'I' => {
-                                    let count = parse_csi_param_default(params, 0, 1).clamp(1, 256);
+                                    let count =
+                                        parse_csi_param_explicit_zero(params, 0, 1).min(256);
                                     out.extend(std::iter::repeat_n(b'\t', count));
                                     i = p + 1;
                                     continue;
@@ -1347,6 +1722,22 @@ fn sanitize_vt_stream<'a>(
                                     out.extend_from_slice(b"\x1b[");
                                     out.extend_from_slice(params);
                                     out.push(b'B');
+                                    i = p + 1;
+                                    continue;
+                                }
+                                // HPB (`CSI n j`) -> CUB (`CSI n D`)
+                                b'j' => {
+                                    out.extend_from_slice(b"\x1b[");
+                                    out.extend_from_slice(params);
+                                    out.push(b'D');
+                                    i = p + 1;
+                                    continue;
+                                }
+                                // VPB (`CSI n k`) -> CUU (`CSI n A`)
+                                b'k' => {
+                                    out.extend_from_slice(b"\x1b[");
+                                    out.extend_from_slice(params);
+                                    out.push(b'A');
                                     i = p + 1;
                                     continue;
                                 }
@@ -1409,6 +1800,10 @@ fn sanitize_vt_stream<'a>(
                                 i = e + 1;
                                 continue;
                             }
+                            // RIS (`ESC c` — Full Reset) restores Mode 2027 default
+                            b'c' => {
+                                grapheme.mode_2027_disabled = false;
+                            }
                             _ => {}
                         }
                     }
@@ -1419,26 +1814,44 @@ fn sanitize_vt_stream<'a>(
             }
         }
 
+        if grapheme.mode_2027_disabled {
+            if slice[i].is_ascii() {
+                out.push(slice[i]);
+                i += 1;
+            } else if let Some((ch, ch_len)) = next_utf8_char(&slice[i..]) {
+                if ch != '\u{FE0F}' {
+                    out.extend_from_slice(&slice[i..i + ch_len]);
+                }
+                i += ch_len;
+            } else {
+                out.push(slice[i]);
+                i += 1;
+            }
+            continue;
+        }
+
         if slice[i].is_ascii() {
             let b = slice[i];
             if b < 0x20 || b == 0x7f {
                 out.push(b);
-                *grapheme = GraphemeState::default();
+                grapheme.reset_cluster();
             } else if grapheme.after_zwj {
                 grapheme.after_zwj = false;
                 grapheme.suppress_zero_width = true;
             } else {
                 out.push(b);
-                *grapheme = GraphemeState::from_char(b as char);
+                grapheme.set_from_char(b as char);
             }
             i += 1;
         } else if let Some((ch, ch_len)) = next_utf8_char(&slice[i..]) {
             if ch == '\u{FE0F}' {
                 // U+FE0F (Variation Selector-16) requests 2-column emoji presentation for
-                // preceding 1-column symbols (such as U+2699 '⚙', U+26A0 '⚠', or keycap bases
-                // `[0-9#*]`). Emitting an ASCII space widens 1-column bases to 2 columns
-                // identically across `vt100`, Grapheme-Cluster terminals, and SSH clients.
-                if grapheme.cluster_cols == 1 {
+                // preceding 1-column emoji/keycap bases (such as U+2699 '⚙', U+26A0 '⚠', or
+                // `[0-9#*]`). Emitting an ASCII space widens them to 2 columns identically
+                // across `vt100`, Grapheme-Cluster terminals, and SSH clients.
+                if grapheme.cluster_cols == 1
+                    && (grapheme.prev_emoji_symbol || grapheme.ascii_keycap_base)
+                {
                     out.push(b' ');
                     grapheme.cluster_cols = 2;
                     grapheme.prev_emoji_symbol = true;
@@ -1451,11 +1864,8 @@ fn sanitize_vt_stream<'a>(
                 if !grapheme.suppress_zero_width {
                     out.extend_from_slice(&slice[i..i + ch_len]);
                 }
-                *grapheme = GraphemeState::default();
-            } else if ch == '\u{200D}'
-                && (grapheme.cluster_cols >= 2
-                    || (grapheme.cluster_cols == 1 && grapheme.prev_emoji_symbol))
-            {
+                grapheme.reset_cluster();
+            } else if ch == '\u{200D}' && grapheme.prev_emoji_symbol {
                 if grapheme.cluster_cols == 1 {
                     out.push(b' ');
                     grapheme.cluster_cols = 2;
@@ -1465,10 +1875,7 @@ fn sanitize_vt_stream<'a>(
             } else if grapheme.after_zwj {
                 grapheme.after_zwj = false;
                 grapheme.suppress_zero_width = true;
-            } else if is_skin_tone_modifier(ch)
-                && (grapheme.cluster_cols >= 2
-                    || (grapheme.cluster_cols == 1 && grapheme.prev_emoji_symbol))
-            {
+            } else if is_skin_tone_modifier(ch) && grapheme.prev_emoji_symbol {
                 if grapheme.cluster_cols == 1 {
                     out.push(b' ');
                     grapheme.cluster_cols = 2;
@@ -1480,12 +1887,12 @@ fn sanitize_vt_stream<'a>(
                 }
             } else {
                 out.extend_from_slice(&slice[i..i + ch_len]);
-                *grapheme = GraphemeState::from_char(ch);
+                grapheme.set_from_char(ch);
             }
             i += ch_len;
         } else {
             out.push(slice[i]);
-            *grapheme = GraphemeState::default();
+            grapheme.reset_cluster();
             i += 1;
         }
     }
@@ -2368,7 +2775,6 @@ struct SyncOutcome {
     newly_attached_active: bool,
     active_attach_failed: bool,
     has_unwarmed_siblings: bool,
-    has_unresized_siblings: bool,
 }
 
 fn active_needs_sync(
@@ -2389,6 +2795,122 @@ fn active_needs_sync(
     true
 }
 
+fn reconcile_attached_sizes(
+    world: &World,
+    attached_map: &mut BTreeMap<String, AttachedTerminal>,
+    active_addr: Option<&str>,
+) -> bool {
+    let mut active_resized = false;
+    for (addr, att) in attached_map.iter_mut() {
+        let Some(info) = world.terminals.get(addr) else {
+            continue;
+        };
+        if info.cols > 0 && info.rows > 0 && (att.cols != info.cols || att.rows != info.rows) {
+            att.resize(info.cols, info.rows);
+            if active_addr == Some(addr.as_str()) {
+                active_resized = true;
+            }
+        }
+    }
+    active_resized
+}
+
+#[allow(clippy::too_many_arguments)]
+fn schedule_active_pty_redraw(
+    channel: u32,
+    now: Instant,
+    eink_mode: bool,
+    eink_interval: Duration,
+    first_frame_drawn: bool,
+    force_immediate: bool,
+    last_pty_input: Option<crate::core::LastPtyInput>,
+    dirty: &mut bool,
+    pty_dirty: &mut bool,
+    eink_pacer: &mut EinkInputPacer,
+) {
+    if !eink_mode || eink_interval.is_zero() || !first_frame_drawn || force_immediate {
+        *dirty = true;
+    } else {
+        *pty_dirty = true;
+        eink_pacer.record_active_pty_data(channel, now, last_pty_input);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flush_expired_sync_updates(
+    attached_map: &mut BTreeMap<String, AttachedTerminal>,
+    active_addr: Option<&str>,
+    now: Instant,
+    modal: &Modal,
+    eink_mode: bool,
+    eink_interval: Duration,
+    first_frame_drawn: bool,
+    last_pty_input: Option<crate::core::LastPtyInput>,
+    dirty: &mut bool,
+    pty_dirty: &mut bool,
+    eink_pacer: &mut EinkInputPacer,
+) {
+    for (addr, att) in attached_map.iter_mut() {
+        if att.sync_update_deadline().is_some_and(|d| now >= d)
+            && att.flush_sync_update()
+            && active_addr == Some(addr.as_str())
+            && !matches!(modal, Modal::TabOverview { .. } | Modal::Reader { .. })
+        {
+            schedule_active_pty_redraw(
+                att.channel,
+                now,
+                eink_mode,
+                eink_interval,
+                first_frame_drawn,
+                false,
+                last_pty_input,
+                dirty,
+                pty_dirty,
+                eink_pacer,
+            );
+        }
+    }
+}
+
+fn reclaim_active_pty_size_on_input(
+    core: &CoreClient,
+    world: &mut World,
+    attached_map: &mut BTreeMap<String, AttachedTerminal>,
+    active_addr: Option<&str>,
+    term_rect: Rect,
+    prev_input_seq: Option<u64>,
+) -> bool {
+    let Some(last_in) = core.last_pty_input() else {
+        return false;
+    };
+    if Some(last_in.seq) == prev_input_seq {
+        return false;
+    }
+    let Some(addr) = active_addr else {
+        return false;
+    };
+    let Some(att) = attached_map.get_mut(addr) else {
+        return false;
+    };
+    if att.channel != last_in.channel {
+        return false;
+    }
+    let cols = term_rect.width.max(1);
+    let rows = term_rect.height.max(1);
+    if att.cols == cols && att.rows == rows {
+        return false;
+    }
+    att.resize(cols, rows);
+    att.client_cols = cols;
+    att.client_rows = rows;
+    core.resize_channel(att.channel, cols, rows);
+    if let Some(info) = world.terminals.get_mut(addr) {
+        info.cols = cols;
+        info.rows = rows;
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 fn sync_attached_terminals(
     core: &CoreClient,
@@ -2398,7 +2920,6 @@ fn sync_attached_terminals(
     term_rect: Rect,
     scrollback_offset: &mut usize,
     warm_siblings: bool,
-    resize_siblings: bool,
     mark_seen: bool,
 ) -> SyncOutcome {
     let mut outcome = SyncOutcome::default();
@@ -2426,20 +2947,45 @@ fn sync_attached_terminals(
     let mut resolved_active: Option<String> = None;
     if let Some(ref addr) = want_addr {
         if let Some(cur) = attached_map.get_mut(addr) {
-            if cur.cols != cols || cur.rows != rows {
+            let switching_active = active_addr.as_ref() != Some(addr);
+            let viewport_changed = cur.client_cols != cols || cur.client_rows != rows;
+            if viewport_changed || (switching_active && (cur.cols != cols || cur.rows != rows)) {
+                cur.client_cols = cols;
+                cur.client_rows = rows;
                 cur.resize(cols, rows);
                 core.resize_channel(cur.channel, cols, rows);
+                if let Some(info) = world.terminals.get_mut(addr) {
+                    info.cols = cols;
+                    info.rows = rows;
+                }
             }
-            if active_addr.as_ref() != Some(addr) {
+            if switching_active {
                 core.set_focus(cur.channel, true);
                 if mark_seen {
                     world.mark_active_seen(core);
                 }
             }
             resolved_active = Some(addr.clone());
-        } else if let Ok(ch) = core.attach_terminal(addr, cols, rows, ATTACH_HISTORY_LINES) {
-            core.set_focus(ch, true);
-            attached_map.insert(addr.clone(), AttachedTerminal::new(ch, cols, rows));
+        } else if let Ok(attach_info) =
+            core.attach_terminal(addr, cols, rows, ATTACH_HISTORY_LINES, false)
+        {
+            let pty_cols = attach_info.cols.unwrap_or(cols);
+            let pty_rows = attach_info.rows.unwrap_or(rows);
+            core.set_focus(attach_info.channel, true);
+            attached_map.insert(
+                addr.clone(),
+                AttachedTerminal::new_with_client_size(
+                    attach_info.channel,
+                    pty_cols,
+                    pty_rows,
+                    cols,
+                    rows,
+                ),
+            );
+            if let Some(info) = world.terminals.get_mut(addr) {
+                info.cols = pty_cols;
+                info.rows = pty_rows;
+            }
             if mark_seen {
                 world.mark_active_seen(core);
             }
@@ -2452,7 +2998,8 @@ fn sync_attached_terminals(
     *active_addr = resolved_active;
 
     // Progressively pre-attach sibling terminals in the active space (at most 1 per pass)
-    // and debounce background sibling SIGWINCH resizes so active interaction stays 0ms-responsive.
+    // using `resumed: true` and never resizing unfocused background channels so another
+    // connected client viewing those tabs keeps its own PTY geometry.
     if warm_siblings {
         let mut sibling_addrs = Vec::new();
         if let Some(space) = world.active_space() {
@@ -2467,22 +3014,38 @@ fn sync_attached_terminals(
         }
         let mut warmed_one = false;
         for sib_addr in sibling_addrs {
-            if let Some(sib) = attached_map.get_mut(&sib_addr) {
-                if sib.cols != cols || sib.rows != rows {
-                    if resize_siblings {
-                        sib.resize(cols, rows);
-                        core.resize_channel(sib.channel, cols, rows);
-                    } else {
-                        outcome.has_unresized_siblings = true;
-                    }
-                }
-            } else if world.terminals.contains_key(&sib_addr) {
+            if attached_map.contains_key(&sib_addr) {
+                continue;
+            }
+            if world.terminals.contains_key(&sib_addr) {
                 if !warmed_one {
-                    if let Ok(ch) =
-                        core.attach_terminal(&sib_addr, cols, rows, ATTACH_HISTORY_LINES)
+                    if let Ok(attach_info) =
+                        core.attach_terminal(&sib_addr, cols, rows, ATTACH_HISTORY_LINES, true)
                     {
-                        core.set_focus(ch, false);
-                        attached_map.insert(sib_addr, AttachedTerminal::new(ch, cols, rows));
+                        let world_dims = world
+                            .terminals
+                            .get(&sib_addr)
+                            .filter(|i| i.cols > 0 && i.rows > 0)
+                            .map(|i| (i.cols, i.rows));
+                        let pty_cols = attach_info
+                            .cols
+                            .or_else(|| world_dims.map(|(c, _)| c))
+                            .unwrap_or(cols);
+                        let pty_rows = attach_info
+                            .rows
+                            .or_else(|| world_dims.map(|(_, r)| r))
+                            .unwrap_or(rows);
+                        core.set_focus(attach_info.channel, false);
+                        attached_map.insert(
+                            sib_addr,
+                            AttachedTerminal::new_with_client_size(
+                                attach_info.channel,
+                                pty_cols,
+                                pty_rows,
+                                cols,
+                                rows,
+                            ),
+                        );
                         warmed_one = true;
                     }
                 } else {
@@ -3622,7 +4185,6 @@ fn run_app_loop(
     let mut selection_initial_fence = false;
     let mut clipboard_buffer = String::new();
     let mut copied_until: Option<Instant> = None;
-    let mut pending_sibling_resize_at: Option<Instant> = None;
     let mut pending_attach_retry: Option<(String, Instant)> = None;
     let mut last_usage_rev: u64 = 0;
     let mut has_focused_agent = false;
@@ -3662,10 +4224,19 @@ fn run_app_loop(
             &mut pending_reader_rpc,
             &mut dirty,
         );
-        if pending_sibling_resize_at.is_some_and(|t| now >= t) {
-            pending_sibling_resize_at = None;
-            need_sync_terminals = true;
-        }
+        flush_expired_sync_updates(
+            attached_map,
+            active_addr.as_deref(),
+            now,
+            &modal,
+            eink_mode,
+            eink_interval,
+            first_frame_drawn,
+            core.last_pty_input(),
+            &mut dirty,
+            &mut pty_dirty,
+            &mut eink_pacer,
+        );
         if pending_attach_retry.as_ref().is_some_and(|(addr, t)| {
             now >= *t || world.active_terminal_address_ref() != Some(addr.as_str())
         }) {
@@ -3696,7 +4267,6 @@ fn run_app_loop(
             )
         {
             let prev_addr = active_addr.clone();
-            let allow_sibling_resize = pending_sibling_resize_at.is_none();
             let sync_out = sync_attached_terminals(
                 core,
                 world,
@@ -3705,7 +4275,6 @@ fn run_app_loop(
                 term_rect,
                 &mut scrollback_offset,
                 first_frame_drawn,
-                allow_sibling_resize,
                 !matches!(modal, Modal::TabOverview { .. }),
             );
             last_synced_doc_version = world.doc_version;
@@ -3717,9 +4286,6 @@ fn run_app_loop(
                     .map(|want| (want, Instant::now() + ATTACH_RETRY_DELAY));
             } else {
                 pending_attach_retry = None;
-            }
-            if sync_out.has_unresized_siblings && pending_sibling_resize_at.is_none() {
-                pending_sibling_resize_at = Some(Instant::now() + SIBLING_RESIZE_DEBOUNCE);
             }
             if *active_addr != prev_addr {
                 dpad_drag = None;
@@ -3773,6 +4339,10 @@ fn run_app_loop(
             };
             let retry_deadline = pending_attach_retry.as_ref().map(|(_, t)| *t);
             let reader_rpc_deadline = pending_reader_rpc.as_ref().map(|r| r.deadline);
+            let sync_update_deadline = attached_map
+                .values()
+                .filter_map(AttachedTerminal::sync_update_deadline)
+                .min();
             let pty_deadline = if eink_mode && !eink_interval.is_zero() {
                 eink_pacer.next_deadline(pty_dirty, eink_mode, eink_interval, now, last_draw_at)
             } else {
@@ -3780,9 +4350,9 @@ fn run_app_loop(
             };
             for deadline in [
                 copied_until,
-                pending_sibling_resize_at,
                 retry_deadline,
                 reader_rpc_deadline,
+                sync_update_deadline,
                 pty_deadline,
             ]
             .into_iter()
@@ -3811,11 +4381,19 @@ fn run_app_loop(
                             &mut pending_reader_rpc,
                             &mut dirty,
                         );
-                        if pending_sibling_resize_at.is_some_and(|t| after >= t) {
-                            pending_sibling_resize_at = None;
-                            need_sync_terminals = true;
-                            continue;
-                        }
+                        flush_expired_sync_updates(
+                            attached_map,
+                            active_addr.as_deref(),
+                            after,
+                            &modal,
+                            eink_mode,
+                            eink_interval,
+                            first_frame_drawn,
+                            core.last_pty_input(),
+                            &mut dirty,
+                            &mut pty_dirty,
+                            &mut eink_pacer,
+                        );
                         if pending_attach_retry
                             .as_ref()
                             .is_some_and(|(_, t)| after >= *t)
@@ -3878,10 +4456,10 @@ fn run_app_loop(
                             flush_credits(core, &mut pending_credits, &mut pending_credit_bytes);
                         }
                         let is_active = active_channel == Some(channel);
-                        if let Some(att) = attached_map.values_mut().find(|a| a.channel == channel)
-                        {
-                            att.process_vt_bytes(&data);
-                        }
+                        let committed = attached_map
+                            .values_mut()
+                            .find(|a| a.channel == channel)
+                            .is_some_and(|att| att.process_vt_bytes_at(&data, Instant::now()));
                         let mut cleared_vis_sel = false;
                         if is_active && selection.as_ref().is_some_and(|s| !s.active) {
                             cleared_vis_sel = selection
@@ -3892,22 +4470,21 @@ fn run_app_loop(
                             selection_vt_seq = None;
                         }
                         if is_active
+                            && (committed || cleared_vis_sel)
                             && !matches!(modal, Modal::TabOverview { .. } | Modal::Reader { .. })
                         {
-                            if !eink_mode
-                                || eink_interval.is_zero()
-                                || !first_frame_drawn
-                                || cleared_vis_sel
-                            {
-                                dirty = true;
-                            } else {
-                                pty_dirty = true;
-                                eink_pacer.record_active_pty_data(
-                                    channel,
-                                    Instant::now(),
-                                    core.last_pty_input(),
-                                );
-                            }
+                            schedule_active_pty_redraw(
+                                channel,
+                                Instant::now(),
+                                eink_mode,
+                                eink_interval,
+                                first_frame_drawn,
+                                cleared_vis_sel,
+                                core.last_pty_input(),
+                                &mut dirty,
+                                &mut pty_dirty,
+                                &mut eink_pacer,
+                            );
                         }
                     }
                     CoreMessage::TerminalClosed { channel, .. } => {
@@ -3948,6 +4525,13 @@ fn run_app_loop(
                             dirty = true;
                             check_active_seen = true;
                         }
+                        EventDisposition::TerminalResized => {
+                            if reconcile_attached_sizes(world, attached_map, active_addr.as_deref())
+                            {
+                                dirty = true;
+                                pty_dirty = false;
+                            }
+                        }
                         EventDisposition::NeedsTerminalRefresh => {
                             pending_term_refresh = true;
                         }
@@ -3967,6 +4551,7 @@ fn run_app_loop(
                     dirty = true;
                 }
                 AppEvent::Input(ev) => {
+                    let prev_input_seq = core.last_pty_input().map(|i| i.seq);
                     let active_att = active_addr.as_ref().and_then(|a| attached_map.get(a));
                     match ev {
                         Event::Resize(w, h) => {
@@ -3977,8 +4562,6 @@ fn run_app_loop(
                             reader_drag = None;
                             cur_size = (w, h);
                             clamp_reader_scroll_on_resize(&mut modal, Rect::new(0, 0, w, h));
-                            pending_sibling_resize_at =
-                                Some(Instant::now() + SIBLING_RESIZE_DEBOUNCE);
                             need_sync_terminals = true;
                             force_clear = true;
                             dirty = true;
@@ -5005,6 +5588,17 @@ fn run_app_loop(
                         _ => {}
                     }
 
+                    if reclaim_active_pty_size_on_input(
+                        core,
+                        world,
+                        attached_map,
+                        active_addr.as_deref(),
+                        term_rect,
+                        prev_input_seq,
+                    ) {
+                        dirty = true;
+                    }
+
                     // Break batch early if the active terminal switched so `sync_attached_terminals`
                     // updates `active_addr` before any subsequent input events in the queue.
                     let has_active_att = active_addr
@@ -5036,6 +5630,7 @@ fn run_app_loop(
         if pending_doc_sync {
             if world.fetch_doc(core).is_ok() && world.refresh_terminals(core).is_ok() {
                 let _ = world.reconcile_and_sync(core);
+                let _ = reconcile_attached_sizes(world, attached_map, active_addr.as_deref());
             }
             if !matches!(modal, Modal::TabOverview { .. }) {
                 world.mark_active_seen(core);
@@ -5045,6 +5640,7 @@ fn run_app_loop(
         } else if pending_lifecycle_sync {
             if world.refresh_terminals(core).is_ok() {
                 let _ = world.reconcile_and_sync(core);
+                let _ = reconcile_attached_sizes(world, attached_map, active_addr.as_deref());
             }
             if !matches!(modal, Modal::TabOverview { .. }) {
                 world.mark_active_seen(core);
@@ -5052,7 +5648,9 @@ fn run_app_loop(
             need_sync_terminals = true;
             dirty = true;
         } else if pending_term_refresh {
-            let _ = world.refresh_terminals(core);
+            if world.refresh_terminals(core).is_ok() {
+                let _ = reconcile_attached_sizes(world, attached_map, active_addr.as_deref());
+            }
             if !matches!(modal, Modal::TabOverview { .. }) {
                 world.mark_active_seen(core);
             }
@@ -5212,6 +5810,7 @@ fn run_app_loop(
                 force_clear = false;
             }
             let mut geom_eink_snapshot = None;
+            let mut geom_hidden_cursor_pos = None;
             terminal.draw(|f| {
                 let geom = render_ui_full_with_eink_color_and_fence(
                     f,
@@ -5243,7 +5842,11 @@ fn run_app_loop(
                 last_page_up_rect = geom.page_up_rect;
                 last_page_down_rect = geom.page_down_rect;
                 geom_eink_snapshot = geom.eink_snapshot;
+                geom_hidden_cursor_pos = geom.hidden_cursor_pos;
             })?;
+            if let Some((cx, cy)) = geom_hidden_cursor_pos {
+                queue!(terminal.backend_mut(), MoveTo(cx, cy))?;
+            }
             execute!(terminal.backend_mut(), EndSynchronizedUpdate)?;
             dirty = false;
             pty_dirty = false;
@@ -10579,5 +11182,393 @@ mod tests {
         let expected_step = reader_page_step(reader_rect).min(max_full);
         assert_eq!(after_pgdn, expected_step);
         assert!(after_pgdn > reader_page_step(term_rect));
+    }
+
+    #[test]
+    fn reconcile_attached_sizes_updates_parser_without_clobbering_client_viewport() {
+        use crate::model::TerminalInfo;
+        let mut world = World::default();
+        world.terminals.insert(
+            "t1".to_string(),
+            TerminalInfo {
+                address: "t1".to_string(),
+                state: "live".to_string(),
+                cols: 68,
+                rows: 23,
+                ..Default::default()
+            },
+        );
+        world.terminals.insert(
+            "t2".to_string(),
+            TerminalInfo {
+                address: "t2".to_string(),
+                state: "live".to_string(),
+                cols: 120,
+                rows: 40,
+                ..Default::default()
+            },
+        );
+        world.terminals.insert(
+            "t3".to_string(),
+            TerminalInfo {
+                address: "t3".to_string(),
+                state: "live".to_string(),
+                cols: 0,
+                rows: 0,
+                ..Default::default()
+            },
+        );
+
+        let mut attached_map = BTreeMap::new();
+        attached_map.insert(
+            "t1".to_string(),
+            AttachedTerminal::new_with_client_size(1, 140, 51, 140, 51),
+        );
+        attached_map.insert(
+            "t2".to_string(),
+            AttachedTerminal::new_with_client_size(2, 140, 51, 140, 51),
+        );
+        attached_map.insert(
+            "t3".to_string(),
+            AttachedTerminal::new_with_client_size(3, 140, 51, 140, 51),
+        );
+
+        // Changing only sibling `t2` returns `false`
+        world.terminals.get_mut("t1").unwrap().cols = 140;
+        world.terminals.get_mut("t1").unwrap().rows = 51;
+        assert!(!reconcile_attached_sizes(
+            &world,
+            &mut attached_map,
+            Some("t1")
+        ));
+        assert_eq!(
+            (attached_map["t2"].cols, attached_map["t2"].rows),
+            (120, 40)
+        );
+        assert_eq!(
+            attached_map["t2"].parser.screen().size(),
+            (non_zero_u16(40), non_zero_u16(120))
+        );
+        assert_eq!(
+            (
+                attached_map["t2"].client_cols,
+                attached_map["t2"].client_rows
+            ),
+            (140, 51)
+        );
+
+        // `0x0` dims in world.terminals are ignored
+        assert_eq!(
+            (attached_map["t3"].cols, attached_map["t3"].rows),
+            (140, 51)
+        );
+
+        // Changing active `t1` returns `true` and keeps `client_cols`/`client_rows` intact
+        world.terminals.get_mut("t1").unwrap().cols = 68;
+        world.terminals.get_mut("t1").unwrap().rows = 23;
+        assert!(reconcile_attached_sizes(
+            &world,
+            &mut attached_map,
+            Some("t1")
+        ));
+        assert_eq!((attached_map["t1"].cols, attached_map["t1"].rows), (68, 23));
+        assert_eq!(
+            attached_map["t1"].parser.screen().size(),
+            (non_zero_u16(23), non_zero_u16(68))
+        );
+        assert_eq!(
+            (
+                attached_map["t1"].client_cols,
+                attached_map["t1"].client_rows
+            ),
+            (140, 51)
+        );
+        // Second call is a no-op
+        assert!(!reconcile_attached_sizes(
+            &world,
+            &mut attached_map,
+            Some("t1")
+        ));
+    }
+
+    #[test]
+    fn mode_2026_buffers_split_frames_and_flushes_on_close_timeout_or_resize() {
+        let t0 = Instant::now();
+        let mut att = AttachedTerminal::new(1, 40, 6);
+        att.process_vt_bytes_at(b"\x1b[1;1H> \xe4\xb8\xad\xe6\x96\x87\x1b[1;5H", t0);
+        assert_eq!(att.parser.screen().cursor_position(), (0, 4));
+        assert_eq!(att.sync_update_deadline(), None);
+
+        // 1. Chunk 1 opens `?2026h`, writes longer text and leaves cursor at tail `(0, 10)`
+        let committed_1 =
+            att.process_vt_bytes_at("\x1b[?2026h\x1b[1;1H> 你好世界\x1b[1;11H".as_bytes(), t0);
+        assert!(!committed_1);
+        assert_eq!(att.parser.screen().cursor_position(), (0, 4));
+        assert_eq!(att.sync_update_deadline(), Some(t0 + SYNC_UPDATE_TIMEOUT));
+
+        // 2. Chunk 2 restores middle cursor `(0, 4)` and closes `?2026l`
+        let committed_2 =
+            att.process_vt_bytes_at(b"\x1b[1;5H\x1b[?2026l", t0 + Duration::from_millis(5));
+        assert!(committed_2);
+        assert_eq!(att.parser.screen().cursor_position(), (0, 4));
+        assert_eq!(att.sync_update_deadline(), None);
+        assert_eq!(
+            att.parser.screen().contents_between(0, 0, 0, 10),
+            "> 你好世界"
+        );
+
+        // 3. Unclosed `?2026h` flushes safely after SYNC_UPDATE_TIMEOUT in Normal mode
+        let mut map = BTreeMap::new();
+        map.insert("t1".to_string(), att);
+        let t1 = t0 + Duration::from_millis(20);
+        assert!(!map
+            .get_mut("t1")
+            .unwrap()
+            .process_vt_bytes_at(b"\x1b[?2026h\x1b[2;1Hlate", t1));
+        let mut dirty = false;
+        let mut pty_dirty = false;
+        let mut eink_pacer = EinkInputPacer::default();
+        let interval = Duration::from_millis(250);
+        flush_expired_sync_updates(
+            &mut map,
+            Some("t1"),
+            t1 + SYNC_UPDATE_TIMEOUT - Duration::from_millis(1),
+            &Modal::None,
+            false,
+            interval,
+            true,
+            None,
+            &mut dirty,
+            &mut pty_dirty,
+            &mut eink_pacer,
+        );
+        assert!(!dirty);
+        assert!(!pty_dirty);
+        assert!(map["t1"].sync_update_deadline().is_some());
+
+        flush_expired_sync_updates(
+            &mut map,
+            Some("t1"),
+            t1 + SYNC_UPDATE_TIMEOUT,
+            &Modal::None,
+            false,
+            interval,
+            true,
+            None,
+            &mut dirty,
+            &mut pty_dirty,
+            &mut eink_pacer,
+        );
+        assert!(dirty);
+        assert_eq!(map["t1"].sync_update_deadline(), None);
+        assert_eq!(
+            map["t1"].parser.screen().contents_between(1, 0, 1, 4),
+            "late"
+        );
+
+        // 3b. In E-Ink mode, timeout flush routes through `pty_dirty` + `EinkInputPacer`
+        let t2 = t1 + SYNC_UPDATE_TIMEOUT + Duration::from_millis(5);
+        assert!(!map
+            .get_mut("t1")
+            .unwrap()
+            .process_vt_bytes_at(b"\x1b[?2026h\x1b[3;1Hslow-eink", t2));
+        dirty = false;
+        pty_dirty = false;
+        let flush_at = t2 + SYNC_UPDATE_TIMEOUT;
+        flush_expired_sync_updates(
+            &mut map,
+            Some("t1"),
+            flush_at,
+            &Modal::None,
+            true,
+            interval,
+            true,
+            None,
+            &mut dirty,
+            &mut pty_dirty,
+            &mut eink_pacer,
+        );
+        assert!(!dirty);
+        assert!(pty_dirty);
+        assert_eq!(
+            eink_pacer.next_deadline(pty_dirty, true, interval, flush_at, Some(t0)),
+            Some(t0 + interval)
+        );
+        assert_eq!(
+            map["t1"].parser.screen().contents_between(2, 0, 2, 9),
+            "slow-eink"
+        );
+
+        // 4. Stray `?2026l` (e.g. attach replay reset) commits immediately without stalling
+        let mut stray = AttachedTerminal::new(2, 30, 5);
+        assert!(stray.process_vt_bytes_at(b"\x1b[?2026l\x1b[1;3Hok", t0));
+        assert_eq!(stray.sync_update_deadline(), None);
+        assert_eq!(stray.parser.screen().cursor_position(), (0, 4));
+
+        // 5. Resize flushes pending sync buffer before applying the new parser dimensions
+        assert!(!stray.process_vt_bytes_at(b"\x1b[?2026h\x1b[2;1Hpre-resize", t0));
+        assert!(stray.sync_update_deadline().is_some());
+        stray.resize(40, 8);
+        assert_eq!(stray.sync_update_deadline(), None);
+        assert_eq!(
+            stray.parser.screen().contents_between(1, 0, 1, 10),
+            "pre-resize"
+        );
+
+        // 6. Strict `SYNC_UPDATE_MAX_BYTES` cap flushes without allocating past the cap
+        let mut capped = AttachedTerminal::new(3, 40, 6);
+        assert!(!capped.process_vt_bytes_at(b"\x1b[?2026h\x1b[1;1H", t0));
+        let mut huge = vec![b'x'; SYNC_UPDATE_MAX_BYTES + 1024];
+        huge.splice(0..0, b"\x1b[2;1H".iter().copied());
+        huge.extend_from_slice(b"\x1b[3;1Htail");
+        assert!(capped.process_vt_bytes_at(&huge, t0));
+        assert_eq!(capped.sync_update_deadline(), None);
+        assert!(capped.sync_update_buf.is_empty());
+        assert!(capped.sync_update_buf.capacity() < SYNC_UPDATE_MAX_BYTES);
+        assert_eq!(capped.parser.screen().contents_between(2, 0, 2, 4), "tail");
+    }
+
+    #[test]
+    fn reclaim_active_pty_size_on_input_sends_resize_even_when_client_viewport_unchanged() {
+        use crate::model::TerminalInfo;
+
+        let core = CoreClient::dummy_for_tests();
+        let mut world = World::default();
+        world.terminals.insert(
+            "t1".to_string(),
+            TerminalInfo {
+                address: "t1".to_string(),
+                state: "live".to_string(),
+                cols: 68,
+                rows: 23,
+                ..Default::default()
+            },
+        );
+        let mut attached_map = BTreeMap::new();
+        attached_map.insert(
+            "t1".to_string(),
+            AttachedTerminal::new_with_client_size(7, 68, 23, 140, 51),
+        );
+        let term_rect = Rect::new(0, 1, 140, 51);
+
+        // No new input -> no reclaim
+        let prev_seq = core.last_pty_input().map(|i| i.seq);
+        assert!(!reclaim_active_pty_size_on_input(
+            &core,
+            &mut world,
+            &mut attached_map,
+            Some("t1"),
+            term_rect,
+            prev_seq,
+        ));
+
+        // Local input on active channel reclaims `(140, 51)` even though `client_cols`/`client_rows` already matched
+        core.send_input(7, b"a");
+        assert!(reclaim_active_pty_size_on_input(
+            &core,
+            &mut world,
+            &mut attached_map,
+            Some("t1"),
+            term_rect,
+            prev_seq,
+        ));
+        assert_eq!(
+            (attached_map["t1"].cols, attached_map["t1"].rows),
+            (140, 51)
+        );
+        assert_eq!(
+            (
+                attached_map["t1"].client_cols,
+                attached_map["t1"].client_rows
+            ),
+            (140, 51)
+        );
+        assert_eq!(
+            (world.terminals["t1"].cols, world.terminals["t1"].rows),
+            (140, 51)
+        );
+
+        // Subsequent input with matching dimensions is a no-op
+        let next_seq = core.last_pty_input().map(|i| i.seq);
+        core.send_input(7, b"b");
+        assert!(!reclaim_active_pty_size_on_input(
+            &core,
+            &mut world,
+            &mut attached_map,
+            Some("t1"),
+            term_rect,
+            next_seq,
+        ));
+    }
+
+    #[test]
+    fn vt_cursor_modes_1047_1048_hpb_vpb_zero_tab_and_grapheme_edge_cases() {
+        // 1. Standalone and compound `CSI ? 1048 h/l` save and restore cursor position
+        let mut att_1048 = AttachedTerminal::new(1, 40, 10);
+        att_1048.process_vt_bytes(b"\x1b[2;6H\x1b[?1048h\x1b[4;30Htail\x1b[?1048l");
+        assert_eq!(att_1048.parser.screen().cursor_position(), (1, 5));
+
+        att_1048.process_vt_bytes(b"\x1b[3;8H\x1b[?1048;25h\x1b[5;25HX\x1b[?1048;25l");
+        assert_eq!(att_1048.parser.screen().cursor_position(), (2, 7));
+        assert!(att_1048.parser.screen().hide_cursor());
+        att_1048.process_vt_bytes(b"\x1b[?25h");
+        assert!(!att_1048.parser.screen().hide_cursor());
+
+        // 2. `CSI ? 1047 h/l` switches alt screen, preserves cursor, clears alt on exit,
+        //    and keeps per-screen `1048` saved cursor intact
+        let mut att_1047 = AttachedTerminal::new(2, 40, 10);
+        att_1047.process_vt_bytes(b"\x1b[2;4H\x1b[?1047h");
+        assert!(att_1047.parser.screen().alternate_screen());
+        assert_eq!(att_1047.parser.screen().cursor_position(), (1, 3));
+        att_1047.process_vt_bytes(b"\x1b[3;8H\x1b[?1047l");
+        assert!(!att_1047.parser.screen().alternate_screen());
+        assert_eq!(att_1047.parser.screen().cursor_position(), (2, 7));
+
+        att_1047
+            .process_vt_bytes(b"\x1b[2;4H\x1b[?1048h\x1b[?1047h\x1b[3;8Halt\x1b[?1047l\x1b[?1048l");
+        assert_eq!(att_1047.parser.screen().cursor_position(), (1, 3));
+        att_1047.process_vt_bytes(b"\x1b[?1047h");
+        assert_eq!(att_1047.parser.screen().contents_between(2, 7, 2, 10), "");
+
+        // 3. `HPB` (`CSI Ps j`) & `VPB` (`CSI Ps k`), including from deferred-wrap margin
+        let mut att_hv = AttachedTerminal::new(3, 10, 5);
+        att_hv.process_vt_bytes(b"\x1b[3;8H\x1b[5j\x1b[1k");
+        assert_eq!(att_hv.parser.screen().cursor_position(), (1, 2));
+        att_hv.process_vt_bytes(b"\x1b[1;1H0123456789\x1b[2jY");
+        assert_eq!(
+            att_hv.parser.screen().contents_between(0, 0, 0, 10),
+            "0123456Y89"
+        );
+
+        // 4. `CBT 0` (`CSI 0 Z`) and `CHT 0` (`CSI 0 I`) are no-ops; omitted/default uses 1
+        let mut att_tab = AttachedTerminal::new(4, 30, 4);
+        att_tab.process_vt_bytes(b"\x1b[1;10H\x1b[0Z\x1b[0I");
+        assert_eq!(att_tab.parser.screen().cursor_position(), (0, 9));
+        att_tab.process_vt_bytes(b"\x1b[Z");
+        assert_eq!(att_tab.parser.screen().cursor_position(), (0, 8));
+        att_tab.process_vt_bytes(b"\x1b[I");
+        assert_eq!(att_tab.parser.screen().cursor_position(), (0, 16));
+
+        // 5. `GraphemeState` & Mode 2027: CJK+ZWJ, non-emoji+VS16, `?2027l`, and RIS (`ESC c`)
+        let mut att_g = AttachedTerminal::new(5, 20, 4);
+        att_g.process_vt_bytes("\x1b[1;1H中\u{200D}文".as_bytes());
+        assert_eq!(att_g.parser.screen().cursor_position(), (0, 4));
+        assert_eq!(att_g.parser.screen().cell(0, 2).unwrap().contents(), "文");
+
+        att_g.process_vt_bytes("\x1b[2;1H─\u{FE0F}b".as_bytes());
+        assert_eq!(att_g.parser.screen().cursor_position(), (1, 2));
+        assert_eq!(att_g.parser.screen().cell(1, 1).unwrap().contents(), "b");
+
+        att_g.process_vt_bytes("\x1b[3;1H\x1b[?2027l⚠\u{FE0F}b".as_bytes());
+        assert_eq!(att_g.parser.screen().cursor_position(), (2, 2));
+        assert_eq!(att_g.parser.screen().cell(2, 1).unwrap().contents(), "b");
+        att_g.process_vt_bytes("\x1b[4;1H👨\u{200D}💻x".as_bytes());
+        assert_eq!(att_g.parser.screen().cursor_position(), (3, 5));
+        assert_eq!(att_g.parser.screen().cell(3, 4).unwrap().contents(), "x");
+
+        // Full reset (`ESC c`) restores Mode 2027 widening (`⚠\u{FE0F}b` -> 3 columns)
+        att_g.process_vt_bytes("\x1bc\x1b[1;1H⚠\u{FE0F}b".as_bytes());
+        assert_eq!(att_g.parser.screen().cursor_position(), (0, 3));
+        assert_eq!(att_g.parser.screen().cell(0, 2).unwrap().contents(), "b");
     }
 }
