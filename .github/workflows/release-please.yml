@@ -90,12 +90,12 @@ jobs:
             run_smoke: true
             expected_arch: aarch64
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-latest
             linux_musl: false
             run_smoke: true
             expected_arch: arm64
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: macos-latest
             linux_musl: false
             run_smoke: false
             expected_arch: x86_64
