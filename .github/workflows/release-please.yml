@@ -5,6 +5,12 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Optional existing release tag (e.g. v0.13.0) to rebuild and upload assets for
+        required: false
+        default: ""
+        type: string
 
 permissions: {}
 
@@ -19,9 +25,234 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+    outputs:
+      should_publish: ${{ steps.target.outputs.should_publish }}
+      tag_name: ${{ steps.target.outputs.tag_name }}
     steps:
       - name: Run release-please
+        id: release
+        if: github.event_name != 'workflow_dispatch' || inputs.tag == ''
         uses: googleapis/release-please-action@v4
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+      - name: Resolve release target
+        id: target
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          RP_CREATED: ${{ steps.release.outputs.release_created }}
+          RP_TAG: ${{ steps.release.outputs.tag_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_TAG" ]; then
+            if ! printf '%s\n' "$INPUT_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+              echo "Invalid tag format: $INPUT_TAG" >&2
+              exit 1
+            fi
+            gh release view "$INPUT_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
+            {
+              echo "should_publish=true"
+              echo "tag_name=$INPUT_TAG"
+            } >> "$GITHUB_OUTPUT"
+          elif [ "$RP_CREATED" = "true" ] && [ -n "$RP_TAG" ]; then
+            {
+              echo "should_publish=true"
+              echo "tag_name=$RP_TAG"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "should_publish=false"
+              echo "tag_name="
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+  build-release-assets:
+    name: Build (${{ matrix.target }})
+    needs: release-please
+    if: needs.release-please.outputs.should_publish == 'true'
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            linux_musl: true
+            run_smoke: true
+            expected_arch: x86_64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            linux_musl: true
+            run_smoke: true
+            expected_arch: aarch64
+          - target: aarch64-apple-darwin
+            os: macos-14
+            linux_musl: false
+            run_smoke: true
+            expected_arch: arm64
+          - target: x86_64-apple-darwin
+            os: macos-14
+            linux_musl: false
+            run_smoke: false
+            expected_arch: x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+          fetch-depth: 0
+
+      - name: Install Linux musl toolchain
+        if: matrix.linux_musl
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y musl-tools musl-dev file
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: release-${{ matrix.target }}
+
+      - name: Build release binary
+        env:
+          TARGET: ${{ matrix.target }}
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: -C target-feature=+crt-static
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: -C target-feature=+crt-static
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: cargo build --release --locked --target "$TARGET"
+
+      - name: Verify release binary
+        env:
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+          TARGET: ${{ matrix.target }}
+          LINUX_MUSL: ${{ matrix.linux_musl }}
+          RUN_SMOKE: ${{ matrix.run_smoke }}
+          EXPECTED_ARCH: ${{ matrix.expected_arch }}
+        run: |
+          set -euo pipefail
+          BIN="target/${TARGET}/release/hct"
+          test -x "$BIN"
+          FILE_INFO=$(file "$BIN")
+          echo "$FILE_INFO"
+
+          if [ "$LINUX_MUSL" = "true" ]; then
+            if readelf -d "$BIN" 2>/dev/null | grep -q '(NEEDED)'; then
+              echo "Expected static Linux binary with zero NEEDED libraries" >&2
+              readelf -d "$BIN" >&2
+              exit 1
+            fi
+          else
+            if ! printf '%s\n' "$FILE_INFO" | grep -q 'Mach-O 64-bit executable'; then
+              echo "Unexpected macOS binary format: $FILE_INFO" >&2
+              exit 1
+            fi
+            if ! printf '%s\n' "$FILE_INFO" | grep -q "$EXPECTED_ARCH"; then
+              echo "Expected architecture $EXPECTED_ARCH in: $FILE_INFO" >&2
+              exit 1
+            fi
+          fi
+
+          if [ "$RUN_SMOKE" = "true" ]; then
+            VER=$("$BIN" --version)
+            echo "Smoke output: $VER"
+            EXPECTED_VER="${TAG#v}"
+            case "$VER" in
+              *"$EXPECTED_VER"*) ;;
+              *)
+                echo "Expected version output to contain '$EXPECTED_VER', got: $VER" >&2
+                exit 1
+                ;;
+            esac
+            case "$VER" in
+              *dirty*)
+                echo "Unexpected dirty version string: $VER" >&2
+                exit 1
+                ;;
+            esac
+          fi
+
+      - name: Package release archive
+        env:
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          STEM="hct-${TAG}-${TARGET}"
+          STAGE="dist/${STEM}"
+          mkdir -p "$STAGE"
+          cp "target/${TARGET}/release/hct" "$STAGE/hct"
+          chmod 755 "$STAGE/hct"
+          cp README.md LICENSE "$STAGE/"
+          tar -C dist -czf "dist/${STEM}.tar.gz" "$STEM"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-asset-${{ matrix.target }}
+          path: dist/hct-*.tar.gz
+          if-no-files-found: error
+
+  publish-release-assets:
+    name: Publish Release Assets
+    needs: [release-please, build-release-assets]
+    if: needs.release-please.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    timeout-minutes: 15
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-asset-*
+          merge-multiple: true
+          path: dist
+
+      - name: Generate SHA256SUMS and verify archives
+        env:
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          for target in \
+            x86_64-unknown-linux-musl \
+            aarch64-unknown-linux-musl \
+            aarch64-apple-darwin \
+            x86_64-apple-darwin
+          do
+            archive="dist/hct-${TAG}-${target}.tar.gz"
+            if [ ! -f "$archive" ]; then
+              echo "Missing expected archive: $archive" >&2
+              exit 1
+            fi
+          done
+          (
+            cd dist
+            LC_ALL=C sha256sum hct-*.tar.gz > SHA256SUMS
+            sha256sum -c SHA256SUMS
+            cat SHA256SUMS
+          )
+
+      - name: Upload assets to GitHub Release
+        env:
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" dist/hct-*.tar.gz dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --clobber

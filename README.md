@@ -75,6 +75,48 @@ A fast, lightweight **multi-tab TUI client** for [`herdr-core` (`hc`)](https://g
 
 Requires [`herdr-core` (`hc`)](https://github.com/herdrdev/herdr-core) installed on `PATH` (or `~/.local/bin/herdr-core`).
 
+### Quick Install & Update (Linux & macOS) / 一键安装与更新
+
+Install the latest release or update an existing installation with the same command (no compiler or `sudo` required):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/xxb/herdr-tui/main/install.sh | sh
+```
+
+- Supports **Linux** (`x86_64`, `aarch64` static binary) and **macOS** (Apple Silicon & Intel).
+- Verifies the archive against `SHA256SUMS` before atomically installing to `~/.local/bin/hct`.
+- Re-run the exact same command anytime to update to the latest version.
+
+Options (install a pinned version, change directory, or use a release mirror):
+
+```sh
+# Install a specific version or custom directory
+curl -fsSL https://raw.githubusercontent.com/xxb/herdr-tui/main/install.sh | sh -s -- --version v0.13.0 --dir ~/.local/bin
+
+# Override release base URL (e.g. proxy / mirror)
+HCT_RELEASE_URL="https://your-mirror.example.com/herdr-tui/releases" sh -c 'curl -fsSL https://raw.githubusercontent.com/xxb/herdr-tui/main/install.sh | sh'
+```
+
+Prefer manual installation? Download the matching `.tar.gz` archive and `SHA256SUMS` directly from [GitHub Releases](https://github.com/xxb/herdr-tui/releases).
+
+### Uninstall / 卸载
+
+Remove `hct` cleanly without touching `herdr-core` (`hc`), running sessions, or `~/.config/herdr`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/xxb/herdr-tui/main/install.sh | sh -s -- --uninstall
+```
+
+- To also remove `hct`'s own config directory (`~/.config/herdr-tui`):
+
+  ```sh
+  curl -fsSL https://raw.githubusercontent.com/xxb/herdr-tui/main/install.sh | sh -s -- --uninstall --purge-config
+  ```
+
+- Or remove the binary manually at any time: `rm -f ~/.local/bin/hct`.
+
+### Build from Source / 从源码编译
+
 ```bash
 cargo build --release
 install -Dm755 target/release/hct ~/.local/bin/hct
