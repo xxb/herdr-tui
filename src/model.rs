@@ -57,6 +57,8 @@ pub struct TerminalInfo {
     pub seen_turn: Option<u64>,
     pub pinned: bool,
     pub parent: Option<String>,
+    pub cols: u16,
+    pub rows: u16,
 }
 
 fn parse_fg_argv(v: Option<&Value>) -> Vec<String> {
@@ -209,6 +211,16 @@ impl TerminalInfo {
             .and_then(Value::as_str)
             .is_some_and(|s| !s.is_empty());
         let parent = v.get("parent").and_then(Value::as_str).map(String::from);
+        let cols = v
+            .get("cols")
+            .and_then(Value::as_u64)
+            .and_then(|n| u16::try_from(n).ok())
+            .unwrap_or(0);
+        let rows = v
+            .get("rows")
+            .and_then(Value::as_u64)
+            .and_then(|n| u16::try_from(n).ok())
+            .unwrap_or(0);
 
         Some(Self {
             address,
@@ -226,6 +238,8 @@ impl TerminalInfo {
             seen_turn,
             pinned,
             parent,
+            cols,
+            rows,
         })
     }
 
@@ -498,6 +512,8 @@ pub enum EventDisposition {
     Unchanged,
     /// Event was applied in-place in `O(1)` without needing any RPC.
     AppliedInPlace,
+    /// Shared PTY size changed for a known terminal; attached VT parsers should reconcile.
+    TerminalResized,
     /// Needs a coalesced `refresh_terminals` RPC after draining the current event batch.
     NeedsTerminalRefresh,
     /// Needs `refresh_terminals` + `reconcile_and_sync` (`created` / `started` / `finished`).
@@ -742,6 +758,37 @@ impl World {
                         }
                     }
                     _ => EventDisposition::NeedsTerminalRefresh,
+                }
+            }
+            "size" => {
+                let Some(addr) = params.get("terminal").and_then(Value::as_str) else {
+                    return EventDisposition::NeedsTerminalRefresh;
+                };
+                let Some(info) = self.terminals.get_mut(addr) else {
+                    return EventDisposition::NeedsTerminalRefresh;
+                };
+                let Some(data) = params.get("data") else {
+                    return EventDisposition::Unchanged;
+                };
+                let new_cols = data
+                    .get("cols")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| u16::try_from(n).ok())
+                    .filter(|&n| n > 0);
+                let new_rows = data
+                    .get("rows")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| u16::try_from(n).ok())
+                    .filter(|&n| n > 0);
+                let (Some(new_cols), Some(new_rows)) = (new_cols, new_rows) else {
+                    return EventDisposition::Unchanged;
+                };
+                if info.cols == new_cols && info.rows == new_rows {
+                    EventDisposition::Unchanged
+                } else {
+                    info.cols = new_cols;
+                    info.rows = new_rows;
+                    EventDisposition::TerminalResized
                 }
             }
             _ => EventDisposition::Unchanged,
@@ -1990,5 +2037,80 @@ mod tests {
             EventDisposition::AppliedInPlace
         );
         assert!(world.terminals["t1"].fg_argv.is_empty());
+    }
+
+    #[test]
+    fn terminal_info_parses_size_and_apply_core_event_handles_size_events() {
+        let parsed = TerminalInfo::from_json(&json!({
+            "address": "t1",
+            "state": "live",
+            "cols": 140,
+            "rows": 51
+        }))
+        .unwrap();
+        assert_eq!((parsed.cols, parsed.rows), (140, 51));
+
+        let fallback = TerminalInfo::from_json(&json!({
+            "address": "t2",
+            "state": "live"
+        }))
+        .unwrap();
+        assert_eq!((fallback.cols, fallback.rows), (0, 0));
+
+        let mut world = World::default();
+        world.terminals.insert("t1".to_string(), parsed);
+
+        let size_ev = json!({
+            "jsonrpc": "2.0",
+            "method": "event",
+            "params": {
+                "type": "size",
+                "terminal": "t1",
+                "data": { "cols": 68, "rows": 23 }
+            }
+        });
+        assert_eq!(
+            world.apply_core_event(&size_ev),
+            EventDisposition::TerminalResized
+        );
+        assert_eq!(
+            (world.terminals["t1"].cols, world.terminals["t1"].rows),
+            (68, 23)
+        );
+        // Duplicate size event is suppressed as Unchanged
+        assert_eq!(
+            world.apply_core_event(&size_ev),
+            EventDisposition::Unchanged
+        );
+
+        // Zero or malformed size data does not corrupt dimensions
+        let invalid_ev = json!({
+            "params": {
+                "type": "size",
+                "terminal": "t1",
+                "data": { "cols": 0, "rows": 23 }
+            }
+        });
+        assert_eq!(
+            world.apply_core_event(&invalid_ev),
+            EventDisposition::Unchanged
+        );
+        assert_eq!(
+            (world.terminals["t1"].cols, world.terminals["t1"].rows),
+            (68, 23)
+        );
+
+        // Unknown terminal falls back to NeedsTerminalRefresh
+        let unknown_ev = json!({
+            "params": {
+                "type": "size",
+                "terminal": "t99",
+                "data": { "cols": 80, "rows": 24 }
+            }
+        });
+        assert_eq!(
+            world.apply_core_event(&unknown_ev),
+            EventDisposition::NeedsTerminalRefresh
+        );
     }
 }

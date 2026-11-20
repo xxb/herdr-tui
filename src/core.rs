@@ -79,6 +79,37 @@ pub struct LastPtyInput {
     pub at: Instant,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttachedChannelInfo {
+    pub channel: u32,
+    pub cols: Option<u16>,
+    pub rows: Option<u16>,
+}
+
+fn parse_attach_channel_info(result: &Value) -> Result<AttachedChannelInfo> {
+    let ch = result
+        .get("channel")
+        .and_then(Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or_else(|| anyhow!("terminal.attach returned no valid channel"))?;
+    let term = result.get("terminal");
+    let cols = term
+        .and_then(|t| t.get("cols"))
+        .and_then(Value::as_u64)
+        .and_then(|v| u16::try_from(v).ok())
+        .filter(|&v| v > 0);
+    let rows = term
+        .and_then(|t| t.get("rows"))
+        .and_then(Value::as_u64)
+        .and_then(|v| u16::try_from(v).ok())
+        .filter(|&v| v > 0);
+    Ok(AttachedChannelInfo {
+        channel: ch,
+        cols,
+        rows,
+    })
+}
+
 pub struct CoreClient {
     _child: Child,
     writer: Arc<Mutex<BufWriter<ChildStdin>>>,
@@ -394,27 +425,25 @@ impl CoreClient {
         Ok(result)
     }
 
-    /// Attach to a terminal and return its stream channel ID.
+    /// Attach to a terminal and return its stream channel ID and live PTY size.
     pub fn attach_terminal(
         &self,
         terminal: &str,
         cols: u16,
         rows: u16,
         history: usize,
-    ) -> Result<u32> {
+        resumed: bool,
+    ) -> Result<AttachedChannelInfo> {
         let params = json!({
             "terminal": terminal,
             "observe": false,
             "history": history,
             "cols": cols,
             "rows": rows,
+            "resumed": resumed,
         });
         let result = self.call("terminal.attach", params)?;
-        let ch = result
-            .get("channel")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| anyhow!("terminal.attach returned no channel"))?;
-        Ok(ch as u32)
+        parse_attach_channel_info(&result)
     }
 
     /// Close an attached stream channel without killing the underlying terminal.
@@ -731,5 +760,37 @@ mod tests {
         let map = core.pending_async_reads.lock().unwrap();
         assert!(!map.contains_key(&777));
         assert!(map.contains_key(&id_fresh));
+    }
+
+    #[test]
+    fn parses_attach_channel_info_with_and_without_terminal_size() {
+        let full = json!({
+            "channel": 9,
+            "terminal": { "address": "t1", "cols": 80, "rows": 24 }
+        });
+        assert_eq!(
+            parse_attach_channel_info(&full).unwrap(),
+            AttachedChannelInfo {
+                channel: 9,
+                cols: Some(80),
+                rows: Some(24),
+            }
+        );
+
+        let zero_dim = json!({
+            "channel": 3,
+            "terminal": { "cols": 0, "rows": 40 }
+        });
+        assert_eq!(
+            parse_attach_channel_info(&zero_dim).unwrap(),
+            AttachedChannelInfo {
+                channel: 3,
+                cols: None,
+                rows: Some(40),
+            }
+        );
+
+        let missing_channel = json!({ "terminal": { "cols": 80, "rows": 24 } });
+        assert!(parse_attach_channel_info(&missing_channel).is_err());
     }
 }
