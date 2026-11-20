@@ -174,11 +174,10 @@ resolve_latest_tag() {
             return 0
         fi
     else
-        _rlt_headers=$(wget --max-redirect=5 -S -O /dev/null "$_rlt_latest_url" 2>&1 || true)
+        _rlt_headers=$(wget -q -S -O /dev/null "$_rlt_latest_url" 2>&1 || true)
         _rlt_loc=$(printf '%s\n' "$_rlt_headers" \
             | tr -d '\r' \
-            | sed -n 's/^[[:space:]]*[Ll][Oo][Cc][Aa][Tt][Ii][Oo][Nn]:[[:space:]]*//p' \
-            | tail -n 1)
+            | awk 'tolower($1) == "location:" && NF >= 2 && $2 ~ /\/tag\// { loc = $2 } END { if (loc != "") print loc }')
         if [ -n "$_rlt_loc" ] && _rlt_tag=$(extract_tag_from_url "$_rlt_loc"); then
             printf '%s\n' "$_rlt_tag"
             return 0
@@ -323,6 +322,10 @@ run_uninstall() {
     _ru_purge=$2
     _ru_bin="${_ru_dir%/}/hct"
 
+    if [ -d "$_ru_bin" ] && [ ! -L "$_ru_bin" ]; then
+        die "Refusing to remove directory '${_ru_bin}'."
+    fi
+
     if [ -e "$_ru_bin" ] || [ -L "$_ru_bin" ]; then
         if [ ! -w "$_ru_dir" ]; then
             die "Cannot remove '${_ru_bin}': directory '${_ru_dir}' is not writable."
@@ -344,6 +347,9 @@ run_uninstall() {
         if [ "$_ru_purge" = "1" ]; then
             case "$_ru_cfg" in
                 */herdr-tui)
+                    if [ "$_ru_cfg" = "/herdr-tui" ]; then
+                        die "Refusing to remove unexpected config path '${_ru_cfg}'."
+                    fi
                     if [ -d "$_ru_cfg" ] || [ -L "$_ru_cfg" ]; then
                         rm -rf "$_ru_cfg"
                         info "Removed config directory ${_ru_cfg}"
@@ -441,8 +447,11 @@ run_install() {
     fi
 
     _ri_dest="${_ri_dir%/}/hct"
+    if [ -d "$_ri_dest" ]; then
+        die "Install destination '${_ri_dest}' is a directory."
+    fi
     _ri_prev_ver=""
-    if [ -x "$_ri_dest" ]; then
+    if [ -f "$_ri_dest" ] && [ -x "$_ri_dest" ]; then
         _ri_prev_ver=$("$_ri_dest" --version 2>/dev/null | head -n 1 || true)
     fi
 

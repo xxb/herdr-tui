@@ -295,6 +295,35 @@ PYEOF
         fail "empty --version should fail"
     fi
 
+    # Test 9: wget-only path (without curl on PATH)
+    if command -v wget >/dev/null 2>&1; then
+        NO_CURL_BIN="${TEST_ROOT}/no-curl-bin"
+        WGET_OUT_BIN="${TEST_ROOT}/wget-bin"
+        mkdir -p "$NO_CURL_BIN" "$WGET_OUT_BIN"
+        for tool in sh wget tar gzip awk sed grep tr wc head tail mktemp cp chmod mv rm mkdir uname; do
+            tool_path=$(command -v "$tool" 2>/dev/null || true)
+            if [ -n "$tool_path" ]; then
+                ln -sf "$tool_path" "${NO_CURL_BIN}/${tool}"
+            fi
+        done
+        for sum_tool in sha256sum shasum openssl; do
+            sum_path=$(command -v "$sum_tool" 2>/dev/null || true)
+            if [ -n "$sum_path" ]; then
+                ln -sf "$sum_path" "${NO_CURL_BIN}/${sum_tool}"
+            fi
+        done
+        if (PATH="$NO_CURL_BIN" command -v curl >/dev/null 2>&1); then
+            fail "curl should not be resolvable under NO_CURL_BIN PATH"
+        fi
+        PATH="$NO_CURL_BIN" \
+        HOME="$TEST_HOME" \
+        XDG_CONFIG_HOME="$TEST_XDG" \
+        HCT_INSTALL_DIR="$WGET_OUT_BIN" \
+        HCT_RELEASE_URL="http://127.0.0.1:${PORT}/releases" \
+        sh "$INSTALL_SH" >/dev/null
+        assert_eq "$("${WGET_OUT_BIN}/hct" --version)" "hct 9.9.9" "wget-only install version"
+    fi
+
     printf 'All install_script_test.sh checks passed (%s).\n' "$HOST_TARGET"
 }
 
