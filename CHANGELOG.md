@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.14.0](https://github.com/xxb/herdr-tui/compare/v0.13.0...v0.14.0) (2026-11-21)
+
+
+### Features
+
+* **release:** add prebuilt Linux/macOS binaries and cross-platform installer ([#100](https://github.com/xxb/herdr-tui/issues/100)) ([80c19e4](https://github.com/xxb/herdr-tui/commit/80c19e4de96546bfc8df4d1190f1201c6329a844))
+
+
+### Bug Fixes
+
+* **cursor:** sync remote resizes, position hidden cursor, buffer mode 2026, and fix VT cursor gaps ([#97](https://github.com/xxb/herdr-tui/issues/97)) ([62c65ab](https://github.com/xxb/herdr-tui/commit/62c65ab8876c09b8f6612e5304d0585ff9caf6ea))
+* **release:** switch macOS release runner to macos-latest ([#102](https://github.com/xxb/herdr-tui/issues/102)) ([4bdaf56](https://github.com/xxb/herdr-tui/commit/4bdaf563d62f6766b208585578b39bb6d8d632b6))
+
 ## [0.13.0](https://github.com/xxb/herdr-tui/compare/v0.12.0...v0.13.0) (2026-11-19)
 
 
