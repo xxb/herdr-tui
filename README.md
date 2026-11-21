@@ -1,133 +1,164 @@
 # herdr-tui (`hct`)
 
-A fast, lightweight **multi-tab TUI client** for [`herdr-core` (`hc`)](https://github.com/herdrdev/herdr-core) with **bidirectional Space & Tab synchronization** across Herdr Desktop and Android clients.
+Lightweight multi-tab TUI client for [`herdr-core` (`hc`)](https://github.com/herdrdev/herdr-core) with real-time Space & Tab sync across Herdr Desktop and Android.
 
-> **Why `herdr-tui`?**
-> `herdr-core` (`hc`) decoupled the terminal runtime from the UI ("Core draws nothing"). While great for native desktop and mobile apps, pure SSH / terminal workflows (such as connecting from an iPad or laptop over SSH) lost the persistent tab bar, collapsible workspace sidebar, and instant tab-switching shortcuts of the classic `herdr` TUI.
->
-> `herdr-tui` (`hct`) brings back the classic `herdr` TUI experience—top tab bar, collapsible left sidebar, touch/mouse tab switching, and `Ctrl+b` / `Alt+Arrow` shortcuts—directly on top of `herdr-core`, without complex pane splitting overhead.
+[![Release](https://img.shields.io/github/v/release/xxb/herdr-tui)](https://github.com/xxb/herdr-tui/releases)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS-lightgrey)
 
----
+**English** | [简体中文](README.zh-CN.md)
 
-## Features / 功能特性
-
-- **Bidirectional Official Client Sync (与官方客户端双向实时同步)**
-  Reads and writes `herdr-core`'s `doc("herdr-app")` layout document directly. Spaces and Tabs created, renamed, or closed in `hct` immediately appear in the official Herdr Android / Desktop client, and vice versa.
-- **Top `Space / Tab1 / Tab2 / [+]` Bar + Secondary Space Popover (顶部 Space/Tab 状态栏 + 二级浮层菜单)**
-  - **Top Tab Bar**: Displays `[ ⏏ ] [ ▾ Space ] ╱ [ 1:tab1 ] [ 2:tab2 ] [ + ] ... [ ? ]` along the top edge, with `[ ⏏ ]` on the far left for one-tap detach (`^b q`), transparent background, active-tab bold default-fg + state-colored bottom highlight underline (`Red` `Blocked`, `Yellow` `Working`, `Green` `Done`, `Cyan` `Idle`/`None`; no opaque pill fill), and zero-width color-coded Agent states on inactive tabs.
-  - **Terminal-Native Transparent Chrome (普通模式透明底色 + 线条边框，实时跟随终端明暗主题)**: In Normal mode, the Top Tab Bar, Bottom Quota Bar (100% transparent when no data/copied/scrollback is active), modals, floating `--touch` crosses (`Magenta` idle border → `Cyan` dragging border, `Green` arrows/paste/active modifiers, dimmed pass-through VT glyphs), and text selection all use transparent terminal defaults (`Color::Reset`) with rounded line borders, underlines, and semantic ANSI colors—highlighting every active tab with default-fg `BOLD` + state-colored bottom underline while keeping chromatic ANSI 1..6 chrome un-bolded for `bold_is_bright` compatibility on light terminals, so switching Light/Dark theme mid-session in your terminal updates both the viewport and all `hct` UI chrome instantaneously (leaving just **Normal** and **E-Ink** modes; muted chrome expects a theme-tuned ANSI 16 palette and SGR 2 `DIM` support, while active tabs stay distinct via bold + underline and quota tracks via `░`). On Agent tabs, Normal mode also italicizes intermediate AI process rows by default (thought, tool, spinner, and collapsed action summaries such as `… 10 more actions …`, excluding fenced code blocks and numbered code lines), dropping bold and dimming non-muted cells while keeping VT colors intact and leaving plain shell tabs unchanged.
-  - **Accordion Folding & Overflow Count Badges**: When many tabs are open, inactive tabs automatically fold into compact `[ 1 ] [ 2 ] [ 3:active ] [ 4 ]` pills so all tabs stay visible in fixed order without disorienting horizontal scrolling; on extreme tab counts, clickable `[ ‹N ]` / `[ N› ]` badges open the Quick Fuzzy Switcher directly.
-  - **Secondary Space Popover (`^b b` or Tap `[ ▾ Space ]`)**: Tapping the Space button opens a floating popover menu listing all Spaces with live Agent status and a `[ + New Space ]` button—eliminating the need for a permanent Left Sidebar so the terminal viewport always enjoys 100% horizontal width.
-  - **Direct Tab Switching & `[ + ]` New Tab**: Tap any Tab pill on the top bar, swipe horizontally / use horizontal mouse wheel (`ScrollLeft` / `ScrollRight`) anywhere in the TUI, or scroll the vertical mouse wheel over the top bar for linear (non-wrapping) tab navigation—stopping at Tab 1 on the left and swiping past the last tab into a full-viewport `hc`-style Space Tab Overview / `+ New Tab` page (swipe back or press `Esc` to exit); tap `[ + ]` on the top bar to immediately create a new Tab.
-- **Dual Floating Draggable Semi-Transparent `+` Cross Pads (`hct --touch` 开启双悬浮可拖动半透明十字按钮盘)**
-  - Enabled with `hct --touch` (hidden by default when running `hct` on desktop without `--touch`).
-  - **Left Modifier Cross (`Esc` / `Ctl` / `^B` / `Alt` / `Tab`)**: `15 × 7` hollow-corner `+` cross with `Esc` (top), sticky `Ctl` (left), sticky `^B` prefix (center), sticky `Alt` (right), and `Tab` (bottom).
-  - **Right Directional & Paste Cross (`↑` / `←` / `⎘` / `→` / `↓`)**: `15 × 7` hollow-corner `+` cross with 4 directional keys (`↑`, `↓`, `←`, `→`) and centered Paste (`⎘`).
-  - Both `+` crosses can be tapped or dragged independently anywhere over the terminal viewport, with 4 completely hollow corners so underlying terminal text remains visible and clickable.
-- **Bottom 1-Row Read-Only Focused-Agent Quota Bar (底部单行聚焦 Agent 配额剩余百分比进度条)**
-  - Displays **only** the currently focused Agent's quota remaining percentage (`剩余百分比`) with an 8-step Unicode fractional block progress bar (e.g. `Codex  5h ██████▋░ 83% (3h12m)  ·  7d █▎░░░░░░ 16% (5d04h)`, `Antigravity  5h ███████▋ 95% (3h51m)  ·  7d ███▌░░░░ 44% (2d17h)`, `OpenCode  今日 ██████▉░ 86% (28/200 · 142k)`), never exceeding 1 line, without repeating status/CWD/turn info that the agent TUI already shows, plus `[ ✓ Copied ]` and clickable `[ ▼ BOT (+N) ]` when viewing scrollback.
-- **Touch & Mouse Friendly for iPad / Mobile SSH (触控与鼠标丝滑切换)**
-  - **Touch Drag Text Selection + Auto Copy over SSH (手指拖动选字自动复制)**: Drag across terminal text with your finger (or mouse) to highlight text in real time; releasing automatically copies the selected text to the remote SSH client's system clipboard via OSC 52 (and local clipboard when available) and flashes `[✓ Copied]`.
-  - **1-Row Compact Touch Top Bar**: Uses a crisp 1-row pill bar (with bottom highlight underline on the active tab) so terminal sessions immediately start on Row 1 without wasting vertical screen space.
-  - **Touch-Interactive Modals**: Directly tap items in the Space Popover (`^b b`) or Fuzzy Switcher (`^b w`), tap Confirm/Cancel buttons in dialogs, or tap any of the 18 quick-action buttons in the `[ ? ]` panel.
-- **E-Ink Monochrome & Agent Pacing Mode (`hct -e` / `hct --eink` / `^b e` 墨水屏高对比低刷模式)**
-  - **Strict 300 PPI Monochrome Chrome & Viewport Filter**: Quantizes UI chrome, tabs, floating crosses, and modals to Carta 4-bit neutral grays (`#FFFFFF`, `#EEEEEE`, `#DDDDDD`, `#777777`, `#666666`, `#333333`, `#000000`) with a 4-tier hierarchy (light gray italic `#777777` for AI thought/tool/spinner and collapsed action summary process lines, excluding fenced code blocks; muted upright `#666666` for secondary annotations; crisp `#000000` body text; and bold headings), keeps the top bar on white paper (`#FFFFFF`) with an active-tab highlight underline to minimize block ghosting and redraws, adds monochrome non-color Agent prefixes (`!` / `*` / `✓`) and dither-free progress bars (`█` / `─` with `!` low-quota warning), strips `Modifier::DIM`, and remaps dark-mode RGB/TrueColor agent output onto crisp white paper without restarting running sessions.
-  - **Spinner Freezing & Frame Pacing**: Freezes isolated Braille/quarter-circle/arc agent spinners to static `◈` while preserving multi-cell Braille charts and decorative box corners, keeps user input at 0 ms responsiveness, coalesces passive PTY bursts over `--eink-interval-ms` (default `250`, max `2000`, configurable via `ui.eink_interval_ms`), and skips redundant draws when the snapped screen is unchanged.
-  - **Edge Tab Controls & Built-In Book Reader**: Adds left/right vertically-centered see-through edge tabs (`[ ‹ ]` / `[ › ]`) in `-e` / `--eink` for linear tab stepping (`[ ‹ ]` clamps at Tab 1 and exits `TabOverview` back to the last tab; `[ › ]` steps past the last tab into trailing `TabOverview`), keeps keyboard page scrolling (`Shift+PgUp` / `^b PgUp` / `^b PgDn` and `[ ? ]` quick actions), `^b v` (or `[ 📖 Reader ]` in `[ ? ]`) full-screen paginated Reader with top/bottom frame rules backed by `hc terminal.read` (with offline screen fallback, 3-tier semantic dividers `═`/`─`/`┄` for turn or command boundaries, prose sections, and collapsed process steps, Agent Clean/Full toggle `c`/`f`/`Tab`, keyboard/wheel/touch-drag scrolling, `r` refresh, `l` latest anchor), `^b r` clean redraw, and environment auto-detection (`HCT_EINK`, `LC_TERMINAL_PROFILE`, `HCT_THEME`, `TERM`).
-  - **Optional Kaleido Color E-Ink Accent Overprint (`--eink-color` / `^b E` 彩墨套印点缀模式)**: Opt-in overprint mode ("95% 300 PPI monochrome + 5% high-contrast semantic accent") designed for Kaleido color E-Ink panels (`ui.eink_color = true`, `HCT_EINK_COLOR`, `HCT_THEME=kaleido`, `LC_TERMINAL_PROFILE=eink-color`). Keeps backgrounds `#FFFFFF` white and all normal/muted text strictly neutral (`R == G == B`), adding deep vermilion/forest/navy semantic inks (`#990000`, `#005522`, `#003388`) only to top tab agent state markers, git diff/patch markers & side bars, and `< 15%` low-quota warnings.
-- **Classic `herdr` Keybindings (兼容旧版 `herdr` 快捷键)**
-  Compatible with `~/.config/herdr/config.toml` and `~/.config/herdr-tui/config.toml`.
-- **Shared Attention (`herdr.seen`)**
-  Follows the `herdr.seen=<turn>` label specification so viewing a finished agent in `hct` clears its unread `done` indicator across all connected devices.
-- **Outer Terminal User Variables (`OSC 1337;SetUserVar`)**
-  Exposes the effective `herdr-core` session (`herdr_session`) and currently focused terminal address (`herdr_terminal`) to outer terminals and SSH clients via standard Base64-encoded `OSC 1337;SetUserVar` sequences (with `tmux` and GNU `screen` DCS passthrough; nested `tmux` requires `set -g allow-passthrough on`), deduplicated on focus changes and cleared on exit.
-- **Anti-Nesting Guard (防嵌套启动保护)**
-  Automatically refuses to launch inside an already active `hc` (`herdr-core` / `hct`), `herdr`, `tmux`, `zellij`, or GNU `screen` session to prevent prefix-key collisions, mouse/OSC 52 clipboard breakage, and terminal feedback loops. Pass `hct --allow-nested` (or set `ui.allow_nested = true` in `config.toml`) to override when needed.
+```text
+[ ⏏ ] [ ▾ Work ] ╱ 1:codex  2:shell  [ + ]      [ ? ]
+──────────────────────────────────────────────────────
+                  Terminal Viewport
+──────────────────────────────────────────────────────
+Codex  5h ██████▋░ 83% (3h12m) · 7d █▎░░░░░░ 16%
+```
 
 ---
 
-## Default Shortcuts / 默认快捷键
+## Quick Start
 
-| Action / 功能 | Prefix Shortcut (`Ctrl+b`) | Direct / Touch Shortcut |
-|---|---|---|
-| **Next / Previous Tab** (切换标签页) | `^b n` / `^b p` | `Alt+Right` / `Alt+Left`, Horiz Swipe, Top-Bar Wheel, or `[ ‹ ]` / `[ › ]` in `-e` (linear + trailing overview page), Tap Tab |
-| **Select Tab 1..9** (跳转标签页 1..9) | `^b 1` .. `^b 9` | `Alt+1` .. `Alt+9` |
-| **New Tab in Space** (新建标签页) | `^b c` | Tap `[ + ]` on top tab bar |
-| **Rename Current Tab** (重命名标签页) | `^b ,` | — |
-| **Close Current Tab** (关闭当前标签页) | `^b x` | — |
-| **Next / Previous Space** (切换工作区) | `^b Down` / `^b Up` | `Alt+Down` / `Alt+Up`, Tap Space, or Wheel / Horiz Swipe in Space menu |
-| **New Space** (新建工作区) | `^b C` (or `^b s`) | Tap `[ + New Space ]` in Space menu |
-| **Rename Current Space** (重命名工作区) | `^b $` (or `^b R`) | — |
-| **Toggle Space Menu** (展开/收起工作区浮层菜单) | `^b b` | Tap `[ ▾ Space ]` on top tab bar |
-| **Quick Fuzzy Switcher** (模糊搜索跳转) | `^b w` (or `^b f`) | Tap `[ ‹N ]` / `[ N› ]` overflow badge |
-| **Jump to Alert Agent** (跳转待处理 Agent) | `^b a` | — |
-| **Cycle Pane in Split Tab** (多窗格轮换) | `^b o` | — |
-| **Scrollback Mode** (历史回滚查看) | `^b [` | Mouse Wheel Up / Down |
-| **Page Up / Page Down** (整页翻页) | `^b PgUp` / `^b PgDn` | `Shift+PgUp` (or `PgUp` / `PgDn` in scrollback), Tap `[▲PgUp]` / `[▼PgDn]` in `[ ? ]` |
-| **E-Ink Mode / Kaleido Accent / Book Reader** (墨水屏 / 彩墨点缀 / 书页阅读) | `^b e` / `^b E` / `^b v` | `hct -e` / `--eink-color` / `--no-eink-color`, or Tap `[ ◐ E-Ink ]` / `[ ◈ Kaleido ]` / `[ 📖 Reader ]` in `[ ? ]` |
-| **Clean Redraw** (手动清残影重绘) | `^b r` | Tap `[ ↻ Redraw ]` in `[ ? ]` |
-| **Help Overlay** (快捷键帮助) | `^b ?` | Tap `[ ? ]` on top tab bar |
-| **Detach `hct`** (脱离并保持后台运行) | `^b q` (or `^b d`) | `Ctrl+\` or Tap `[ ⏏ ]` on top tab bar |
+> Requires [`herdr-core` (`hc`)](https://github.com/herdrdev/herdr-core) on `PATH` (or `~/.local/bin/herdr-core`).
 
----
+### Install or Update
 
-## Build & Install / 编译与安装
-
-Requires [`herdr-core` (`hc`)](https://github.com/herdrdev/herdr-core) installed on `PATH` (or `~/.local/bin/herdr-core`).
-
-### Quick Install & Update (Linux & macOS) / 一键安装与更新
-
-Install the latest release or update an existing installation with the same command (no compiler or `sudo` required):
+Supports **Linux** (`x86_64`, `aarch64` static binary) and **macOS** (Apple Silicon & Intel). Verifies `SHA256SUMS` and installs to `~/.local/bin/hct` without `sudo`. Re-run the same command anytime to update:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/xxb/herdr-tui/main/install.sh | sh
 ```
 
-- Supports **Linux** (`x86_64`, `aarch64` static binary) and **macOS** (Apple Silicon & Intel).
-- Verifies the archive against `SHA256SUMS` before atomically installing to `~/.local/bin/hct`.
-- Re-run the exact same command anytime to update to the latest version.
-
-Options (install a pinned version, change directory, or use a release mirror):
+Start `hct`:
 
 ```sh
-# Install a specific version or custom directory
-curl -fsSL https://raw.githubusercontent.com/xxb/herdr-tui/main/install.sh | sh -s -- --version v0.13.0 --dir ~/.local/bin
-
-# Override release base URL (e.g. proxy / mirror)
-HCT_RELEASE_URL="https://your-mirror.example.com/herdr-tui/releases" sh -c 'curl -fsSL https://raw.githubusercontent.com/xxb/herdr-tui/main/install.sh | sh'
+hct
 ```
 
-Prefer manual installation? Download the matching `.tar.gz` archive and `SHA256SUMS` directly from [GitHub Releases](https://github.com/xxb/herdr-tui/releases).
-
-### Uninstall / 卸载
-
-Remove `hct` cleanly without touching `herdr-core` (`hc`), running sessions, or `~/.config/herdr`:
+### Uninstall
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/xxb/herdr-tui/main/install.sh | sh -s -- --uninstall
 ```
 
-- To also remove `hct`'s own config directory (`~/.config/herdr-tui`):
+Removes only the `hct` binary — `herdr-core` (`hc`), running sessions, and existing configs stay untouched.
+
+- Remove offline manually: `rm -f ~/.local/bin/hct`.
+- Also remove `~/.config/herdr-tui`:
 
   ```sh
   curl -fsSL https://raw.githubusercontent.com/xxb/herdr-tui/main/install.sh | sh -s -- --uninstall --purge-config
   ```
 
-- Or remove the binary manually at any time: `rm -f ~/.local/bin/hct`.
+<details>
+<summary>More installation options (pin version, mirror, manual download, build from source)</summary>
 
-### Build from Source / 从源码编译
+**Pin a version or choose another install directory:**
 
-```bash
+```sh
+curl -fsSL https://raw.githubusercontent.com/xxb/herdr-tui/main/install.sh | sh -s -- --version v0.13.0 --dir ~/.local/bin
+```
+
+**Use a release mirror or proxy:**
+
+```sh
+HCT_RELEASE_URL="https://your-mirror.example.com/herdr-tui/releases" sh -c 'curl -fsSL https://raw.githubusercontent.com/xxb/herdr-tui/main/install.sh | sh'
+```
+
+**Manual download:**
+
+Grab the matching `.tar.gz` archive and `SHA256SUMS` from [GitHub Releases](https://github.com/xxb/herdr-tui/releases).
+
+**Build from source:**
+
+```sh
 cargo build --release
-install -Dm755 target/release/hct ~/.local/bin/hct
+mkdir -p ~/.local/bin && install -m 755 target/release/hct ~/.local/bin/hct
 ```
 
-Run:
+</details>
 
-```bash
-hct
-hct --version
+---
+
+## Why `herdr-tui`?
+
+`herdr-core` separates terminal runtime from UI so Desktop and Android apps can draw native chrome. `hct` brings that same Space/Tab workflow back to pure SSH and terminal sessions—one clean full-width viewport per tab, zero pane-splitting clutter.
+
+---
+
+## Highlights
+
+- **Real-Time Client Sync** — Spaces, tabs, and unread agent state stay synced with Herdr Desktop and Android.
+- **Theme-Aware Minimal Chrome** — 1-row transparent top bar (`[ ⏏ ] [ ▾ Space ] ╱ Tabs [ + ] [ ? ]`) with accordion tab folding and a floating Space switcher popover; automatically follows your terminal's light or dark theme and subtly italicizes AI agent intermediate steps while leaving plain shells untouched.
+- **Focused Agent Quota Bar** — 1-row bottom progress bar displaying remaining quota for the focused agent (Codex, Antigravity, OpenCode, Claude, Freebuff), staying transparent when idle.
+- **Touch & Mobile SSH Friendly** — Drag to select and auto-copy over SSH (OSC 52), tap tabs and menus directly, swipe horizontally to switch tabs (or open the full-screen Tab Overview), and toggle dual floating draggable `+` cross pads (`hct --touch`).
+- **E-Ink Mode & Built-In Reader** — High-contrast monochrome mode (`hct -e`) with optional Kaleido color accents (`--eink-color`), spinner freezing, frame pacing, edge tab buttons, and a full-screen paginated Reader (`^b v`) with Clean/Full toggle for reading long AI responses comfortably.
+- **Familiar & Safe** — Compatible with classic `herdr` shortcuts and `~/.config/herdr/config.toml`, reports focused session and terminal to outer terminals (`OSC 1337`), and guards against accidental multiplexer nesting (override with `--allow-nested`).
+
+---
+
+## CLI Flags & Configuration
+
+| Flag | Purpose |
+|---|---|
+| `-s, --session <name>` | Target `herdr-core` session (same as `HC_SESSION`) |
+| `--touch` / `--no-touch` | Show or hide dual floating `+` touch pads |
+| `-e, --eink` / `--no-eink` | Enable or disable monochrome E-Ink mode |
+| `--eink-color` / `--no-eink-color` | Enable or disable Kaleido color E-Ink accents (implies `-e`) |
+| `--eink-interval-ms <ms>` | Frame coalescing interval in E-Ink mode (default `250`, max `2000`) |
+| `--allow-nested` / `--no-allow-nested` | Allow or block launching inside `hc`, `herdr`, `tmux`, `zellij`, or `screen` |
+| `--version` | Print installed version |
+
+Optional config file at `~/.config/herdr-tui/config.toml` (falls back to `~/.config/herdr/config.toml`):
+
+```toml
+[keys]
+prefix = "ctrl+b"
+
+[ui]
+touch_mode = false
+eink = false
+eink_color = false
+eink_interval_ms = 250
+allow_nested = false
 ```
+
+---
+
+## Shortcuts
+
+Default prefix is `Ctrl+b` (written `^b` below). Tap `[ ? ]` in the top-right corner anytime for interactive quick actions.
+
+### Tabs & Spaces
+
+| Action | Prefix (`Ctrl+b`) | Direct / Touch |
+|---|---|---|
+| Next / Previous Tab | `^b n` / `^b p` (or `^b →` / `^b ←`) | `Alt+→` / `Alt+←`, tap tab, swipe, top-bar wheel |
+| Jump to Tab 1–9 | `^b 1`..`9` | `Alt+1`..`9` |
+| New / Rename / Close Tab | `^b c` / `^b ,` / `^b x` | Tap `[ + ]` for new tab |
+| Next / Previous Space | `^b ↓` / `^b ↑` | `Alt+↓` / `Alt+↑` |
+| Space Menu / New / Rename Space | `^b b` / `^b C` (`^b s`) / `^b $` (`^b R`) | Tap `[ ▾ Space ]` |
+| Fuzzy Switcher | `^b w` (`^b f`) | Tap overflow badge `[ ‹N ]` / `[ N› ]` |
+| Jump to Alert Agent | `^b a` | — |
+| Cycle Split Pane | `^b o` | — |
+
+### Reading, Scrolling & Display
+
+| Action | Prefix (`Ctrl+b`) | Direct / Touch |
+|---|---|---|
+| Scrollback Mode | `^b [` | Mouse wheel up / down |
+| Page Up / Down | `^b PgUp` / `^b PgDn` | `Shift+PgUp` (`PgUp` / `PgDn` in scrollback) |
+| Built-In Reader | `^b v` | Tap `[ 📖 Reader ]` in `[ ? ]` (`c`/`f`/`Tab` Clean/Full, `r` refresh, `l` latest) |
+| E-Ink / Kaleido Mode | `^b e` / `^b E` | Tap in `[ ? ]` |
+| Clean Redraw | `^b r` | Tap `[ ↻ Redraw ]` in `[ ? ]` |
+
+### Session & Help
+
+| Action | Prefix (`Ctrl+b`) | Direct / Touch |
+|---|---|---|
+| Quick Actions & Help | `^b ?` | Tap `[ ? ]` |
+| Detach (keep running) | `^b q` (`^b d`) | `Ctrl+\` or tap `[ ⏏ ]` |
 
 ---
 
