@@ -90,7 +90,7 @@ mkdir -p ~/.local/bin && install -m 755 target/release/hct ~/.local/bin/hct
 ## Highlights
 
 - **Real-Time Client Sync** — Spaces, tabs, and unread agent state stay synced with Herdr Desktop and Android.
-- **Theme-Aware Minimal Chrome** — 1-row transparent top bar (`[ ⏏ ] [ ▾ Space ] ╱ Tabs [ + ] [ ? ]`) with accordion tab folding and a floating Space switcher popover; automatically follows your terminal's light or dark theme and subtly italicizes AI agent intermediate steps while leaving plain shells untouched.
+- **Theme-Aware Minimal Chrome** — 1-row transparent top bar (`[ ⏏ ] [ ▾ <space> ] ╱ Tabs [ + ] [ ? ]`) with accordion tab folding and a floating Space switcher popover; automatically follows your terminal's light or dark theme and subtly italicizes AI agent intermediate steps while leaving plain shells untouched.
 - **Focused Agent Quota Bar** — 1-row bottom progress bar displaying remaining quota for the focused agent (Codex, Antigravity, OpenCode, Claude, Freebuff), staying transparent when idle.
 - **Touch & Mobile SSH Friendly** — Drag to select and auto-copy over SSH (OSC 52), tap tabs and menus directly, swipe horizontally to switch tabs (or open the full-screen Tab Overview), and toggle dual floating draggable `+` cross pads (`hct --touch`).
 - **E-Ink Mode & Built-In Reader** — High-contrast monochrome mode (`hct -e`) with optional Kaleido color accents (`--eink-color`), spinner freezing, frame pacing, edge tab buttons, and a full-screen paginated Reader (`^b v`) with Clean/Full toggle for reading long AI responses comfortably.
@@ -138,7 +138,8 @@ Default prefix is `Ctrl+b` (written `^b` below). Tap `[ ? ]` in the top-right co
 | Jump to Tab 1–9 | `^b 1`..`9` | `Alt+1`..`9` |
 | New / Rename / Close Tab | `^b c` / `^b ,` / `^b x` | Tap `[ + ]` for new tab |
 | Next / Previous Space | `^b ↓` / `^b ↑` | `Alt+↓` / `Alt+↑` |
-| Space Menu / New / Rename Space | `^b b` / `^b C` (`^b s`) / `^b $` (`^b R`) | Tap `[ ▾ Space ]` |
+| Toggle Space Menu | `^b b` | Tap `[ ▾ <space> ]` |
+| New / Rename Space | `^b C` (`^b s`) / `^b $` (`^b R`) | Tap `[ + New Space ]` in Space menu |
 | Fuzzy Switcher | `^b w` (`^b f`) | Tap overflow badge `[ ‹N ]` / `[ N› ]` |
 | Jump to Alert Agent | `^b a` | — |
 | Cycle Split Pane | `^b o` | — |
