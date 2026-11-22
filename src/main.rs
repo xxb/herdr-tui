@@ -4412,7 +4412,6 @@ fn unlock_height_locked_active_pty(
         if matches!(modal, Modal::None) {
             pty_pacer.arm_settle(att.channel, now);
             *pty_dirty = true;
-            *dirty = false;
         } else {
             *dirty = true;
         }
@@ -13034,6 +13033,7 @@ mod tests {
         assert!(pty_pacer.is_settling());
 
         // 3. Explicit redraw (`^b r` -> force_unlock=true) unlocks main-screen height lock
+        //    while preserving any pre-existing `dirty` flag from the same event batch.
         force_clear = false;
         dirty = true;
         pty_dirty = false;
@@ -13059,7 +13059,7 @@ mod tests {
         assert_eq!((attached_map["t1"].cols, attached_map["t1"].rows), (80, 12));
         assert!(force_clear);
         assert!(pty_dirty);
-        assert!(!dirty);
+        assert!(dirty);
 
         // 4. Non-height-locked mismatch (e.g., another client resized PTY) is NOT touched by unlock helper
         force_clear = false;
