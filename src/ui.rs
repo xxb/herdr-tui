@@ -555,15 +555,25 @@ impl TerminalSelection {
         }
     }
 
+    #[cfg(test)]
     pub fn extract_text(&self, screen: &vt100::Screen) -> String {
+        self.extract_text_with_row_offset(screen, 0)
+    }
+
+    pub fn extract_text_with_row_offset(&self, screen: &vt100::Screen, row_start: u16) -> String {
         if !self.is_non_empty() {
             return String::new();
         }
         let ((sr, sc), (er, ec)) = self.normalized();
         let (scr_rows, scr_cols) = screen.size();
-        let end_row = er.min(scr_rows.get() - 1);
+        let max_row = scr_rows.get() - 1;
+        let start_row = sr.saturating_add(row_start);
+        if start_row > max_row {
+            return String::new();
+        }
+        let end_row = er.saturating_add(row_start).min(max_row);
         let end_col_excl = ec.min(scr_cols.get() - 1).saturating_add(1);
-        screen.contents_between(sr, sc, end_row, end_col_excl)
+        screen.contents_between(start_row, sc, end_row, end_col_excl)
     }
 }
 
@@ -925,6 +935,7 @@ pub fn render_ui_full_with_eink_color(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn render_ui_full_with_eink_color_and_fence(
     f: &mut Frame,
@@ -948,6 +959,57 @@ pub fn render_ui_full_with_eink_color_and_fence(
     eink_mode: bool,
     eink_color: bool,
     initial_in_code_fence: bool,
+) -> UiGeometry {
+    render_ui_full_with_eink_color_fence_and_row_offset(
+        f,
+        world,
+        screen,
+        sidebar_open,
+        sidebar_width,
+        touch_mode,
+        prefix_active,
+        ctrl_active,
+        alt_active,
+        scrollback_offset,
+        selection,
+        copied_flash,
+        modal,
+        mod_pos,
+        mod_dragging,
+        dpad_pos,
+        dpad_dragging,
+        focused_quota,
+        eink_mode,
+        eink_color,
+        initial_in_code_fence,
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_ui_full_with_eink_color_fence_and_row_offset(
+    f: &mut Frame,
+    world: &World,
+    screen: Option<&vt100::Screen>,
+    sidebar_open: bool,
+    sidebar_width: u16,
+    touch_mode: bool,
+    prefix_active: bool,
+    ctrl_active: bool,
+    alt_active: bool,
+    scrollback_offset: usize,
+    selection: Option<&TerminalSelection>,
+    copied_flash: bool,
+    modal: &Modal,
+    mod_pos: Option<(u16, u16)>,
+    mod_dragging: bool,
+    dpad_pos: Option<(u16, u16)>,
+    dpad_dragging: bool,
+    focused_quota: Option<&AgentQuota>,
+    eink_mode: bool,
+    eink_color: bool,
+    initial_in_code_fence: bool,
+    row_start: u16,
 ) -> UiGeometry {
     let effective_eink_color = eink_mode && eink_color;
     let area = f.area();
@@ -982,9 +1044,11 @@ pub fn render_ui_full_with_eink_color_and_fence(
             (c.get(), r.get())
         };
         let (rows, cols) = vt_render_dims((scr_cols, scr_rows), term_rect);
+        let row_start = row_start.min(scr_rows.saturating_sub(rows));
+        let annot_rows = row_start.saturating_add(rows);
         let (diff_rows, process_rows) = compute_eink_row_annotations(
             scr,
-            rows,
+            annot_rows,
             cols,
             eink_mode && effective_eink_color,
             eink_mode || is_active_tab_agent(world),
@@ -993,6 +1057,7 @@ pub fn render_ui_full_with_eink_color_and_fence(
         if eink_mode && matches!(modal, Modal::None) && selection.is_none() {
             eink_snapshot = Some(build_eink_screen_snapshot(
                 scr,
+                row_start,
                 rows,
                 cols,
                 scrollback_offset,
@@ -1009,19 +1074,23 @@ pub fn render_ui_full_with_eink_color_and_fence(
                 eink_color: effective_eink_color,
                 diff_rows: diff_rows.as_deref(),
                 process_rows: process_rows.as_deref(),
+                row_start,
             },
             term_rect,
         );
         if matches!(modal, Modal::None) && scrollback_offset == 0 {
             let (row, col) = scr.cursor_position();
-            let clamped_col = col.min(term_rect.width.saturating_sub(1));
-            let cx = term_rect.x.saturating_add(clamped_col);
-            let cy = term_rect.y.saturating_add(row);
-            if cx < term_rect.x + term_rect.width && cy < term_rect.y + term_rect.height {
-                if !scr.hide_cursor() {
-                    f.set_cursor_position((cx, cy));
-                } else {
-                    hidden_cursor_pos = Some((cx, cy));
+            if row >= row_start && row < row_start.saturating_add(rows) {
+                let vis_row = row - row_start;
+                let clamped_col = col.min(term_rect.width.saturating_sub(1));
+                let cx = term_rect.x.saturating_add(clamped_col);
+                let cy = term_rect.y.saturating_add(vis_row);
+                if cx < term_rect.x + term_rect.width && cy < term_rect.y + term_rect.height {
+                    if !scr.hide_cursor() {
+                        f.set_cursor_position((cx, cy));
+                    } else {
+                        hidden_cursor_pos = Some((cx, cy));
+                    }
                 }
             }
         }
@@ -3657,6 +3726,7 @@ struct ResolvedVtScreenWidget<'a> {
     eink_color: bool,
     diff_rows: Option<&'a [Option<EinkDiffRowHighlight>]>,
     process_rows: Option<&'a [bool]>,
+    row_start: u16,
 }
 
 fn is_braille_char(s: &str) -> bool {
@@ -4926,8 +4996,10 @@ fn compute_eink_row_annotations(
     (diff_rows, process_rows)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_eink_screen_snapshot(
     screen: &vt100::Screen,
+    row_start: u16,
     rows: u16,
     cols: u16,
     scrollback_offset: usize,
@@ -4935,13 +5007,18 @@ fn build_eink_screen_snapshot(
     diff_rows: Option<&[Option<EinkDiffRowHighlight>]>,
     process_rows: Option<&[bool]>,
 ) -> EinkScreenSnapshot {
+    let scr_rows = screen.size().0.get();
+    let row_start = row_start.min(scr_rows.saturating_sub(rows));
     let mut cells = Vec::with_capacity(usize::from(rows) * usize::from(cols));
-    for r in 0..rows {
-        let row_diff = diff_rows.and_then(|rows_vec| rows_vec[usize::from(r)]);
-        let row_is_process = process_rows.is_some_and(|rows_vec| rows_vec[usize::from(r)]);
+    for vr in 0..rows {
+        let scr_r = row_start + vr;
+        let row_diff =
+            diff_rows.and_then(|rows_vec| rows_vec.get(usize::from(scr_r)).copied().flatten());
+        let row_is_process = process_rows
+            .is_some_and(|rows_vec| rows_vec.get(usize::from(scr_r)).copied().unwrap_or(false));
         let mut c = 0;
         while c < cols {
-            let Some(cell) = screen.cell(r, c) else {
+            let Some(cell) = screen.cell(scr_r, c) else {
                 c += 1;
                 continue;
             };
@@ -4985,7 +5062,8 @@ fn build_eink_screen_snapshot(
                     c += 2;
                 }
             } else {
-                let sym = normalized_narrow_vt_symbol(screen, r, c, rows, cols, raw_sym, true);
+                let sym =
+                    normalized_narrow_vt_symbol(screen, scr_r, c, scr_rows, cols, raw_sym, true);
                 cells.push(EinkSnapCell {
                     sym: EinkSnapSym::from_str(sym),
                     fg,
@@ -4996,11 +5074,13 @@ fn build_eink_screen_snapshot(
             }
         }
     }
-    let cursor =
-        (scrollback_offset == 0 && !screen.hide_cursor() && rows > 0 && cols > 0).then(|| {
-            let (cr, cc) = screen.cursor_position();
-            (cr.min(rows - 1), cc.min(cols - 1))
-        });
+    let cursor = if scrollback_offset == 0 && !screen.hide_cursor() && rows > 0 && cols > 0 {
+        let (cr, cc) = screen.cursor_position();
+        (cr >= row_start && cr < row_start.saturating_add(rows))
+            .then(|| (cr - row_start, cc.min(cols - 1)))
+    } else {
+        None
+    };
     EinkScreenSnapshot {
         rows,
         cols,
@@ -5010,6 +5090,7 @@ fn build_eink_screen_snapshot(
     }
 }
 
+#[cfg(test)]
 pub fn capture_eink_screen_snapshot_with_color_and_fence(
     screen: &vt100::Screen,
     area: Rect,
@@ -5017,15 +5098,42 @@ pub fn capture_eink_screen_snapshot_with_color_and_fence(
     eink_color: bool,
     initial_in_code_fence: bool,
 ) -> EinkScreenSnapshot {
+    capture_eink_screen_snapshot_with_color_fence_and_row_offset(
+        screen,
+        area,
+        scrollback_offset,
+        eink_color,
+        initial_in_code_fence,
+        0,
+    )
+}
+
+pub fn capture_eink_screen_snapshot_with_color_fence_and_row_offset(
+    screen: &vt100::Screen,
+    area: Rect,
+    scrollback_offset: usize,
+    eink_color: bool,
+    initial_in_code_fence: bool,
+    row_start: u16,
+) -> EinkScreenSnapshot {
     let (scr_cols, scr_rows) = {
         let (r, c) = screen.size();
         (c.get(), r.get())
     };
     let (rows, cols) = vt_render_dims((scr_cols, scr_rows), area);
-    let (diff_rows, process_rows) =
-        compute_eink_row_annotations(screen, rows, cols, eink_color, true, initial_in_code_fence);
+    let row_start = row_start.min(scr_rows.saturating_sub(rows));
+    let annot_rows = row_start.saturating_add(rows);
+    let (diff_rows, process_rows) = compute_eink_row_annotations(
+        screen,
+        annot_rows,
+        cols,
+        eink_color,
+        true,
+        initial_in_code_fence,
+    );
     build_eink_screen_snapshot(
         screen,
+        row_start,
         rows,
         cols,
         scrollback_offset,
@@ -5033,6 +5141,57 @@ pub fn capture_eink_screen_snapshot_with_color_and_fence(
         diff_rows.as_deref(),
         process_rows.as_deref(),
     )
+}
+
+fn vt_row_has_visible_content(screen: &vt100::Screen, r: u16, cols: u16) -> bool {
+    for c in 0..cols {
+        let Some(cell) = screen.cell(r, c) else {
+            continue;
+        };
+        if cell.is_wide_continuation() {
+            continue;
+        }
+        if cell.bgcolor() != vt100::Color::Default || cell.inverse() || cell.underline() {
+            return true;
+        }
+        if cell.has_contents() && !cell.contents().trim().is_empty() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Compute the top `vt100::Screen` row index to display when a live (non-scrolled)
+/// main-screen PTY is taller than the visible viewport (`scr_rows > view_rows`).
+///
+/// Anchors the viewport to include the bottommost visually non-empty row (keeping
+/// agent input boxes and footers visible above a popped-up soft keyboard), while
+/// ensuring a visible hardware cursor is never cropped off the top.
+pub fn vt_live_row_start(screen: &vt100::Screen, view_rows: u16) -> u16 {
+    let (scr_rows_nz, scr_cols_nz) = screen.size();
+    let scr_rows = scr_rows_nz.get();
+    let scr_cols = scr_cols_nz.get();
+    if view_rows == 0 || scr_rows <= view_rows || screen.alternate_screen() {
+        return 0;
+    }
+    let last_non_empty = (0..scr_rows)
+        .rev()
+        .find(|&r| vt_row_has_visible_content(screen, r, scr_cols));
+    let (cursor_row, _) = screen.cursor_position();
+    let cursor_row = cursor_row.min(scr_rows - 1);
+    let hide_cursor = screen.hide_cursor();
+
+    let anchor_bottom = match (last_non_empty, hide_cursor) {
+        (Some(last), true) => last,
+        (Some(last), false) => last.max(cursor_row),
+        (None, true) => 0,
+        (None, false) => cursor_row,
+    };
+    let mut row_start = anchor_bottom.saturating_add(1).saturating_sub(view_rows);
+    if !hide_cursor && cursor_row < row_start {
+        row_start = cursor_row;
+    }
+    row_start.min(scr_rows.saturating_sub(view_rows))
 }
 
 /// Resolve how many rows and columns of the vt100 screen to paint into `area`.
@@ -5062,6 +5221,7 @@ fn render_vt_screen_with_rows(
     eink_color: bool,
     diff_rows: Option<&[Option<EinkDiffRowHighlight>]>,
     process_rows: Option<&[bool]>,
+    row_start: u16,
     area: Rect,
     buf: &mut Buffer,
 ) {
@@ -5082,16 +5242,20 @@ fn render_vt_screen_with_rows(
         (c.get(), r.get())
     };
     let (rows, cols) = vt_render_dims((scr_cols, scr_rows), area);
+    let row_start = row_start.min(scr_rows.saturating_sub(rows));
     let active_sel = selection.filter(|s| s.is_non_empty());
     let sel_bounds = active_sel.map(|s| s.normalized());
 
-    for r in 0..rows {
-        let row_diff = diff_rows.and_then(|rows_vec| rows_vec[usize::from(r)]);
-        let row_is_process = process_rows.is_some_and(|rows_vec| rows_vec[usize::from(r)]);
-        let row_in_sel = sel_bounds.is_some_and(|((sr, _), (er, _))| r >= sr && r <= er);
+    for vr in 0..rows {
+        let scr_r = row_start + vr;
+        let row_diff =
+            diff_rows.and_then(|rows_vec| rows_vec.get(usize::from(scr_r)).copied().flatten());
+        let row_is_process = process_rows
+            .is_some_and(|rows_vec| rows_vec.get(usize::from(scr_r)).copied().unwrap_or(false));
+        let row_in_sel = sel_bounds.is_some_and(|((sr, _), (er, _))| vr >= sr && vr <= er);
         let mut c = 0;
         while c < cols {
-            let Some(cell) = screen.cell(r, c) else {
+            let Some(cell) = screen.cell(scr_r, c) else {
                 c += 1;
                 continue;
             };
@@ -5100,11 +5264,11 @@ fn render_vt_screen_with_rows(
                 continue;
             }
             let x = area.x + c;
-            let y = area.y + r;
+            let y = area.y + vr;
             let is_wide = cell.is_wide();
             let selected = row_in_sel
                 && active_sel
-                    .is_some_and(|sel| sel.contains(r, c) || (is_wide && sel.contains(r, c + 1)));
+                    .is_some_and(|sel| sel.contains(vr, c) || (is_wide && sel.contains(vr, c + 1)));
 
             let style = if eink_mode {
                 let (fg_col, bg_col, mods) = if eink_color {
@@ -5181,7 +5345,9 @@ fn render_vt_screen_with_rows(
                     c += 2;
                 }
             } else {
-                let sym = normalized_narrow_vt_symbol(screen, r, c, rows, cols, raw_sym, eink_mode);
+                let sym = normalized_narrow_vt_symbol(
+                    screen, scr_r, c, scr_rows, cols, raw_sym, eink_mode,
+                );
                 if let Some(dst) = buf.cell_mut((x, y)) {
                     dst.reset();
                     dst.set_symbol(sym);
@@ -5202,6 +5368,7 @@ impl Widget for ResolvedVtScreenWidget<'_> {
             self.eink_color,
             self.diff_rows,
             self.process_rows,
+            self.row_start,
             area,
             buf,
         );
@@ -5231,6 +5398,7 @@ impl Widget for VtScreenWidget<'_> {
             self.eink_color,
             diff_rows.as_deref(),
             process_rows.as_deref(),
+            0,
             area,
             buf,
         );
@@ -11196,5 +11364,259 @@ mod tests {
         })
         .unwrap();
         assert_eq!(sb_geom.unwrap().hidden_cursor_pos, None);
+    }
+
+    #[test]
+    fn vt_live_row_start_anchors_bottom_content_and_visible_cursor() {
+        let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
+
+        // 1. Viewport >= screen height (and alt-screen) always start at row 0
+        let mut p1 = vt100::Parser::new(nz(20), nz(80), 0);
+        for r in 1..=20 {
+            p1.process(format!("\x1b[{r};1Hrow {r}").as_bytes());
+        }
+        assert_eq!(vt_live_row_start(p1.screen(), 20), 0);
+        assert_eq!(vt_live_row_start(p1.screen(), 30), 0);
+        p1.process(b"\x1b[?1049h");
+        assert_eq!(vt_live_row_start(p1.screen(), 10), 0);
+
+        // 2. Short top content on a 36-row screen in an 18-row view stays anchored at row 0
+        let mut p_short = vt100::Parser::new(nz(36), nz(80), 0);
+        p_short.process(b"\x1b[4;1H$ ls");
+        assert_eq!(vt_live_row_start(p_short.screen(), 18), 0);
+
+        // 3. Full screen with cursor at row 32 (0-based) and footer at row 35 in 18-row view -> 18
+        let mut p_full = vt100::Parser::new(nz(36), nz(80), 0);
+        p_full.process(b"\x1b[36;1Hfooter status\x1b[33;5H");
+        assert_eq!(p_full.screen().cursor_position(), (32, 4));
+        assert_eq!(vt_live_row_start(p_full.screen(), 18), 18);
+
+        // 4. Hidden cursor parked at (0, 0) with bottom content at row 35 still anchors at 18
+        p_full.process(b"\x1b[?25l\x1b[1;1H");
+        assert!(p_full.screen().hide_cursor());
+        assert_eq!(p_full.screen().cursor_position(), (0, 0));
+        assert_eq!(vt_live_row_start(p_full.screen(), 18), 18);
+
+        // 5. Visible cursor arrowed up to row 10 keeps cursor visible by pulling row_start to 10
+        p_full.process(b"\x1b[?25h\x1b[11;1H");
+        assert_eq!(p_full.screen().cursor_position(), (10, 0));
+        assert_eq!(vt_live_row_start(p_full.screen(), 18), 10);
+
+        // 6. Colored background bar with only spaces counts as visible bottom content
+        let mut p_bg = vt100::Parser::new(nz(36), nz(80), 0);
+        p_bg.process(b"\x1b[?25l\x1b[1;1H\x1b[36;1H\x1b[44m   \x1b[0m\x1b[1;1H");
+        assert_eq!(vt_live_row_start(p_bg.screen(), 18), 18);
+    }
+
+    #[test]
+    fn render_and_snapshot_with_row_offset_slice_preserve_cursor_annotations_and_selection() {
+        let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
+        let mut parser = vt100::Parser::new(nz(20), nz(40), 0);
+        // Put opening code fence ABOVE row_start=12:
+        // row 10 (1-based 11): markdown code fence open (```` ```rust ````)
+        // row 12 (1-based 13): `○ Thought inside fence` -> process-looking text inside open fence stays upright
+        // row 13 (1-based 14): ```` ``` ```` closes fence
+        // row 14 (1-based 15): `● Used Read(file.rs)` -> italicized process row
+        // row 15 (1-based 16): `  ⎿ done` (muted continuation)
+        // row 16 (1-based 17): `\x1b[32m+green added\x1b[0m`
+        // row 17 (1-based 18): `Hello World` (selection test target)
+        // row 18 (1-based 19): cursor target `(18, 4)` -> viewport row 6 => terminal y = 1 + 6 = 7
+        parser.process(
+            b"\x1b[11;1H```rust\
+              \x1b[13;1H\xE2\x97\x8B Thought inside fence\
+              \x1b[14;1H```\
+              \x1b[15;1H\xE2\x97\x8F Used Read(file.rs)\
+              \x1b[16;1H\x1b[2m  \xE2\x8E\xBF done\x1b[0m\
+              \x1b[17;1H\x1b[32m+green added\x1b[0m\
+              \x1b[18;1HHello World\
+              \x1b[19;5H> \x1b[19;5H",
+        );
+
+        let mut world = World::default();
+        world.doc.spaces.push(SharedSpace {
+            id: "sp".to_string(),
+            name: "work".to_string(),
+            tabs: vec![SharedTab {
+                id: "tab-agent".to_string(),
+                name: "agent".to_string(),
+                root: serde_json::json!({"content": {"terminal": "t-agent"}}),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        world.terminals.insert(
+            "t-agent".to_string(),
+            TerminalInfo {
+                address: "t-agent".to_string(),
+                fg_name: Some("claude".to_string()),
+                ..Default::default()
+            },
+        );
+
+        // 10 total terminal lines = 1 top bar + 8 VT rows (y=1..=8) + 1 bottom bar
+        let sel = TerminalSelection {
+            anchor: (5, 0),
+            head: (5, 10),
+            active: false,
+            dragged: true,
+        };
+        assert_eq!(
+            sel.extract_text_with_row_offset(parser.screen(), 12),
+            "Hello World"
+        );
+
+        let backend = TestBackend::new(40, 10);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut geom = None;
+        term.draw(|f| {
+            geom = Some(render_ui_full_with_eink_color_fence_and_row_offset(
+                f,
+                &world,
+                Some(parser.screen()),
+                false,
+                24,
+                false,
+                false,
+                false,
+                false,
+                0,
+                Some(&sel),
+                false,
+                &Modal::None,
+                None,
+                false,
+                None,
+                false,
+                None,
+                true,
+                true,
+                false,
+                12,
+            ));
+        })
+        .unwrap();
+
+        let geom = geom.unwrap();
+        assert_eq!(geom.term_rect, Rect::new(0, 1, 40, 8));
+        // Visible cursor at screen row 18, col 4 -> viewport row 6 (y=7), col 4
+        term.backend_mut().assert_cursor_position((4, 7));
+
+        let buf = term.backend().buffer();
+        // Viewport y=1 (screen row 12): "○ Thought inside fence" stays upright because ```rust was above row_start=12
+        assert_eq!(buf[(0, 1)].symbol(), "○");
+        assert!(!buf[(0, 1)].modifier.contains(Modifier::ITALIC));
+        assert_eq!(buf[(0, 1)].fg, EINK_INK);
+        // Viewport y=3 (screen row 14): "● Used Read(file.rs)" after closing ``` at row 13 is process italic
+        assert_eq!(buf[(0, 3)].symbol(), "●");
+        assert!(buf[(0, 3)].modifier.contains(Modifier::ITALIC));
+        // Viewport y=4 (screen row 15): muted continuation stays process italic
+        assert_eq!(buf[(2, 4)].symbol(), "⎿");
+        assert!(buf[(2, 4)].modifier.contains(Modifier::ITALIC));
+        // Viewport y=5 (screen row 16): Kaleido diff '+' green
+        assert_eq!(buf[(0, 5)].symbol(), "+");
+        assert_eq!(buf[(0, 5)].fg, KALEIDO_GREEN);
+        // Viewport y=6 (screen row 17): selected row "Hello World" rendered inverted
+        assert_eq!(buf[(0, 6)].symbol(), "H");
+        assert_eq!(buf[(0, 6)].fg, EINK_PAPER);
+        assert_eq!(buf[(0, 6)].bg, EINK_INK);
+
+        // Snapshot matches sliced draw pass and translates cursor relative to row_start=12
+        let snap = capture_eink_screen_snapshot_with_color_fence_and_row_offset(
+            parser.screen(),
+            geom.term_rect,
+            0,
+            true,
+            false,
+            12,
+        );
+        assert_eq!(snap.cursor, Some((6, 4)));
+        let mut geom_no_sel = None;
+        term.draw(|f| {
+            geom_no_sel = Some(render_ui_full_with_eink_color_fence_and_row_offset(
+                f,
+                &world,
+                Some(parser.screen()),
+                false,
+                24,
+                false,
+                false,
+                false,
+                false,
+                0,
+                None,
+                false,
+                &Modal::None,
+                None,
+                false,
+                None,
+                false,
+                None,
+                true,
+                true,
+                false,
+                12,
+            ));
+        })
+        .unwrap();
+        assert_eq!(geom_no_sel.unwrap().eink_snapshot, Some(snap));
+
+        // Uncolored unified diff hunk header (`@@ -1,3 +1,4 @@`) above row_start=12 still colors `+`/`-` in 12..20
+        let mut diff_parser = vt100::Parser::new(nz(20), nz(40), 0);
+        diff_parser.process(
+            b"\x1b[11;1H@@ -1,3 +1,4 @@\
+              \x1b[12;1H context above crop\
+              \x1b[13;1H+new code\
+              \x1b[14;1H-old line",
+        );
+        term.draw(|f| {
+            let _ = render_ui_full_with_eink_color_fence_and_row_offset(
+                f,
+                &world,
+                Some(diff_parser.screen()),
+                false,
+                24,
+                false,
+                false,
+                false,
+                false,
+                0,
+                None,
+                false,
+                &Modal::None,
+                None,
+                false,
+                None,
+                false,
+                None,
+                true,
+                true,
+                false,
+                12,
+            );
+        })
+        .unwrap();
+        let dbuf = term.backend().buffer();
+        assert_eq!(dbuf[(0, 1)].symbol(), "+");
+        assert_eq!(dbuf[(0, 1)].fg, KALEIDO_GREEN);
+        assert_eq!(dbuf[(0, 2)].symbol(), "-");
+        assert_eq!(dbuf[(0, 2)].fg, KALEIDO_RED);
+    }
+
+    #[test]
+    fn terminal_selection_extract_text_with_row_offset_shifts_rows() {
+        let nz = |v: u16| std::num::NonZeroU16::new(v).unwrap();
+        let mut parser = vt100::Parser::new(nz(12), nz(20), 0);
+        parser.process(b"\x1b[6;1Hline five\x1b[7;1Hline six");
+        let sel = TerminalSelection {
+            anchor: (0, 0),
+            head: (1, 7),
+            active: false,
+            dragged: true,
+        };
+        assert_eq!(
+            sel.extract_text_with_row_offset(parser.screen(), 5),
+            "line five\nline six"
+        );
+        assert_eq!(sel.extract_text_with_row_offset(parser.screen(), 12), "");
     }
 }

@@ -17,15 +17,16 @@ use crate::keys::{
 };
 use crate::model::{AgentState, EventDisposition, World};
 #[cfg(test)]
-use crate::ui::capture_eink_screen_snapshot;
+use crate::ui::{capture_eink_screen_snapshot, capture_eink_screen_snapshot_with_color_and_fence};
 use crate::ui::{
-    capture_eink_screen_snapshot_with_color_and_fence, collect_fuzzy_items, collect_overview_items,
-    compute_terminal_rect, find_hit_target, is_active_tab_agent, is_in_rect, is_on_dpad_disc,
-    overview_selection_after_query_change, overview_selection_for_index, reader_body_metrics,
-    reader_initial_scroll, render_ui_full_with_eink_color_and_fence, resolve_dpad_disc_rect,
+    capture_eink_screen_snapshot_with_color_fence_and_row_offset, collect_fuzzy_items,
+    collect_overview_items, compute_terminal_rect, find_hit_target, is_active_tab_agent,
+    is_in_rect, is_on_dpad_disc, overview_selection_after_query_change,
+    overview_selection_for_index, reader_body_metrics, reader_initial_scroll,
+    render_ui_full_with_eink_color_fence_and_row_offset, resolve_dpad_disc_rect,
     resolve_fuzzy_selection, resolve_mod_cross_rect, resolve_overview_selection,
-    scan_viewport_initial_code_fence, EinkScreenSnapshot, HitRegion, HitTarget, Modal,
-    OverviewItem, OverviewSelection, PromptKind, TerminalSelection,
+    scan_viewport_initial_code_fence, vt_live_row_start, EinkScreenSnapshot, HitRegion, HitTarget,
+    Modal, OverviewItem, OverviewSelection, PromptKind, TerminalSelection,
 };
 use crate::usage::UsageTracker;
 use anyhow::Result;
@@ -531,6 +532,7 @@ struct AttachedTerminal {
     rows: u16,
     client_cols: u16,
     client_rows: u16,
+    height_locked: bool,
     supports_automatic_input: bool,
     has_attach_history: bool,
     utf8_tail: Vec<u8>,
@@ -590,6 +592,7 @@ impl AttachedTerminal {
             rows,
             client_cols,
             client_rows,
+            height_locked: false,
             supports_automatic_input,
             has_attach_history,
             utf8_tail: Vec::new(),
@@ -615,11 +618,24 @@ impl AttachedTerminal {
         let _ = self.flush_sync_update();
         self.cols = cols;
         self.rows = rows;
+        self.height_locked = false;
         self.scroll_top = 0;
         self.main_scroll_top = 0;
         self.dropped_wide_at_margin = false;
         self.cached_viewport_fence = None;
         self.parser.set_size(non_zero_u16(rows), non_zero_u16(cols));
+    }
+
+    fn apply_scrollback_and_viewport_row_start(
+        &mut self,
+        view_rows: u16,
+        scrollback_offset: &mut usize,
+    ) -> u16 {
+        apply_scrollback_and_row_start_on_screen(
+            self.parser.screen_mut(),
+            view_rows,
+            scrollback_offset,
+        )
     }
 
     fn viewport_initial_code_fence(&mut self, scrollback_offset: usize) -> bool {
@@ -2902,6 +2918,32 @@ fn flush_expired_sync_updates(
     }
 }
 
+fn should_keep_pty_height_locked(att: &AttachedTerminal, new_cols: u16, new_rows: u16) -> bool {
+    !att.parser.screen().alternate_screen() && new_cols == att.cols && new_rows < att.rows
+}
+
+fn apply_scrollback_and_row_start_on_screen(
+    screen: &mut vt100::Screen,
+    view_rows: u16,
+    scrollback_offset: &mut usize,
+) -> u16 {
+    screen.set_scrollback(0);
+    let base_row_start = vt_live_row_start(screen, view_rows);
+    let total_sb = screen.scrollback_len();
+    let max_offset = total_sb.saturating_add(usize::from(base_row_start));
+    if *scrollback_offset > max_offset {
+        *scrollback_offset = max_offset;
+    }
+    let base_usize = usize::from(base_row_start);
+    if *scrollback_offset <= base_usize {
+        base_row_start - (*scrollback_offset as u16)
+    } else {
+        let vt_sb = *scrollback_offset - base_usize;
+        screen.set_scrollback(vt_sb);
+        0
+    }
+}
+
 fn reclaim_active_pty_size_on_input(
     core: &CoreClient,
     world: &mut World,
@@ -2931,7 +2973,9 @@ fn reclaim_active_pty_size_on_input(
     }
     let cols = term_rect.width.max(1);
     let rows = term_rect.height.max(1);
-    if att.cols == cols && att.rows == rows {
+    if (att.cols == cols && att.rows == rows)
+        || (att.height_locked && should_keep_pty_height_locked(att, cols, rows))
+    {
         return false;
     }
     att.resize(cols, rows);
@@ -3004,12 +3048,22 @@ fn sync_attached_terminals(
             let switching_active = active_addr.as_ref() != Some(addr);
             let mut hydrated = false;
             if should_reattach_for_history(cur, switching_active) {
-                if let Ok(attach_info) =
-                    core.attach_terminal(addr, cols, rows, ATTACH_HISTORY_LINES, false)
-                {
+                let keep_height_locked = should_keep_pty_height_locked(cur, cols, rows);
+                let (attach_cols, attach_rows) = if keep_height_locked {
+                    (cur.cols, cur.rows)
+                } else {
+                    (cols, rows)
+                };
+                if let Ok(attach_info) = core.attach_terminal(
+                    addr,
+                    attach_cols,
+                    attach_rows,
+                    ATTACH_HISTORY_LINES,
+                    false,
+                ) {
                     let old_channel = cur.channel;
-                    let pty_cols = attach_info.cols.unwrap_or(cols);
-                    let pty_rows = attach_info.rows.unwrap_or(rows);
+                    let pty_cols = attach_info.cols.unwrap_or(attach_cols);
+                    let pty_rows = attach_info.rows.unwrap_or(attach_rows);
                     core.set_focus(attach_info.channel, true);
                     core.detach_channel(old_channel);
                     *cur = AttachedTerminal::new_with_capabilities(
@@ -3021,6 +3075,7 @@ fn sync_attached_terminals(
                         attach_info.automatic_input,
                         true,
                     );
+                    cur.height_locked = keep_height_locked && pty_cols == cols && pty_rows > rows;
                     if let Some(info) = world.terminals.get_mut(addr) {
                         info.cols = pty_cols;
                         info.rows = pty_rows;
@@ -3040,13 +3095,19 @@ fn sync_attached_terminals(
                 {
                     cur.client_cols = cols;
                     cur.client_rows = rows;
-                    cur.resize(cols, rows);
-                    core.resize_channel(cur.channel, cols, rows);
-                    if let Some(info) = world.terminals.get_mut(addr) {
-                        info.cols = cols;
-                        info.rows = rows;
+                    if cur.cols == cols && cur.rows == rows {
+                        cur.height_locked = false;
+                    } else if should_keep_pty_height_locked(cur, cols, rows) {
+                        cur.height_locked = true;
+                    } else {
+                        cur.resize(cols, rows);
+                        core.resize_channel(cur.channel, cols, rows);
+                        if let Some(info) = world.terminals.get_mut(addr) {
+                            info.cols = cols;
+                            info.rows = rows;
+                        }
+                        outcome.resized_active = true;
                     }
-                    outcome.resized_active = true;
                 }
                 if switching_active {
                     core.set_focus(cur.channel, true);
@@ -4177,7 +4238,7 @@ fn handle_resize_event(
     page_tap: &mut Option<PendingPageTurnTap>,
     reader_drag: &mut Option<u16>,
     modal: &mut Modal,
-    attached_map: &BTreeMap<String, AttachedTerminal>,
+    attached_map: &mut BTreeMap<String, AttachedTerminal>,
     active_addr: Option<&str>,
     pending_pty_resize: &mut Option<PendingPtyResize>,
     need_sync_terminals: &mut bool,
@@ -4198,12 +4259,18 @@ fn handle_resize_event(
     let new_term_rect = compute_terminal_rect(new_area, *sidebar_open, sidebar_width, touch_mode);
     let new_cols = new_term_rect.width.max(1);
     let new_rows = new_term_rect.height.max(1);
-    if let Some(att) = active_addr.and_then(|a| attached_map.get(a)) {
-        if att.cols == new_cols
-            && att.rows == new_rows
-            && att.client_cols == new_cols
-            && att.client_rows == new_rows
-        {
+    if let Some(att) = active_addr.and_then(|a| attached_map.get_mut(a)) {
+        if att.cols == new_cols && att.rows == new_rows {
+            att.client_cols = new_cols;
+            att.client_rows = new_rows;
+            att.height_locked = false;
+            *pending_pty_resize = None;
+            *force_clear = true;
+            *dirty = true;
+        } else if should_keep_pty_height_locked(att, new_cols, new_rows) {
+            att.client_cols = new_cols;
+            att.client_rows = new_rows;
+            att.height_locked = true;
             *pending_pty_resize = None;
             *force_clear = true;
             *dirty = true;
@@ -4275,7 +4342,12 @@ fn flush_due_pty_resize(
     {
         att.client_cols = cols;
         att.client_rows = rows;
-        if att.cols != cols || att.rows != rows {
+        let keep_locked = should_keep_pty_height_locked(att, cols, rows);
+        if (att.cols == cols && att.rows == rows) || keep_locked {
+            att.height_locked = keep_locked;
+            *force_clear = true;
+            *dirty = true;
+        } else {
             att.resize(cols, rows);
             core.resize_channel(att.channel, cols, rows);
             if let Some(info) = world.terminals.get_mut(addr) {
@@ -4289,14 +4361,64 @@ fn flush_due_pty_resize(
             } else {
                 *dirty = true;
             }
-        } else {
-            *force_clear = true;
-            *dirty = true;
         }
     } else {
         *need_sync_terminals = true;
         *force_clear = true;
         *dirty = true;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn unlock_height_locked_active_pty(
+    core: &CoreClient,
+    world: &mut World,
+    attached_map: &mut BTreeMap<String, AttachedTerminal>,
+    active_addr: Option<&str>,
+    term_rect: Rect,
+    modal: &Modal,
+    now: Instant,
+    force_clear: &mut bool,
+    dirty: &mut bool,
+    pty_dirty: &mut bool,
+    pty_pacer: &mut PtyOutputPacer,
+    force_unlock: bool,
+) -> bool {
+    let Some(addr) = active_addr else {
+        return false;
+    };
+    let Some(att) = attached_map.get_mut(addr) else {
+        return false;
+    };
+    if !att.height_locked {
+        return false;
+    }
+    let cols = term_rect.width.max(1);
+    let rows = term_rect.height.max(1);
+    if !force_unlock && should_keep_pty_height_locked(att, cols, rows) {
+        return false;
+    }
+    att.height_locked = false;
+    att.client_cols = cols;
+    att.client_rows = rows;
+    if att.cols != cols || att.rows != rows {
+        att.resize(cols, rows);
+        core.resize_channel(att.channel, cols, rows);
+        if let Some(info) = world.terminals.get_mut(addr) {
+            info.cols = cols;
+            info.rows = rows;
+        }
+        *force_clear = true;
+        if matches!(modal, Modal::None) {
+            pty_pacer.arm_settle(att.channel, now);
+            *pty_dirty = true;
+            *dirty = false;
+        } else {
+            *dirty = true;
+        }
+        true
+    } else {
+        false
     }
 }
 
@@ -4383,15 +4505,17 @@ fn promote_due_pty_dirty_with_color(
     }
     if !force_clear && eink_mode && matches!(modal, Modal::None) && selection.is_none() {
         if let Some(att) = active_addr.and_then(|a| attached_map.get_mut(a)) {
-            att.parser.screen_mut().set_scrollback(*scrollback_offset);
-            *scrollback_offset = att.parser.screen().scrollback();
-            let initial_in_code_fence = att.viewport_initial_code_fence(*scrollback_offset);
-            let snap = capture_eink_screen_snapshot_with_color_and_fence(
+            let row_start =
+                att.apply_scrollback_and_viewport_row_start(term_rect.height, scrollback_offset);
+            let vt_sb = att.parser.screen().scrollback();
+            let initial_in_code_fence = att.viewport_initial_code_fence(vt_sb);
+            let snap = capture_eink_screen_snapshot_with_color_fence_and_row_offset(
                 att.parser.screen(),
                 term_rect,
                 *scrollback_offset,
                 eink_color,
                 initial_in_code_fence,
+                row_start,
             );
             if last_eink_snap
                 .as_ref()
@@ -4411,9 +4535,13 @@ fn promote_due_pty_dirty_with_color(
 
 fn capture_selection_snapshot(
     att: &AttachedTerminal,
+    view_rows: u16,
+    scrollback_offset: usize,
     compute_fence: bool,
-) -> (vt100::Screen, u64, bool) {
+) -> (vt100::Screen, u64, bool, u16) {
     let mut scr = att.parser.screen().clone();
+    let mut sb_copy = scrollback_offset;
+    let row_start = apply_scrollback_and_row_start_on_screen(&mut scr, view_rows, &mut sb_copy);
     let sb = scr.scrollback();
     let initial_fence = if compute_fence {
         att.cached_viewport_fence
@@ -4425,7 +4553,7 @@ fn capture_selection_snapshot(
     } else {
         false
     };
-    (scr, att.vt_seq, initial_fence)
+    (scr, att.vt_seq, initial_fence, row_start)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4515,6 +4643,7 @@ fn run_app_loop(
     let mut selection_screen: Option<vt100::Screen> = None;
     let mut selection_vt_seq: Option<u64> = None;
     let mut selection_initial_fence = false;
+    let mut selection_row_start: u16 = 0;
     let mut clipboard_buffer = String::new();
     let mut copied_until: Option<Instant> = None;
     let mut pending_attach_retry: Option<(String, Instant)> = None;
@@ -4571,6 +4700,28 @@ fn run_app_loop(
             &mut pty_dirty,
             &mut pty_pacer,
         );
+        if pending_pty_resize.is_none() {
+            let cur_term_rect = compute_terminal_rect(
+                Rect::new(0, 0, cur_size.0, cur_size.1),
+                *sidebar_open,
+                sidebar_width,
+                touch_mode,
+            );
+            unlock_height_locked_active_pty(
+                core,
+                world,
+                attached_map,
+                active_addr.as_deref(),
+                cur_term_rect,
+                &modal,
+                now,
+                &mut force_clear,
+                &mut dirty,
+                &mut pty_dirty,
+                &mut pty_pacer,
+                false,
+            );
+        }
         flush_due_pty_resize(
             core,
             world,
@@ -4774,6 +4925,28 @@ fn run_app_loop(
                             &mut pty_dirty,
                             &mut pty_pacer,
                         );
+                        if pending_pty_resize.is_none() {
+                            let cur_term_rect = compute_terminal_rect(
+                                Rect::new(0, 0, cur_size.0, cur_size.1),
+                                *sidebar_open,
+                                sidebar_width,
+                                touch_mode,
+                            );
+                            unlock_height_locked_active_pty(
+                                core,
+                                world,
+                                attached_map,
+                                active_addr.as_deref(),
+                                cur_term_rect,
+                                &modal,
+                                after,
+                                &mut force_clear,
+                                &mut dirty,
+                                &mut pty_dirty,
+                                &mut pty_pacer,
+                                false,
+                            );
+                        }
                         flush_due_pty_resize(
                             core,
                             world,
@@ -4843,10 +5016,11 @@ fn run_app_loop(
                             flush_credits(core, &mut pending_credits, &mut pending_credit_bytes);
                         }
                         let is_active = active_channel == Some(channel);
+                        let now_vt = Instant::now();
                         let committed_bytes = attached_map
                             .values_mut()
                             .find(|a| a.channel == channel)
-                            .map_or(0, |att| att.process_vt_bytes_at(&data, Instant::now()));
+                            .map_or(0, |att| att.process_vt_bytes_at(&data, now_vt));
                         let mut cleared_vis_sel = false;
                         if is_active && selection.as_ref().is_some_and(|s| !s.active) {
                             cleared_vis_sel = selection
@@ -4856,14 +5030,39 @@ fn run_app_loop(
                             selection_screen = None;
                             selection_vt_seq = None;
                         }
+                        let unlocked_height_lock = if is_active && pending_pty_resize.is_none() {
+                            let cur_term_rect = compute_terminal_rect(
+                                Rect::new(0, 0, cur_size.0, cur_size.1),
+                                *sidebar_open,
+                                sidebar_width,
+                                touch_mode,
+                            );
+                            unlock_height_locked_active_pty(
+                                core,
+                                world,
+                                attached_map,
+                                active_addr.as_deref(),
+                                cur_term_rect,
+                                &modal,
+                                now_vt,
+                                &mut force_clear,
+                                &mut dirty,
+                                &mut pty_dirty,
+                                &mut pty_pacer,
+                                false,
+                            )
+                        } else {
+                            false
+                        };
                         if is_active
+                            && !unlocked_height_lock
                             && (committed_bytes > 0 || cleared_vis_sel)
                             && !matches!(modal, Modal::TabOverview { .. } | Modal::Reader { .. })
                         {
                             schedule_active_pty_redraw(
                                 channel,
                                 committed_bytes,
-                                Instant::now(),
+                                now_vt,
                                 eink_mode,
                                 eink_interval,
                                 first_frame_drawn,
@@ -4873,6 +5072,8 @@ fn run_app_loop(
                                 &mut pty_dirty,
                                 &mut pty_pacer,
                             );
+                        } else if unlocked_height_lock && cleared_vis_sel {
+                            dirty = true;
                         }
                     }
                     CoreMessage::TerminalClosed { channel, .. } => {
@@ -4940,9 +5141,22 @@ fn run_app_loop(
                 }
                 AppEvent::Input(ev) => {
                     let prev_input_seq = core.last_pty_input().map(|i| i.seq);
+                    let mut pending_redraw_unlock = false;
                     let active_att = active_addr.as_ref().and_then(|a| attached_map.get(a));
                     match ev {
                         Event::Resize(w, h) => {
+                            if (w, h) != cur_size {
+                                if selection
+                                    .as_ref()
+                                    .is_some_and(TerminalSelection::is_non_empty)
+                                {
+                                    dirty = true;
+                                }
+                                selection = None;
+                                selection_screen = None;
+                                selection_vt_seq = None;
+                                selection_row_start = 0;
+                            }
                             handle_resize_event(
                                 w,
                                 h,
@@ -5112,6 +5326,8 @@ fn run_app_loop(
                                             prefix_active = false;
                                             ctrl_active = false;
                                             alt_active = false;
+                                            let prev_eink = (eink_mode, eink_color);
+                                            let mut action_force_clear = false;
                                             if execute_action_full(
                                                 act,
                                                 core,
@@ -5125,7 +5341,7 @@ fn run_app_loop(
                                                 area,
                                                 &mut eink_mode,
                                                 &mut eink_color,
-                                                &mut force_clear,
+                                                &mut action_force_clear,
                                                 Some(&mut pending_reader_rpc),
                                             )? {
                                                 flush_credits(
@@ -5134,6 +5350,11 @@ fn run_app_loop(
                                                     &mut pending_credit_bytes,
                                                 );
                                                 return Ok(());
+                                            }
+                                            if action_force_clear {
+                                                force_clear = true;
+                                                pending_redraw_unlock |=
+                                                    (eink_mode, eink_color) == prev_eink;
                                             }
                                             dirty = true;
                                         }
@@ -5275,6 +5496,8 @@ fn run_app_loop(
                                             dirty = true;
                                         }
                                         HitTarget::SendKey(kev) => {
+                                            let prev_eink = (eink_mode, eink_color);
+                                            let mut action_force_clear = false;
                                             match handle_key_event_full(
                                                 kev,
                                                 core,
@@ -5291,7 +5514,7 @@ fn run_app_loop(
                                                 area,
                                                 &mut eink_mode,
                                                 &mut eink_color,
-                                                &mut force_clear,
+                                                &mut action_force_clear,
                                                 Some(&mut pending_reader_rpc),
                                             )? {
                                                 KeyOutcome::Quit => {
@@ -5304,6 +5527,11 @@ fn run_app_loop(
                                                 }
                                                 KeyOutcome::UiChanged => dirty = true,
                                                 KeyOutcome::ForwardedToPty => {}
+                                            }
+                                            if action_force_clear {
+                                                force_clear = true;
+                                                pending_redraw_unlock |=
+                                                    (eink_mode, eink_color) == prev_eink;
                                             }
                                         }
                                     }
@@ -5415,15 +5643,18 @@ fn run_app_loop(
                                                 if sel.is_non_empty() && selection_screen.is_none()
                                                 {
                                                     if let Some(att) = active_att {
-                                                        let (scr, vt_seq, init_fence) =
+                                                        let (scr, vt_seq, init_fence, row_start) =
                                                             capture_selection_snapshot(
                                                                 att,
+                                                                term_rect.height,
+                                                                scrollback_offset,
                                                                 eink_mode
                                                                     || is_active_tab_agent(world),
                                                             );
                                                         selection_screen = Some(scr);
                                                         selection_vt_seq = Some(vt_seq);
                                                         selection_initial_fence = init_fence;
+                                                        selection_row_start = row_start;
                                                     }
                                                 }
                                                 dirty = true;
@@ -5435,14 +5666,17 @@ fn run_app_loop(
                                     if sel.update_drag(term_rect, mev.column, mev.row) {
                                         if sel.is_non_empty() && selection_screen.is_none() {
                                             if let Some(att) = active_att {
-                                                let (scr, vt_seq, init_fence) =
+                                                let (scr, vt_seq, init_fence, row_start) =
                                                     capture_selection_snapshot(
                                                         att,
+                                                        term_rect.height,
+                                                        scrollback_offset,
                                                         eink_mode || is_active_tab_agent(world),
                                                     );
                                                 selection_screen = Some(scr);
                                                 selection_vt_seq = Some(vt_seq);
                                                 selection_initial_fence = init_fence;
+                                                selection_row_start = row_start;
                                             }
                                         }
                                         dirty = true;
@@ -5510,6 +5744,8 @@ fn run_app_loop(
                                                 }
                                             }
                                             Some(HitTarget::SendKey(kev)) => {
+                                                let prev_eink = (eink_mode, eink_color);
+                                                let mut action_force_clear = false;
                                                 match handle_key_event_full(
                                                     kev,
                                                     core,
@@ -5526,7 +5762,7 @@ fn run_app_loop(
                                                     area,
                                                     &mut eink_mode,
                                                     &mut eink_color,
-                                                    &mut force_clear,
+                                                    &mut action_force_clear,
                                                     Some(&mut pending_reader_rpc),
                                                 )? {
                                                     KeyOutcome::Quit => {
@@ -5539,6 +5775,11 @@ fn run_app_loop(
                                                     }
                                                     KeyOutcome::UiChanged => dirty = true,
                                                     KeyOutcome::ForwardedToPty => {}
+                                                }
+                                                if action_force_clear {
+                                                    force_clear = true;
+                                                    pending_redraw_unlock |=
+                                                        (eink_mode, eink_color) == prev_eink;
                                                 }
                                             }
                                             _ => {}
@@ -5575,19 +5816,34 @@ fn run_app_loop(
                                         sel.active = false;
                                         let snap = selection_screen.take();
                                         let snap_seq = selection_vt_seq.take();
+                                        let snap_row_start = selection_row_start;
                                         if sel.is_non_empty() {
-                                            let scr = snap
-                                                .as_ref()
-                                                .or_else(|| active_att.map(|a| a.parser.screen()));
-                                            if let Some(screen) = scr {
-                                                let text = sel.extract_text(screen);
-                                                if !text.is_empty() {
-                                                    clipboard_buffer = text.clone();
-                                                    copy_to_clipboard(&text);
-                                                    copied_until = Some(
-                                                        Instant::now() + Duration::from_secs(2),
-                                                    );
-                                                }
+                                            let text =
+                                                if let Some(ref screen) = snap {
+                                                    Some(sel.extract_text_with_row_offset(
+                                                        screen,
+                                                        snap_row_start,
+                                                    ))
+                                                } else if let Some(att) = active_att {
+                                                    let mut scr = att.parser.screen().clone();
+                                                    let mut sb = scrollback_offset;
+                                                    let row_start =
+                                                        apply_scrollback_and_row_start_on_screen(
+                                                            &mut scr,
+                                                            term_rect.height,
+                                                            &mut sb,
+                                                        );
+                                                    Some(sel.extract_text_with_row_offset(
+                                                        &scr, row_start,
+                                                    ))
+                                                } else {
+                                                    None
+                                                };
+                                            if let Some(text) = text.filter(|t| !t.is_empty()) {
+                                                clipboard_buffer = text.clone();
+                                                copy_to_clipboard(&text);
+                                                copied_until =
+                                                    Some(Instant::now() + Duration::from_secs(2));
                                             }
                                             if snap.is_some()
                                                 && snap_seq != active_att.map(|a| a.vt_seq)
@@ -5953,6 +6209,8 @@ fn run_app_loop(
                             if had_drag_or_sel {
                                 dirty = true;
                             }
+                            let prev_eink = (eink_mode, eink_color);
+                            let mut action_force_clear = false;
                             match handle_key_event_full(
                                 kev,
                                 core,
@@ -5969,7 +6227,7 @@ fn run_app_loop(
                                 area,
                                 &mut eink_mode,
                                 &mut eink_color,
-                                &mut force_clear,
+                                &mut action_force_clear,
                                 Some(&mut pending_reader_rpc),
                             )? {
                                 KeyOutcome::Quit => {
@@ -5985,8 +6243,35 @@ fn run_app_loop(
                                 }
                                 KeyOutcome::ForwardedToPty => {}
                             }
+                            if action_force_clear {
+                                force_clear = true;
+                                pending_redraw_unlock |= (eink_mode, eink_color) == prev_eink;
+                            }
                         }
                         _ => {}
+                    }
+
+                    let cur_term_rect = compute_terminal_rect(
+                        Rect::new(0, 0, cur_size.0, cur_size.1),
+                        *sidebar_open,
+                        sidebar_width,
+                        touch_mode,
+                    );
+                    if pending_redraw_unlock && pending_pty_resize.is_none() {
+                        unlock_height_locked_active_pty(
+                            core,
+                            world,
+                            attached_map,
+                            active_addr.as_deref(),
+                            cur_term_rect,
+                            &modal,
+                            Instant::now(),
+                            &mut force_clear,
+                            &mut dirty,
+                            &mut pty_dirty,
+                            &mut pty_pacer,
+                            true,
+                        );
                     }
 
                     if reclaim_active_pty_size_on_input(
@@ -5994,7 +6279,7 @@ fn run_app_loop(
                         world,
                         attached_map,
                         active_addr.as_deref(),
-                        term_rect,
+                        cur_term_rect,
                         prev_input_seq,
                         pending_pty_resize.is_some(),
                     ) {
@@ -6142,9 +6427,10 @@ fn run_app_loop(
             dirty = true;
         }
 
+        let mut active_row_start = 0u16;
         if let Some(att) = active_addr.as_ref().and_then(|a| attached_map.get_mut(a)) {
-            att.parser.screen_mut().set_scrollback(scrollback_offset);
-            scrollback_offset = att.parser.screen().scrollback();
+            active_row_start = att
+                .apply_scrollback_and_viewport_row_start(term_rect.height, &mut scrollback_offset);
         }
 
         let focused_quota = usage_tracker.focused_quota(world);
@@ -6188,6 +6474,7 @@ fn run_app_loop(
 
         if selection_screen.is_none() {
             selection_initial_fence = false;
+            selection_row_start = 0;
         }
 
         if dirty {
@@ -6200,7 +6487,8 @@ fn run_app_loop(
                     selection_initial_fence
                 } else if let Some(att) = active_addr.as_ref().and_then(|a| attached_map.get_mut(a))
                 {
-                    att.viewport_initial_code_fence(scrollback_offset)
+                    let vt_sb = att.parser.screen().scrollback();
+                    att.viewport_initial_code_fence(vt_sb)
                 } else {
                     false
                 }
@@ -6215,6 +6503,11 @@ fn run_app_loop(
                     .and_then(|a| attached_map.get(a))
                     .map(|a| a.parser.screen())
             };
+            let effective_row_start = if use_selection_screen {
+                selection_row_start
+            } else {
+                active_row_start
+            };
             let copied_flash = copied_until.is_some();
             let mod_dragging = dpad_drag.as_ref().is_some_and(|d| d.is_mod && d.moved);
             let dpad_dragging = dpad_drag.as_ref().is_some_and(|d| !d.is_mod && d.moved);
@@ -6226,7 +6519,7 @@ fn run_app_loop(
             let mut geom_eink_snapshot = None;
             let mut geom_hidden_cursor_pos = None;
             terminal.draw(|f| {
-                let geom = render_ui_full_with_eink_color_and_fence(
+                let geom = render_ui_full_with_eink_color_fence_and_row_offset(
                     f,
                     world,
                     scr_ref,
@@ -6248,6 +6541,7 @@ fn run_app_loop(
                     eink_mode,
                     eink_color,
                     initial_in_code_fence,
+                    effective_row_start,
                 );
                 last_hits = geom.hits;
                 last_mod_rect = geom.mod_rect;
@@ -7017,7 +7311,8 @@ fn handle_key_event_full(
                     scrollback_offset.saturating_sub((term_rect.height as usize / 2).max(1));
             }
             KeyCode::Char('g') => {
-                *scrollback_offset = SCROLLBACK_LINES;
+                *scrollback_offset =
+                    SCROLLBACK_LINES.saturating_add(usize::from(attached.map_or(0, |a| a.rows)));
             }
             KeyCode::Char('G') => {
                 *scrollback_offset = 0;
@@ -11164,9 +11459,10 @@ mod tests {
         assert_eq!(att.vt_seq, saved_seq);
 
         // Capture selection snapshot preserves `initial_in_code_fence = true`
-        let (_scr, seq, init_fence) = capture_selection_snapshot(&att, true);
+        let (_scr, seq, init_fence, row_start) = capture_selection_snapshot(&att, 4, 0, true);
         assert_eq!(seq, saved_seq);
         assert!(init_fence);
+        assert_eq!(row_start, 0);
 
         // Scrolling back to show the opening ``` line changes cache key and returns false
         att.parser.screen_mut().set_scrollback(2);
@@ -12128,9 +12424,9 @@ mod tests {
         let mut pty_pacer = PtyOutputPacer::default();
         let t0 = Instant::now();
 
-        // 1. Rapid animated resize steps coalesce into a single pending resize without touching PTY
+        // 1. Rapid animated resize steps (changing width) coalesce into a single pending resize without touching PTY
         handle_resize_event(
-            80,
+            72,
             20,
             t0,
             &mut cur_size,
@@ -12141,7 +12437,7 @@ mod tests {
             &mut page_tap,
             &mut reader_drag,
             &mut modal,
-            &attached_map,
+            &mut attached_map,
             Some("t1"),
             &mut pending_pty_resize,
             &mut need_sync_terminals,
@@ -12151,7 +12447,7 @@ mod tests {
         assert_eq!(
             pending_pty_resize,
             Some(PendingPtyResize {
-                cols: 80,
+                cols: 72,
                 rows: 18,
                 due: t0 + RESIZE_DEBOUNCE,
             })
@@ -12160,7 +12456,7 @@ mod tests {
         assert!(!force_clear);
 
         handle_resize_event(
-            80,
+            64,
             15,
             t0 + Duration::from_millis(40),
             &mut cur_size,
@@ -12171,7 +12467,7 @@ mod tests {
             &mut page_tap,
             &mut reader_drag,
             &mut modal,
-            &attached_map,
+            &mut attached_map,
             Some("t1"),
             &mut pending_pty_resize,
             &mut need_sync_terminals,
@@ -12181,7 +12477,7 @@ mod tests {
         assert_eq!(
             pending_pty_resize,
             Some(PendingPtyResize {
-                cols: 80,
+                cols: 64,
                 rows: 13,
                 due: t0 + Duration::from_millis(40) + RESIZE_DEBOUNCE,
             })
@@ -12201,7 +12497,7 @@ mod tests {
             &mut page_tap,
             &mut reader_drag,
             &mut modal,
-            &attached_map,
+            &mut attached_map,
             Some("t1"),
             &mut pending_pty_resize,
             &mut need_sync_terminals,
@@ -12218,7 +12514,7 @@ mod tests {
         // 3. Settled resize applies once after RESIZE_DEBOUNCE, sets force_clear, and arms settle
         let t1 = t0 + Duration::from_millis(100);
         handle_resize_event(
-            80,
+            64,
             15,
             t1,
             &mut cur_size,
@@ -12229,7 +12525,7 @@ mod tests {
             &mut page_tap,
             &mut reader_drag,
             &mut modal,
-            &attached_map,
+            &mut attached_map,
             Some("t1"),
             &mut pending_pty_resize,
             &mut need_sync_terminals,
@@ -12283,11 +12579,11 @@ mod tests {
             &mut pty_pacer,
         );
         assert_eq!(pending_pty_resize, None);
-        assert_eq!(prev_term_rect, Rect::new(0, 1, 80, 13));
-        assert_eq!((attached_map["t1"].cols, attached_map["t1"].rows), (80, 13));
+        assert_eq!(prev_term_rect, Rect::new(0, 1, 64, 13));
+        assert_eq!((attached_map["t1"].cols, attached_map["t1"].rows), (64, 13));
         assert_eq!(
             (world.terminals["t1"].cols, world.terminals["t1"].rows),
-            (80, 13)
+            (64, 13)
         );
         assert!(force_clear);
         assert!(pty_dirty);
@@ -12417,5 +12713,596 @@ mod tests {
         // 3. Terminal already attached with history never triggers reattach
         let mut hydrated = AttachedTerminal::new_with_capabilities(12, 80, 10, 80, 10, false, true);
         assert!(!should_reattach_for_history(&mut hydrated, true));
+    }
+
+    #[test]
+    fn height_only_shrink_locks_main_screen_pty_and_restores_without_sigwinch() {
+        use crate::model::{make_single_terminal_tab, SharedSpace, TerminalInfo};
+
+        let core = CoreClient::dummy_for_tests();
+        let mut world = World::default();
+        world.doc.spaces.push(SharedSpace {
+            id: "sp1".to_string(),
+            name: "main".to_string(),
+            tabs: vec![make_single_terminal_tab("tab1", "agent", "t1")],
+            ..Default::default()
+        });
+        world.terminals.insert(
+            "t1".to_string(),
+            TerminalInfo {
+                address: "t1".to_string(),
+                state: "live".to_string(),
+                cols: 80,
+                rows: 22,
+                ..Default::default()
+            },
+        );
+        let mut attached_map = BTreeMap::new();
+        attached_map.insert(
+            "t1".to_string(),
+            AttachedTerminal::new_with_client_size(7, 80, 22, 80, 22),
+        );
+
+        let mut cur_size = (80u16, 24u16);
+        let mut sidebar_open = false;
+        let mut page_tap = None;
+        let mut reader_drag = None;
+        let mut modal = Modal::None;
+        let mut prev_term_rect = compute_terminal_rect(Rect::new(0, 0, 80, 24), false, 24, false);
+        let mut pending_pty_resize = None;
+        let mut need_sync_terminals = false;
+        let mut force_clear = false;
+        let mut dirty = false;
+        let mut pty_dirty = false;
+        let mut pty_pacer = PtyOutputPacer::default();
+        let t0 = Instant::now();
+
+        // 1. Vertical-only shrink on main screen (80x24 -> 80x14, viewport 80x12) locks PTY at 80x22
+        handle_resize_event(
+            80,
+            14,
+            t0,
+            &mut cur_size,
+            60,
+            &mut sidebar_open,
+            24,
+            false,
+            &mut page_tap,
+            &mut reader_drag,
+            &mut modal,
+            &mut attached_map,
+            Some("t1"),
+            &mut pending_pty_resize,
+            &mut need_sync_terminals,
+            &mut force_clear,
+            &mut dirty,
+        );
+        assert_eq!(pending_pty_resize, None);
+        assert!(dirty);
+        assert!(force_clear);
+        assert_eq!((attached_map["t1"].cols, attached_map["t1"].rows), (80, 22));
+        assert_eq!(
+            (
+                attached_map["t1"].client_cols,
+                attached_map["t1"].client_rows
+            ),
+            (80, 12)
+        );
+        assert!(attached_map["t1"].height_locked);
+
+        // 2. Typing while height-locked must NOT shrink/reclaim backend PTY height
+        let prev_seq = core.last_pty_input().map(|i| i.seq);
+        core.send_input(7, b"hi");
+        let shrunk_rect = compute_terminal_rect(Rect::new(0, 0, 80, 14), false, 24, false);
+        assert!(!reclaim_active_pty_size_on_input(
+            &core,
+            &mut world,
+            &mut attached_map,
+            Some("t1"),
+            shrunk_rect,
+            prev_seq,
+            false,
+        ));
+        assert_eq!((attached_map["t1"].cols, attached_map["t1"].rows), (80, 22));
+        assert!(attached_map["t1"].height_locked);
+
+        // 3. Dismissing soft keyboard (80x14 -> 80x24) unlocks cleanly with zero SIGWINCH
+        force_clear = false;
+        dirty = false;
+        handle_resize_event(
+            80,
+            24,
+            t0 + Duration::from_millis(100),
+            &mut cur_size,
+            60,
+            &mut sidebar_open,
+            24,
+            false,
+            &mut page_tap,
+            &mut reader_drag,
+            &mut modal,
+            &mut attached_map,
+            Some("t1"),
+            &mut pending_pty_resize,
+            &mut need_sync_terminals,
+            &mut force_clear,
+            &mut dirty,
+        );
+        assert_eq!(pending_pty_resize, None);
+        assert!(dirty);
+        assert!(force_clear);
+        assert_eq!((attached_map["t1"].cols, attached_map["t1"].rows), (80, 22));
+        assert_eq!(
+            (
+                attached_map["t1"].client_cols,
+                attached_map["t1"].client_rows
+            ),
+            (80, 22)
+        );
+        assert!(!attached_map["t1"].height_locked);
+
+        // 4. Re-lock then change width (80x14 -> 60x14) -> debounced PTY resize unlocks and resizes to (60, 12)
+        handle_resize_event(
+            80,
+            14,
+            t0 + Duration::from_millis(200),
+            &mut cur_size,
+            40,
+            &mut sidebar_open,
+            24,
+            false,
+            &mut page_tap,
+            &mut reader_drag,
+            &mut modal,
+            &mut attached_map,
+            Some("t1"),
+            &mut pending_pty_resize,
+            &mut need_sync_terminals,
+            &mut force_clear,
+            &mut dirty,
+        );
+        assert!(attached_map["t1"].height_locked);
+
+        let t_w = t0 + Duration::from_millis(250);
+        handle_resize_event(
+            60,
+            14,
+            t_w,
+            &mut cur_size,
+            40,
+            &mut sidebar_open,
+            24,
+            false,
+            &mut page_tap,
+            &mut reader_drag,
+            &mut modal,
+            &mut attached_map,
+            Some("t1"),
+            &mut pending_pty_resize,
+            &mut need_sync_terminals,
+            &mut force_clear,
+            &mut dirty,
+        );
+        assert!(pending_pty_resize.is_some());
+        flush_due_pty_resize(
+            &core,
+            &mut world,
+            &mut attached_map,
+            Some("t1"),
+            t_w + RESIZE_DEBOUNCE,
+            cur_size,
+            sidebar_open,
+            24,
+            false,
+            &modal,
+            &mut prev_term_rect,
+            &mut pending_pty_resize,
+            &mut need_sync_terminals,
+            &mut force_clear,
+            &mut dirty,
+            &mut pty_dirty,
+            &mut pty_pacer,
+        );
+        assert_eq!((attached_map["t1"].cols, attached_map["t1"].rows), (60, 12));
+        assert!(!attached_map["t1"].height_locked);
+
+        // 5. Height growth above locked PTY height (60x36 -> 60x34) resizes PTY upward
+        let t_grow = t_w + RESIZE_DEBOUNCE + Duration::from_millis(50);
+        handle_resize_event(
+            60,
+            36,
+            t_grow,
+            &mut cur_size,
+            40,
+            &mut sidebar_open,
+            24,
+            false,
+            &mut page_tap,
+            &mut reader_drag,
+            &mut modal,
+            &mut attached_map,
+            Some("t1"),
+            &mut pending_pty_resize,
+            &mut need_sync_terminals,
+            &mut force_clear,
+            &mut dirty,
+        );
+        assert!(pending_pty_resize.is_some());
+        flush_due_pty_resize(
+            &core,
+            &mut world,
+            &mut attached_map,
+            Some("t1"),
+            t_grow + RESIZE_DEBOUNCE,
+            cur_size,
+            sidebar_open,
+            24,
+            false,
+            &modal,
+            &mut prev_term_rect,
+            &mut pending_pty_resize,
+            &mut need_sync_terminals,
+            &mut force_clear,
+            &mut dirty,
+            &mut pty_dirty,
+            &mut pty_pacer,
+        );
+        assert_eq!((attached_map["t1"].cols, attached_map["t1"].rows), (60, 34));
+        assert!(!attached_map["t1"].height_locked);
+    }
+
+    #[test]
+    fn height_lock_unlocks_on_alt_screen_entry_and_explicit_redraw() {
+        use crate::model::{make_single_terminal_tab, SharedSpace, TerminalInfo};
+
+        let core = CoreClient::dummy_for_tests();
+        let mut world = World::default();
+        world.doc.spaces.push(SharedSpace {
+            id: "sp1".to_string(),
+            name: "main".to_string(),
+            tabs: vec![make_single_terminal_tab("tab1", "sh", "t1")],
+            ..Default::default()
+        });
+        world.terminals.insert(
+            "t1".to_string(),
+            TerminalInfo {
+                address: "t1".to_string(),
+                state: "live".to_string(),
+                cols: 80,
+                rows: 22,
+                ..Default::default()
+            },
+        );
+        let mut att = AttachedTerminal::new_with_client_size(7, 80, 22, 80, 12);
+        att.height_locked = true;
+        let mut attached_map = BTreeMap::new();
+        attached_map.insert("t1".to_string(), att);
+
+        let term_rect = Rect::new(0, 1, 80, 12);
+        let modal = Modal::None;
+        let mut force_clear = false;
+        let mut dirty = false;
+        let mut pty_dirty = false;
+        let mut pty_pacer = PtyOutputPacer::default();
+        let t0 = Instant::now();
+
+        // 1. Staying on main screen with force_unlock=false keeps height lock
+        assert!(!unlock_height_locked_active_pty(
+            &core,
+            &mut world,
+            &mut attached_map,
+            Some("t1"),
+            term_rect,
+            &modal,
+            t0,
+            &mut force_clear,
+            &mut dirty,
+            &mut pty_dirty,
+            &mut pty_pacer,
+            false,
+        ));
+        assert!(attached_map["t1"].height_locked);
+        assert_eq!((attached_map["t1"].cols, attached_map["t1"].rows), (80, 22));
+
+        // 2. Entering alternate screen triggers automatic unlock + PTY resize to (80, 12) + settle
+        attached_map
+            .get_mut("t1")
+            .unwrap()
+            .process_vt_bytes(b"\x1b[?1049h");
+        assert!(unlock_height_locked_active_pty(
+            &core,
+            &mut world,
+            &mut attached_map,
+            Some("t1"),
+            term_rect,
+            &modal,
+            t0,
+            &mut force_clear,
+            &mut dirty,
+            &mut pty_dirty,
+            &mut pty_pacer,
+            false,
+        ));
+        assert!(!attached_map["t1"].height_locked);
+        assert_eq!((attached_map["t1"].cols, attached_map["t1"].rows), (80, 12));
+        assert_eq!(
+            (world.terminals["t1"].cols, world.terminals["t1"].rows),
+            (80, 12)
+        );
+        assert!(force_clear);
+        assert!(pty_dirty);
+        assert!(pty_pacer.is_settling());
+
+        // 3. Explicit redraw (`^b r` -> force_unlock=true) unlocks main-screen height lock
+        force_clear = false;
+        dirty = true;
+        pty_dirty = false;
+        pty_pacer = PtyOutputPacer::default();
+        let mut att2 = AttachedTerminal::new_with_client_size(7, 80, 22, 80, 12);
+        att2.height_locked = true;
+        attached_map.insert("t1".to_string(), att2);
+        assert!(unlock_height_locked_active_pty(
+            &core,
+            &mut world,
+            &mut attached_map,
+            Some("t1"),
+            term_rect,
+            &modal,
+            t0,
+            &mut force_clear,
+            &mut dirty,
+            &mut pty_dirty,
+            &mut pty_pacer,
+            true,
+        ));
+        assert!(!attached_map["t1"].height_locked);
+        assert_eq!((attached_map["t1"].cols, attached_map["t1"].rows), (80, 12));
+        assert!(force_clear);
+        assert!(pty_dirty);
+        assert!(!dirty);
+
+        // 4. Non-height-locked mismatch (e.g., another client resized PTY) is NOT touched by unlock helper
+        force_clear = false;
+        pty_dirty = false;
+        let att3 = AttachedTerminal::new_with_client_size(7, 80, 22, 80, 12);
+        attached_map.insert("t1".to_string(), att3);
+        assert!(!unlock_height_locked_active_pty(
+            &core,
+            &mut world,
+            &mut attached_map,
+            Some("t1"),
+            term_rect,
+            &modal,
+            t0,
+            &mut force_clear,
+            &mut dirty,
+            &mut pty_dirty,
+            &mut pty_pacer,
+            true,
+        ));
+        assert_eq!((attached_map["t1"].cols, attached_map["t1"].rows), (80, 22));
+        assert!(!force_clear);
+        assert!(!pty_dirty);
+    }
+
+    #[test]
+    fn height_locked_virtual_scrollback_traverses_cropped_live_rows_then_vt_scrollback() {
+        // 1. 20-row PTY in an 8-row viewport with content to bottom row (base_row_start = 12) and zero vt scrollback
+        let mut att_no_sb = AttachedTerminal::new_with_client_size(1, 40, 20, 40, 8);
+        att_no_sb.height_locked = true;
+        att_no_sb.process_vt_bytes(b"\x1b[20;1Hrow20");
+
+        let mut sb = 0usize;
+        assert_eq!(
+            att_no_sb.apply_scrollback_and_viewport_row_start(8, &mut sb),
+            12
+        );
+        assert_eq!(sb, 0);
+        assert_eq!(att_no_sb.parser.screen().scrollback(), 0);
+
+        sb = 5;
+        assert_eq!(
+            att_no_sb.apply_scrollback_and_viewport_row_start(8, &mut sb),
+            7
+        );
+        assert_eq!(sb, 5);
+        assert_eq!(att_no_sb.parser.screen().scrollback(), 0);
+
+        sb = 12;
+        assert_eq!(
+            att_no_sb.apply_scrollback_and_viewport_row_start(8, &mut sb),
+            0
+        );
+        assert_eq!(sb, 12);
+        assert_eq!(att_no_sb.parser.screen().scrollback(), 0);
+
+        // Scrolling past base_row_start clamps cleanly to 12 when scrollback_len == 0
+        sb = 50;
+        assert_eq!(
+            att_no_sb.apply_scrollback_and_viewport_row_start(8, &mut sb),
+            0
+        );
+        assert_eq!(sb, 12);
+        assert_eq!(att_no_sb.parser.screen().scrollback(), 0);
+
+        // 2. With 30 lines of vt100 scrollback: 0..=12 slides row_start, 13..=42 steps into vt scrollback
+        let mut att_sb = AttachedTerminal::new_with_client_size(2, 40, 20, 40, 8);
+        att_sb.height_locked = true;
+        for i in 0..49 {
+            att_sb.process_vt_bytes(format!("line {i}\r\n").as_bytes());
+        }
+        assert_eq!(att_sb.parser.screen().scrollback_len(), 30);
+        // Screen now has 20 live rows (cursor at row 19) and 30 lines in scrollback
+        let mut sb2 = 0usize;
+        assert_eq!(
+            att_sb.apply_scrollback_and_viewport_row_start(8, &mut sb2),
+            12
+        );
+        assert_eq!(att_sb.parser.screen().scrollback(), 0);
+
+        sb2 = 12;
+        assert_eq!(
+            att_sb.apply_scrollback_and_viewport_row_start(8, &mut sb2),
+            0
+        );
+        assert_eq!(att_sb.parser.screen().scrollback(), 0);
+
+        sb2 = 15;
+        assert_eq!(
+            att_sb.apply_scrollback_and_viewport_row_start(8, &mut sb2),
+            0
+        );
+        assert_eq!(sb2, 15);
+        assert_eq!(att_sb.parser.screen().scrollback(), 3);
+
+        sb2 = 999;
+        assert_eq!(
+            att_sb.apply_scrollback_and_viewport_row_start(8, &mut sb2),
+            0
+        );
+        assert_eq!(sb2, 42);
+        assert_eq!(att_sb.parser.screen().scrollback(), 30);
+    }
+
+    #[test]
+    fn sync_attached_terminals_preserves_height_lock_on_tab_switch_and_unlocks_alt_screen_tab() {
+        use crate::model::{make_single_terminal_tab, SharedSpace, TerminalInfo};
+
+        let core = CoreClient::dummy_for_tests();
+        let mut world = World::default();
+        world.doc.spaces.push(SharedSpace {
+            id: "sp1".to_string(),
+            name: "main".to_string(),
+            tabs: vec![
+                make_single_terminal_tab("tab1", "first", "t1"),
+                make_single_terminal_tab("tab2", "main_tall", "t2"),
+                make_single_terminal_tab("tab3", "alt_tall", "t3"),
+                make_single_terminal_tab("tab4", "wide_tab", "t4"),
+            ],
+            ..Default::default()
+        });
+        for (addr, cols, rows) in [
+            ("t1", 80, 12),
+            ("t2", 80, 22),
+            ("t3", 80, 22),
+            ("t4", 100, 22),
+        ] {
+            world.terminals.insert(
+                addr.to_string(),
+                TerminalInfo {
+                    address: addr.to_string(),
+                    state: "live".to_string(),
+                    cols,
+                    rows,
+                    ..Default::default()
+                },
+            );
+        }
+
+        let mut attached_map = BTreeMap::new();
+        attached_map.insert(
+            "t1".to_string(),
+            AttachedTerminal::new_with_capabilities(1, 80, 12, 80, 12, false, true),
+        );
+        // t2: already hydrated main-screen taller same-width tab -> stays height-locked at 80x22
+        let mut att2 = AttachedTerminal::new_with_capabilities(2, 80, 22, 80, 22, false, true);
+        att2.process_vt_bytes(b"shell output\r\n");
+        attached_map.insert("t2".to_string(), att2);
+        // t3: alt-screen taller same-width tab -> cannot height-lock, must resize to 80x12
+        let mut att3 = AttachedTerminal::new_with_capabilities(3, 80, 22, 80, 22, false, true);
+        att3.process_vt_bytes(b"\x1b[?1049hvim");
+        attached_map.insert("t3".to_string(), att3);
+        // t4: different-width tab -> must resize to 80x12
+        attached_map.insert(
+            "t4".to_string(),
+            AttachedTerminal::new_with_capabilities(4, 100, 22, 100, 22, false, true),
+        );
+
+        let mut active_addr = Some("t1".to_string());
+        let mut scrollback = 0usize;
+        let shrunk_rect = Rect::new(0, 1, 80, 12);
+
+        // Switch to tab2 (main screen 80x22 while soft keyboard shows 80x12) -> locks height without resize
+        world.select_tab_index(1);
+        let out2 = sync_attached_terminals(
+            &core,
+            &mut world,
+            &mut attached_map,
+            &mut active_addr,
+            shrunk_rect,
+            &mut scrollback,
+            false,
+            false,
+            true,
+        );
+        assert!(!out2.resized_active);
+        assert_eq!((attached_map["t2"].cols, attached_map["t2"].rows), (80, 22));
+        assert_eq!(
+            (
+                attached_map["t2"].client_cols,
+                attached_map["t2"].client_rows
+            ),
+            (80, 12)
+        );
+        assert!(attached_map["t2"].height_locked);
+
+        // Switch to tab3 (alternate screen 80x22) -> resizes PTY to 80x12
+        world.select_tab_index(2);
+        let out3 = sync_attached_terminals(
+            &core,
+            &mut world,
+            &mut attached_map,
+            &mut active_addr,
+            shrunk_rect,
+            &mut scrollback,
+            false,
+            false,
+            true,
+        );
+        assert!(out3.resized_active);
+        assert_eq!((attached_map["t3"].cols, attached_map["t3"].rows), (80, 12));
+        assert!(!attached_map["t3"].height_locked);
+
+        // Switch to tab4 (different width 100x22) -> resizes PTY to 80x12
+        world.select_tab_index(3);
+        let out4 = sync_attached_terminals(
+            &core,
+            &mut world,
+            &mut attached_map,
+            &mut active_addr,
+            shrunk_rect,
+            &mut scrollback,
+            false,
+            false,
+            true,
+        );
+        assert!(out4.resized_active);
+        assert_eq!((attached_map["t4"].cols, attached_map["t4"].rows), (80, 12));
+        assert!(!attached_map["t4"].height_locked);
+
+        // Switch back to tab2 after dismissing keyboard (80x22) -> clears height_locked with zero resize
+        world.select_tab_index(1);
+        let full_rect = Rect::new(0, 1, 80, 22);
+        let out2_back = sync_attached_terminals(
+            &core,
+            &mut world,
+            &mut attached_map,
+            &mut active_addr,
+            full_rect,
+            &mut scrollback,
+            false,
+            false,
+            true,
+        );
+        assert!(!out2_back.resized_active);
+        assert_eq!((attached_map["t2"].cols, attached_map["t2"].rows), (80, 22));
+        assert_eq!(
+            (
+                attached_map["t2"].client_cols,
+                attached_map["t2"].client_rows
+            ),
+            (80, 22)
+        );
+        assert!(!attached_map["t2"].height_locked);
     }
 }
