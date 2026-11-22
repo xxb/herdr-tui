@@ -20,7 +20,6 @@ pub const FOCUS: u8 = 4;
 #[allow(dead_code)]
 pub const FACTS: u8 = 5;
 /// Viewer -> core: terminal-generated replies.
-#[allow(dead_code)]
 pub const AUTOMATIC_INPUT: u8 = 6;
 
 pub fn encode_header(channel: u32, kind: u8, len: usize) -> [u8; HEADER] {

@@ -57,11 +57,19 @@ use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthChar;
 
 const SCROLLBACK_LINES: usize = 2000;
-const ATTACH_HISTORY_LINES: usize = SCROLLBACK_LINES;
+const ATTACH_HISTORY_LINES: usize = 200;
+const SIBLING_ATTACH_HISTORY_LINES: usize = 0;
 const MAX_EVENTS_PER_TICK: usize = 512;
 const CREDIT_FLUSH_THRESHOLD_BYTES: usize = 16 * 1024;
-const SYNC_UPDATE_TIMEOUT: Duration = Duration::from_millis(80);
-const SYNC_UPDATE_MAX_BYTES: usize = 256 * 1024;
+const SYNC_UPDATE_TIMEOUT: Duration = Duration::from_millis(150);
+const SYNC_UPDATE_MAX_BYTES: usize = 2 * 1024 * 1024;
+const NORMAL_PASSIVE_FRAME_INTERVAL: Duration = Duration::from_millis(33);
+const BURST_BYTES_THRESHOLD: usize = 8 * 1024;
+const BURST_QUIET_WINDOW: Duration = Duration::from_millis(60);
+const BURST_MAX_HOLD: Duration = Duration::from_millis(400);
+const SETTLE_QUIET_WINDOW: Duration = Duration::from_millis(60);
+const SETTLE_MAX_HOLD: Duration = Duration::from_millis(350);
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(160);
 const ATTACH_RETRY_DELAY: Duration = Duration::from_millis(250);
 const CLIPBOARD_READ_TIMEOUT: Duration = Duration::from_millis(200);
 const HORIZ_WHEEL_QUIET_GAP: Duration = Duration::from_millis(180);
@@ -523,6 +531,8 @@ struct AttachedTerminal {
     rows: u16,
     client_cols: u16,
     client_rows: u16,
+    supports_automatic_input: bool,
+    has_attach_history: bool,
     utf8_tail: Vec<u8>,
     sanitize_ctrl_str: Option<ControlStringKind>,
     feed_ctrl_str: Option<ControlStringKind>,
@@ -550,15 +560,28 @@ fn non_zero_u16(v: u16) -> std::num::NonZeroU16 {
 impl AttachedTerminal {
     #[allow(dead_code)]
     fn new(channel: u32, cols: u16, rows: u16) -> Self {
-        Self::new_with_client_size(channel, cols, rows, cols, rows)
+        Self::new_with_capabilities(channel, cols, rows, cols, rows, false, true)
     }
 
+    #[allow(dead_code)]
     fn new_with_client_size(
         channel: u32,
         cols: u16,
         rows: u16,
         client_cols: u16,
         client_rows: u16,
+    ) -> Self {
+        Self::new_with_capabilities(channel, cols, rows, client_cols, client_rows, false, true)
+    }
+
+    fn new_with_capabilities(
+        channel: u32,
+        cols: u16,
+        rows: u16,
+        client_cols: u16,
+        client_rows: u16,
+        supports_automatic_input: bool,
+        has_attach_history: bool,
     ) -> Self {
         Self {
             channel,
@@ -567,6 +590,8 @@ impl AttachedTerminal {
             rows,
             client_cols,
             client_rows,
+            supports_automatic_input,
+            has_attach_history,
             utf8_tail: Vec::new(),
             sanitize_ctrl_str: None,
             feed_ctrl_str: None,
@@ -614,15 +639,15 @@ impl AttachedTerminal {
         self.sync_update_started.map(|t| t + SYNC_UPDATE_TIMEOUT)
     }
 
-    fn flush_sync_update(&mut self) -> bool {
+    fn flush_sync_update(&mut self) -> usize {
         self.flush_sync_update_with_tail(&[])
     }
 
-    fn flush_sync_update_with_tail(&mut self, tail: &[u8]) -> bool {
+    fn flush_sync_update_with_tail(&mut self, tail: &[u8]) -> usize {
         self.sync_update_started = None;
         let buf = std::mem::take(&mut self.sync_update_buf);
         if buf.is_empty() && tail.is_empty() {
-            return false;
+            return 0;
         }
         if !buf.is_empty() {
             self.feed_sanitized_bytes(&buf);
@@ -631,18 +656,18 @@ impl AttachedTerminal {
             self.feed_sanitized_bytes(tail);
         }
         self.vt_seq = self.vt_seq.wrapping_add(1);
-        true
+        buf.len().saturating_add(tail.len())
     }
 
-    fn append_sync_bytes(&mut self, bytes: &[u8]) -> bool {
+    fn append_sync_bytes(&mut self, bytes: &[u8]) -> usize {
         if bytes.is_empty() {
-            return false;
+            return 0;
         }
         if self.sync_update_buf.len().saturating_add(bytes.len()) >= SYNC_UPDATE_MAX_BYTES {
             return self.flush_sync_update_with_tail(bytes);
         }
         self.sync_update_buf.extend_from_slice(bytes);
-        false
+        0
     }
 
     #[cfg(test)]
@@ -652,8 +677,8 @@ impl AttachedTerminal {
 
     /// Process incoming VT bytes, buffering Mode 2026 (`CSI ? 2026 h` .. `l`) frames
     /// until closed so intermediate cursor jumps are never rendered mid-frame.
-    /// Returns `true` when at least one chunk was committed to the VT parser.
-    fn process_vt_bytes_at(&mut self, payload: &[u8], now: Instant) -> bool {
+    /// Returns the count of sanitized bytes committed to the VT parser (`0` when buffered).
+    fn process_vt_bytes_at(&mut self, payload: &[u8], now: Instant) -> usize {
         let clean = sanitize_vt_stream(
             payload,
             &mut self.utf8_tail,
@@ -661,7 +686,7 @@ impl AttachedTerminal {
             &mut self.grapheme,
         );
         if clean.is_empty() {
-            return false;
+            return 0;
         }
         if self.sync_update_started.is_none()
             && self.sync_ctrl_str.is_none()
@@ -669,12 +694,12 @@ impl AttachedTerminal {
         {
             self.feed_sanitized_bytes(&clean);
             self.vt_seq = self.vt_seq.wrapping_add(1);
-            return true;
+            return clean.len();
         }
 
         let mut seg_start = 0usize;
         let mut i = 0usize;
-        let mut committed = false;
+        let mut committed_bytes = 0usize;
 
         while i < clean.len() {
             if let Some(kind) = self.sync_ctrl_str {
@@ -730,19 +755,19 @@ impl AttachedTerminal {
                         {
                             if final_byte == b'h' && self.sync_update_started.is_none() {
                                 if seg_start < i {
-                                    self.feed_sanitized_bytes(&clean[seg_start..i]);
+                                    let chunk = &clean[seg_start..i];
+                                    self.feed_sanitized_bytes(chunk);
                                     self.vt_seq = self.vt_seq.wrapping_add(1);
-                                    committed = true;
+                                    committed_bytes = committed_bytes.saturating_add(chunk.len());
                                 }
                                 self.sync_update_started = Some(now);
-                                if self.append_sync_bytes(&clean[i..=p]) {
-                                    committed = true;
-                                }
+                                committed_bytes = committed_bytes
+                                    .saturating_add(self.append_sync_bytes(&clean[i..=p]));
                                 seg_start = p + 1;
                             } else if final_byte == b'l' && self.sync_update_started.is_some() {
-                                if self.flush_sync_update_with_tail(&clean[seg_start..=p]) {
-                                    committed = true;
-                                }
+                                committed_bytes = committed_bytes.saturating_add(
+                                    self.flush_sync_update_with_tail(&clean[seg_start..=p]),
+                                );
                                 seg_start = p + 1;
                             }
                         } else if params.is_empty()
@@ -750,9 +775,9 @@ impl AttachedTerminal {
                             && final_byte == b'p'
                             && self.sync_update_started.is_some()
                         {
-                            if self.flush_sync_update_with_tail(&clean[seg_start..=p]) {
-                                committed = true;
-                            }
+                            committed_bytes = committed_bytes.saturating_add(
+                                self.flush_sync_update_with_tail(&clean[seg_start..=p]),
+                            );
                             seg_start = p + 1;
                         }
                         i = p + 1;
@@ -768,9 +793,9 @@ impl AttachedTerminal {
                 }
                 if e < clean.len() && (0x30..=0x7E).contains(&clean[e]) {
                     if e == i + 1 && clean[e] == b'c' && self.sync_update_started.is_some() {
-                        if self.flush_sync_update_with_tail(&clean[seg_start..=e]) {
-                            committed = true;
-                        }
+                        committed_bytes = committed_bytes.saturating_add(
+                            self.flush_sync_update_with_tail(&clean[seg_start..=e]),
+                        );
                         seg_start = e + 1;
                     }
                     i = e + 1;
@@ -781,15 +806,15 @@ impl AttachedTerminal {
         }
 
         if self.sync_update_started.is_some() {
-            if self.append_sync_bytes(&clean[seg_start..]) {
-                committed = true;
-            }
+            committed_bytes =
+                committed_bytes.saturating_add(self.append_sync_bytes(&clean[seg_start..]));
         } else if seg_start < clean.len() {
-            self.feed_sanitized_bytes(&clean[seg_start..]);
+            let tail = &clean[seg_start..];
+            self.feed_sanitized_bytes(tail);
             self.vt_seq = self.vt_seq.wrapping_add(1);
-            committed = true;
+            committed_bytes = committed_bytes.saturating_add(tail.len());
         }
-        committed
+        committed_bytes
     }
 
     fn clamp_pending_wrap(&mut self) {
@@ -2773,6 +2798,7 @@ fn main() -> Result<()> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct SyncOutcome {
     newly_attached_active: bool,
+    resized_active: bool,
     active_attach_failed: bool,
     has_unwarmed_siblings: bool,
 }
@@ -2818,21 +2844,22 @@ fn reconcile_attached_sizes(
 #[allow(clippy::too_many_arguments)]
 fn schedule_active_pty_redraw(
     channel: u32,
+    bytes_len: usize,
     now: Instant,
-    eink_mode: bool,
-    eink_interval: Duration,
+    _eink_mode: bool,
+    _eink_interval: Duration,
     first_frame_drawn: bool,
     force_immediate: bool,
     last_pty_input: Option<crate::core::LastPtyInput>,
     dirty: &mut bool,
     pty_dirty: &mut bool,
-    eink_pacer: &mut EinkInputPacer,
+    pty_pacer: &mut PtyOutputPacer,
 ) {
-    if !eink_mode || eink_interval.is_zero() || !first_frame_drawn || force_immediate {
+    if force_immediate || (!first_frame_drawn && !pty_pacer.is_settling()) {
         *dirty = true;
     } else {
         *pty_dirty = true;
-        eink_pacer.record_active_pty_data(channel, now, last_pty_input);
+        pty_pacer.record_active_pty_data(channel, bytes_len, now, last_pty_input);
     }
 }
 
@@ -2848,26 +2875,29 @@ fn flush_expired_sync_updates(
     last_pty_input: Option<crate::core::LastPtyInput>,
     dirty: &mut bool,
     pty_dirty: &mut bool,
-    eink_pacer: &mut EinkInputPacer,
+    pty_pacer: &mut PtyOutputPacer,
 ) {
     for (addr, att) in attached_map.iter_mut() {
-        if att.sync_update_deadline().is_some_and(|d| now >= d)
-            && att.flush_sync_update()
-            && active_addr == Some(addr.as_str())
-            && !matches!(modal, Modal::TabOverview { .. } | Modal::Reader { .. })
-        {
-            schedule_active_pty_redraw(
-                att.channel,
-                now,
-                eink_mode,
-                eink_interval,
-                first_frame_drawn,
-                false,
-                last_pty_input,
-                dirty,
-                pty_dirty,
-                eink_pacer,
-            );
+        if att.sync_update_deadline().is_some_and(|d| now >= d) {
+            let flushed = att.flush_sync_update();
+            if flushed > 0
+                && active_addr == Some(addr.as_str())
+                && !matches!(modal, Modal::TabOverview { .. } | Modal::Reader { .. })
+            {
+                schedule_active_pty_redraw(
+                    att.channel,
+                    flushed,
+                    now,
+                    eink_mode,
+                    eink_interval,
+                    first_frame_drawn,
+                    false,
+                    last_pty_input,
+                    dirty,
+                    pty_dirty,
+                    pty_pacer,
+                );
+            }
         }
     }
 }
@@ -2879,11 +2909,15 @@ fn reclaim_active_pty_size_on_input(
     active_addr: Option<&str>,
     term_rect: Rect,
     prev_input_seq: Option<u64>,
+    has_pending_resize: bool,
 ) -> bool {
+    if has_pending_resize {
+        return false;
+    }
     let Some(last_in) = core.last_pty_input() else {
         return false;
     };
-    if Some(last_in.seq) == prev_input_seq {
+    if !last_in.reclaims_size || Some(last_in.seq) == prev_input_seq {
         return false;
     }
     let Some(addr) = active_addr else {
@@ -2911,6 +2945,25 @@ fn reclaim_active_pty_size_on_input(
     true
 }
 
+fn parser_scrollback_len(parser: &mut vt100::Parser) -> usize {
+    let prev = parser.screen().scrollback();
+    parser.screen_mut().set_scrollback(usize::MAX);
+    let max_sb = parser.screen().scrollback();
+    parser.screen_mut().set_scrollback(prev);
+    max_sb
+}
+
+fn should_reattach_for_history(att: &mut AttachedTerminal, switching_active: bool) -> bool {
+    if !switching_active || att.has_attach_history {
+        return false;
+    }
+    if parser_scrollback_len(&mut att.parser) >= ATTACH_HISTORY_LINES {
+        att.has_attach_history = true;
+        return false;
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 fn sync_attached_terminals(
     core: &CoreClient,
@@ -2921,6 +2974,7 @@ fn sync_attached_terminals(
     scrollback_offset: &mut usize,
     warm_siblings: bool,
     mark_seen: bool,
+    allow_active_resize: bool,
 ) -> SyncOutcome {
     let mut outcome = SyncOutcome::default();
     let cols = term_rect.width.max(1);
@@ -2948,24 +3002,60 @@ fn sync_attached_terminals(
     if let Some(ref addr) = want_addr {
         if let Some(cur) = attached_map.get_mut(addr) {
             let switching_active = active_addr.as_ref() != Some(addr);
-            let viewport_changed = cur.client_cols != cols || cur.client_rows != rows;
-            if viewport_changed || (switching_active && (cur.cols != cols || cur.rows != rows)) {
-                cur.client_cols = cols;
-                cur.client_rows = rows;
-                cur.resize(cols, rows);
-                core.resize_channel(cur.channel, cols, rows);
-                if let Some(info) = world.terminals.get_mut(addr) {
-                    info.cols = cols;
-                    info.rows = rows;
+            let mut hydrated = false;
+            if should_reattach_for_history(cur, switching_active) {
+                if let Ok(attach_info) =
+                    core.attach_terminal(addr, cols, rows, ATTACH_HISTORY_LINES, false)
+                {
+                    let old_channel = cur.channel;
+                    let pty_cols = attach_info.cols.unwrap_or(cols);
+                    let pty_rows = attach_info.rows.unwrap_or(rows);
+                    core.set_focus(attach_info.channel, true);
+                    core.detach_channel(old_channel);
+                    *cur = AttachedTerminal::new_with_capabilities(
+                        attach_info.channel,
+                        pty_cols,
+                        pty_rows,
+                        cols,
+                        rows,
+                        attach_info.automatic_input,
+                        true,
+                    );
+                    if let Some(info) = world.terminals.get_mut(addr) {
+                        info.cols = pty_cols;
+                        info.rows = pty_rows;
+                    }
+                    if mark_seen {
+                        world.mark_active_seen(core);
+                    }
+                    outcome.newly_attached_active = true;
+                    resolved_active = Some(addr.clone());
+                    hydrated = true;
                 }
             }
-            if switching_active {
-                core.set_focus(cur.channel, true);
-                if mark_seen {
-                    world.mark_active_seen(core);
+            if !hydrated {
+                let viewport_changed = cur.client_cols != cols || cur.client_rows != rows;
+                if (allow_active_resize && viewport_changed)
+                    || (switching_active && (cur.cols != cols || cur.rows != rows))
+                {
+                    cur.client_cols = cols;
+                    cur.client_rows = rows;
+                    cur.resize(cols, rows);
+                    core.resize_channel(cur.channel, cols, rows);
+                    if let Some(info) = world.terminals.get_mut(addr) {
+                        info.cols = cols;
+                        info.rows = rows;
+                    }
+                    outcome.resized_active = true;
                 }
+                if switching_active {
+                    core.set_focus(cur.channel, true);
+                    if mark_seen {
+                        world.mark_active_seen(core);
+                    }
+                }
+                resolved_active = Some(addr.clone());
             }
-            resolved_active = Some(addr.clone());
         } else if let Ok(attach_info) =
             core.attach_terminal(addr, cols, rows, ATTACH_HISTORY_LINES, false)
         {
@@ -2974,12 +3064,14 @@ fn sync_attached_terminals(
             core.set_focus(attach_info.channel, true);
             attached_map.insert(
                 addr.clone(),
-                AttachedTerminal::new_with_client_size(
+                AttachedTerminal::new_with_capabilities(
                     attach_info.channel,
                     pty_cols,
                     pty_rows,
                     cols,
                     rows,
+                    attach_info.automatic_input,
+                    true,
                 ),
             );
             if let Some(info) = world.terminals.get_mut(addr) {
@@ -3019,9 +3111,13 @@ fn sync_attached_terminals(
             }
             if world.terminals.contains_key(&sib_addr) {
                 if !warmed_one {
-                    if let Ok(attach_info) =
-                        core.attach_terminal(&sib_addr, cols, rows, ATTACH_HISTORY_LINES, true)
-                    {
+                    if let Ok(attach_info) = core.attach_terminal(
+                        &sib_addr,
+                        cols,
+                        rows,
+                        SIBLING_ATTACH_HISTORY_LINES,
+                        true,
+                    ) {
                         let world_dims = world
                             .terminals
                             .get(&sib_addr)
@@ -3038,12 +3134,14 @@ fn sync_attached_terminals(
                         core.set_focus(attach_info.channel, false);
                         attached_map.insert(
                             sib_addr,
-                            AttachedTerminal::new_with_client_size(
+                            AttachedTerminal::new_with_capabilities(
                                 attach_info.channel,
                                 pty_cols,
                                 pty_rows,
                                 cols,
                                 rows,
+                                attach_info.automatic_input,
+                                SIBLING_ATTACH_HISTORY_LINES != 0,
                             ),
                         );
                         warmed_one = true;
@@ -3265,7 +3363,7 @@ fn execute_action_full(
                 && *scrollback_offset == 0
             {
                 if let Some(att) = attached {
-                    core.send_input(att.channel, b"\x1b[5~");
+                    core.send_scroll_input(att.channel, b"\x1b[5~", att.supports_automatic_input);
                 }
             } else {
                 let step = (term_rect.height as usize).saturating_sub(2).max(1);
@@ -3284,7 +3382,7 @@ fn execute_action_full(
                 && *scrollback_offset == 0
             {
                 if let Some(att) = attached {
-                    core.send_input(att.channel, b"\x1b[6~");
+                    core.send_scroll_input(att.channel, b"\x1b[6~", att.supports_automatic_input);
                 }
             } else {
                 let step = (term_rect.height as usize).saturating_sub(2).max(1);
@@ -3903,19 +4001,86 @@ const EINK_INPUT_BYPASS_WINDOW: Duration = Duration::from_millis(200);
 const EINK_INPUT_FOLLOWUP_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct EinkInputPacer {
+struct PtyOutputPacer {
     last_drawn_input_seq: u64,
     pty_dirty_interactive: bool,
     pending_echo_seq: Option<u64>,
+    unrendered_bytes: usize,
+    burst_channel: Option<u32>,
+    burst_started: Option<Instant>,
+    burst_last_data: Option<Instant>,
+    burst_quiet: Duration,
+    burst_max_hold: Duration,
 }
 
-impl EinkInputPacer {
+impl PtyOutputPacer {
+    fn clear_burst(&mut self) {
+        self.unrendered_bytes = 0;
+        self.burst_channel = None;
+        self.burst_started = None;
+        self.burst_last_data = None;
+        self.burst_quiet = Duration::ZERO;
+        self.burst_max_hold = Duration::ZERO;
+    }
+
+    fn is_settling(&self) -> bool {
+        self.burst_started.is_some()
+    }
+
+    fn arm_settle(&mut self, channel: u32, now: Instant) {
+        self.pty_dirty_interactive = false;
+        self.pending_echo_seq = None;
+        self.unrendered_bytes = 0;
+        self.burst_channel = Some(channel);
+        self.burst_started = Some(now);
+        self.burst_last_data = Some(now);
+        self.burst_quiet = SETTLE_QUIET_WINDOW;
+        self.burst_max_hold = SETTLE_MAX_HOLD;
+    }
+
     fn record_active_pty_data(
         &mut self,
         channel: u32,
+        bytes_len: usize,
         now: Instant,
         last_input: Option<crate::core::LastPtyInput>,
     ) {
+        if self.burst_channel.is_some_and(|ch| ch != channel) {
+            self.clear_burst();
+        }
+        self.unrendered_bytes = self.unrendered_bytes.saturating_add(bytes_len);
+
+        if let Some(started) = self.burst_started {
+            self.burst_last_data = Some(now);
+            if self.unrendered_bytes >= BURST_BYTES_THRESHOLD {
+                self.burst_max_hold = self.burst_max_hold.max(BURST_MAX_HOLD);
+                self.burst_quiet = BURST_QUIET_WINDOW;
+                self.pending_echo_seq = None;
+                self.pty_dirty_interactive = false;
+                return;
+            }
+            if last_input.is_some_and(|inp| {
+                inp.channel == channel
+                    && inp.at > started
+                    && now.saturating_duration_since(inp.at) <= EINK_INPUT_BYPASS_WINDOW
+            }) {
+                self.clear_burst();
+            } else {
+                return;
+            }
+        }
+
+        if self.unrendered_bytes >= BURST_BYTES_THRESHOLD {
+            self.burst_channel = Some(channel);
+            self.burst_started = Some(now);
+            self.burst_last_data = Some(now);
+            self.burst_quiet = BURST_QUIET_WINDOW;
+            self.burst_max_hold = BURST_MAX_HOLD;
+            self.pending_echo_seq = None;
+            self.pty_dirty_interactive = false;
+            return;
+        }
+
         if let Some(inp) = last_input {
             if inp.channel == channel
                 && now.saturating_duration_since(inp.at) <= EINK_INPUT_BYPASS_WINDOW
@@ -3939,21 +4104,41 @@ impl EinkInputPacer {
         if !pty_dirty {
             return None;
         }
-        if !eink_mode || eink_interval.is_zero() || self.pending_echo_seq.is_some() {
-            return Some(now);
-        }
-        let interval = if self.pty_dirty_interactive {
-            EINK_INPUT_FOLLOWUP_INTERVAL.min(eink_interval)
-        } else {
-            eink_interval
+        let burst_deadline = match (self.burst_started, self.burst_last_data) {
+            (Some(started), Some(last_data)) => {
+                Some((last_data + self.burst_quiet).min(started + self.burst_max_hold))
+            }
+            _ => None,
         };
-        Some(last_draw_at.map_or(now, |t| t + interval))
+        let pace_deadline = if (burst_deadline.is_none() && self.pending_echo_seq.is_some())
+            || (eink_mode && eink_interval.is_zero())
+        {
+            now
+        } else {
+            let base = if eink_mode {
+                eink_interval
+            } else {
+                NORMAL_PASSIVE_FRAME_INTERVAL
+            };
+            let interval = if self.pty_dirty_interactive {
+                EINK_INPUT_FOLLOWUP_INTERVAL.min(base)
+            } else {
+                base
+            };
+            last_draw_at.map_or(now, |t| t + interval)
+        };
+        match burst_deadline {
+            Some(b_due) if eink_mode && !eink_interval.is_zero() => Some(b_due.max(pace_deadline)),
+            Some(b_due) => Some(b_due),
+            None => Some(pace_deadline),
+        }
     }
 
     fn clear_zero_diff(&mut self) -> bool {
         let was_interactive = self.pty_dirty_interactive;
         self.pty_dirty_interactive = false;
         self.pending_echo_seq = None;
+        self.clear_burst();
         was_interactive
     }
 
@@ -3962,11 +4147,156 @@ impl EinkInputPacer {
             self.last_drawn_input_seq = seq;
         }
         self.pty_dirty_interactive = false;
+        self.clear_burst();
     }
 
     fn reset_on_channel_switch(&mut self) {
         self.pty_dirty_interactive = false;
         self.pending_echo_seq = None;
+        self.clear_burst();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingPtyResize {
+    cols: u16,
+    rows: u16,
+    due: Instant,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_resize_event(
+    w: u16,
+    h: u16,
+    now: Instant,
+    cur_size: &mut (u16, u16),
+    mobile_threshold: u16,
+    sidebar_open: &mut bool,
+    sidebar_width: u16,
+    touch_mode: bool,
+    page_tap: &mut Option<PendingPageTurnTap>,
+    reader_drag: &mut Option<u16>,
+    modal: &mut Modal,
+    attached_map: &BTreeMap<String, AttachedTerminal>,
+    active_addr: Option<&str>,
+    pending_pty_resize: &mut Option<PendingPtyResize>,
+    need_sync_terminals: &mut bool,
+    force_clear: &mut bool,
+    dirty: &mut bool,
+) {
+    if (w, h) == *cur_size {
+        return;
+    }
+    *cur_size = (w, h);
+    if w < mobile_threshold {
+        *sidebar_open = false;
+    }
+    *page_tap = None;
+    *reader_drag = None;
+    let new_area = Rect::new(0, 0, w, h);
+    clamp_reader_scroll_on_resize(modal, new_area);
+    let new_term_rect = compute_terminal_rect(new_area, *sidebar_open, sidebar_width, touch_mode);
+    let new_cols = new_term_rect.width.max(1);
+    let new_rows = new_term_rect.height.max(1);
+    if let Some(att) = active_addr.and_then(|a| attached_map.get(a)) {
+        if att.cols == new_cols
+            && att.rows == new_rows
+            && att.client_cols == new_cols
+            && att.client_rows == new_rows
+        {
+            *pending_pty_resize = None;
+            *force_clear = true;
+            *dirty = true;
+        } else {
+            *pending_pty_resize = Some(PendingPtyResize {
+                cols: new_cols,
+                rows: new_rows,
+                due: now + RESIZE_DEBOUNCE,
+            });
+            if !matches!(modal, Modal::None) {
+                *force_clear = true;
+                *dirty = true;
+            }
+        }
+    } else {
+        *pending_pty_resize = None;
+        *need_sync_terminals = true;
+        *force_clear = true;
+        *dirty = true;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flush_due_pty_resize(
+    core: &CoreClient,
+    world: &mut World,
+    attached_map: &mut BTreeMap<String, AttachedTerminal>,
+    active_addr: Option<&str>,
+    now: Instant,
+    cur_size: (u16, u16),
+    sidebar_open: bool,
+    sidebar_width: u16,
+    touch_mode: bool,
+    modal: &Modal,
+    prev_term_rect: &mut Rect,
+    pending_pty_resize: &mut Option<PendingPtyResize>,
+    need_sync_terminals: &mut bool,
+    force_clear: &mut bool,
+    dirty: &mut bool,
+    pty_dirty: &mut bool,
+    pty_pacer: &mut PtyOutputPacer,
+) {
+    let Some(pending) = *pending_pty_resize else {
+        return;
+    };
+    if now < pending.due {
+        return;
+    }
+    *pending_pty_resize = None;
+    let cur_term_rect = compute_terminal_rect(
+        Rect::new(0, 0, cur_size.0, cur_size.1),
+        sidebar_open,
+        sidebar_width,
+        touch_mode,
+    );
+    *prev_term_rect = cur_term_rect;
+    let cols = if cur_term_rect.width > 0 {
+        cur_term_rect.width
+    } else {
+        pending.cols.max(1)
+    };
+    let rows = if cur_term_rect.height > 0 {
+        cur_term_rect.height
+    } else {
+        pending.rows.max(1)
+    };
+    if let Some((addr, att)) =
+        active_addr.and_then(|addr| attached_map.get_mut(addr).map(|att| (addr, att)))
+    {
+        att.client_cols = cols;
+        att.client_rows = rows;
+        if att.cols != cols || att.rows != rows {
+            att.resize(cols, rows);
+            core.resize_channel(att.channel, cols, rows);
+            if let Some(info) = world.terminals.get_mut(addr) {
+                info.cols = cols;
+                info.rows = rows;
+            }
+            *force_clear = true;
+            if matches!(modal, Modal::None) {
+                pty_pacer.arm_settle(att.channel, now);
+                *pty_dirty = true;
+            } else {
+                *dirty = true;
+            }
+        } else {
+            *force_clear = true;
+            *dirty = true;
+        }
+    } else {
+        *need_sync_terminals = true;
+        *force_clear = true;
+        *dirty = true;
     }
 }
 
@@ -3990,7 +4320,7 @@ fn promote_due_pty_dirty(
     eink_interval: Duration,
     now: Instant,
     pty_dirty: &mut bool,
-    eink_pacer: &mut EinkInputPacer,
+    pty_pacer: &mut PtyOutputPacer,
     dirty: &mut bool,
     last_draw_at: &mut Option<Instant>,
     last_eink_snap: &Option<(String, EinkScreenSnapshot)>,
@@ -4007,7 +4337,7 @@ fn promote_due_pty_dirty(
         eink_interval,
         now,
         pty_dirty,
-        eink_pacer,
+        pty_pacer,
         dirty,
         last_draw_at,
         last_eink_snap,
@@ -4017,6 +4347,7 @@ fn promote_due_pty_dirty(
         scrollback_offset,
         modal,
         selection,
+        false,
     );
 }
 
@@ -4027,7 +4358,7 @@ fn promote_due_pty_dirty_with_color(
     eink_interval: Duration,
     now: Instant,
     pty_dirty: &mut bool,
-    eink_pacer: &mut EinkInputPacer,
+    pty_pacer: &mut PtyOutputPacer,
     dirty: &mut bool,
     last_draw_at: &mut Option<Instant>,
     last_eink_snap: &Option<(String, EinkScreenSnapshot)>,
@@ -4037,19 +4368,20 @@ fn promote_due_pty_dirty_with_color(
     scrollback_offset: &mut usize,
     modal: &Modal,
     selection: &Option<TerminalSelection>,
+    force_clear: bool,
 ) {
     if *dirty || matches!(modal, Modal::Reader { .. }) {
         return;
     }
     let Some(deadline) =
-        eink_pacer.next_deadline(*pty_dirty, eink_mode, eink_interval, now, *last_draw_at)
+        pty_pacer.next_deadline(*pty_dirty, eink_mode, eink_interval, now, *last_draw_at)
     else {
         return;
     };
     if now < deadline {
         return;
     }
-    if eink_mode && matches!(modal, Modal::None) && selection.is_none() {
+    if !force_clear && eink_mode && matches!(modal, Modal::None) && selection.is_none() {
         if let Some(att) = active_addr.and_then(|a| attached_map.get_mut(a)) {
             att.parser.screen_mut().set_scrollback(*scrollback_offset);
             *scrollback_offset = att.parser.screen().scrollback();
@@ -4066,7 +4398,7 @@ fn promote_due_pty_dirty_with_color(
                 .is_some_and(|(a, prev)| Some(a.as_str()) == active_addr && prev == &snap)
             {
                 *pty_dirty = false;
-                if !eink_pacer.clear_zero_diff() {
+                if !pty_pacer.clear_zero_diff() {
                     *last_draw_at = Some(now);
                 }
                 return;
@@ -4074,7 +4406,7 @@ fn promote_due_pty_dirty_with_color(
         }
     }
     *dirty = true;
-    eink_pacer.on_promoted_or_drawn();
+    pty_pacer.on_promoted_or_drawn();
 }
 
 fn capture_selection_snapshot(
@@ -4190,14 +4522,16 @@ fn run_app_loop(
     let mut has_focused_agent = false;
     let mut dirty = true;
     let mut pty_dirty = false;
-    let mut eink_pacer = EinkInputPacer::default();
+    let mut pty_pacer = PtyOutputPacer::default();
     let mut last_draw_at: Option<Instant> = None;
     let mut last_eink_snap: Option<(String, EinkScreenSnapshot)> = None;
     let mut pending_reader_rpc: Option<PendingReaderRpc> = None;
     let mut reader_drag: Option<u16> = None;
     let mut reader_open_scope: Option<ReaderScope> = None;
     let mut prev_active_agent_state: Option<(String, AgentState)> = None;
+    let mut pending_pty_resize: Option<PendingPtyResize> = None;
     let mut need_sync_terminals = true;
+    let mut need_warm_siblings = false;
     let mut more_events = false;
     let mut resynced_this_frame = false;
     let mut last_synced_doc_version: u64 = 0;
@@ -4235,7 +4569,26 @@ fn run_app_loop(
             core.last_pty_input(),
             &mut dirty,
             &mut pty_dirty,
-            &mut eink_pacer,
+            &mut pty_pacer,
+        );
+        flush_due_pty_resize(
+            core,
+            world,
+            attached_map,
+            active_addr.as_deref(),
+            now,
+            cur_size,
+            *sidebar_open,
+            sidebar_width,
+            touch_mode,
+            &modal,
+            &mut prev_term_rect,
+            &mut pending_pty_resize,
+            &mut need_sync_terminals,
+            &mut force_clear,
+            &mut dirty,
+            &mut pty_dirty,
+            &mut pty_pacer,
         );
         if pending_attach_retry.as_ref().is_some_and(|(addr, t)| {
             now >= *t || world.active_terminal_address_ref() != Some(addr.as_str())
@@ -4247,7 +4600,7 @@ fn run_app_loop(
         let area_size = cur_size;
         let area = Rect::new(0, 0, area_size.0, area_size.1);
         let term_rect = compute_terminal_rect(area, *sidebar_open, sidebar_width, touch_mode);
-        if term_rect != prev_term_rect {
+        if pending_pty_resize.is_none() && term_rect != prev_term_rect {
             prev_term_rect = term_rect;
             need_sync_terminals = true;
             dirty = true;
@@ -4256,16 +4609,23 @@ fn run_app_loop(
         let attached_has_active = active_addr
             .as_ref()
             .is_some_and(|a| attached_map.contains_key(a));
-        let mut newly_attached_active = false;
+        let active_switched = active_needs_sync(
+            world.active_terminal_address_ref(),
+            active_addr.as_deref(),
+            attached_has_active,
+            pending_attach_retry.as_ref(),
+        );
+        let can_warm_siblings = first_frame_drawn && !pty_pacer.is_settling();
         if need_sync_terminals
+            || (need_warm_siblings && can_warm_siblings)
             || world.doc_version != last_synced_doc_version
-            || active_needs_sync(
-                world.active_terminal_address_ref(),
-                active_addr.as_deref(),
-                attached_has_active,
-                pending_attach_retry.as_ref(),
-            )
+            || active_switched
         {
+            if active_switched && pending_pty_resize.take().is_some() {
+                prev_term_rect = term_rect;
+                force_clear = true;
+            }
+            let doc_changed = world.doc_version != last_synced_doc_version;
             let prev_addr = active_addr.clone();
             let sync_out = sync_attached_terminals(
                 core,
@@ -4274,12 +4634,17 @@ fn run_app_loop(
                 active_addr,
                 term_rect,
                 &mut scrollback_offset,
-                first_frame_drawn,
+                can_warm_siblings,
                 !matches!(modal, Modal::TabOverview { .. }),
+                pending_pty_resize.is_none(),
             );
             last_synced_doc_version = world.doc_version;
-            newly_attached_active = sync_out.newly_attached_active;
-            need_sync_terminals = sync_out.has_unwarmed_siblings;
+            need_sync_terminals = false;
+            if can_warm_siblings {
+                need_warm_siblings = sync_out.has_unwarmed_siblings;
+            } else if doc_changed || *active_addr != prev_addr {
+                need_warm_siblings = true;
+            }
             if sync_out.active_attach_failed {
                 pending_attach_retry = world
                     .active_terminal_address()
@@ -4294,8 +4659,21 @@ fn run_app_loop(
                 selection_screen = None;
                 selection_vt_seq = None;
                 pty_dirty = false;
-                eink_pacer.reset_on_channel_switch();
+                pty_pacer.reset_on_channel_switch();
                 dirty = true;
+            }
+            if (sync_out.newly_attached_active || sync_out.resized_active)
+                && matches!(modal, Modal::None)
+            {
+                if let Some(ch) = active_addr
+                    .as_deref()
+                    .and_then(|a| attached_map.get(a))
+                    .map(|a| a.channel)
+                {
+                    pty_pacer.arm_settle(ch, Instant::now());
+                    pty_dirty = true;
+                    dirty = false;
+                }
             }
         }
 
@@ -4316,7 +4694,7 @@ fn run_app_loop(
             eink_interval,
             Instant::now(),
             &mut pty_dirty,
-            &mut eink_pacer,
+            &mut pty_pacer,
             &mut dirty,
             &mut last_draw_at,
             &last_eink_snap,
@@ -4326,11 +4704,14 @@ fn run_app_loop(
             &mut scrollback_offset,
             &modal,
             &selection,
+            force_clear,
         );
 
         // When completely idle, block on the unified `AppEvent` channel with zero polling.
         let mut first_event: Option<AppEvent> = None;
-        if !dirty && !more_events && !need_sync_terminals && !newly_attached_active {
+        let pending_sibling_warm =
+            need_warm_siblings && first_frame_drawn && !pty_pacer.is_settling();
+        if !(dirty || more_events || need_sync_terminals || pending_sibling_warm) {
             let now = Instant::now();
             let mut wait_timeout: Option<Duration> = if has_focused_agent {
                 Some(Duration::from_secs(30))
@@ -4343,17 +4724,16 @@ fn run_app_loop(
                 .values()
                 .filter_map(AttachedTerminal::sync_update_deadline)
                 .min();
-            let pty_deadline = if eink_mode && !eink_interval.is_zero() {
-                eink_pacer.next_deadline(pty_dirty, eink_mode, eink_interval, now, last_draw_at)
-            } else {
-                None
-            };
+            let pty_deadline =
+                pty_pacer.next_deadline(pty_dirty, eink_mode, eink_interval, now, last_draw_at);
+            let resize_deadline = pending_pty_resize.map(|r| r.due);
             for deadline in [
                 copied_until,
                 retry_deadline,
                 reader_rpc_deadline,
                 sync_update_deadline,
                 pty_deadline,
+                resize_deadline,
             ]
             .into_iter()
             .flatten()
@@ -4392,7 +4772,26 @@ fn run_app_loop(
                             core.last_pty_input(),
                             &mut dirty,
                             &mut pty_dirty,
-                            &mut eink_pacer,
+                            &mut pty_pacer,
+                        );
+                        flush_due_pty_resize(
+                            core,
+                            world,
+                            attached_map,
+                            active_addr.as_deref(),
+                            after,
+                            cur_size,
+                            *sidebar_open,
+                            sidebar_width,
+                            touch_mode,
+                            &modal,
+                            &mut prev_term_rect,
+                            &mut pending_pty_resize,
+                            &mut need_sync_terminals,
+                            &mut force_clear,
+                            &mut dirty,
+                            &mut pty_dirty,
+                            &mut pty_pacer,
                         );
                         if pending_attach_retry
                             .as_ref()
@@ -4413,16 +4812,12 @@ fn run_app_loop(
             };
         }
 
-        // Drain queued `AppEvent`s BEFORE rendering so initial attach history replays,
-        // rapid PTY output bursts, core events, and mouse drag streams coalesce into a single draw.
+        // Drain queued `AppEvent`s BEFORE rendering so rapid PTY output bursts,
+        // core events, and mouse drag streams coalesce into a single draw.
         let drain_start = Instant::now();
         let mut drained = 0usize;
         more_events = false;
-        let drain_budget = if newly_attached_active {
-            Duration::from_millis(80)
-        } else {
-            Duration::from_millis(12)
-        };
+        let drain_budget = Duration::from_millis(12);
         let mut pending_doc_sync = false;
         let mut pending_lifecycle_sync = false;
         let mut pending_term_refresh = false;
@@ -4431,16 +4826,8 @@ fn run_app_loop(
         loop {
             let next_ev = if let Some(ev) = first_event.take() {
                 Some(ev)
-            } else if drained == 0 && newly_attached_active {
-                flush_credits(core, &mut pending_credits, &mut pending_credit_bytes);
-                app_rx.recv_timeout(Duration::from_millis(30)).ok()
-            } else if let Ok(ev) = app_rx.try_recv() {
-                Some(ev)
-            } else if newly_attached_active && drain_start.elapsed() < drain_budget {
-                flush_credits(core, &mut pending_credits, &mut pending_credit_bytes);
-                app_rx.recv_timeout(Duration::from_millis(4)).ok()
             } else {
-                None
+                app_rx.try_recv().ok()
             };
             let Some(app_ev) = next_ev else {
                 break;
@@ -4456,10 +4843,10 @@ fn run_app_loop(
                             flush_credits(core, &mut pending_credits, &mut pending_credit_bytes);
                         }
                         let is_active = active_channel == Some(channel);
-                        let committed = attached_map
+                        let committed_bytes = attached_map
                             .values_mut()
                             .find(|a| a.channel == channel)
-                            .is_some_and(|att| att.process_vt_bytes_at(&data, Instant::now()));
+                            .map_or(0, |att| att.process_vt_bytes_at(&data, Instant::now()));
                         let mut cleared_vis_sel = false;
                         if is_active && selection.as_ref().is_some_and(|s| !s.active) {
                             cleared_vis_sel = selection
@@ -4470,11 +4857,12 @@ fn run_app_loop(
                             selection_vt_seq = None;
                         }
                         if is_active
-                            && (committed || cleared_vis_sel)
+                            && (committed_bytes > 0 || cleared_vis_sel)
                             && !matches!(modal, Modal::TabOverview { .. } | Modal::Reader { .. })
                         {
                             schedule_active_pty_redraw(
                                 channel,
+                                committed_bytes,
                                 Instant::now(),
                                 eink_mode,
                                 eink_interval,
@@ -4483,7 +4871,7 @@ fn run_app_loop(
                                 core.last_pty_input(),
                                 &mut dirty,
                                 &mut pty_dirty,
-                                &mut eink_pacer,
+                                &mut pty_pacer,
                             );
                         }
                     }
@@ -4555,16 +4943,25 @@ fn run_app_loop(
                     let active_att = active_addr.as_ref().and_then(|a| attached_map.get(a));
                     match ev {
                         Event::Resize(w, h) => {
-                            if w < mobile_threshold {
-                                *sidebar_open = false;
-                            }
-                            page_tap = None;
-                            reader_drag = None;
-                            cur_size = (w, h);
-                            clamp_reader_scroll_on_resize(&mut modal, Rect::new(0, 0, w, h));
-                            need_sync_terminals = true;
-                            force_clear = true;
-                            dirty = true;
+                            handle_resize_event(
+                                w,
+                                h,
+                                Instant::now(),
+                                &mut cur_size,
+                                mobile_threshold,
+                                sidebar_open,
+                                sidebar_width,
+                                touch_mode,
+                                &mut page_tap,
+                                &mut reader_drag,
+                                &mut modal,
+                                attached_map,
+                                active_addr.as_deref(),
+                                &mut pending_pty_resize,
+                                &mut need_sync_terminals,
+                                &mut force_clear,
+                                &mut dirty,
+                            );
                         }
                         Event::Paste(text) => {
                             if !text.is_empty() {
@@ -5333,16 +5730,18 @@ fn run_app_loop(
                                         mev.column.saturating_sub(term_rect.x).saturating_add(1);
                                     let rel_row =
                                         mev.row.saturating_sub(term_rect.y).saturating_add(1);
-                                    if let Some((ch, bytes)) = active_att.and_then(|att| {
-                                        encode_wheel_for_terminal(
-                                            att.parser.screen(),
-                                            true,
-                                            rel_col,
-                                            rel_row,
-                                        )
-                                        .map(|b| (att.channel, b))
-                                    }) {
-                                        core.send_input(ch, &bytes);
+                                    if let Some((ch, supports_auto, bytes)) =
+                                        active_att.and_then(|att| {
+                                            encode_wheel_for_terminal(
+                                                att.parser.screen(),
+                                                true,
+                                                rel_col,
+                                                rel_row,
+                                            )
+                                            .map(|b| (att.channel, att.supports_automatic_input, b))
+                                        })
+                                    {
+                                        core.send_scroll_input(ch, &bytes, supports_auto);
                                     } else {
                                         let prev_scroll = scrollback_offset;
                                         let step =
@@ -5477,16 +5876,18 @@ fn run_app_loop(
                                         mev.column.saturating_sub(term_rect.x).saturating_add(1);
                                     let rel_row =
                                         mev.row.saturating_sub(term_rect.y).saturating_add(1);
-                                    if let Some((ch, bytes)) = active_att.and_then(|att| {
-                                        encode_wheel_for_terminal(
-                                            att.parser.screen(),
-                                            false,
-                                            rel_col,
-                                            rel_row,
-                                        )
-                                        .map(|b| (att.channel, b))
-                                    }) {
-                                        core.send_input(ch, &bytes);
+                                    if let Some((ch, supports_auto, bytes)) =
+                                        active_att.and_then(|att| {
+                                            encode_wheel_for_terminal(
+                                                att.parser.screen(),
+                                                false,
+                                                rel_col,
+                                                rel_row,
+                                            )
+                                            .map(|b| (att.channel, att.supports_automatic_input, b))
+                                        })
+                                    {
+                                        core.send_scroll_input(ch, &bytes, supports_auto);
                                     } else {
                                         let prev_scroll = scrollback_offset;
                                         let step =
@@ -5595,8 +5996,20 @@ fn run_app_loop(
                         active_addr.as_deref(),
                         term_rect,
                         prev_input_seq,
+                        pending_pty_resize.is_some(),
                     ) {
-                        dirty = true;
+                        if matches!(modal, Modal::None) {
+                            if let Some(ch) = active_addr
+                                .as_deref()
+                                .and_then(|a| attached_map.get(a))
+                                .map(|a| a.channel)
+                            {
+                                pty_pacer.arm_settle(ch, Instant::now());
+                                pty_dirty = true;
+                            }
+                        } else {
+                            dirty = true;
+                        }
                     }
 
                     // Break batch early if the active terminal switched so `sync_attached_terminals`
@@ -5669,7 +6082,7 @@ fn run_app_loop(
             .as_ref()
             .is_some_and(|a| attached_map.contains_key(a));
         if !resynced_this_frame
-            && (cur_size != area_size
+            && ((cur_size != area_size && pending_pty_resize.is_none())
                 || active_needs_sync(
                     world.active_terminal_address_ref(),
                     active_addr.as_deref(),
@@ -5748,7 +6161,7 @@ fn run_app_loop(
             eink_interval,
             Instant::now(),
             &mut pty_dirty,
-            &mut eink_pacer,
+            &mut pty_pacer,
             &mut dirty,
             &mut last_draw_at,
             &last_eink_snap,
@@ -5758,6 +6171,7 @@ fn run_app_loop(
             &mut scrollback_offset,
             &modal,
             &selection,
+            force_clear,
         );
 
         let cur_agent = active_addr
@@ -5850,12 +6264,13 @@ fn run_app_loop(
             execute!(terminal.backend_mut(), EndSynchronizedUpdate)?;
             dirty = false;
             pty_dirty = false;
-            eink_pacer.on_promoted_or_drawn();
+            pty_pacer.on_promoted_or_drawn();
             last_draw_at = Some(Instant::now());
             last_eink_snap = geom_eink_snapshot
                 .and_then(|snap| active_addr.as_ref().map(|addr| (addr.clone(), snap)));
             if !first_frame_drawn {
                 first_frame_drawn = true;
+                need_warm_siblings = true;
                 need_sync_terminals = true;
             }
         }
@@ -6666,7 +7081,9 @@ mod tests {
 
     #[test]
     fn wheel_scrolls_main_screen_scrollback_and_forwards_in_alternate_screen() {
-        assert_eq!(ATTACH_HISTORY_LINES, SCROLLBACK_LINES);
+        assert_eq!(ATTACH_HISTORY_LINES, 200);
+        assert_eq!(SIBLING_ATTACH_HISTORY_LINES, 0);
+        assert_eq!(SCROLLBACK_LINES, 2000);
 
         let mut att = AttachedTerminal::new(1, 20, 4);
         for i in 1..=10 {
@@ -9286,7 +9703,7 @@ mod tests {
         let t0 = Instant::now();
         let mut last_draw_at = Some(t0);
         let mut pty_dirty = true;
-        let mut eink_pacer = EinkInputPacer::default();
+        let mut pty_pacer = PtyOutputPacer::default();
         let mut dirty = false;
         let interval = Duration::from_millis(250);
         promote_due_pty_dirty(
@@ -9294,7 +9711,7 @@ mod tests {
             interval,
             t0 + Duration::from_millis(50),
             &mut pty_dirty,
-            &mut eink_pacer,
+            &mut pty_pacer,
             &mut dirty,
             &mut last_draw_at,
             &last_snap,
@@ -9315,7 +9732,7 @@ mod tests {
             interval,
             t1,
             &mut pty_dirty,
-            &mut eink_pacer,
+            &mut pty_pacer,
             &mut dirty,
             &mut last_draw_at,
             &last_snap,
@@ -9341,7 +9758,7 @@ mod tests {
             interval,
             t1 + Duration::from_millis(300),
             &mut pty_dirty,
-            &mut eink_pacer,
+            &mut pty_pacer,
             &mut dirty,
             &mut last_draw_at,
             &last_snap,
@@ -9412,14 +9829,14 @@ mod tests {
         let mut last_draw_at = Some(draw0);
         let mut pty_dirty = true;
         let mut dirty = false;
-        let mut eink_pacer = EinkInputPacer::default();
+        let mut pty_pacer = PtyOutputPacer::default();
         attached_map
             .get_mut("term-1")
             .unwrap()
             .process_vt_bytes(b"a");
-        eink_pacer.record_active_pty_data(9, t_echo1, core.last_pty_input());
+        pty_pacer.record_active_pty_data(9, 1, t_echo1, core.last_pty_input());
         assert_eq!(
-            eink_pacer.next_deadline(pty_dirty, true, interval, t_echo1, last_draw_at),
+            pty_pacer.next_deadline(pty_dirty, true, interval, t_echo1, last_draw_at),
             Some(t_echo1)
         );
         promote_due_pty_dirty(
@@ -9427,7 +9844,7 @@ mod tests {
             interval,
             t_echo1,
             &mut pty_dirty,
-            &mut eink_pacer,
+            &mut pty_pacer,
             &mut dirty,
             &mut last_draw_at,
             &last_snap,
@@ -9442,7 +9859,7 @@ mod tests {
 
         // Simulate completing draw after first echo
         dirty = false;
-        eink_pacer.on_promoted_or_drawn();
+        pty_pacer.on_promoted_or_drawn();
         last_draw_at = Some(t_echo1);
         last_snap = Some((
             "term-1".to_string(),
@@ -9460,9 +9877,9 @@ mod tests {
             .unwrap()
             .process_vt_bytes(b"bc");
         pty_dirty = true;
-        eink_pacer.record_active_pty_data(9, t_follow, core.last_pty_input());
+        pty_pacer.record_active_pty_data(9, 2, t_follow, core.last_pty_input());
         assert_eq!(
-            eink_pacer.next_deadline(pty_dirty, true, interval, t_follow, last_draw_at),
+            pty_pacer.next_deadline(pty_dirty, true, interval, t_follow, last_draw_at),
             Some(t_echo1 + EINK_INPUT_FOLLOWUP_INTERVAL)
         );
         promote_due_pty_dirty(
@@ -9470,7 +9887,7 @@ mod tests {
             interval,
             t_follow,
             &mut pty_dirty,
-            &mut eink_pacer,
+            &mut pty_pacer,
             &mut dirty,
             &mut last_draw_at,
             &last_snap,
@@ -9488,7 +9905,7 @@ mod tests {
             interval,
             t_follow_due,
             &mut pty_dirty,
-            &mut eink_pacer,
+            &mut pty_pacer,
             &mut dirty,
             &mut last_draw_at,
             &last_snap,
@@ -9503,7 +9920,7 @@ mod tests {
 
         // Complete follow-up draw and capture updated snapshot
         dirty = false;
-        eink_pacer.on_promoted_or_drawn();
+        pty_pacer.on_promoted_or_drawn();
         last_draw_at = Some(t_follow_due);
         last_snap = Some((
             "term-1".to_string(),
@@ -9545,13 +9962,13 @@ mod tests {
             .unwrap()
             .process_vt_bytes(b"\x1b[?25l\x1b[?25h");
         pty_dirty = true;
-        eink_pacer.record_active_pty_data(9, t_noop, core.last_pty_input());
+        pty_pacer.record_active_pty_data(9, 12, t_noop, core.last_pty_input());
         promote_due_pty_dirty(
             true,
             interval,
             t_noop,
             &mut pty_dirty,
-            &mut eink_pacer,
+            &mut pty_pacer,
             &mut dirty,
             &mut last_draw_at,
             &last_snap,
@@ -9572,9 +9989,9 @@ mod tests {
             .unwrap()
             .process_vt_bytes(b"\x1b[D");
         pty_dirty = true;
-        eink_pacer.record_active_pty_data(9, t_cursor, core.last_pty_input());
+        pty_pacer.record_active_pty_data(9, 3, t_cursor, core.last_pty_input());
         assert_eq!(
-            eink_pacer.next_deadline(pty_dirty, true, interval, t_cursor, last_draw_at),
+            pty_pacer.next_deadline(pty_dirty, true, interval, t_cursor, last_draw_at),
             Some(t_cursor)
         );
         promote_due_pty_dirty(
@@ -9582,7 +9999,7 @@ mod tests {
             interval,
             t_cursor,
             &mut pty_dirty,
-            &mut eink_pacer,
+            &mut pty_pacer,
             &mut dirty,
             &mut last_draw_at,
             &last_snap,
@@ -9598,16 +10015,16 @@ mod tests {
         // 4. Passive output 300ms after input (> 200ms window) is throttled by full eink_interval
         dirty = false;
         pty_dirty = true;
-        eink_pacer.on_promoted_or_drawn();
+        pty_pacer.on_promoted_or_drawn();
         last_draw_at = Some(t_cursor);
         let t_passive = inp2.at + Duration::from_millis(300);
         attached_map
             .get_mut("term-1")
             .unwrap()
             .process_vt_bytes(b"\r\npassive");
-        eink_pacer.record_active_pty_data(9, t_passive, core.last_pty_input());
+        pty_pacer.record_active_pty_data(9, 9, t_passive, core.last_pty_input());
         assert_eq!(
-            eink_pacer.next_deadline(pty_dirty, true, interval, t_passive, last_draw_at),
+            pty_pacer.next_deadline(pty_dirty, true, interval, t_passive, last_draw_at),
             Some(t_cursor + interval)
         );
         promote_due_pty_dirty(
@@ -9615,7 +10032,7 @@ mod tests {
             interval,
             t_passive,
             &mut pty_dirty,
-            &mut eink_pacer,
+            &mut pty_pacer,
             &mut dirty,
             &mut last_draw_at,
             &last_snap,
@@ -10791,7 +11208,7 @@ mod tests {
         map.insert("t1".to_string(), att3);
         let now = Instant::now();
         let mut pty_dirty = true;
-        let mut pacer = EinkInputPacer::default();
+        let mut pacer = PtyOutputPacer::default();
         let mut dirty = false;
         let mut last_draw_at = Some(now - Duration::from_secs(1));
         let mut sb = 0usize;
@@ -10812,6 +11229,7 @@ mod tests {
             &mut sb,
             &Modal::None,
             &None,
+            false,
         );
         assert!(
             dirty,
@@ -11302,14 +11720,14 @@ mod tests {
         // 1. Chunk 1 opens `?2026h`, writes longer text and leaves cursor at tail `(0, 10)`
         let committed_1 =
             att.process_vt_bytes_at("\x1b[?2026h\x1b[1;1H> 你好世界\x1b[1;11H".as_bytes(), t0);
-        assert!(!committed_1);
+        assert_eq!(committed_1, 0);
         assert_eq!(att.parser.screen().cursor_position(), (0, 4));
         assert_eq!(att.sync_update_deadline(), Some(t0 + SYNC_UPDATE_TIMEOUT));
 
         // 2. Chunk 2 restores middle cursor `(0, 4)` and closes `?2026l`
         let committed_2 =
             att.process_vt_bytes_at(b"\x1b[1;5H\x1b[?2026l", t0 + Duration::from_millis(5));
-        assert!(committed_2);
+        assert!(committed_2 > 0);
         assert_eq!(att.parser.screen().cursor_position(), (0, 4));
         assert_eq!(att.sync_update_deadline(), None);
         assert_eq!(
@@ -11317,17 +11735,19 @@ mod tests {
             "> 你好世界"
         );
 
-        // 3. Unclosed `?2026h` flushes safely after SYNC_UPDATE_TIMEOUT in Normal mode
+        // 3. Unclosed `?2026h` flushes safely after SYNC_UPDATE_TIMEOUT and routes through PtyOutputPacer in Normal mode
         let mut map = BTreeMap::new();
         map.insert("t1".to_string(), att);
         let t1 = t0 + Duration::from_millis(20);
-        assert!(!map
-            .get_mut("t1")
-            .unwrap()
-            .process_vt_bytes_at(b"\x1b[?2026h\x1b[2;1Hlate", t1));
+        assert_eq!(
+            map.get_mut("t1")
+                .unwrap()
+                .process_vt_bytes_at(b"\x1b[?2026h\x1b[2;1Hlate", t1),
+            0
+        );
         let mut dirty = false;
         let mut pty_dirty = false;
-        let mut eink_pacer = EinkInputPacer::default();
+        let mut pty_pacer = PtyOutputPacer::default();
         let interval = Duration::from_millis(250);
         flush_expired_sync_updates(
             &mut map,
@@ -11340,16 +11760,17 @@ mod tests {
             None,
             &mut dirty,
             &mut pty_dirty,
-            &mut eink_pacer,
+            &mut pty_pacer,
         );
         assert!(!dirty);
         assert!(!pty_dirty);
         assert!(map["t1"].sync_update_deadline().is_some());
 
+        let flush_normal = t1 + SYNC_UPDATE_TIMEOUT;
         flush_expired_sync_updates(
             &mut map,
             Some("t1"),
-            t1 + SYNC_UPDATE_TIMEOUT,
+            flush_normal,
             &Modal::None,
             false,
             interval,
@@ -11357,21 +11778,47 @@ mod tests {
             None,
             &mut dirty,
             &mut pty_dirty,
-            &mut eink_pacer,
+            &mut pty_pacer,
         );
-        assert!(dirty);
+        assert!(pty_dirty);
         assert_eq!(map["t1"].sync_update_deadline(), None);
         assert_eq!(
             map["t1"].parser.screen().contents_between(1, 0, 1, 4),
             "late"
         );
+        let mut last_draw_at = None;
+        let mut sb = 0usize;
+        promote_due_pty_dirty_with_color(
+            false,
+            false,
+            interval,
+            flush_normal,
+            &mut pty_dirty,
+            &mut pty_pacer,
+            &mut dirty,
+            &mut last_draw_at,
+            &None,
+            Some("t1"),
+            &mut map,
+            Rect::new(0, 1, 40, 6),
+            &mut sb,
+            &Modal::None,
+            &None,
+            false,
+        );
+        assert!(
+            dirty,
+            "small flushed frame in Normal mode promotes immediately when no prior draw"
+        );
 
-        // 3b. In E-Ink mode, timeout flush routes through `pty_dirty` + `EinkInputPacer`
-        let t2 = t1 + SYNC_UPDATE_TIMEOUT + Duration::from_millis(5);
-        assert!(!map
-            .get_mut("t1")
-            .unwrap()
-            .process_vt_bytes_at(b"\x1b[?2026h\x1b[3;1Hslow-eink", t2));
+        // 3b. In E-Ink mode, timeout flush routes through `pty_dirty` + `PtyOutputPacer`
+        let t2 = flush_normal + Duration::from_millis(5);
+        assert_eq!(
+            map.get_mut("t1")
+                .unwrap()
+                .process_vt_bytes_at(b"\x1b[?2026h\x1b[3;1Hslow-eink", t2),
+            0
+        );
         dirty = false;
         pty_dirty = false;
         let flush_at = t2 + SYNC_UPDATE_TIMEOUT;
@@ -11386,12 +11833,12 @@ mod tests {
             None,
             &mut dirty,
             &mut pty_dirty,
-            &mut eink_pacer,
+            &mut pty_pacer,
         );
         assert!(!dirty);
         assert!(pty_dirty);
         assert_eq!(
-            eink_pacer.next_deadline(pty_dirty, true, interval, flush_at, Some(t0)),
+            pty_pacer.next_deadline(pty_dirty, true, interval, flush_at, Some(t0)),
             Some(t0 + interval)
         );
         assert_eq!(
@@ -11401,12 +11848,15 @@ mod tests {
 
         // 4. Stray `?2026l` (e.g. attach replay reset) commits immediately without stalling
         let mut stray = AttachedTerminal::new(2, 30, 5);
-        assert!(stray.process_vt_bytes_at(b"\x1b[?2026l\x1b[1;3Hok", t0));
+        assert!(stray.process_vt_bytes_at(b"\x1b[?2026l\x1b[1;3Hok", t0) > 0);
         assert_eq!(stray.sync_update_deadline(), None);
         assert_eq!(stray.parser.screen().cursor_position(), (0, 4));
 
         // 5. Resize flushes pending sync buffer before applying the new parser dimensions
-        assert!(!stray.process_vt_bytes_at(b"\x1b[?2026h\x1b[2;1Hpre-resize", t0));
+        assert_eq!(
+            stray.process_vt_bytes_at(b"\x1b[?2026h\x1b[2;1Hpre-resize", t0),
+            0
+        );
         assert!(stray.sync_update_deadline().is_some());
         stray.resize(40, 8);
         assert_eq!(stray.sync_update_deadline(), None);
@@ -11417,11 +11867,11 @@ mod tests {
 
         // 6. Strict `SYNC_UPDATE_MAX_BYTES` cap flushes without allocating past the cap
         let mut capped = AttachedTerminal::new(3, 40, 6);
-        assert!(!capped.process_vt_bytes_at(b"\x1b[?2026h\x1b[1;1H", t0));
+        assert_eq!(capped.process_vt_bytes_at(b"\x1b[?2026h\x1b[1;1H", t0), 0);
         let mut huge = vec![b'x'; SYNC_UPDATE_MAX_BYTES + 1024];
         huge.splice(0..0, b"\x1b[2;1H".iter().copied());
         huge.extend_from_slice(b"\x1b[3;1Htail");
-        assert!(capped.process_vt_bytes_at(&huge, t0));
+        assert!(capped.process_vt_bytes_at(&huge, t0) >= SYNC_UPDATE_MAX_BYTES);
         assert_eq!(capped.sync_update_deadline(), None);
         assert!(capped.sync_update_buf.is_empty());
         assert!(capped.sync_update_buf.capacity() < SYNC_UPDATE_MAX_BYTES);
@@ -11460,7 +11910,35 @@ mod tests {
             Some("t1"),
             term_rect,
             prev_seq,
+            false,
         ));
+
+        // Scroll-only input (`send_scroll_input`) must NOT reclaim PTY size
+        core.send_scroll_input(7, b"\x1b[<64;10;3M", true);
+        assert!(!reclaim_active_pty_size_on_input(
+            &core,
+            &mut world,
+            &mut attached_map,
+            Some("t1"),
+            term_rect,
+            prev_seq,
+            false,
+        ));
+        assert_eq!((attached_map["t1"].cols, attached_map["t1"].rows), (68, 23));
+
+        // Pending resize debounce also suppresses reclaim even for real typing input
+        let scroll_seq = core.last_pty_input().map(|i| i.seq);
+        core.send_input(7, b"x");
+        assert!(!reclaim_active_pty_size_on_input(
+            &core,
+            &mut world,
+            &mut attached_map,
+            Some("t1"),
+            term_rect,
+            scroll_seq,
+            true,
+        ));
+        assert_eq!((attached_map["t1"].cols, attached_map["t1"].rows), (68, 23));
 
         // Local input on active channel reclaims `(140, 51)` even though `client_cols`/`client_rows` already matched
         core.send_input(7, b"a");
@@ -11470,7 +11948,8 @@ mod tests {
             &mut attached_map,
             Some("t1"),
             term_rect,
-            prev_seq,
+            scroll_seq,
+            false,
         ));
         assert_eq!(
             (attached_map["t1"].cols, attached_map["t1"].rows),
@@ -11498,7 +11977,351 @@ mod tests {
             Some("t1"),
             term_rect,
             next_seq,
+            false,
         ));
+    }
+
+    #[test]
+    fn pty_output_pacer_absorbs_bursts_and_caps_normal_mode_fps() {
+        let core = CoreClient::dummy_for_tests();
+        let mut pacer = PtyOutputPacer::default();
+        let t0 = Instant::now();
+        let eink_interval = Duration::from_millis(250);
+
+        // 1. Normal mode: interactive echo promotes immediately (0ms), passive output is capped at 33ms
+        core.send_input(3, b"x");
+        let inp = core.last_pty_input().unwrap();
+        let t_echo = inp.at + Duration::from_millis(2);
+        pacer.record_active_pty_data(3, 1, t_echo, Some(inp));
+        assert_eq!(
+            pacer.next_deadline(true, false, eink_interval, t_echo, Some(inp.at)),
+            Some(t_echo)
+        );
+        pacer.on_promoted_or_drawn();
+
+        let t_passive = inp.at + Duration::from_millis(300);
+        pacer.record_active_pty_data(3, 64, t_passive, Some(inp));
+        assert_eq!(
+            pacer.next_deadline(true, false, eink_interval, t_passive, Some(t_echo)),
+            Some(t_echo + NORMAL_PASSIVE_FRAME_INTERVAL)
+        );
+        pacer.on_promoted_or_drawn();
+
+        // 2. Bulk burst (>= 8 KiB) holds in both Normal and E-Ink modes for quiet window up to BURST_MAX_HOLD
+        let t_burst = t_passive + Duration::from_secs(5);
+        pacer.record_active_pty_data(3, 4096, t_burst, Some(inp));
+        assert!(!pacer.is_settling());
+        pacer.record_active_pty_data(3, 4096, t_burst + Duration::from_millis(10), Some(inp));
+        assert!(pacer.is_settling());
+        assert_eq!(
+            pacer.next_deadline(
+                true,
+                false,
+                eink_interval,
+                t_burst + Duration::from_millis(10),
+                Some(t0)
+            ),
+            Some(t_burst + Duration::from_millis(10) + BURST_QUIET_WINDOW)
+        );
+        // E-Ink mode honors max(burst_deadline, pace_deadline)
+        assert_eq!(
+            pacer.next_deadline(
+                true,
+                true,
+                eink_interval,
+                t_burst + Duration::from_millis(10),
+                Some(t_burst + Duration::from_millis(5))
+            ),
+            Some(t_burst + Duration::from_millis(5) + eink_interval)
+        );
+
+        // Continuous chunks cannot delay past BURST_MAX_HOLD
+        let t_late = t_burst + BURST_MAX_HOLD - Duration::from_millis(10);
+        pacer.record_active_pty_data(3, 2048, t_late, Some(inp));
+        assert_eq!(
+            pacer.next_deadline(true, false, eink_interval, t_late, Some(t0)),
+            Some(t_burst + Duration::from_millis(10) + BURST_MAX_HOLD)
+        );
+        pacer.on_promoted_or_drawn();
+        assert!(!pacer.is_settling());
+
+        // 3. Post-attach/resize settle holds small chunks for 60ms quiet / 350ms max
+        let t_settle = t_late + Duration::from_secs(1);
+        pacer.arm_settle(3, t_settle);
+        assert!(pacer.is_settling());
+        assert_eq!(
+            pacer.next_deadline(true, false, eink_interval, t_settle, Some(t0)),
+            Some(t_settle + SETTLE_QUIET_WINDOW)
+        );
+        pacer.record_active_pty_data(3, 512, t_settle + Duration::from_millis(20), Some(inp));
+        assert_eq!(
+            pacer.next_deadline(
+                true,
+                false,
+                eink_interval,
+                t_settle + Duration::from_millis(20),
+                Some(t0)
+            ),
+            Some(t_settle + Duration::from_millis(20) + SETTLE_QUIET_WINDOW)
+        );
+        let t_settle_cap = t_settle + SETTLE_MAX_HOLD - Duration::from_millis(5);
+        pacer.record_active_pty_data(3, 512, t_settle_cap, Some(inp));
+        assert_eq!(
+            pacer.next_deadline(true, false, eink_interval, t_settle_cap, Some(t0)),
+            Some(t_settle + SETTLE_MAX_HOLD)
+        );
+
+        // A brand-new keystroke after settle started with tiny output (< 8 KiB) breaks settle immediately
+        let settle_before_key = Instant::now() - Duration::from_millis(10);
+        pacer.arm_settle(3, settle_before_key);
+        core.send_input(3, b"k");
+        let inp_after = core.last_pty_input().unwrap();
+        assert!(inp_after.at > settle_before_key);
+        let t_key_echo = inp_after.at + Duration::from_millis(2);
+        pacer.record_active_pty_data(3, 1, t_key_echo, Some(inp_after));
+        assert!(!pacer.is_settling());
+        assert_eq!(
+            pacer.next_deadline(true, false, eink_interval, t_key_echo, Some(inp_after.at)),
+            Some(t_key_echo)
+        );
+    }
+
+    #[test]
+    fn resize_debounce_coalesces_animated_resizes_cancels_bounce_back_and_arms_settle() {
+        use crate::model::{make_single_terminal_tab, SharedSpace, TerminalInfo};
+
+        let core = CoreClient::dummy_for_tests();
+        let mut world = World::default();
+        world.doc.spaces.push(SharedSpace {
+            id: "sp1".to_string(),
+            name: "main".to_string(),
+            tabs: vec![make_single_terminal_tab("tab1", "agent", "t1")],
+            ..Default::default()
+        });
+        world.terminals.insert(
+            "t1".to_string(),
+            TerminalInfo {
+                address: "t1".to_string(),
+                state: "live".to_string(),
+                cols: 80,
+                rows: 22,
+                ..Default::default()
+            },
+        );
+        let mut attached_map = BTreeMap::new();
+        attached_map.insert(
+            "t1".to_string(),
+            AttachedTerminal::new_with_client_size(7, 80, 22, 80, 22),
+        );
+
+        let mut cur_size = (80u16, 24u16);
+        let mut sidebar_open = false;
+        let mut page_tap = None;
+        let mut reader_drag = None;
+        let mut modal = Modal::None;
+        let mut prev_term_rect = compute_terminal_rect(Rect::new(0, 0, 80, 24), false, 24, false);
+        let mut pending_pty_resize = None;
+        let mut need_sync_terminals = false;
+        let mut force_clear = false;
+        let mut dirty = false;
+        let mut pty_dirty = false;
+        let mut pty_pacer = PtyOutputPacer::default();
+        let t0 = Instant::now();
+
+        // 1. Rapid animated resize steps coalesce into a single pending resize without touching PTY
+        handle_resize_event(
+            80,
+            20,
+            t0,
+            &mut cur_size,
+            60,
+            &mut sidebar_open,
+            24,
+            false,
+            &mut page_tap,
+            &mut reader_drag,
+            &mut modal,
+            &attached_map,
+            Some("t1"),
+            &mut pending_pty_resize,
+            &mut need_sync_terminals,
+            &mut force_clear,
+            &mut dirty,
+        );
+        assert_eq!(
+            pending_pty_resize,
+            Some(PendingPtyResize {
+                cols: 80,
+                rows: 18,
+                due: t0 + RESIZE_DEBOUNCE,
+            })
+        );
+        assert!(!dirty);
+        assert!(!force_clear);
+
+        handle_resize_event(
+            80,
+            15,
+            t0 + Duration::from_millis(40),
+            &mut cur_size,
+            60,
+            &mut sidebar_open,
+            24,
+            false,
+            &mut page_tap,
+            &mut reader_drag,
+            &mut modal,
+            &attached_map,
+            Some("t1"),
+            &mut pending_pty_resize,
+            &mut need_sync_terminals,
+            &mut force_clear,
+            &mut dirty,
+        );
+        assert_eq!(
+            pending_pty_resize,
+            Some(PendingPtyResize {
+                cols: 80,
+                rows: 13,
+                due: t0 + Duration::from_millis(40) + RESIZE_DEBOUNCE,
+            })
+        );
+        assert_eq!((attached_map["t1"].cols, attached_map["t1"].rows), (80, 22));
+
+        // 2. Bounce-back to original size cancels PTY debounce (zero SIGWINCH) while repainting outer viewport
+        handle_resize_event(
+            80,
+            24,
+            t0 + Duration::from_millis(60),
+            &mut cur_size,
+            60,
+            &mut sidebar_open,
+            24,
+            false,
+            &mut page_tap,
+            &mut reader_drag,
+            &mut modal,
+            &attached_map,
+            Some("t1"),
+            &mut pending_pty_resize,
+            &mut need_sync_terminals,
+            &mut force_clear,
+            &mut dirty,
+        );
+        assert_eq!(pending_pty_resize, None);
+        assert!(dirty);
+        assert!(force_clear);
+        assert_eq!((attached_map["t1"].cols, attached_map["t1"].rows), (80, 22));
+        force_clear = false;
+        dirty = false;
+
+        // 3. Settled resize applies once after RESIZE_DEBOUNCE, sets force_clear, and arms settle
+        let t1 = t0 + Duration::from_millis(100);
+        handle_resize_event(
+            80,
+            15,
+            t1,
+            &mut cur_size,
+            60,
+            &mut sidebar_open,
+            24,
+            false,
+            &mut page_tap,
+            &mut reader_drag,
+            &mut modal,
+            &attached_map,
+            Some("t1"),
+            &mut pending_pty_resize,
+            &mut need_sync_terminals,
+            &mut force_clear,
+            &mut dirty,
+        );
+        assert!(pending_pty_resize.is_some());
+
+        // Not yet due -> no-op
+        flush_due_pty_resize(
+            &core,
+            &mut world,
+            &mut attached_map,
+            Some("t1"),
+            t1 + RESIZE_DEBOUNCE - Duration::from_millis(1),
+            cur_size,
+            sidebar_open,
+            24,
+            false,
+            &modal,
+            &mut prev_term_rect,
+            &mut pending_pty_resize,
+            &mut need_sync_terminals,
+            &mut force_clear,
+            &mut dirty,
+            &mut pty_dirty,
+            &mut pty_pacer,
+        );
+        assert!(pending_pty_resize.is_some());
+        assert_eq!((attached_map["t1"].cols, attached_map["t1"].rows), (80, 22));
+
+        // Due -> applies resize once and arms settle
+        let due_at = t1 + RESIZE_DEBOUNCE;
+        flush_due_pty_resize(
+            &core,
+            &mut world,
+            &mut attached_map,
+            Some("t1"),
+            due_at,
+            cur_size,
+            sidebar_open,
+            24,
+            false,
+            &modal,
+            &mut prev_term_rect,
+            &mut pending_pty_resize,
+            &mut need_sync_terminals,
+            &mut force_clear,
+            &mut dirty,
+            &mut pty_dirty,
+            &mut pty_pacer,
+        );
+        assert_eq!(pending_pty_resize, None);
+        assert_eq!(prev_term_rect, Rect::new(0, 1, 80, 13));
+        assert_eq!((attached_map["t1"].cols, attached_map["t1"].rows), (80, 13));
+        assert_eq!(
+            (world.terminals["t1"].cols, world.terminals["t1"].rows),
+            (80, 13)
+        );
+        assert!(force_clear);
+        assert!(pty_dirty);
+        assert!(!dirty);
+        assert!(pty_pacer.is_settling());
+
+        // E-Ink zero-diff elision must NOT drop the post-resize redraw when force_clear is true
+        let snap =
+            capture_eink_screen_snapshot(attached_map["t1"].parser.screen(), prev_term_rect, 0);
+        let last_snap = Some(("t1".to_string(), snap));
+        let mut last_draw_at = Some(t0);
+        let mut sb = 0usize;
+        promote_due_pty_dirty_with_color(
+            true,
+            false,
+            Duration::from_millis(10),
+            due_at + SETTLE_QUIET_WINDOW,
+            &mut pty_dirty,
+            &mut pty_pacer,
+            &mut dirty,
+            &mut last_draw_at,
+            &last_snap,
+            Some("t1"),
+            &mut attached_map,
+            prev_term_rect,
+            &mut sb,
+            &modal,
+            &None,
+            force_clear,
+        );
+        assert!(
+            dirty,
+            "post-resize force_clear must bypass E-Ink zero-diff elision"
+        );
     }
 
     #[test]
@@ -11570,5 +12393,29 @@ mod tests {
         att_g.process_vt_bytes("\x1bc\x1b[1;1H⚠\u{FE0F}b".as_bytes());
         assert_eq!(att_g.parser.screen().cursor_position(), (0, 3));
         assert_eq!(att_g.parser.screen().cell(0, 2).unwrap().contents(), "b");
+    }
+
+    #[test]
+    fn prewarmed_sibling_promotion_hydrates_zero_history_unless_local_scrollback_filled() {
+        // 1. Pre-warmed zero-history sibling with < ATTACH_HISTORY_LINES local scrollback
+        let mut cold_sib =
+            AttachedTerminal::new_with_capabilities(10, 80, 10, 80, 10, false, false);
+        assert!(!should_reattach_for_history(&mut cold_sib, false));
+        assert!(should_reattach_for_history(&mut cold_sib, true));
+
+        // 2. Sibling that accumulated >= ATTACH_HISTORY_LINES locally skips reattach & preserves scrollback
+        let mut warm_sib =
+            AttachedTerminal::new_with_capabilities(11, 80, 10, 80, 10, false, false);
+        for i in 0..(ATTACH_HISTORY_LINES + 20) {
+            warm_sib.process_vt_bytes(format!("line {i}\r\n").as_bytes());
+        }
+        warm_sib.parser.screen_mut().set_scrollback(7);
+        assert!(!should_reattach_for_history(&mut warm_sib, true));
+        assert!(warm_sib.has_attach_history);
+        assert_eq!(warm_sib.parser.screen().scrollback(), 7);
+
+        // 3. Terminal already attached with history never triggers reattach
+        let mut hydrated = AttachedTerminal::new_with_capabilities(12, 80, 10, 80, 10, false, true);
+        assert!(!should_reattach_for_history(&mut hydrated, true));
     }
 }
