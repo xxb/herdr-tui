@@ -77,6 +77,7 @@ pub struct LastPtyInput {
     pub seq: u64,
     pub channel: u32,
     pub at: Instant,
+    pub reclaims_size: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +85,7 @@ pub struct AttachedChannelInfo {
     pub channel: u32,
     pub cols: Option<u16>,
     pub rows: Option<u16>,
+    pub automatic_input: bool,
 }
 
 fn parse_attach_channel_info(result: &Value) -> Result<AttachedChannelInfo> {
@@ -103,10 +105,15 @@ fn parse_attach_channel_info(result: &Value) -> Result<AttachedChannelInfo> {
         .and_then(Value::as_u64)
         .and_then(|v| u16::try_from(v).ok())
         .filter(|&v| v > 0);
+    let automatic_input = result
+        .get("automatic_input")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     Ok(AttachedChannelInfo {
         channel: ch,
         cols,
         rows,
+        automatic_input,
     })
 }
 
@@ -481,12 +488,17 @@ impl CoreClient {
         let _ = w.flush();
     }
 
-    /// Send input bytes to an attached terminal channel.
-    pub fn send_input(&self, channel: u32, bytes: &[u8]) {
+    fn send_input_with_options(
+        &self,
+        channel: u32,
+        bytes: &[u8],
+        frame_kind: u8,
+        reclaims_size: bool,
+    ) {
         if bytes.is_empty() {
             return;
         }
-        if self.send_frame(channel, wire::DATA, bytes).is_ok() {
+        if self.send_frame(channel, frame_kind, bytes).is_ok() {
             let mut guard = self
                 .last_pty_input
                 .lock()
@@ -496,8 +508,25 @@ impl CoreClient {
                 seq: next_seq,
                 channel,
                 at: Instant::now(),
+                reclaims_size,
             });
         }
+    }
+
+    /// Send input bytes to an attached terminal channel.
+    pub fn send_input(&self, channel: u32, bytes: &[u8]) {
+        self.send_input_with_options(channel, bytes, wire::DATA, true);
+    }
+
+    /// Send scroll-only bytes (e.g. wheel or page scroll in alt-screen) without
+    /// reclaiming PTY size, using `AUTOMATIC_INPUT` when supported by `herdr-core`.
+    pub fn send_scroll_input(&self, channel: u32, bytes: &[u8], use_automatic_input: bool) {
+        let frame_kind = if use_automatic_input {
+            wire::AUTOMATIC_INPUT
+        } else {
+            wire::DATA
+        };
+        self.send_input_with_options(channel, bytes, frame_kind, false);
     }
 
     /// Snapshot of the most recent user-forwarded PTY input chunk.
@@ -766,6 +795,7 @@ mod tests {
     fn parses_attach_channel_info_with_and_without_terminal_size() {
         let full = json!({
             "channel": 9,
+            "automatic_input": true,
             "terminal": { "address": "t1", "cols": 80, "rows": 24 }
         });
         assert_eq!(
@@ -774,6 +804,7 @@ mod tests {
                 channel: 9,
                 cols: Some(80),
                 rows: Some(24),
+                automatic_input: true,
             }
         );
 
@@ -787,10 +818,40 @@ mod tests {
                 channel: 3,
                 cols: None,
                 rows: Some(40),
+                automatic_input: false,
             }
         );
 
         let missing_channel = json!({ "terminal": { "cols": 80, "rows": 24 } });
         assert!(parse_attach_channel_info(&missing_channel).is_err());
+    }
+
+    #[test]
+    fn send_input_vs_send_scroll_input_tracks_reclaims_size() {
+        let core = CoreClient::dummy_for_tests();
+        assert_eq!(core.last_pty_input(), None);
+
+        core.send_input(5, b"a");
+        let inp1 = core
+            .last_pty_input()
+            .expect("send_input records LastPtyInput");
+        assert_eq!(inp1.channel, 5);
+        assert!(inp1.reclaims_size);
+
+        core.send_scroll_input(5, b"\x1b[5~", true);
+        let inp2 = core
+            .last_pty_input()
+            .expect("send_scroll_input records LastPtyInput");
+        assert_eq!(inp2.channel, 5);
+        assert!(inp2.seq > inp1.seq);
+        assert!(!inp2.reclaims_size);
+
+        core.send_scroll_input(5, b"\x1b[6~", false);
+        let inp3 = core
+            .last_pty_input()
+            .expect("fallback DATA scroll input records LastPtyInput");
+        assert_eq!(inp3.channel, 5);
+        assert!(inp3.seq > inp2.seq);
+        assert!(!inp3.reclaims_size);
     }
 }
