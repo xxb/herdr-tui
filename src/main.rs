@@ -532,6 +532,7 @@ struct AttachedTerminal {
     client_cols: u16,
     client_rows: u16,
     supports_automatic_input: bool,
+    has_attach_history: bool,
     utf8_tail: Vec<u8>,
     sanitize_ctrl_str: Option<ControlStringKind>,
     feed_ctrl_str: Option<ControlStringKind>,
@@ -559,7 +560,7 @@ fn non_zero_u16(v: u16) -> std::num::NonZeroU16 {
 impl AttachedTerminal {
     #[allow(dead_code)]
     fn new(channel: u32, cols: u16, rows: u16) -> Self {
-        Self::new_with_capabilities(channel, cols, rows, cols, rows, false)
+        Self::new_with_capabilities(channel, cols, rows, cols, rows, false, true)
     }
 
     #[allow(dead_code)]
@@ -570,7 +571,7 @@ impl AttachedTerminal {
         client_cols: u16,
         client_rows: u16,
     ) -> Self {
-        Self::new_with_capabilities(channel, cols, rows, client_cols, client_rows, false)
+        Self::new_with_capabilities(channel, cols, rows, client_cols, client_rows, false, true)
     }
 
     fn new_with_capabilities(
@@ -580,6 +581,7 @@ impl AttachedTerminal {
         client_cols: u16,
         client_rows: u16,
         supports_automatic_input: bool,
+        has_attach_history: bool,
     ) -> Self {
         Self {
             channel,
@@ -589,6 +591,7 @@ impl AttachedTerminal {
             client_cols,
             client_rows,
             supports_automatic_input,
+            has_attach_history,
             utf8_tail: Vec::new(),
             sanitize_ctrl_str: None,
             feed_ctrl_str: None,
@@ -2942,6 +2945,25 @@ fn reclaim_active_pty_size_on_input(
     true
 }
 
+fn parser_scrollback_len(parser: &mut vt100::Parser) -> usize {
+    let prev = parser.screen().scrollback();
+    parser.screen_mut().set_scrollback(usize::MAX);
+    let max_sb = parser.screen().scrollback();
+    parser.screen_mut().set_scrollback(prev);
+    max_sb
+}
+
+fn should_reattach_for_history(att: &mut AttachedTerminal, switching_active: bool) -> bool {
+    if !switching_active || att.has_attach_history {
+        return false;
+    }
+    if parser_scrollback_len(&mut att.parser) >= ATTACH_HISTORY_LINES {
+        att.has_attach_history = true;
+        return false;
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 fn sync_attached_terminals(
     core: &CoreClient,
@@ -2980,27 +3002,60 @@ fn sync_attached_terminals(
     if let Some(ref addr) = want_addr {
         if let Some(cur) = attached_map.get_mut(addr) {
             let switching_active = active_addr.as_ref() != Some(addr);
-            let viewport_changed = cur.client_cols != cols || cur.client_rows != rows;
-            if (allow_active_resize && viewport_changed)
-                || (switching_active && (cur.cols != cols || cur.rows != rows))
-            {
-                cur.client_cols = cols;
-                cur.client_rows = rows;
-                cur.resize(cols, rows);
-                core.resize_channel(cur.channel, cols, rows);
-                if let Some(info) = world.terminals.get_mut(addr) {
-                    info.cols = cols;
-                    info.rows = rows;
+            let mut hydrated = false;
+            if should_reattach_for_history(cur, switching_active) {
+                if let Ok(attach_info) =
+                    core.attach_terminal(addr, cols, rows, ATTACH_HISTORY_LINES, false)
+                {
+                    let old_channel = cur.channel;
+                    let pty_cols = attach_info.cols.unwrap_or(cols);
+                    let pty_rows = attach_info.rows.unwrap_or(rows);
+                    core.set_focus(attach_info.channel, true);
+                    core.detach_channel(old_channel);
+                    *cur = AttachedTerminal::new_with_capabilities(
+                        attach_info.channel,
+                        pty_cols,
+                        pty_rows,
+                        cols,
+                        rows,
+                        attach_info.automatic_input,
+                        true,
+                    );
+                    if let Some(info) = world.terminals.get_mut(addr) {
+                        info.cols = pty_cols;
+                        info.rows = pty_rows;
+                    }
+                    if mark_seen {
+                        world.mark_active_seen(core);
+                    }
+                    outcome.newly_attached_active = true;
+                    resolved_active = Some(addr.clone());
+                    hydrated = true;
                 }
-                outcome.resized_active = true;
             }
-            if switching_active {
-                core.set_focus(cur.channel, true);
-                if mark_seen {
-                    world.mark_active_seen(core);
+            if !hydrated {
+                let viewport_changed = cur.client_cols != cols || cur.client_rows != rows;
+                if (allow_active_resize && viewport_changed)
+                    || (switching_active && (cur.cols != cols || cur.rows != rows))
+                {
+                    cur.client_cols = cols;
+                    cur.client_rows = rows;
+                    cur.resize(cols, rows);
+                    core.resize_channel(cur.channel, cols, rows);
+                    if let Some(info) = world.terminals.get_mut(addr) {
+                        info.cols = cols;
+                        info.rows = rows;
+                    }
+                    outcome.resized_active = true;
                 }
+                if switching_active {
+                    core.set_focus(cur.channel, true);
+                    if mark_seen {
+                        world.mark_active_seen(core);
+                    }
+                }
+                resolved_active = Some(addr.clone());
             }
-            resolved_active = Some(addr.clone());
         } else if let Ok(attach_info) =
             core.attach_terminal(addr, cols, rows, ATTACH_HISTORY_LINES, false)
         {
@@ -3016,6 +3071,7 @@ fn sync_attached_terminals(
                     cols,
                     rows,
                     attach_info.automatic_input,
+                    true,
                 ),
             );
             if let Some(info) = world.terminals.get_mut(addr) {
@@ -3085,6 +3141,7 @@ fn sync_attached_terminals(
                                 cols,
                                 rows,
                                 attach_info.automatic_input,
+                                SIBLING_ATTACH_HISTORY_LINES != 0,
                             ),
                         );
                         warmed_one = true;
@@ -4652,11 +4709,9 @@ fn run_app_loop(
 
         // When completely idle, block on the unified `AppEvent` channel with zero polling.
         let mut first_event: Option<AppEvent> = None;
-        if !dirty
-            && !more_events
-            && !need_sync_terminals
-            && !(need_warm_siblings && first_frame_drawn && !pty_pacer.is_settling())
-        {
+        let pending_sibling_warm =
+            need_warm_siblings && first_frame_drawn && !pty_pacer.is_settling();
+        if !(dirty || more_events || need_sync_terminals || pending_sibling_warm) {
             let now = Instant::now();
             let mut wait_timeout: Option<Duration> = if has_focused_agent {
                 Some(Duration::from_secs(30))
@@ -12338,5 +12393,29 @@ mod tests {
         att_g.process_vt_bytes("\x1bc\x1b[1;1H⚠\u{FE0F}b".as_bytes());
         assert_eq!(att_g.parser.screen().cursor_position(), (0, 3));
         assert_eq!(att_g.parser.screen().cell(0, 2).unwrap().contents(), "b");
+    }
+
+    #[test]
+    fn prewarmed_sibling_promotion_hydrates_zero_history_unless_local_scrollback_filled() {
+        // 1. Pre-warmed zero-history sibling with < ATTACH_HISTORY_LINES local scrollback
+        let mut cold_sib =
+            AttachedTerminal::new_with_capabilities(10, 80, 10, 80, 10, false, false);
+        assert!(!should_reattach_for_history(&mut cold_sib, false));
+        assert!(should_reattach_for_history(&mut cold_sib, true));
+
+        // 2. Sibling that accumulated >= ATTACH_HISTORY_LINES locally skips reattach & preserves scrollback
+        let mut warm_sib =
+            AttachedTerminal::new_with_capabilities(11, 80, 10, 80, 10, false, false);
+        for i in 0..(ATTACH_HISTORY_LINES + 20) {
+            warm_sib.process_vt_bytes(format!("line {i}\r\n").as_bytes());
+        }
+        warm_sib.parser.screen_mut().set_scrollback(7);
+        assert!(!should_reattach_for_history(&mut warm_sib, true));
+        assert!(warm_sib.has_attach_history);
+        assert_eq!(warm_sib.parser.screen().scrollback(), 7);
+
+        // 3. Terminal already attached with history never triggers reattach
+        let mut hydrated = AttachedTerminal::new_with_capabilities(12, 80, 10, 80, 10, false, true);
+        assert!(!should_reattach_for_history(&mut hydrated, true));
     }
 }
