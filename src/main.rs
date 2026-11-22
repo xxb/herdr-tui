@@ -4120,7 +4120,6 @@ fn handle_resize_event(
     page_tap: &mut Option<PendingPageTurnTap>,
     reader_drag: &mut Option<u16>,
     modal: &mut Modal,
-    prev_term_rect: Rect,
     attached_map: &BTreeMap<String, AttachedTerminal>,
     active_addr: Option<&str>,
     pending_pty_resize: &mut Option<PendingPtyResize>,
@@ -4149,10 +4148,8 @@ fn handle_resize_event(
             && att.client_rows == new_rows
         {
             *pending_pty_resize = None;
-            if !matches!(modal, Modal::None) || new_term_rect != prev_term_rect {
-                *force_clear = true;
-                *dirty = true;
-            }
+            *force_clear = true;
+            *dirty = true;
         } else {
             *pending_pty_resize = Some(PendingPtyResize {
                 cols: new_cols,
@@ -4567,9 +4564,9 @@ fn run_app_loop(
             || world.doc_version != last_synced_doc_version
             || active_switched
         {
-            if active_switched {
-                pending_pty_resize = None;
+            if active_switched && pending_pty_resize.take().is_some() {
                 prev_term_rect = term_rect;
+                force_clear = true;
             }
             let doc_changed = world.doc_version != last_synced_doc_version;
             let prev_addr = active_addr.clone();
@@ -4903,7 +4900,6 @@ fn run_app_loop(
                                 &mut page_tap,
                                 &mut reader_drag,
                                 &mut modal,
-                                prev_term_rect,
                                 attached_map,
                                 active_addr.as_deref(),
                                 &mut pending_pty_resize,
@@ -12090,7 +12086,6 @@ mod tests {
             &mut page_tap,
             &mut reader_drag,
             &mut modal,
-            prev_term_rect,
             &attached_map,
             Some("t1"),
             &mut pending_pty_resize,
@@ -12121,7 +12116,6 @@ mod tests {
             &mut page_tap,
             &mut reader_drag,
             &mut modal,
-            prev_term_rect,
             &attached_map,
             Some("t1"),
             &mut pending_pty_resize,
@@ -12139,7 +12133,7 @@ mod tests {
         );
         assert_eq!((attached_map["t1"].cols, attached_map["t1"].rows), (80, 22));
 
-        // 2. Bounce-back to original size cancels debounce with zero resize and zero redraw
+        // 2. Bounce-back to original size cancels PTY debounce (zero SIGWINCH) while repainting outer viewport
         handle_resize_event(
             80,
             24,
@@ -12152,7 +12146,6 @@ mod tests {
             &mut page_tap,
             &mut reader_drag,
             &mut modal,
-            prev_term_rect,
             &attached_map,
             Some("t1"),
             &mut pending_pty_resize,
@@ -12161,9 +12154,11 @@ mod tests {
             &mut dirty,
         );
         assert_eq!(pending_pty_resize, None);
-        assert!(!dirty);
-        assert!(!force_clear);
+        assert!(dirty);
+        assert!(force_clear);
         assert_eq!((attached_map["t1"].cols, attached_map["t1"].rows), (80, 22));
+        force_clear = false;
+        dirty = false;
 
         // 3. Settled resize applies once after RESIZE_DEBOUNCE, sets force_clear, and arms settle
         let t1 = t0 + Duration::from_millis(100);
@@ -12179,7 +12174,6 @@ mod tests {
             &mut page_tap,
             &mut reader_drag,
             &mut modal,
-            prev_term_rect,
             &attached_map,
             Some("t1"),
             &mut pending_pty_resize,
