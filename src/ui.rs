@@ -2065,6 +2065,14 @@ fn metric_display_width(
     eink_mode: bool,
     eink_color: bool,
 ) -> usize {
+    let detail_part = if show_detail {
+        m.detail.as_ref().map_or(0, |d| 3 + d.width())
+    } else {
+        0
+    };
+    if let Some(ref val) = m.value_text {
+        return m.window_label.width() + 1 + val.width() + detail_part;
+    }
     let pct = m.remaining_percent.clamp(0.0, 100.0).round() as u64;
     let pct_str = if eink_mode && is_eink_low_quota(m.remaining_percent, eink_color) {
         format!("{pct}%!")
@@ -2072,11 +2080,6 @@ fn metric_display_width(
         format!("{pct}%")
     };
     let bar_part = if bar_w > 0 { bar_w + 1 } else { 0 };
-    let detail_part = if show_detail {
-        m.detail.as_ref().map_or(0, |d| 3 + d.width())
-    } else {
-        0
-    };
     m.window_label.width() + 1 + bar_part + pct_str.width() + detail_part
 }
 
@@ -2146,7 +2149,7 @@ fn render_bottom_status_bar(
     let right_reserved = copied_w + scroll_w;
     let avail_end = max_x.saturating_sub(right_reserved);
 
-    // Strictly render ONLY the currently focused agent's quota usage on this single row.
+    // Strictly render ONLY the currently focused agent's quota/usage on this single row.
     // When no agent is focused (e.g. a plain shell tab), keep the left side clean without
     // repeating status/cwd/turn info that the terminal already displays.
     if let Some(quota) = focused_quota {
@@ -2155,16 +2158,34 @@ fn render_bottom_status_bar(
         } else {
             (Color::Reset, agent_ansi_color(quota.agent))
         };
-        let badge_lbl = if avail_end.saturating_sub(x) < 22 {
-            match quota.agent {
-                AgentKind::Codex => " Cdx ".to_string(),
-                AgentKind::Claude => " Clau ".to_string(),
-                AgentKind::OpenCode => " OC ".to_string(),
-                AgentKind::Antigravity => " Agy ".to_string(),
-                AgentKind::Freebuff => " Fb ".to_string(),
-            }
+        let all_usage_only =
+            !quota.metrics.is_empty() && quota.metrics.iter().all(|m| m.value_text.is_some());
+        let full_badge = format!(" {} ", quota.agent.display_name());
+        let short_badge = match quota.agent {
+            AgentKind::Codex => " Cdx ",
+            AgentKind::Claude => " Clau ",
+            AgentKind::OpenCode => " OC ",
+            AgentKind::Antigravity => " Agy ",
+            AgentKind::Freebuff => " Fb ",
+        };
+        let rem_w = avail_end.saturating_sub(x) as usize;
+        let usage_min_w = if all_usage_only {
+            let sep_total = " · ".width() * quota.metrics.len().saturating_sub(1);
+            let metrics_total: usize = quota
+                .metrics
+                .iter()
+                .map(|m| metric_display_width(m, 0, false, eink_mode, eink_color))
+                .sum();
+            metrics_total + sep_total
         } else {
-            format!(" {} ", quota.agent.display_name())
+            0
+        };
+        let use_short_badge =
+            rem_w < 22 || (all_usage_only && full_badge.width() + 1 + usage_min_w > rem_w);
+        let badge_lbl = if use_short_badge {
+            short_badge.to_string()
+        } else {
+            full_badge
         };
         let badge_style = if eink_mode {
             Style::default()
@@ -2189,18 +2210,40 @@ fn render_bottom_status_bar(
                     .fg(Color::Reset)
                     .add_modifier(Modifier::DIM)
             };
-            push_clamped_str(buf, &mut x, rect.y, avail_end, "剩余 --", empty_style);
+            let empty_lbl = match quota.agent {
+                AgentKind::Antigravity => "用量 --",
+                _ => "剩余 --",
+            };
+            push_clamped_str(buf, &mut x, rect.y, avail_end, empty_lbl, empty_style);
         } else if x < avail_end {
             let avail_w = (avail_end - x) as usize;
-            const TIERS: [(usize, bool, &str); 5] = [
+            const QUOTA_TIERS: [(usize, bool, &str); 5] = [
                 (8, true, "  ·  "),
                 (6, true, " · "),
                 (8, false, "  ·  "),
                 (5, false, " · "),
                 (0, false, " · "),
             ];
-            let (bar_w, show_detail, sep) = TIERS
-                .into_iter()
+            const USAGE_TIERS: [(usize, bool, &str); 5] = [
+                (0, true, "  ·  "),
+                (0, true, " · "),
+                (0, false, "  ·  "),
+                (0, false, " · "),
+                (0, false, "·"),
+            ];
+            let tiers = if all_usage_only {
+                &USAGE_TIERS
+            } else {
+                &QUOTA_TIERS
+            };
+            let fallback = if all_usage_only {
+                (0, false, "·")
+            } else {
+                (0, false, " · ")
+            };
+            let (bar_w, show_detail, sep) = tiers
+                .iter()
+                .copied()
                 .find(|(bw, sd, sp)| {
                     let sep_total = sp.width() * quota.metrics.len().saturating_sub(1);
                     let metrics_total: usize = quota
@@ -2210,7 +2253,7 @@ fn render_bottom_status_bar(
                         .sum();
                     metrics_total + sep_total <= avail_w
                 })
-                .unwrap_or((0, false, " · "));
+                .unwrap_or(fallback);
 
             let (lbl_style, track_style, detail_style, sep_style) = if eink_mode {
                 (
@@ -2248,60 +2291,101 @@ fn render_bottom_status_bar(
                 push_clamped_str(buf, &mut x, rect.y, avail_end, &m.window_label, lbl_style);
                 push_clamped_str(buf, &mut x, rect.y, avail_end, " ", base_style);
 
-                let (fill_style, pct_style, pct_suffix) = if eink_mode {
-                    let low = is_eink_low_quota(m.remaining_percent, eink_color);
-                    if eink_color && low {
-                        (
-                            Style::default().bg(bar_bg).fg(KALEIDO_RED),
-                            Style::default()
-                                .bg(bar_bg)
-                                .fg(KALEIDO_RED)
-                                .add_modifier(Modifier::BOLD),
-                            "!",
-                        )
+                if let Some(ref val) = m.value_text {
+                    let val_style = if eink_mode {
+                        Style::default().bg(bar_bg).fg(EINK_INK)
                     } else {
-                        (
-                            Style::default().bg(bar_bg).fg(EINK_INK),
-                            if low {
-                                Style::default()
-                                    .bg(EINK_INK)
-                                    .fg(EINK_PAPER)
-                                    .add_modifier(Modifier::BOLD)
-                            } else {
+                        Style::default().bg(Color::Reset).fg(Color::Reset)
+                    };
+                    push_clamped_str(buf, &mut x, rect.y, avail_end, val, val_style);
+                } else {
+                    let (fill_style, pct_style, pct_suffix) = if eink_mode {
+                        let low = is_eink_low_quota(m.remaining_percent, eink_color);
+                        if eink_color && low {
+                            (
+                                Style::default().bg(bar_bg).fg(KALEIDO_RED),
                                 Style::default()
                                     .bg(bar_bg)
-                                    .fg(EINK_INK)
-                                    .add_modifier(Modifier::BOLD)
-                            },
-                            if low { "!" } else { "" },
-                        )
-                    }
-                } else {
-                    let u_col = quota_remaining_color(m.remaining_percent);
-                    let pct_st = Style::default().bg(Color::Reset).fg(u_col);
-                    (pct_st, pct_st, "")
-                };
-
-                if bar_w > 0 {
-                    if eink_mode {
-                        let bar = render_eink_progress_bar(m.remaining_percent, bar_w);
-                        let filled_part: String = bar.chars().take_while(|&c| c != '─').collect();
-                        let empty_part: String = bar.chars().skip_while(|&c| c != '─').collect();
-                        push_clamped_str(buf, &mut x, rect.y, avail_end, &filled_part, fill_style);
-                        push_clamped_str(buf, &mut x, rect.y, avail_end, &empty_part, track_style);
+                                    .fg(KALEIDO_RED)
+                                    .add_modifier(Modifier::BOLD),
+                                "!",
+                            )
+                        } else {
+                            (
+                                Style::default().bg(bar_bg).fg(EINK_INK),
+                                if low {
+                                    Style::default()
+                                        .bg(EINK_INK)
+                                        .fg(EINK_PAPER)
+                                        .add_modifier(Modifier::BOLD)
+                                } else {
+                                    Style::default()
+                                        .bg(bar_bg)
+                                        .fg(EINK_INK)
+                                        .add_modifier(Modifier::BOLD)
+                                },
+                                if low { "!" } else { "" },
+                            )
+                        }
                     } else {
-                        let bar = render_progress_bar(m.remaining_percent, bar_w);
-                        let filled_part: String = bar.chars().take_while(|&c| c != '░').collect();
-                        let empty_part: String = bar.chars().skip_while(|&c| c != '░').collect();
-                        push_clamped_str(buf, &mut x, rect.y, avail_end, &filled_part, fill_style);
-                        push_clamped_str(buf, &mut x, rect.y, avail_end, &empty_part, track_style);
-                    }
-                    push_clamped_str(buf, &mut x, rect.y, avail_end, " ", base_style);
-                }
+                        let u_col = quota_remaining_color(m.remaining_percent);
+                        let pct_st = Style::default().bg(Color::Reset).fg(u_col);
+                        (pct_st, pct_st, "")
+                    };
 
-                let pct = m.remaining_percent.clamp(0.0, 100.0).round() as u64;
-                let pct_str = format!("{pct}%{pct_suffix}");
-                push_clamped_str(buf, &mut x, rect.y, avail_end, &pct_str, pct_style);
+                    if bar_w > 0 {
+                        if eink_mode {
+                            let bar = render_eink_progress_bar(m.remaining_percent, bar_w);
+                            let filled_part: String =
+                                bar.chars().take_while(|&c| c != '─').collect();
+                            let empty_part: String =
+                                bar.chars().skip_while(|&c| c != '─').collect();
+                            push_clamped_str(
+                                buf,
+                                &mut x,
+                                rect.y,
+                                avail_end,
+                                &filled_part,
+                                fill_style,
+                            );
+                            push_clamped_str(
+                                buf,
+                                &mut x,
+                                rect.y,
+                                avail_end,
+                                &empty_part,
+                                track_style,
+                            );
+                        } else {
+                            let bar = render_progress_bar(m.remaining_percent, bar_w);
+                            let filled_part: String =
+                                bar.chars().take_while(|&c| c != '░').collect();
+                            let empty_part: String =
+                                bar.chars().skip_while(|&c| c != '░').collect();
+                            push_clamped_str(
+                                buf,
+                                &mut x,
+                                rect.y,
+                                avail_end,
+                                &filled_part,
+                                fill_style,
+                            );
+                            push_clamped_str(
+                                buf,
+                                &mut x,
+                                rect.y,
+                                avail_end,
+                                &empty_part,
+                                track_style,
+                            );
+                        }
+                        push_clamped_str(buf, &mut x, rect.y, avail_end, " ", base_style);
+                    }
+
+                    let pct = m.remaining_percent.clamp(0.0, 100.0).round() as u64;
+                    let pct_str = format!("{pct}%{pct_suffix}");
+                    push_clamped_str(buf, &mut x, rect.y, avail_end, &pct_str, pct_style);
+                }
 
                 if show_detail {
                     if let Some(ref d) = m.detail {
@@ -7596,11 +7680,13 @@ mod tests {
                 QuotaMetric {
                     window_label: "5h".to_string(),
                     remaining_percent: 49.0,
+                    value_text: None,
                     detail: Some("2h14m".to_string()),
                 },
                 QuotaMetric {
                     window_label: "7d".to_string(),
                     remaining_percent: 8.0,
+                    value_text: None,
                     detail: Some("4d12h".to_string()),
                 },
             ],
@@ -7714,6 +7800,182 @@ mod tests {
     }
 
     #[test]
+    fn bottom_bar_renders_antigravity_five_window_usage_counters_across_widths_and_eink() {
+        let extract_row = |buf: &ratatui::buffer::Buffer, width: u16, y: u16| -> String {
+            let mut out = String::new();
+            let mut x = 0u16;
+            while x < width {
+                let sym = buf[(x, y)].symbol();
+                out.push_str(sym);
+                x = x.saturating_add(sym.width().max(1) as u16);
+            }
+            out
+        };
+
+        let world = sample_world();
+        let quota = AgentQuota {
+            agent: AgentKind::Antigravity,
+            metrics: vec![
+                QuotaMetric::usage("会话", "10.1M", Some("559步".to_string())),
+                QuotaMetric::usage("5h", "21.1M", Some("1.5k步".to_string())),
+                QuotaMetric::usage("今日", "35.1M", Some("2.7k步".to_string())),
+                QuotaMetric::usage("7d", "224.5M", Some("13.5k步".to_string())),
+                QuotaMetric::usage("30d", "716.8M", Some("58.3k步".to_string())),
+            ],
+        };
+
+        // 1. Wide (140 cols): renders full badge, all 5 windows, tokens + step details, and zero `%` / bars
+        let mut wide_term = Terminal::new(TestBackend::new(140, 12)).unwrap();
+        wide_term
+            .draw(|f| {
+                render_ui_with_pads_and_quota(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::None,
+                    None,
+                    false,
+                    None,
+                    false,
+                    Some(&quota),
+                );
+            })
+            .unwrap();
+        let wbuf = wide_term.backend().buffer();
+        let wline = extract_row(wbuf, 140, 11);
+        assert!(wline.contains("Antigravity"));
+        assert!(wline.contains("会话 10.1M (559步)"));
+        assert!(wline.contains("5h 21.1M (1.5k步)"));
+        assert!(wline.contains("今日 35.1M (2.7k步)"));
+        assert!(wline.contains("7d 224.5M (13.5k步)"));
+        assert!(wline.contains("30d 716.8M (58.3k步)"));
+        assert!(!wline.contains('%'));
+        assert!(!wline.contains('█'));
+        assert!(!wline.contains('░'));
+
+        // 2. Standard (80 cols): drops step details cleanly so full badge + all 5 token counters fit
+        let mut std_term = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        std_term
+            .draw(|f| {
+                render_ui_with_pads_and_quota(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::None,
+                    None,
+                    false,
+                    None,
+                    false,
+                    Some(&quota),
+                );
+            })
+            .unwrap();
+        let sbuf = std_term.backend().buffer();
+        let sline = extract_row(sbuf, 80, 11);
+        assert!(sline.contains("Antigravity"));
+        assert!(sline.contains("会话 10.1M"));
+        assert!(sline.contains("5h 21.1M"));
+        assert!(sline.contains("今日 35.1M"));
+        assert!(sline.contains("7d 224.5M"));
+        assert!(sline.contains("30d 716.8M"));
+        assert!(!sline.contains('%'));
+
+        // 3. Narrow (60 cols): compacts badge to `Agy` so all 5 token counters still fit on 1 row
+        let mut narrow_term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        narrow_term
+            .draw(|f| {
+                render_ui_with_pads_and_quota(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::None,
+                    None,
+                    false,
+                    None,
+                    false,
+                    Some(&quota),
+                );
+            })
+            .unwrap();
+        let nbuf = narrow_term.backend().buffer();
+        let nline = extract_row(nbuf, 60, 11);
+        assert!(nline.contains("Agy"));
+        assert!(nline.contains("会话 10.1M"));
+        assert!(nline.contains("5h 21.1M"));
+        assert!(nline.contains("今日 35.1M"));
+        assert!(nline.contains("7d 224.5M"));
+        assert!(nline.contains("30d 716.8M"));
+
+        // 4. E-Ink Kaleido mode: neutral ink, zero `!` low-quota alarm, zero `%`
+        let mut eink_term = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        eink_term
+            .draw(|f| {
+                render_ui_full_with_eink_color(
+                    f,
+                    &world,
+                    None,
+                    false,
+                    24,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    None,
+                    false,
+                    &Modal::None,
+                    None,
+                    false,
+                    None,
+                    false,
+                    Some(&quota),
+                    true,
+                    true,
+                );
+            })
+            .unwrap();
+        let ebuf = eink_term.backend().buffer();
+        let eline = extract_row(ebuf, 100, 11);
+        assert!(eline.contains("Antigravity"));
+        assert!(eline.contains("会话 10.1M"));
+        assert!(eline.contains("30d 716.8M"));
+        assert!(!eline.contains('!'));
+        assert!(!eline.contains('%'));
+        let val_x = (0..100u16)
+            .find(|&x| ebuf[(x, 11)].symbol() == "1" && ebuf[(x + 1, 11)].symbol() == "0")
+            .unwrap();
+        assert_eq!(ebuf[(val_x, 11)].fg, EINK_INK);
+        assert_eq!(ebuf[(val_x, 11)].bg, EINK_PAPER);
+    }
+
+    #[test]
     fn tab_overview_renders_full_viewport_highlights_plus_pill_and_preserves_topbar_hits() {
         use crate::model::{make_single_terminal_tab, TerminalInfo};
         use crate::usage::{AgentKind, AgentQuota, QuotaMetric};
@@ -7769,6 +8031,7 @@ mod tests {
             metrics: vec![QuotaMetric {
                 window_label: "5h".to_string(),
                 remaining_percent: 80.0,
+                value_text: None,
                 detail: None,
             }],
         };
@@ -8109,11 +8372,13 @@ mod tests {
                 QuotaMetric {
                     window_label: "5h".to_string(),
                     remaining_percent: 12.0,
+                    value_text: None,
                     detail: Some("1h10m".to_string()),
                 },
                 QuotaMetric {
                     window_label: "7d".to_string(),
                     remaining_percent: 85.0,
+                    value_text: None,
                     detail: None,
                 },
             ],
@@ -8944,6 +9209,7 @@ mod tests {
                 metrics: vec![QuotaMetric {
                     window_label: "5h".to_string(),
                     remaining_percent: pct,
+                    value_text: None,
                     detail: Some("2h10m".to_string()),
                 }],
             };
@@ -9665,11 +9931,13 @@ mod tests {
                 QuotaMetric {
                     window_label: "5h".to_string(),
                     remaining_percent: 82.0,
+                    value_text: None,
                     detail: Some("3h10m".to_string()),
                 },
                 QuotaMetric {
                     window_label: "7d".to_string(),
                     remaining_percent: 12.0,
+                    value_text: None,
                     detail: Some("4d05h".to_string()),
                 },
             ],
@@ -9900,6 +10168,7 @@ mod tests {
             metrics: vec![QuotaMetric {
                 window_label: "5h".to_string(),
                 remaining_percent: 25.0,
+                value_text: None,
                 detail: None,
             }],
         };

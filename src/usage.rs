@@ -48,8 +48,26 @@ pub struct QuotaMetric {
     pub window_label: String,
     /// Remaining percentage (`0.0..=100.0`).
     pub remaining_percent: f64,
+    /// Optional usage-only display text (e.g. `"21.1M"` or `"559步"`).
+    /// When present, the bottom bar renders this value directly without a progress bar or `%`.
+    pub value_text: Option<String>,
     /// Optional compact suffix such as reset countdown (`"2h14m"`) or count (`"28/200 · 142k"`).
     pub detail: Option<String>,
+}
+
+impl QuotaMetric {
+    pub fn usage(
+        window_label: impl Into<String>,
+        value_text: impl Into<String>,
+        detail: Option<String>,
+    ) -> Self {
+        Self {
+            window_label: window_label.into(),
+            remaining_percent: 0.0,
+            value_text: Some(value_text.into()),
+            detail,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -58,13 +76,29 @@ pub struct AgentQuota {
     pub metrics: Vec<QuotaMetric>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct AgySessionHint {
+    pub conversation_id: Option<String>,
+    pub cwd: Option<String>,
+    pub title: Option<String>,
+}
+
+type CacheKey = (AgentKind, Option<String>);
+
+#[derive(Clone, Debug)]
+struct QuotaRequest {
+    cache_key: CacheKey,
+    kind: AgentKind,
+    agy_hint: Option<AgySessionHint>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum QuotaFetchOutcome {
     /// Definitive quota snapshot (possibly empty when credentials/files are absent or a session
     /// such as Freebuff has expired and must clear any previously cached metrics).
     Authoritative(Vec<QuotaMetric>),
-    /// External/API helper timed out or transiently failed with no local fallback available;
-    /// retain last-known-good cached metrics if present and retry shortly.
+    /// Local SQLite helper timed out or transiently failed; retain last-known-good cached metrics
+    /// if present and retry shortly.
     TransientError,
 }
 
@@ -76,14 +110,14 @@ struct CacheEntry {
 
 #[derive(Default)]
 struct TrackerState {
-    cache: HashMap<AgentKind, CacheEntry>,
-    in_flight: HashSet<AgentKind>,
+    cache: HashMap<CacheKey, CacheEntry>,
+    in_flight: HashSet<CacheKey>,
 }
 
 pub struct UsageTracker {
     state: Arc<Mutex<TrackerState>>,
     revision: Arc<AtomicU64>,
-    req_tx: SyncSender<AgentKind>,
+    req_tx: SyncSender<QuotaRequest>,
 }
 
 impl UsageTracker {
@@ -97,42 +131,57 @@ impl UsageTracker {
         F: Fn() + Send + 'static,
     {
         Self::new_with_collector(
-            move |kind, claude_cache| collect_quota_for_agent(kind, &cfg, claude_cache),
+            move |kind, agy_hint, claude_cache, agy_cache| {
+                collect_quota_for_agent(kind, agy_hint, &cfg, claude_cache, agy_cache)
+            },
             waker,
         )
     }
 
     fn new_with_collector<C, F>(mut collector: C, waker: F) -> Self
     where
-        C: FnMut(AgentKind, &mut ClaudeFileCache) -> QuotaFetchOutcome + Send + 'static,
+        C: FnMut(
+                AgentKind,
+                Option<&AgySessionHint>,
+                &mut ClaudeFileCache,
+                &mut AgyFileCache,
+            ) -> QuotaFetchOutcome
+            + Send
+            + 'static,
         F: Fn() + Send + 'static,
     {
         let state = Arc::new(Mutex::new(TrackerState::default()));
         let revision = Arc::new(AtomicU64::new(0));
-        let (req_tx, req_rx) = mpsc::sync_channel::<AgentKind>(8);
+        let (req_tx, req_rx) = mpsc::sync_channel::<QuotaRequest>(16);
         let state_bg = Arc::clone(&state);
         let rev_bg = Arc::clone(&revision);
 
         std::thread::spawn(move || {
             let mut claude_cache = ClaudeFileCache::default();
-            while let Ok(kind) = req_rx.recv() {
+            let mut agy_cache = AgyFileCache::default();
+            while let Ok(req) = req_rx.recv() {
                 let should_collect = {
                     let guard = state_bg.lock().unwrap();
                     guard
                         .cache
-                        .get(&kind)
+                        .get(&req.cache_key)
                         .is_none_or(|entry| entry.fetched_at.elapsed() >= entry.ttl)
                 };
                 if !should_collect {
                     let mut guard = state_bg.lock().unwrap();
-                    guard.in_flight.remove(&kind);
+                    guard.in_flight.remove(&req.cache_key);
                     continue;
                 }
-                let outcome = collector(kind, &mut claude_cache);
+                let outcome = collector(
+                    req.kind,
+                    req.agy_hint.as_ref(),
+                    &mut claude_cache,
+                    &mut agy_cache,
+                );
                 let normal_ttl = CACHE_TTL;
                 {
                     let mut guard = state_bg.lock().unwrap();
-                    guard.in_flight.remove(&kind);
+                    guard.in_flight.remove(&req.cache_key);
                     let now = Instant::now();
                     let next_entry = match outcome {
                         QuotaFetchOutcome::Authoritative(metrics) => {
@@ -145,7 +194,7 @@ impl UsageTracker {
                                 fetched_at: now,
                                 ttl,
                                 quota: AgentQuota {
-                                    agent: kind,
+                                    agent: req.kind,
                                     metrics,
                                 },
                             }
@@ -153,7 +202,7 @@ impl UsageTracker {
                         QuotaFetchOutcome::TransientError => {
                             if let Some(prev) = guard
                                 .cache
-                                .get(&kind)
+                                .get(&req.cache_key)
                                 .filter(|e| !e.quota.metrics.is_empty())
                             {
                                 CacheEntry {
@@ -166,14 +215,19 @@ impl UsageTracker {
                                     fetched_at: now,
                                     ttl: EMPTY_RETRY_TTL,
                                     quota: AgentQuota {
-                                        agent: kind,
+                                        agent: req.kind,
                                         metrics: Vec::new(),
                                     },
                                 }
                             }
                         }
                     };
-                    guard.cache.insert(kind, next_entry);
+                    if guard.cache.len() > 64 {
+                        guard.cache.retain(|_, entry| {
+                            entry.fetched_at.elapsed() < Duration::from_secs(600)
+                        });
+                    }
+                    guard.cache.insert(req.cache_key, next_entry);
                 }
                 rev_bg.fetch_add(1, Ordering::Release);
                 waker();
@@ -192,27 +246,45 @@ impl UsageTracker {
     }
 
     pub fn focused_quota(&self, world: &World) -> Option<AgentQuota> {
-        let kind = detect_focused_agent(world)?;
+        let addr = world.active_terminal_address_ref()?;
+        let info = world.terminals.get(addr)?;
+        let kind = detect_agent_from_terminal(info)?;
+        let (cache_key, agy_hint) = if kind == AgentKind::Antigravity {
+            (
+                (kind, Some(info.address.clone())),
+                Some(extract_agy_session_hint(info)),
+            )
+        } else {
+            ((kind, None), None)
+        };
+
         let mut enqueue = false;
         let cached = {
             let mut guard = self.state.lock().unwrap();
-            let (entry_opt, expired) = match guard.cache.get(&kind) {
+            let (entry_opt, expired) = match guard.cache.get(&cache_key) {
                 Some(entry) => (
                     Some(entry.quota.clone()),
                     entry.fetched_at.elapsed() >= entry.ttl,
                 ),
                 None => (None, true),
             };
-            if expired && !guard.in_flight.contains(&kind) {
-                guard.in_flight.insert(kind);
+            if expired && !guard.in_flight.contains(&cache_key) {
+                guard.in_flight.insert(cache_key.clone());
                 enqueue = true;
             }
             entry_opt
         };
 
-        if enqueue && self.req_tx.try_send(kind).is_err() {
-            let mut guard = self.state.lock().unwrap();
-            guard.in_flight.remove(&kind);
+        if enqueue {
+            let req = QuotaRequest {
+                cache_key: cache_key.clone(),
+                kind,
+                agy_hint,
+            };
+            if self.req_tx.try_send(req).is_err() {
+                let mut guard = self.state.lock().unwrap();
+                guard.in_flight.remove(&cache_key);
+            }
         }
 
         Some(cached.unwrap_or_else(|| AgentQuota {
@@ -222,6 +294,51 @@ impl UsageTracker {
     }
 }
 
+pub fn extract_conversation_id_from_argv(argv: &[String]) -> Option<String> {
+    let mut iter = argv.iter();
+    while let Some(arg) = iter.next() {
+        let trimmed = arg.trim();
+        if let Some(val) = trimmed.strip_prefix("--conversation=") {
+            let id = val.trim();
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        } else if trimmed == "--conversation" {
+            if let Some(next) = iter.next() {
+                let id = next.trim();
+                if !id.is_empty() {
+                    return Some(id.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_agy_session_hint(info: &TerminalInfo) -> AgySessionHint {
+    let conversation_id = extract_conversation_id_from_argv(&info.fg_argv);
+    let cwd = info
+        .fg_cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            let c = info.cwd.trim();
+            (!c.is_empty()).then_some(c)
+        })
+        .map(String::from);
+    let title = {
+        let t = info.title.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    };
+    AgySessionHint {
+        conversation_id,
+        cwd,
+        title,
+    }
+}
+
+#[cfg(test)]
 pub fn detect_focused_agent(world: &World) -> Option<AgentKind> {
     let addr = world.active_terminal_address_ref()?;
     let info = world.terminals.get(addr)?;
@@ -332,12 +449,22 @@ pub fn format_duration_short(secs: u64) -> String {
 }
 
 pub fn format_tokens(tokens: u64) -> String {
-    if tokens >= 1_000_000 {
+    if tokens >= 1_000_000_000 {
+        format!("{:.1}B", tokens as f64 / 1_000_000_000.0)
+    } else if tokens >= 1_000_000 {
         format!("{:.1}M", tokens as f64 / 1_000_000.0)
     } else if tokens >= 1_000 {
         format!("{}k", (tokens + 500) / 1_000)
     } else {
         format!("{tokens}")
+    }
+}
+
+pub fn format_steps_compact(steps: u64) -> String {
+    if steps >= 10_000 {
+        format!("{:.1}k步", steps as f64 / 1_000.0)
+    } else {
+        format!("{steps}步")
     }
 }
 
@@ -511,8 +638,10 @@ pub fn today_midnight_unix_secs(now_secs: u64, utc_offset_secs: i64) -> u64 {
 
 fn collect_quota_for_agent(
     kind: AgentKind,
+    agy_hint: Option<&AgySessionHint>,
     cfg: &QuotaFileConfig,
     claude_cache: &mut ClaudeFileCache,
+    agy_cache: &mut AgyFileCache,
 ) -> QuotaFetchOutcome {
     let now_secs = now_unix_secs();
     match kind {
@@ -521,9 +650,9 @@ fn collect_quota_for_agent(
             QuotaFetchOutcome::Authoritative(collect_claude_metrics(now_secs, cfg, claude_cache))
         }
         AgentKind::OpenCode => collect_opencode_metrics(now_secs, cfg),
-        AgentKind::Antigravity => {
-            QuotaFetchOutcome::Authoritative(collect_antigravity_metrics(now_secs, cfg))
-        }
+        AgentKind::Antigravity => QuotaFetchOutcome::Authoritative(collect_antigravity_metrics(
+            now_secs, agy_hint, agy_cache,
+        )),
         AgentKind::Freebuff => QuotaFetchOutcome::Authoritative(collect_freebuff_metrics(now_secs)),
     }
 }
@@ -629,6 +758,7 @@ pub fn parse_codex_rate_limits_snapshot_from_jsonl(
             metrics.push(QuotaMetric {
                 window_label: lbl,
                 remaining_percent: rem_pct,
+                value_text: None,
                 detail,
             });
         }
@@ -758,6 +888,7 @@ print(json.dumps({"day_reqs": day_reqs, "day_toks": day_toks, "five_reqs": five_
         QuotaMetric {
             window_label: "今日".to_string(),
             remaining_percent: (100.0 - day_used_pct).clamp(0.0, 100.0),
+            value_text: None,
             detail: Some(format!(
                 "{day_reqs}/{daily_limit} · {}",
                 format_tokens(day_toks)
@@ -766,6 +897,7 @@ print(json.dumps({"day_reqs": day_reqs, "day_toks": day_toks, "five_reqs": five_
         QuotaMetric {
             window_label: "5h".to_string(),
             remaining_percent: (100.0 - five_used_pct).clamp(0.0, 100.0),
+            value_text: None,
             detail: Some(format!(
                 "{five_reqs}/{limit_5h} · {}",
                 format_tokens(five_toks)
@@ -983,11 +1115,13 @@ pub fn collect_claude_metrics_from_dir_cached(
         QuotaMetric {
             window_label: "5h".to_string(),
             remaining_percent: (100.0 - used_5h).clamp(0.0, 100.0),
+            value_text: None,
             detail: Some(detail_5h),
         },
         QuotaMetric {
             window_label: "7d".to_string(),
             remaining_percent: (100.0 - used_7d).clamp(0.0, 100.0),
+            value_text: None,
             detail: Some(format_tokens(tok_7d)),
         },
     ]
@@ -1005,21 +1139,47 @@ fn collect_claude_metrics(
     collect_claude_metrics_from_dir_cached(&projects_dir, now_secs, cfg, cache)
 }
 
-fn parse_antigravity_transcript_step_ts(line: &str) -> Option<u64> {
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum AgyTimestamp<'a> {
+    Str(#[serde(borrow)] std::borrow::Cow<'a, str>),
+    Num(u64),
+}
+
+#[derive(serde::Deserialize)]
+struct AgyTranscriptLine<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: Option<std::borrow::Cow<'a, str>>,
+    #[serde(borrow)]
+    created_at: Option<AgyTimestamp<'a>>,
+    #[serde(borrow)]
+    timestamp: Option<AgyTimestamp<'a>>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+}
+
+fn extract_agy_timestamp(ts: Option<AgyTimestamp<'_>>) -> Option<u64> {
+    match ts? {
+        AgyTimestamp::Str(s) => parse_utc_iso8601_secs(&s),
+        AgyTimestamp::Num(n) => Some(n),
+    }
+}
+
+fn parse_antigravity_transcript_step(line: &str) -> Option<(u64, u64)> {
     if !line.contains("\"PLANNER_RESPONSE\"") {
         return None;
     }
-    let val = serde_json::from_str::<Value>(line).ok()?;
-    if val.get("type").and_then(Value::as_str) != Some("PLANNER_RESPONSE") {
+    let parsed = serde_json::from_str::<AgyTranscriptLine<'_>>(line).ok()?;
+    if parsed.kind.as_deref() != Some("PLANNER_RESPONSE") {
         return None;
     }
-    val.get("created_at")
-        .or_else(|| val.get("timestamp"))
-        .and_then(|v| {
-            v.as_str()
-                .and_then(parse_utc_iso8601_secs)
-                .or_else(|| v.as_u64())
-        })
+    let ts = extract_agy_timestamp(parsed.created_at)
+        .or_else(|| extract_agy_timestamp(parsed.timestamp))?;
+    let tokens = parsed
+        .input_tokens
+        .unwrap_or(0)
+        .saturating_add(parsed.output_tokens.unwrap_or(0));
+    Some((ts, tokens))
 }
 
 #[cfg(test)]
@@ -1031,7 +1191,7 @@ pub fn count_antigravity_transcript_steps_in_str(
     let mut steps_5h = 0u64;
     let mut steps_day = 0u64;
     for line in text.lines() {
-        let Some(ts) = parse_antigravity_transcript_step_ts(line) else {
+        let Some((ts, _)) = parse_antigravity_transcript_step(line) else {
             continue;
         };
         if ts >= midnight_secs {
@@ -1044,18 +1204,18 @@ pub fn count_antigravity_transcript_steps_in_str(
     (steps_5h, steps_day)
 }
 
-fn count_antigravity_transcript_steps_in_file(
-    path: &Path,
-    cutoff_5h: u64,
-    midnight_secs: u64,
-) -> (u64, u64) {
-    let Ok(file) = File::open(path) else {
-        return (0, 0);
-    };
+type AgyFileEntry = (SystemTime, u64, Vec<(u64, u64)>);
+
+#[derive(Default)]
+pub struct AgyFileCache {
+    entries: HashMap<PathBuf, AgyFileEntry>,
+}
+
+fn parse_antigravity_transcript_file_records(path: &Path) -> Option<Vec<(u64, u64)>> {
+    let file = File::open(path).ok()?;
     let mut reader = BufReader::new(file);
     let mut buf = Vec::new();
-    let mut steps_5h = 0u64;
-    let mut steps_day = 0u64;
+    let mut records = Vec::new();
     loop {
         buf.clear();
         match reader.read_until(b'\n', &mut buf) {
@@ -1063,80 +1223,285 @@ fn count_antigravity_transcript_steps_in_file(
             Ok(_) => {
                 let line = String::from_utf8_lossy(&buf);
                 let trimmed = line.trim_end_matches(['\r', '\n']);
-                if let Some(ts) = parse_antigravity_transcript_step_ts(trimmed) {
-                    if ts >= midnight_secs {
-                        steps_day += 1;
-                    }
-                    if ts >= cutoff_5h {
-                        steps_5h += 1;
-                    }
+                if let Some(rec) = parse_antigravity_transcript_step(trimmed) {
+                    records.push(rec);
                 }
             }
-            Err(_) => break,
+            Err(_) => return None,
         }
     }
-    (steps_5h, steps_day)
+    Some(records)
 }
 
-pub fn collect_antigravity_metrics_from_brain_dir(
+pub fn resolve_antigravity_session_ids(agy_root: &Path, hint: &AgySessionHint) -> HashSet<String> {
+    let fallback_ids = || {
+        let mut set = HashSet::new();
+        if let Some(id) = hint
+            .conversation_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            set.insert(id.to_string());
+        }
+        set
+    };
+
+    let db_path = agy_root.join("conversation_summaries.db");
+    if !db_path.is_file() {
+        return fallback_ids();
+    }
+
+    let script = r#"
+import json, os, sqlite3, sys, urllib.parse
+
+db_path, explicit_id, cwd_arg, title_arg = sys.argv[1:5]
+conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+rows = conn.execute(
+    "SELECT conversation_id, title, workspace_uris, parent_conversation_id, not_fully_idle, last_modified_time "
+    "FROM conversation_summaries"
+).fetchall()
+parents = {}
+try:
+    for cid, pid in conn.execute("SELECT conversation_id, parent_id FROM conversation_parents").fetchall():
+        if cid and pid:
+            parents[cid] = pid
+except sqlite3.OperationalError:
+    pass
+
+children = {}
+top_rows = []
+for cid, row_title, wuri, pid, active, lmt in rows:
+    if not cid:
+        continue
+    eff_pid = (pid or "").strip() or parents.get(cid, "")
+    if eff_pid:
+        children.setdefault(eff_pid, []).append(cid)
+    else:
+        top_rows.append((cid, row_title or "", wuri or "", int(bool(active)), str(lmt or "")))
+
+target_id = explicit_id.strip() or None
+if target_id is None:
+    norm_cwd = os.path.realpath(cwd_arg.strip()) if cwd_arg.strip() else ""
+    title_lower = title_arg.strip().lower()
+    best = None
+    for cid, row_title, wuri, active, lmt in top_rows:
+        paths = []
+        try:
+            uris = json.loads(wuri) if wuri else []
+        except Exception:
+            uris = []
+        if isinstance(uris, list):
+            for u in uris:
+                if isinstance(u, str) and u.startswith("file://"):
+                    p = urllib.parse.unquote(urllib.parse.urlparse(u).path)
+                    if p:
+                        paths.append(os.path.realpath(p))
+        cwd_exact = bool(norm_cwd) and norm_cwd in paths
+        cwd_prefix = False
+        if bool(norm_cwd) and not cwd_exact:
+            for wp in paths:
+                pref = wp.rstrip(os.sep)
+                if pref and norm_cwd.startswith(pref + os.sep):
+                    cwd_prefix = True
+                    break
+        rt = row_title.strip().lower()
+        title_match = len(rt) >= 3 and bool(title_lower) and (rt in title_lower)
+        if cwd_exact and title_match:
+            tier = 4
+        elif cwd_exact:
+            tier = 3
+        elif title_match:
+            tier = 2
+        elif cwd_prefix:
+            tier = 1
+        else:
+            continue
+        score = (tier, active, lmt, cid)
+        if best is None or score > best[0]:
+            best = (score, cid)
+    if best is not None:
+        target_id = best[1]
+
+out = []
+if target_id:
+    seen = {target_id}
+    queue = [target_id]
+    while queue:
+        cur = queue.pop()
+        out.append(cur)
+        for ch in children.get(cur, []):
+            if ch not in seen:
+                seen.add(ch)
+                queue.append(ch)
+print(json.dumps(out))
+"#;
+
+    let explicit_arg = hint.conversation_id.as_deref().unwrap_or("");
+    let cwd_arg = hint.cwd.as_deref().unwrap_or("");
+    let title_arg = hint.title.as_deref().unwrap_or("");
+    let Some(stdout) = run_command_stdout_with_timeout(
+        "python3",
+        [
+            OsStr::new("-c"),
+            OsStr::new(script),
+            db_path.as_os_str(),
+            OsStr::new(explicit_arg),
+            OsStr::new(cwd_arg),
+            OsStr::new(title_arg),
+        ],
+        QUOTA_LOCAL_HELPER_TIMEOUT,
+    ) else {
+        return fallback_ids();
+    };
+    let Ok(ids) = serde_json::from_str::<Vec<String>>(stdout.trim()) else {
+        return fallback_ids();
+    };
+    ids.into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn antigravity_window_metric(label: &str, steps: u64, tokens: u64) -> QuotaMetric {
+    if tokens > 0 {
+        QuotaMetric::usage(
+            label,
+            format_tokens(tokens),
+            (steps > 0).then(|| format_steps_compact(steps)),
+        )
+    } else if steps > 0 {
+        QuotaMetric::usage(label, format_steps_compact(steps), None)
+    } else {
+        QuotaMetric::usage(label, "0", None)
+    }
+}
+
+pub fn collect_antigravity_metrics_from_brain_dir_cached(
     brain_dir: &Path,
     now_secs: u64,
     utc_offset_secs: i64,
-    cfg: &QuotaFileConfig,
+    session_ids: &HashSet<String>,
+    cache: &mut AgyFileCache,
 ) -> Vec<QuotaMetric> {
     if !brain_dir.is_dir() {
         return Vec::new();
     }
-    let limit_5h = cfg.agy_5h_steps.unwrap_or(300).max(1);
-    let limit_day = cfg.agy_daily_steps.unwrap_or(1000).max(1);
 
-    let cutoff_5h = now_secs.saturating_sub(5 * 3_600);
+    let cut_5h = now_secs.saturating_sub(5 * 3_600);
     let midnight_secs = today_midnight_unix_secs(now_secs, utc_offset_secs);
-    let min_cutoff_secs = cutoff_5h.min(midnight_secs);
+    let cut_7d = now_secs.saturating_sub(7 * 86_400);
+    let cut_30d = now_secs.saturating_sub(30 * 86_400);
+    let min_cutoff_secs = cut_30d.min(cut_7d).min(midnight_secs).min(cut_5h);
     let min_mtime = UNIX_EPOCH.checked_add(Duration::from_secs(min_cutoff_secs));
 
+    if cache.entries.len() > 1024 {
+        cache
+            .entries
+            .retain(|_, (mt, _, _)| min_mtime.is_none_or(|m| *mt >= m));
+    }
+
+    let mut sess_steps = 0u64;
+    let mut sess_toks = 0u64;
     let mut steps_5h = 0u64;
+    let mut toks_5h = 0u64;
     let mut steps_day = 0u64;
+    let mut toks_day = 0u64;
+    let mut steps_7d = 0u64;
+    let mut toks_7d = 0u64;
+    let mut steps_30d = 0u64;
+    let mut toks_30d = 0u64;
+
     if let Ok(entries) = fs::read_dir(brain_dir) {
         for entry in entries.flatten() {
+            let conv_id = entry.file_name();
+            let conv_id_str = conv_id.to_string_lossy();
+            let is_session = session_ids.contains(conv_id_str.as_ref());
             let log_path = entry.path().join(".system_generated/logs/transcript.jsonl");
             let Ok(meta) = fs::metadata(&log_path) else {
                 continue;
             };
             let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
-            if min_mtime.is_some_and(|m| mtime < m) {
+            let file_len = meta.len();
+            if !is_session && min_mtime.is_some_and(|m| mtime < m) {
                 continue;
             }
-            let (s5, sd) =
-                count_antigravity_transcript_steps_in_file(&log_path, cutoff_5h, midnight_secs);
-            steps_5h += s5;
-            steps_day += sd;
+            let records = match cache.entries.get(&log_path) {
+                Some((cached_mtime, cached_len, recs))
+                    if *cached_mtime == mtime && *cached_len == file_len =>
+                {
+                    recs.as_slice()
+                }
+                _ => {
+                    let Some(parsed) = parse_antigravity_transcript_file_records(&log_path) else {
+                        continue;
+                    };
+                    cache
+                        .entries
+                        .insert(log_path.clone(), (mtime, file_len, parsed));
+                    cache.entries.get(&log_path).unwrap().2.as_slice()
+                }
+            };
+
+            for &(ts, toks) in records {
+                if is_session {
+                    sess_steps += 1;
+                    sess_toks = sess_toks.saturating_add(toks);
+                }
+                if ts >= cut_30d {
+                    steps_30d += 1;
+                    toks_30d = toks_30d.saturating_add(toks);
+                    if ts >= cut_7d {
+                        steps_7d += 1;
+                        toks_7d = toks_7d.saturating_add(toks);
+                    }
+                    if ts >= midnight_secs {
+                        steps_day += 1;
+                        toks_day = toks_day.saturating_add(toks);
+                    }
+                    if ts >= cut_5h {
+                        steps_5h += 1;
+                        toks_5h = toks_5h.saturating_add(toks);
+                    }
+                }
+            }
         }
     }
 
-    let used_5h = ((steps_5h as f64 / limit_5h as f64) * 100.0).clamp(0.0, 100.0);
-    let used_day = ((steps_day as f64 / limit_day as f64) * 100.0).clamp(0.0, 100.0);
-
-    vec![
-        QuotaMetric {
-            window_label: "5h".to_string(),
-            remaining_percent: (100.0 - used_5h).clamp(0.0, 100.0),
-            detail: Some(format!("{steps_5h}/{limit_5h} steps")),
-        },
-        QuotaMetric {
-            window_label: "今日".to_string(),
-            remaining_percent: (100.0 - used_day).clamp(0.0, 100.0),
-            detail: Some(format!("{steps_day}/{limit_day} steps")),
-        },
-    ]
+    let mut out = Vec::with_capacity(5);
+    if !session_ids.is_empty() {
+        out.push(antigravity_window_metric("会话", sess_steps, sess_toks));
+    }
+    out.push(antigravity_window_metric("5h", steps_5h, toks_5h));
+    out.push(antigravity_window_metric("今日", steps_day, toks_day));
+    out.push(antigravity_window_metric("7d", steps_7d, toks_7d));
+    out.push(antigravity_window_metric("30d", steps_30d, toks_30d));
+    out
 }
 
-fn collect_antigravity_metrics(now_secs: u64, cfg: &QuotaFileConfig) -> Vec<QuotaMetric> {
+fn collect_antigravity_metrics(
+    now_secs: u64,
+    hint: Option<&AgySessionHint>,
+    cache: &mut AgyFileCache,
+) -> Vec<QuotaMetric> {
     let Some(home) = home_dir() else {
         return Vec::new();
     };
-    let brain_dir = home.join(".gemini/antigravity-cli/brain");
-    collect_antigravity_metrics_from_brain_dir(&brain_dir, now_secs, local_utc_offset_secs(), cfg)
+    let agy_root = home.join(".gemini/antigravity-cli");
+    let brain_dir = agy_root.join("brain");
+    if !brain_dir.is_dir() {
+        return Vec::new();
+    }
+    let session_ids = hint
+        .map(|h| resolve_antigravity_session_ids(&agy_root, h))
+        .unwrap_or_default();
+    collect_antigravity_metrics_from_brain_dir_cached(
+        &brain_dir,
+        now_secs,
+        local_utc_offset_secs(),
+        &session_ids,
+        cache,
+    )
 }
 
 pub fn parse_freebuff_session_quota_json(text: &str, now_secs: u64) -> Option<Vec<QuotaMetric>> {
@@ -1196,6 +1561,7 @@ pub fn parse_freebuff_session_quota_json(text: &str, now_secs: u64) -> Option<Ve
     Some(vec![QuotaMetric {
         window_label: label,
         remaining_percent: rem_pct,
+        value_text: None,
         detail,
     }])
 }
@@ -1295,36 +1661,43 @@ mod tests {
     fn collects_antigravity_metrics_locally_from_brain_dir_and_handles_missing_dir() {
         use std::io::Write;
 
+        assert_eq!(format_tokens(1_500_000_000), "1.5B");
+        assert_eq!(format_steps_compact(559), "559步");
+        assert_eq!(format_steps_compact(12_300), "12.3k步");
+
         let tmp_dir =
             std::env::temp_dir().join(format!("hct_test_agy_brain_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp_dir);
 
-        let cfg = QuotaFileConfig {
-            agy_5h_steps: Some(10),
-            agy_daily_steps: Some(20),
-            ..Default::default()
-        };
-        let now_secs = now_unix_secs().max(2 * 86_400);
+        let now_secs = now_unix_secs().max(40 * 86_400);
         let utc_offset_secs = 12 * 3_600 - (now_secs % 86_400) as i64;
+        let mut cache = AgyFileCache::default();
+        let mut session_ids = HashSet::new();
+        session_ids.insert("conv_main".to_string());
+        session_ids.insert("conv_sub".to_string());
 
-        // Missing brain directory returns empty metrics rather than a bogus 0/N bar
-        assert!(collect_antigravity_metrics_from_brain_dir(
+        // Missing brain directory returns empty metrics rather than bogus zero counters
+        assert!(collect_antigravity_metrics_from_brain_dir_cached(
             &tmp_dir,
             now_secs,
             utc_offset_secs,
-            &cfg
+            &session_ids,
+            &mut cache,
         )
         .is_empty());
 
-        let log_dir = tmp_dir.join("conv_1/.system_generated/logs");
-        fs::create_dir_all(&log_dir).unwrap();
-        let log_path = log_dir.join("transcript.jsonl");
-        let mut f = File::create(&log_path).unwrap();
+        let write_conv = |id: &str| {
+            let log_dir = tmp_dir.join(id).join(".system_generated/logs");
+            fs::create_dir_all(&log_dir).unwrap();
+            log_dir.join("transcript.jsonl")
+        };
 
-        // Early in-window event placed before >600 KiB of filler to verify full-file streaming
+        let main_log = write_conv("conv_main");
+        let mut f = File::create(&main_log).unwrap();
+        // Event A: within 5h/today/7d/30d/session, placed before >600 KiB filler to verify full-file streaming
         writeln!(
             f,
-            "{{\"type\":\"PLANNER_RESPONSE\",\"created_at\":{}}}",
+            "{{\"type\":\"PLANNER_RESPONSE\",\"created_at\":{},\"input_tokens\":1000,\"output_tokens\":500}}",
             now_secs - 3_600
         )
         .unwrap();
@@ -1336,17 +1709,17 @@ mod tests {
         for _ in 0..320 {
             f.write_all(filler_line.as_bytes()).unwrap();
         }
-        // Old event outside both today and 5h windows
+        // Event B: >30d old (counted in current session only, excluded from 30d/7d/today/5h)
         writeln!(
             f,
-            "{{\"type\":\"PLANNER_RESPONSE\",\"created_at\":{}}}",
-            now_secs - 20 * 3_600
+            "{{\"type\":\"PLANNER_RESPONSE\",\"created_at\":{},\"input_tokens\":10000,\"output_tokens\":0}}",
+            now_secs - 35 * 86_400
         )
         .unwrap();
-        // Earlier today (midnight is now_secs - 12h), outside 5h window
+        // Event C: earlier today (midnight is now_secs - 12h), outside 5h
         writeln!(
             f,
-            "{{\"type\":\"PLANNER_RESPONSE\",\"created_at\":{}}}",
+            "{{\"type\":\"PLANNER_RESPONSE\",\"created_at\":{},\"input_tokens\":2000,\"output_tokens\":500}}",
             now_secs - 8 * 3_600
         )
         .unwrap();
@@ -1355,26 +1728,217 @@ mod tests {
             .unwrap();
         f.write_all(b"{\"type\":\"PLANNER_RESPONSE\",\"created_at\":\n")
             .unwrap();
-        // Recent event inside both 5h and today windows
+        // Event D: recent within 5h; `cache_read_tokens` must not inflate uncached+output count
         writeln!(
             f,
-            "{{\"type\":\"PLANNER_RESPONSE\",\"timestamp\":{}}}",
+            "{{\"type\":\"PLANNER_RESPONSE\",\"timestamp\":{},\"input_tokens\":500,\"output_tokens\":500,\"cache_read_tokens\":99999}}",
             now_secs - 600
         )
         .unwrap();
         drop(f);
 
-        let metrics =
-            collect_antigravity_metrics_from_brain_dir(&tmp_dir, now_secs, utc_offset_secs, &cfg);
+        // Subagent belonging to current session, 3 days ago (7d & 30d & session)
+        let sub_log = write_conv("conv_sub");
+        fs::write(
+            &sub_log,
+            format!(
+                "{{\"type\":\"PLANNER_RESPONSE\",\"created_at\":{},\"input_tokens\":4000,\"output_tokens\":1000}}\n",
+                now_secs - 3 * 86_400
+            ),
+        )
+        .unwrap();
+
+        // Unrelated conversation with 15d and 2h events
+        let other_log = write_conv("conv_other");
+        fs::write(
+            &other_log,
+            format!(
+                "{{\"type\":\"PLANNER_RESPONSE\",\"created_at\":{},\"input_tokens\":20000,\"output_tokens\":0}}\n{{\"type\":\"PLANNER_RESPONSE\",\"created_at\":{},\"input_tokens\":3000,\"output_tokens\":0}}\n",
+                now_secs - 15 * 86_400,
+                now_secs - 2 * 3_600
+            ),
+        )
+        .unwrap();
+
+        let metrics = collect_antigravity_metrics_from_brain_dir_cached(
+            &tmp_dir,
+            now_secs,
+            utc_offset_secs,
+            &session_ids,
+            &mut cache,
+        );
+        assert_eq!(metrics.len(), 5);
+        assert_eq!(metrics[0].window_label, "会话");
+        assert_eq!(metrics[0].value_text.as_deref(), Some("20k"));
+        assert_eq!(metrics[0].detail.as_deref(), Some("5步"));
+        assert_eq!(metrics[1].window_label, "5h");
+        assert_eq!(metrics[1].value_text.as_deref(), Some("6k"));
+        assert_eq!(metrics[1].detail.as_deref(), Some("3步"));
+        assert_eq!(metrics[2].window_label, "今日");
+        assert_eq!(metrics[2].value_text.as_deref(), Some("8k"));
+        assert_eq!(metrics[2].detail.as_deref(), Some("4步"));
+        assert_eq!(metrics[3].window_label, "7d");
+        assert_eq!(metrics[3].value_text.as_deref(), Some("13k"));
+        assert_eq!(metrics[3].detail.as_deref(), Some("5步"));
+        assert_eq!(metrics[4].window_label, "30d");
+        assert_eq!(metrics[4].value_text.as_deref(), Some("33k"));
+        assert_eq!(metrics[4].detail.as_deref(), Some("6步"));
+
+        // Appending invalidates the cached `conv_main` entry and updates counts immediately
+        let mut f = fs::OpenOptions::new().append(true).open(&main_log).unwrap();
+        writeln!(
+            f,
+            "{{\"type\":\"PLANNER_RESPONSE\",\"created_at\":{},\"input_tokens\":1000000,\"output_tokens\":0}}",
+            now_secs - 100
+        )
+        .unwrap();
+        drop(f);
+
+        let updated = collect_antigravity_metrics_from_brain_dir_cached(
+            &tmp_dir,
+            now_secs,
+            utc_offset_secs,
+            &session_ids,
+            &mut cache,
+        );
+        assert_eq!(updated[0].value_text.as_deref(), Some("1.0M"));
+        assert_eq!(updated[0].detail.as_deref(), Some("6步"));
+        assert_eq!(updated[1].value_text.as_deref(), Some("1.0M"));
+        assert_eq!(updated[1].detail.as_deref(), Some("4步"));
+
+        // When no current session matches, omit `会话` and return the 4 global time windows
+        let no_sess = collect_antigravity_metrics_from_brain_dir_cached(
+            &tmp_dir,
+            now_secs,
+            utc_offset_secs,
+            &HashSet::new(),
+            &mut cache,
+        );
         let _ = fs::remove_dir_all(&tmp_dir);
 
-        assert_eq!(metrics.len(), 2);
-        assert_eq!(metrics[0].window_label, "5h");
-        assert!((metrics[0].remaining_percent - 80.0).abs() < 1e-4);
-        assert_eq!(metrics[0].detail.as_deref(), Some("2/10 steps"));
-        assert_eq!(metrics[1].window_label, "今日");
-        assert!((metrics[1].remaining_percent - 85.0).abs() < 1e-4);
-        assert_eq!(metrics[1].detail.as_deref(), Some("3/20 steps"));
+        assert_eq!(no_sess.len(), 4);
+        assert_eq!(no_sess[0].window_label, "5h");
+        assert_eq!(no_sess[1].window_label, "今日");
+        assert_eq!(no_sess[2].window_label, "7d");
+        assert_eq!(no_sess[3].window_label, "30d");
+    }
+
+    #[test]
+    fn resolves_antigravity_session_ids_from_argv_and_sqlite_summaries() {
+        assert_eq!(
+            extract_conversation_id_from_argv(&[
+                "agy".to_string(),
+                "--conversation".to_string(),
+                "conv-1".to_string()
+            ]),
+            Some("conv-1".to_string())
+        );
+        assert_eq!(
+            extract_conversation_id_from_argv(&[
+                "agy".to_string(),
+                "--conversation=conv-2".to_string()
+            ]),
+            Some("conv-2".to_string())
+        );
+        assert_eq!(
+            extract_conversation_id_from_argv(&["agy".to_string(), "--continue".to_string()]),
+            None
+        );
+
+        let tmp_dir = std::env::temp_dir().join(format!("hct_test_agy_db_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let proj_a = tmp_dir.join("proj_a");
+        let proj_a_sub = proj_a.join("nested");
+        let proj_b = tmp_dir.join("proj_b");
+        let unrelated = tmp_dir.join("unrelated");
+        fs::create_dir_all(&proj_a_sub).unwrap();
+        fs::create_dir_all(&proj_b).unwrap();
+        fs::create_dir_all(&unrelated).unwrap();
+
+        let db_path = tmp_dir.join("conversation_summaries.db");
+        let py_setup = r#"
+import json, sqlite3, sys
+db_path, proj_a, proj_b = sys.argv[1:4]
+conn = sqlite3.connect(db_path)
+conn.execute(
+    "CREATE TABLE conversation_summaries ("
+    "conversation_id TEXT PRIMARY KEY, title TEXT, workspace_uris TEXT, "
+    "parent_conversation_id TEXT, not_fully_idle INTEGER, last_modified_time TEXT)"
+)
+conn.execute(
+    "CREATE TABLE conversation_parents (conversation_id TEXT PRIMARY KEY, parent_id TEXT)"
+)
+uri_a = json.dumps(["file://" + proj_a])
+uri_b = json.dumps(["file://" + proj_b])
+rows = [
+    ("conv_active_a", "Refactor Usage Bar", uri_a, "", 1, "2026-11-26T10:00:00Z"),
+    ("conv_idle_a", "Old Session", uri_a, "", 0, "2026-11-26T12:00:00Z"),
+    ("conv_sub_col", "", uri_a, "conv_active_a", 0, "2026-11-26T10:01:00Z"),
+    ("conv_sub_tbl", "", uri_a, "", 0, "2026-11-26T10:02:00Z"),
+    ("conv_grandchild", "", uri_a, "conv_sub_tbl", 0, "2026-11-26T10:03:00Z"),
+    ("conv_other", "Other Work", uri_b, "", 1, "2026-11-26T13:00:00Z"),
+]
+conn.executemany("INSERT INTO conversation_summaries VALUES (?,?,?,?,?,?)", rows)
+conn.execute("INSERT INTO conversation_parents VALUES (?,?)", ("conv_sub_tbl", "conv_active_a"))
+conn.commit()
+"#;
+        let setup_out = run_command_stdout_with_timeout(
+            "python3",
+            [
+                OsStr::new("-c"),
+                OsStr::new(py_setup),
+                db_path.as_os_str(),
+                proj_a.as_os_str(),
+                proj_b.as_os_str(),
+            ],
+            Duration::from_secs(3),
+        );
+        assert!(setup_out.is_some());
+
+        // 1. cwd + title tiebreaker prefers exact matching title over active conversation in same dir
+        let title_hint = AgySessionHint {
+            conversation_id: None,
+            cwd: Some(proj_a.to_string_lossy().into_owned()),
+            title: Some("✳ Old Session · agy".to_string()),
+        };
+        let ids_title = resolve_antigravity_session_ids(&tmp_dir, &title_hint);
+        assert_eq!(ids_title, HashSet::from(["conv_idle_a".to_string()]));
+
+        // 2. cwd alone prefers active (`not_fully_idle = 1`) and gathers full subagent tree
+        let cwd_hint = AgySessionHint {
+            conversation_id: None,
+            cwd: Some(proj_a.to_string_lossy().into_owned()),
+            title: Some("agy".to_string()),
+        };
+        let ids_cwd = resolve_antigravity_session_ids(&tmp_dir, &cwd_hint);
+        assert_eq!(
+            ids_cwd,
+            HashSet::from([
+                "conv_active_a".to_string(),
+                "conv_sub_col".to_string(),
+                "conv_sub_tbl".to_string(),
+                "conv_grandchild".to_string(),
+            ])
+        );
+
+        // 3. Nested subdir matches via cwd_prefix fallback
+        let sub_hint = AgySessionHint {
+            conversation_id: None,
+            cwd: Some(proj_a_sub.to_string_lossy().into_owned()),
+            title: None,
+        };
+        let ids_sub = resolve_antigravity_session_ids(&tmp_dir, &sub_hint);
+        assert!(ids_sub.contains("conv_active_a"));
+
+        // 4. Unrelated workspace returns empty set
+        let none_hint = AgySessionHint {
+            conversation_id: None,
+            cwd: Some(unrelated.to_string_lossy().into_owned()),
+            title: Some("zsh".to_string()),
+        };
+        assert!(resolve_antigravity_session_ids(&tmp_dir, &none_hint).is_empty());
+
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]
@@ -1663,7 +2227,7 @@ mod tests {
         use crate::model::{SharedSpace, SharedTab};
         use std::sync::atomic::AtomicUsize;
 
-        fn world_for_agent(addr: &str, name: &str) -> World {
+        fn world_for_agent_with_argv(addr: &str, name: &str, fg_argv: Vec<String>) -> World {
             let mut world = World::default();
             world.terminals.insert(
                 addr.to_string(),
@@ -1671,6 +2235,7 @@ mod tests {
                     address: addr.to_string(),
                     title: name.to_string(),
                     fg_name: Some(name.to_string()),
+                    fg_argv,
                     ..Default::default()
                 },
             );
@@ -1699,9 +2264,18 @@ mod tests {
             world
         }
 
-        let world_agy = world_for_agent("t_agy", "antigravity");
-        let world_codex = world_for_agent("t_codex", "codex");
-        let world_freebuff = world_for_agent("t_fb", "freebuff");
+        let world_agy = world_for_agent_with_argv(
+            "t_agy",
+            "antigravity",
+            vec!["agy".into(), "--conversation=conv-a".into()],
+        );
+        let world_agy_b = world_for_agent_with_argv(
+            "t_agy_2",
+            "antigravity",
+            vec!["agy".into(), "--conversation=conv-b".into()],
+        );
+        let world_codex = world_for_agent_with_argv("t_codex", "codex", Vec::new());
+        let world_freebuff = world_for_agent_with_argv("t_fb", "freebuff", Vec::new());
 
         let (agy_started_tx, agy_started_rx) = mpsc::channel();
         let (unblock_agy_tx, unblock_agy_rx) = mpsc::channel();
@@ -1712,15 +2286,22 @@ mod tests {
         let fb_calls_bg = Arc::clone(&fb_calls);
 
         let tracker = UsageTracker::new_with_collector(
-            move |kind, _| match kind {
+            move |kind, hint, _, _| match kind {
                 AgentKind::Antigravity => {
-                    let _ = agy_started_tx.send(());
-                    let _ = unblock_agy_rx.recv_timeout(Duration::from_secs(3));
-                    QuotaFetchOutcome::Authoritative(vec![QuotaMetric {
-                        window_label: "5h".to_string(),
-                        remaining_percent: 90.0,
-                        detail: None,
-                    }])
+                    let conv = hint
+                        .and_then(|h| h.conversation_id.as_deref())
+                        .unwrap_or("none");
+                    if conv == "conv-a" {
+                        let _ = agy_started_tx.send(());
+                        let _ = unblock_agy_rx.recv_timeout(Duration::from_secs(3));
+                        QuotaFetchOutcome::Authoritative(vec![QuotaMetric::usage(
+                            "会话", "10M", None,
+                        )])
+                    } else {
+                        QuotaFetchOutcome::Authoritative(vec![QuotaMetric::usage(
+                            "会话", "25M", None,
+                        )])
+                    }
                 }
                 AgentKind::Codex => {
                     let n = codex_calls_bg.fetch_add(1, Ordering::SeqCst);
@@ -1728,6 +2309,7 @@ mod tests {
                         QuotaFetchOutcome::Authoritative(vec![QuotaMetric {
                             window_label: "5h".to_string(),
                             remaining_percent: 83.0,
+                            value_text: None,
                             detail: None,
                         }])
                     } else {
@@ -1740,6 +2322,7 @@ mod tests {
                         QuotaFetchOutcome::Authoritative(vec![QuotaMetric {
                             window_label: "会话".to_string(),
                             remaining_percent: 75.0,
+                            value_text: None,
                             detail: None,
                         }])
                     } else {
@@ -1772,7 +2355,23 @@ mod tests {
 
         let populated_agy = tracker.focused_quota(&world_agy).unwrap();
         assert_eq!(populated_agy.metrics.len(), 1);
-        assert_eq!(populated_agy.metrics[0].remaining_percent, 90.0);
+        assert_eq!(populated_agy.metrics[0].value_text.as_deref(), Some("10M"));
+
+        // Second Antigravity pane caches independently by terminal address
+        let _ = tracker.focused_quota(&world_agy_b);
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            tracker.focused_quota(&world_agy_b).unwrap().metrics[0]
+                .value_text
+                .as_deref(),
+            Some("25M")
+        );
+        assert_eq!(
+            tracker.focused_quota(&world_agy).unwrap().metrics[0]
+                .value_text
+                .as_deref(),
+            Some("10M")
+        );
 
         let populated_codex = tracker.focused_quota(&world_codex).unwrap();
         assert_eq!(populated_codex.metrics.len(), 1);
@@ -1781,7 +2380,7 @@ mod tests {
         // TransientError on Codex retains 83%
         {
             let mut guard = tracker.state.lock().unwrap();
-            if let Some(entry) = guard.cache.get_mut(&AgentKind::Codex) {
+            if let Some(entry) = guard.cache.get_mut(&(AgentKind::Codex, None)) {
                 entry.ttl = Duration::ZERO;
             }
         }
@@ -1801,7 +2400,7 @@ mod tests {
         );
         {
             let mut guard = tracker.state.lock().unwrap();
-            if let Some(entry) = guard.cache.get_mut(&AgentKind::Freebuff) {
+            if let Some(entry) = guard.cache.get_mut(&(AgentKind::Freebuff, None)) {
                 entry.ttl = Duration::ZERO;
             }
         }
