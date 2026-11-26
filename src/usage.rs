@@ -1,5 +1,7 @@
 //! Focused-agent quota & usage tracker for the 1-row read-only bottom status bar.
-//! Collects 5h / 7d / daily quota usage in a background worker thread so TUI rendering never blocks.
+//! Collects 5h / 7d / daily quota usage strictly from local agent logs, databases, and files
+//! in a background worker thread so TUI rendering never blocks and no OAuth credentials,
+//! system keyrings, binaries, or external network endpoints are accessed.
 
 use crate::keys::QuotaFileConfig;
 use crate::model::{TerminalInfo, World};
@@ -7,7 +9,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,19 +18,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CACHE_TTL: Duration = Duration::from_secs(10);
-const AGY_CACHE_TTL: Duration = Duration::from_secs(30);
 const EMPTY_RETRY_TTL: Duration = Duration::from_secs(5);
-const QUOTA_API_HELPER_TIMEOUT: Duration = Duration::from_secs(6);
-const AGY_QUOTA_HELPER_TIMEOUT: Duration = Duration::from_secs(20);
 const QUOTA_LOCAL_HELPER_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_HELPER_STDOUT_BYTES: u64 = 2 * 1024 * 1024;
-
-fn cache_ttl_for_agent(kind: AgentKind) -> Duration {
-    match kind {
-        AgentKind::Codex | AgentKind::Antigravity => AGY_CACHE_TTL,
-        _ => CACHE_TTL,
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AgentKind {
@@ -137,7 +129,7 @@ impl UsageTracker {
                     continue;
                 }
                 let outcome = collector(kind, &mut claude_cache);
-                let normal_ttl = cache_ttl_for_agent(kind);
+                let normal_ttl = CACHE_TTL;
                 {
                     let mut guard = state_bg.lock().unwrap();
                     guard.in_flight.remove(&kind);
@@ -524,12 +516,14 @@ fn collect_quota_for_agent(
 ) -> QuotaFetchOutcome {
     let now_secs = now_unix_secs();
     match kind {
-        AgentKind::Codex => collect_codex_metrics(now_secs),
+        AgentKind::Codex => QuotaFetchOutcome::Authoritative(collect_codex_metrics(now_secs)),
         AgentKind::Claude => {
             QuotaFetchOutcome::Authoritative(collect_claude_metrics(now_secs, cfg, claude_cache))
         }
         AgentKind::OpenCode => collect_opencode_metrics(now_secs, cfg),
-        AgentKind::Antigravity => collect_antigravity_metrics(now_secs, cfg),
+        AgentKind::Antigravity => {
+            QuotaFetchOutcome::Authoritative(collect_antigravity_metrics(now_secs, cfg))
+        }
         AgentKind::Freebuff => QuotaFetchOutcome::Authoritative(collect_freebuff_metrics(now_secs)),
     }
 }
@@ -599,40 +593,44 @@ pub fn parse_codex_rate_limits_snapshot_from_jsonl(
             .or_else(|| val.get("timestamp").and_then(Value::as_u64));
         let mut metrics = Vec::new();
         for (key, default_lbl) in [("primary", "5h"), ("secondary", "7d")] {
-            if let Some(win) = rl.get(key) {
-                let win_mins = win
-                    .get("window_minutes")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let lbl = match win_mins {
-                    300 => "5h".to_string(),
-                    10080 => "7d".to_string(),
-                    1440 => "1d".to_string(),
-                    m if m > 0 && m % 60 == 0 => format!("{}h", m / 60),
-                    _ => default_lbl.to_string(),
-                };
-                let raw_used_pct = win
-                    .get("used_percent")
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.0);
-                let raw_rem_pct = (100.0 - raw_used_pct).clamp(0.0, 100.0);
-                let resets_at = win.get("resets_at").and_then(Value::as_u64).unwrap_or(0);
-                let (rem_pct, detail) = if resets_at > 0 && now_secs >= resets_at {
-                    (100.0, None)
-                } else if resets_at > now_secs {
-                    (
-                        raw_rem_pct,
-                        Some(format_duration_short(resets_at - now_secs)),
-                    )
-                } else {
-                    (raw_rem_pct, None)
-                };
-                metrics.push(QuotaMetric {
-                    window_label: lbl,
-                    remaining_percent: rem_pct,
-                    detail,
-                });
-            }
+            let Some(win) = rl.get(key).filter(|v| v.is_object()) else {
+                continue;
+            };
+            let Some(raw_used_pct) = win
+                .get("used_percent")
+                .and_then(Value::as_f64)
+                .filter(|v| v.is_finite())
+            else {
+                continue;
+            };
+            let win_mins = win
+                .get("window_minutes")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let lbl = match win_mins {
+                300 => "5h".to_string(),
+                10080 => "7d".to_string(),
+                1440 => "1d".to_string(),
+                m if m > 0 && m % 60 == 0 => format!("{}h", m / 60),
+                _ => default_lbl.to_string(),
+            };
+            let raw_rem_pct = (100.0 - raw_used_pct).clamp(0.0, 100.0);
+            let resets_at = win.get("resets_at").and_then(Value::as_u64).unwrap_or(0);
+            let (rem_pct, detail) = if resets_at > 0 && now_secs >= resets_at {
+                (100.0, None)
+            } else if resets_at > now_secs {
+                (
+                    raw_rem_pct,
+                    Some(format_duration_short(resets_at - now_secs)),
+                )
+            } else {
+                (raw_rem_pct, None)
+            };
+            metrics.push(QuotaMetric {
+                window_label: lbl,
+                remaining_percent: rem_pct,
+                detail,
+            });
         }
         if !metrics.is_empty() {
             let replace = match &best {
@@ -652,99 +650,6 @@ pub fn parse_codex_rate_limits_snapshot_from_jsonl(
 #[cfg(test)]
 pub fn parse_codex_rate_limits_from_jsonl(text: &str, now_secs: u64) -> Option<Vec<QuotaMetric>> {
     parse_codex_rate_limits_snapshot_from_jsonl(text, now_secs).map(|(_, m)| m)
-}
-
-pub fn parse_codex_wham_usage_json(text: &str, now_secs: u64) -> Option<Vec<QuotaMetric>> {
-    let val: Value = serde_json::from_str(text.trim()).ok()?;
-    let rl = val.get("rate_limit")?;
-    if rl.is_null() {
-        return None;
-    }
-    let mut metrics = Vec::new();
-    for (key, default_lbl) in [("primary_window", "5h"), ("secondary_window", "7d")] {
-        let Some(win) = rl.get(key) else {
-            continue;
-        };
-        if win.is_null() {
-            continue;
-        }
-        let win_secs = win
-            .get("limit_window_seconds")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let lbl = match win_secs {
-            18_000 => "5h".to_string(),
-            604_800 => "7d".to_string(),
-            86_400 => "1d".to_string(),
-            s if s > 0 && s % 3_600 == 0 => format!("{}h", s / 3_600),
-            _ => default_lbl.to_string(),
-        };
-        let raw_used_pct = win
-            .get("used_percent")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-        let raw_rem_pct = (100.0 - raw_used_pct).clamp(0.0, 100.0);
-        let reset_at = win.get("reset_at").and_then(Value::as_u64).unwrap_or(0);
-        let reset_after = win
-            .get("reset_after_seconds")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let (rem_pct, detail) = if reset_at > 0 && now_secs >= reset_at {
-            (100.0, None)
-        } else if reset_at > now_secs {
-            (
-                raw_rem_pct,
-                Some(format_duration_short(reset_at - now_secs)),
-            )
-        } else if reset_after > 0 {
-            (raw_rem_pct, Some(format_duration_short(reset_after)))
-        } else {
-            (raw_rem_pct, None)
-        };
-        metrics.push(QuotaMetric {
-            window_label: lbl,
-            remaining_percent: rem_pct,
-            detail,
-        });
-    }
-    if metrics.is_empty() {
-        None
-    } else {
-        Some(metrics)
-    }
-}
-
-fn fetch_codex_wham_usage(home: &Path, now_secs: u64) -> Option<Vec<QuotaMetric>> {
-    let auth_path = home.join(".codex/auth.json");
-    if !auth_path.is_file() {
-        return None;
-    }
-    let script = r#"
-import json, sys, urllib.request
-auth_path = sys.argv[1]
-with open(auth_path, "r", encoding="utf-8", errors="ignore") as f:
-    auth = json.load(f)
-tokens = auth.get("tokens") or {}
-access_token = tokens.get("access_token")
-if not access_token:
-    sys.exit(1)
-headers = {
-    "Authorization": f"Bearer {access_token}",
-    "User-Agent": "codex-cli",
-}
-account_id = tokens.get("account_id")
-if account_id:
-    headers["ChatGPT-Account-Id"] = account_id
-req = urllib.request.Request("https://chatgpt.com/backend-api/wham/usage", headers=headers)
-out = urllib.request.urlopen(req, timeout=4).read().decode("utf-8", errors="ignore")
-print(out)
-"#;
-    let text = run_command_stdout_with_timeout(
-        "python3",
-        [OsStr::new("-c"), OsStr::new(script), auth_path.as_os_str()],
-        QUOTA_API_HELPER_TIMEOUT,
-    )?;
-    parse_codex_wham_usage_json(&text, now_secs)
 }
 
 pub fn collect_codex_metrics_from_sessions_dir(
@@ -772,23 +677,19 @@ pub fn collect_codex_metrics_from_sessions_dir(
     best.map(|(_, m)| m).unwrap_or_default()
 }
 
-fn collect_codex_metrics(now_secs: u64) -> QuotaFetchOutcome {
-    let Some(home) = home_dir() else {
-        return QuotaFetchOutcome::Authoritative(Vec::new());
+fn codex_home_dir() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|h| h.join(".codex")))
+}
+
+fn collect_codex_metrics(now_secs: u64) -> Vec<QuotaMetric> {
+    let Some(codex_home) = codex_home_dir() else {
+        return Vec::new();
     };
-    let has_auth_file = home.join(".codex/auth.json").is_file();
-    if let Some(wham_metrics) = fetch_codex_wham_usage(&home, now_secs) {
-        return QuotaFetchOutcome::Authoritative(wham_metrics);
-    }
-    let sessions_dir = home.join(".codex/sessions");
-    let local_metrics = collect_codex_metrics_from_sessions_dir(&sessions_dir, now_secs);
-    if !local_metrics.is_empty() {
-        QuotaFetchOutcome::Authoritative(local_metrics)
-    } else if has_auth_file {
-        QuotaFetchOutcome::TransientError
-    } else {
-        QuotaFetchOutcome::Authoritative(Vec::new())
-    }
+    let sessions_dir = codex_home.join("sessions");
+    collect_codex_metrics_from_sessions_dir(&sessions_dir, now_secs)
 }
 
 fn collect_opencode_metrics(_now_secs: u64, cfg: &QuotaFileConfig) -> QuotaFetchOutcome {
@@ -1104,346 +1005,24 @@ fn collect_claude_metrics(
     collect_claude_metrics_from_dir_cached(&projects_dir, now_secs, cfg, cache)
 }
 
-pub fn parse_antigravity_quota_summary(text: &str, now_secs: u64) -> Option<Vec<QuotaMetric>> {
-    let val: Value = serde_json::from_str(text.trim()).ok()?;
-    let groups = val.get("groups")?.as_array()?;
-    if groups.is_empty() {
+fn parse_antigravity_transcript_step_ts(line: &str) -> Option<u64> {
+    if !line.contains("\"PLANNER_RESPONSE\"") {
         return None;
     }
-
-    // Prefer the "Gemini Models" group (`displayName` or `bucketId` contains "gemini"),
-    // falling back to the first group returned by `retrieveUserQuotaSummary`.
-    let chosen_group = groups
-        .iter()
-        .find(|g| {
-            let dname = g
-                .get("displayName")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            if dname.contains("gemini") {
-                return true;
-            }
-            g.get("buckets")
-                .and_then(Value::as_array)
-                .is_some_and(|bs| {
-                    bs.iter().any(|b| {
-                        b.get("bucketId")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_ascii_lowercase()
-                            .contains("gemini")
-                    })
-                })
+    let val = serde_json::from_str::<Value>(line).ok()?;
+    if val.get("type").and_then(Value::as_str) != Some("PLANNER_RESPONSE") {
+        return None;
+    }
+    val.get("created_at")
+        .or_else(|| val.get("timestamp"))
+        .and_then(|v| {
+            v.as_str()
+                .and_then(parse_utc_iso8601_secs)
+                .or_else(|| v.as_u64())
         })
-        .unwrap_or(&groups[0]);
-
-    let buckets = chosen_group.get("buckets")?.as_array()?;
-    let mut metric_5h: Option<QuotaMetric> = None;
-    let mut metric_7d: Option<QuotaMetric> = None;
-    let mut others: Vec<QuotaMetric> = Vec::new();
-
-    for b in buckets {
-        let win_str = b
-            .get("window")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let bid_str = b
-            .get("bucketId")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let is_5h = win_str == "5h" || bid_str.ends_with("-5h");
-        let is_7d = win_str == "weekly" || win_str == "7d" || bid_str.ends_with("-weekly");
-        let lbl = if is_5h {
-            "5h".to_string()
-        } else if is_7d {
-            "7d".to_string()
-        } else if !win_str.is_empty() {
-            win_str
-        } else {
-            continue;
-        };
-
-        let raw_rem = (b
-            .get("remainingFraction")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0)
-            * 100.0)
-            .clamp(0.0, 100.0);
-        let resets_at = b
-            .get("resetTime")
-            .and_then(Value::as_str)
-            .and_then(parse_utc_iso8601_secs)
-            .unwrap_or(0);
-        let (rem_pct, detail) = if resets_at > 0 && now_secs >= resets_at {
-            (100.0, None)
-        } else if resets_at > now_secs {
-            (raw_rem, Some(format_duration_short(resets_at - now_secs)))
-        } else {
-            (raw_rem, None)
-        };
-        let metric = QuotaMetric {
-            window_label: lbl,
-            remaining_percent: rem_pct,
-            detail,
-        };
-        if is_5h && metric_5h.is_none() {
-            metric_5h = Some(metric);
-        } else if is_7d && metric_7d.is_none() {
-            metric_7d = Some(metric);
-        } else {
-            others.push(metric);
-        }
-    }
-
-    let mut out = Vec::new();
-    if let Some(m) = metric_5h {
-        out.push(m);
-    }
-    if let Some(m) = metric_7d {
-        out.push(m);
-    }
-    out.extend(others);
-
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
 }
 
-const AGY_QUOTA_PYTHON_SCRIPT: &str = r#"
-import ctypes, datetime, json, mmap, os, re, shutil, sys, threading, time, urllib.parse, urllib.request
-
-home = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("HOME", "")
-libsecret_thread_started = False
-
-def load_file_token():
-    if not home:
-        return None
-    tok_file = os.path.join(home, ".gemini/antigravity-cli/antigravity-oauth-token")
-    if not os.path.isfile(tok_file):
-        return None
-    try:
-        with open(tok_file, "r", encoding="utf-8", errors="ignore") as f:
-            obj = json.load(f)
-        if isinstance(obj, dict) and isinstance(obj.get("token"), dict):
-            tok = obj["token"]
-            if tok.get("access_token") or tok.get("refresh_token"):
-                return obj
-    except Exception:
-        pass
-    return None
-
-def _lookup_libsecret_raw():
-    if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
-        return None
-    lib = None
-    for cand in ("libsecret-1.so.0", "/usr/lib/libsecret-1.so.0", "/usr/lib/x86_64-linux-gnu/libsecret-1.so.0"):
-        try:
-            lib = ctypes.CDLL(cand)
-            break
-        except Exception:
-            pass
-    if lib is None and os.path.isdir("/nix/store"):
-        try:
-            with os.scandir("/nix/store") as it:
-                for e in it:
-                    if "libsecret-" in e.name and not e.name.endswith(".drv"):
-                        p = os.path.join(e.path, "lib/libsecret-1.so.0")
-                        if os.path.exists(p):
-                            try:
-                                lib = ctypes.CDLL(p)
-                                break
-                            except Exception:
-                                pass
-        except Exception:
-            pass
-    if lib is None:
-        return None
-    try:
-        class SecretSchemaAttribute(ctypes.Structure):
-            _fields_ = [("name", ctypes.c_char_p), ("type", ctypes.c_int)]
-        class SecretSchema(ctypes.Structure):
-            _fields_ = [("name", ctypes.c_char_p), ("flags", ctypes.c_int), ("attributes", SecretSchemaAttribute * 32)]
-        attrs = (SecretSchemaAttribute * 32)()
-        attrs[0] = SecretSchemaAttribute(b"service", 0)
-        attrs[1] = SecretSchemaAttribute(b"username", 0)
-        attrs[2] = SecretSchemaAttribute(None, 0)
-        schema = SecretSchema(b"org.freedesktop.Secret.Generic", 2, attrs)
-        lib.secret_password_lookup_sync.restype = ctypes.c_char_p
-        raw = lib.secret_password_lookup_sync(
-            ctypes.byref(schema),
-            ctypes.c_void_p(None),
-            ctypes.c_void_p(None),
-            b"service",
-            b"gemini",
-            b"username",
-            b"antigravity",
-            ctypes.c_char_p(None),
-        )
-        if raw:
-            return json.loads(raw.decode("utf-8", errors="ignore"))
-    except Exception:
-        pass
-    return None
-
-def load_libsecret_token(timeout_sec=1.0):
-    global libsecret_thread_started
-    if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
-        return None
-    holder = [None]
-    def runner():
-        holder[0] = _lookup_libsecret_raw()
-    libsecret_thread_started = True
-    t = threading.Thread(target=runner, daemon=True)
-    t.start()
-    t.join(timeout=timeout_sec)
-    return holder[0]
-
-def finish(code, payload=None):
-    if payload is not None:
-        sys.stdout.write(payload)
-        if not payload.endswith("\n"):
-            sys.stdout.write("\n")
-        sys.stdout.flush()
-    if libsecret_thread_started:
-        os._exit(code)
-    sys.exit(code)
-
-def candidate_agy_binaries():
-    seen = set()
-    raw_cands = [
-        shutil.which("agy"),
-        os.path.join(home, ".local/bin/agy") if home else None,
-        "/run/current-system/sw/bin/agy",
-    ]
-    for p in raw_cands:
-        if not p or not os.path.isfile(p):
-            continue
-        rp = os.path.realpath(p)
-        if rp not in seen:
-            seen.add(rp)
-            yield rp
-        try:
-            sz = os.path.getsize(rp)
-            if 0 < sz < 65536:
-                with open(rp, "rb") as wf:
-                    wbytes = wf.read()
-                for m in re.findall(rb"/nix/store/[A-Za-z0-9._+-]+/[^\s\"']+", wbytes):
-                    wp = os.path.realpath(m.decode("ascii", errors="ignore"))
-                    if os.path.isfile(wp) and wp not in seen:
-                        seen.add(wp)
-                        yield wp
-        except Exception:
-            pass
-
-def refresh_oauth_token(refresh_token):
-    cid_bytes = None
-    csec_bytes = None
-    for agy_bin in candidate_agy_binaries():
-        try:
-            with open(agy_bin, "rb") as f:
-                if os.fstat(f.fileno()).st_size > 0:
-                    with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                        cid_m = re.search(rb"[0-9]{10,}-[a-z0-9]+\.apps\.googleusercontent\.com", mm)
-                        csec_m = re.search(rb"GOCSPX-[A-Za-z0-9_-]{24,36}", mm)
-                        if cid_m and csec_m:
-                            cid_bytes = cid_m.group(0)
-                            csec_bytes = csec_m.group(0)
-                            break
-        except Exception:
-            pass
-    if not cid_bytes or not csec_bytes:
-        return None
-    data = urllib.parse.urlencode({
-        "client_id": cid_bytes.decode("ascii"),
-        "client_secret": csec_bytes.decode("ascii"),
-        "refresh_token": refresh_token,
-        "grant_type": "refresh_token",
-    }).encode()
-    req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data)
-    return json.loads(urllib.request.urlopen(req, timeout=4).read().decode())["access_token"]
-
-def query_quota(access_token, auth_method):
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-        "User-Agent": f"antigravity/cli/1.5.3 (aidev_client; os_type=linux; arch=amd64; auth_method={auth_method})",
-        "X-Goog-Api-Client": "gl-go/1.24.0",
-    }
-    req = urllib.request.Request(
-        "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
-        data=json.dumps({"project": "aicode-consumers"}).encode(),
-        headers=headers,
-    )
-    return urllib.request.urlopen(req, timeout=4).read().decode("utf-8", errors="ignore")
-
-def try_fetch_with_token_obj(obj):
-    if not isinstance(obj, dict):
-        return None
-    auth_method = (obj.get("auth_method") or "consumer").strip() or "consumer"
-    tok_info = obj.get("token") or {}
-    if not isinstance(tok_info, dict):
-        return None
-    access_token = tok_info.get("access_token")
-    refresh_token = tok_info.get("refresh_token")
-    expiry_str = tok_info.get("expiry") or ""
-    need_refresh = True
-    if access_token and expiry_str:
-        try:
-            exp_ts = datetime.datetime.fromisoformat(expiry_str.replace("Z", "+00:00")).timestamp()
-            if exp_ts > time.time() + 60:
-                need_refresh = False
-        except Exception:
-            pass
-    if need_refresh and refresh_token:
-        try:
-            refreshed = refresh_oauth_token(refresh_token)
-            if refreshed:
-                access_token = refreshed
-        except Exception:
-            pass
-    if not access_token:
-        return None
-    try:
-        return query_quota(access_token, auth_method)
-    except Exception:
-        if not need_refresh and refresh_token:
-            try:
-                refreshed = refresh_oauth_token(refresh_token)
-                if refreshed:
-                    return query_quota(refreshed, auth_method)
-            except Exception:
-                pass
-        return None
-
-for loader in (load_file_token, load_libsecret_token):
-    cand = loader()
-    if cand:
-        out = try_fetch_with_token_obj(cand)
-        if out:
-            finish(0, out)
-
-finish(1)
-"#;
-
-fn fetch_antigravity_api_quota(now_secs: u64) -> Option<Vec<QuotaMetric>> {
-    let home = home_dir()?;
-    let text = run_command_stdout_with_timeout(
-        "python3",
-        [
-            OsStr::new("-c"),
-            OsStr::new(AGY_QUOTA_PYTHON_SCRIPT),
-            home.as_os_str(),
-        ],
-        AGY_QUOTA_HELPER_TIMEOUT,
-    )?;
-    parse_antigravity_quota_summary(&text, now_secs)
-}
-
+#[cfg(test)]
 pub fn count_antigravity_transcript_steps_in_str(
     text: &str,
     cutoff_5h: u64,
@@ -1452,24 +1031,7 @@ pub fn count_antigravity_transcript_steps_in_str(
     let mut steps_5h = 0u64;
     let mut steps_day = 0u64;
     for line in text.lines() {
-        if !line.contains("\"PLANNER_RESPONSE\"") {
-            continue;
-        }
-        let Ok(val) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if val.get("type").and_then(Value::as_str) != Some("PLANNER_RESPONSE") {
-            continue;
-        }
-        let Some(ts) = val
-            .get("created_at")
-            .or_else(|| val.get("timestamp"))
-            .and_then(|v| {
-                v.as_str()
-                    .and_then(parse_utc_iso8601_secs)
-                    .or_else(|| v.as_u64())
-            })
-        else {
+        let Some(ts) = parse_antigravity_transcript_step_ts(line) else {
             continue;
         };
         if ts >= midnight_secs {
@@ -1482,32 +1044,60 @@ pub fn count_antigravity_transcript_steps_in_str(
     (steps_5h, steps_day)
 }
 
-fn collect_antigravity_metrics(now_secs: u64, cfg: &QuotaFileConfig) -> QuotaFetchOutcome {
-    if let Some(api_metrics) = fetch_antigravity_api_quota(now_secs) {
-        return QuotaFetchOutcome::Authoritative(api_metrics);
-    }
-
-    let Some(home) = home_dir() else {
-        return QuotaFetchOutcome::Authoritative(Vec::new());
+fn count_antigravity_transcript_steps_in_file(
+    path: &Path,
+    cutoff_5h: u64,
+    midnight_secs: u64,
+) -> (u64, u64) {
+    let Ok(file) = File::open(path) else {
+        return (0, 0);
     };
-    let brain_dir = home.join(".gemini/antigravity-cli/brain");
-    let has_oauth_token = home
-        .join(".gemini/antigravity-cli/antigravity-oauth-token")
-        .is_file();
-    if has_oauth_token && !brain_dir.is_dir() {
-        return QuotaFetchOutcome::TransientError;
+    let mut reader = BufReader::new(file);
+    let mut buf = Vec::new();
+    let mut steps_5h = 0u64;
+    let mut steps_day = 0u64;
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => break,
+            Ok(_) => {
+                let line = String::from_utf8_lossy(&buf);
+                let trimmed = line.trim_end_matches(['\r', '\n']);
+                if let Some(ts) = parse_antigravity_transcript_step_ts(trimmed) {
+                    if ts >= midnight_secs {
+                        steps_day += 1;
+                    }
+                    if ts >= cutoff_5h {
+                        steps_5h += 1;
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    (steps_5h, steps_day)
+}
+
+pub fn collect_antigravity_metrics_from_brain_dir(
+    brain_dir: &Path,
+    now_secs: u64,
+    utc_offset_secs: i64,
+    cfg: &QuotaFileConfig,
+) -> Vec<QuotaMetric> {
+    if !brain_dir.is_dir() {
+        return Vec::new();
     }
     let limit_5h = cfg.agy_5h_steps.unwrap_or(300).max(1);
     let limit_day = cfg.agy_daily_steps.unwrap_or(1000).max(1);
 
     let cutoff_5h = now_secs.saturating_sub(5 * 3_600);
-    let midnight_secs = today_midnight_unix_secs(now_secs, local_utc_offset_secs());
+    let midnight_secs = today_midnight_unix_secs(now_secs, utc_offset_secs);
     let min_cutoff_secs = cutoff_5h.min(midnight_secs);
     let min_mtime = UNIX_EPOCH.checked_add(Duration::from_secs(min_cutoff_secs));
 
     let mut steps_5h = 0u64;
     let mut steps_day = 0u64;
-    if let Ok(entries) = fs::read_dir(&brain_dir) {
+    if let Ok(entries) = fs::read_dir(brain_dir) {
         for entry in entries.flatten() {
             let log_path = entry.path().join(".system_generated/logs/transcript.jsonl");
             let Ok(meta) = fs::metadata(&log_path) else {
@@ -1517,11 +1107,8 @@ fn collect_antigravity_metrics(now_secs: u64, cfg: &QuotaFileConfig) -> QuotaFet
             if min_mtime.is_some_and(|m| mtime < m) {
                 continue;
             }
-            let Some(tail) = read_tail_string(&log_path, 512 * 1024) else {
-                continue;
-            };
             let (s5, sd) =
-                count_antigravity_transcript_steps_in_str(&tail, cutoff_5h, midnight_secs);
+                count_antigravity_transcript_steps_in_file(&log_path, cutoff_5h, midnight_secs);
             steps_5h += s5;
             steps_day += sd;
         }
@@ -1530,7 +1117,7 @@ fn collect_antigravity_metrics(now_secs: u64, cfg: &QuotaFileConfig) -> QuotaFet
     let used_5h = ((steps_5h as f64 / limit_5h as f64) * 100.0).clamp(0.0, 100.0);
     let used_day = ((steps_day as f64 / limit_day as f64) * 100.0).clamp(0.0, 100.0);
 
-    QuotaFetchOutcome::Authoritative(vec![
+    vec![
         QuotaMetric {
             window_label: "5h".to_string(),
             remaining_percent: (100.0 - used_5h).clamp(0.0, 100.0),
@@ -1541,7 +1128,15 @@ fn collect_antigravity_metrics(now_secs: u64, cfg: &QuotaFileConfig) -> QuotaFet
             remaining_percent: (100.0 - used_day).clamp(0.0, 100.0),
             detail: Some(format!("{steps_day}/{limit_day} steps")),
         },
-    ])
+    ]
+}
+
+fn collect_antigravity_metrics(now_secs: u64, cfg: &QuotaFileConfig) -> Vec<QuotaMetric> {
+    let Some(home) = home_dir() else {
+        return Vec::new();
+    };
+    let brain_dir = home.join(".gemini/antigravity-cli/brain");
+    collect_antigravity_metrics_from_brain_dir(&brain_dir, now_secs, local_utc_offset_secs(), cfg)
 }
 
 pub fn parse_freebuff_session_quota_json(text: &str, now_secs: u64) -> Option<Vec<QuotaMetric>> {
@@ -1685,65 +1280,101 @@ mod tests {
         assert_eq!(expired[0].detail, None);
         assert_eq!(expired[1].remaining_percent, 16.0);
 
-        // Also verify live `/backend-api/wham/usage` JSON parsing
-        let wham_sample = r#"{"rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":17,"limit_window_seconds":18000,"reset_after_seconds":10860,"reset_at":11860},"secondary_window":{"used_percent":84,"limit_window_seconds":604800,"reset_after_seconds":446400,"reset_at":447400}}}"#;
-        let wham_metrics = parse_codex_wham_usage_json(wham_sample, 1000).unwrap();
-        assert_eq!(wham_metrics.len(), 2);
-        assert_eq!(wham_metrics[0].window_label, "5h");
-        assert_eq!(wham_metrics[0].remaining_percent, 83.0);
-        assert_eq!(wham_metrics[0].detail.as_deref(), Some("3h01m"));
-        assert_eq!(wham_metrics[1].window_label, "7d");
-        assert_eq!(wham_metrics[1].remaining_percent, 16.0);
-        assert_eq!(wham_metrics[1].detail.as_deref(), Some("5d4h"));
+        // Null or incomplete window objects are skipped instead of emitting fake 100% bars
+        let partial = r#"{"timestamp":"2026-11-11T04:00:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":25.0,"window_minutes":300,"resets_at":2000},"secondary":null}}}"#;
+        let partial_metrics = parse_codex_rate_limits_from_jsonl(partial, 1000).unwrap();
+        assert_eq!(partial_metrics.len(), 1);
+        assert_eq!(partial_metrics[0].window_label, "5h");
+        assert_eq!(partial_metrics[0].remaining_percent, 75.0);
+
+        let missing_used = r#"{"timestamp":"2026-11-11T04:00:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"window_minutes":300},"secondary":null}}}"#;
+        assert!(parse_codex_rate_limits_from_jsonl(missing_used, 1000).is_none());
     }
 
     #[test]
-    fn parses_antigravity_quota_summary_gemini_models_remaining_percentages() {
-        let sample = r#"{
-          "groups": [
-            {
-              "displayName": "Gemini Models",
-              "description": "Models within this group: Gemini Flash, Gemini Pro",
-              "buckets": [
-                {
-                  "bucketId": "gemini-weekly",
-                  "displayName": "Weekly Limit Remaining",
-                  "window": "weekly",
-                  "resetTime": "2026-11-14T00:28:34Z",
-                  "remainingFraction": 0.4396
-                },
-                {
-                  "bucketId": "gemini-5h",
-                  "displayName": "Five Hour Limit Remaining",
-                  "window": "5h",
-                  "resetTime": "2026-11-11T10:41:18Z",
-                  "remainingFraction": 0.9545
-                }
-              ]
-            },
-            {
-              "displayName": "Claude and GPT models",
-              "buckets": [
-                {
-                  "bucketId": "3p-weekly",
-                  "window": "weekly",
-                  "resetTime": "2026-11-12T07:31:10Z",
-                  "remainingFraction": 0.0084
-                }
-              ]
-            }
-          ]
-        }"#;
+    fn collects_antigravity_metrics_locally_from_brain_dir_and_handles_missing_dir() {
+        use std::io::Write;
 
-        let now_secs = parse_utc_iso8601_secs("2026-11-11T06:50:00Z").unwrap();
-        let metrics = parse_antigravity_quota_summary(sample, now_secs).unwrap();
+        let tmp_dir =
+            std::env::temp_dir().join(format!("hct_test_agy_brain_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp_dir);
+
+        let cfg = QuotaFileConfig {
+            agy_5h_steps: Some(10),
+            agy_daily_steps: Some(20),
+            ..Default::default()
+        };
+        let now_secs = now_unix_secs().max(2 * 86_400);
+        let utc_offset_secs = 12 * 3_600 - (now_secs % 86_400) as i64;
+
+        // Missing brain directory returns empty metrics rather than a bogus 0/N bar
+        assert!(collect_antigravity_metrics_from_brain_dir(
+            &tmp_dir,
+            now_secs,
+            utc_offset_secs,
+            &cfg
+        )
+        .is_empty());
+
+        let log_dir = tmp_dir.join("conv_1/.system_generated/logs");
+        fs::create_dir_all(&log_dir).unwrap();
+        let log_path = log_dir.join("transcript.jsonl");
+        let mut f = File::create(&log_path).unwrap();
+
+        // Early in-window event placed before >600 KiB of filler to verify full-file streaming
+        writeln!(
+            f,
+            "{{\"type\":\"PLANNER_RESPONSE\",\"created_at\":{}}}",
+            now_secs - 3_600
+        )
+        .unwrap();
+        let filler_line = format!(
+            "{{\"type\":\"USER_INPUT\",\"created_at\":{},\"content\":\"{}\"}}\n",
+            now_secs - 3_500,
+            "x".repeat(2048)
+        );
+        for _ in 0..320 {
+            f.write_all(filler_line.as_bytes()).unwrap();
+        }
+        // Old event outside both today and 5h windows
+        writeln!(
+            f,
+            "{{\"type\":\"PLANNER_RESPONSE\",\"created_at\":{}}}",
+            now_secs - 20 * 3_600
+        )
+        .unwrap();
+        // Earlier today (midnight is now_secs - 12h), outside 5h window
+        writeln!(
+            f,
+            "{{\"type\":\"PLANNER_RESPONSE\",\"created_at\":{}}}",
+            now_secs - 8 * 3_600
+        )
+        .unwrap();
+        // Invalid UTF-8 and malformed JSON lines should be skipped cleanly
+        f.write_all(b"{\"type\":\"PLANNER_RESPONSE\",\"bad\":\xff}\n")
+            .unwrap();
+        f.write_all(b"{\"type\":\"PLANNER_RESPONSE\",\"created_at\":\n")
+            .unwrap();
+        // Recent event inside both 5h and today windows
+        writeln!(
+            f,
+            "{{\"type\":\"PLANNER_RESPONSE\",\"timestamp\":{}}}",
+            now_secs - 600
+        )
+        .unwrap();
+        drop(f);
+
+        let metrics =
+            collect_antigravity_metrics_from_brain_dir(&tmp_dir, now_secs, utc_offset_secs, &cfg);
+        let _ = fs::remove_dir_all(&tmp_dir);
+
         assert_eq!(metrics.len(), 2);
         assert_eq!(metrics[0].window_label, "5h");
-        assert!((metrics[0].remaining_percent - 95.45).abs() < 1e-4);
-        assert_eq!(metrics[0].detail.as_deref(), Some("3h51m"));
-        assert_eq!(metrics[1].window_label, "7d");
-        assert!((metrics[1].remaining_percent - 43.96).abs() < 1e-4);
-        assert_eq!(metrics[1].detail.as_deref(), Some("2d17h"));
+        assert!((metrics[0].remaining_percent - 80.0).abs() < 1e-4);
+        assert_eq!(metrics[0].detail.as_deref(), Some("2/10 steps"));
+        assert_eq!(metrics[1].window_label, "今日");
+        assert!((metrics[1].remaining_percent - 85.0).abs() < 1e-4);
+        assert_eq!(metrics[1].detail.as_deref(), Some("3/20 steps"));
     }
 
     #[test]

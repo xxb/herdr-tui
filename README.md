@@ -91,7 +91,7 @@ mkdir -p ~/.local/bin && install -m 755 target/release/hct ~/.local/bin/hct
 
 - **Real-Time Client Sync** — Spaces, tabs, and unread agent state stay synced with Herdr Desktop and Android.
 - **Theme-Aware Minimal Chrome** — 1-row transparent top bar (`[ ⏏ ] [ ▾ <space> ] ╱ Tabs [ + ] [ ? ]`) with accordion tab folding and a floating Space switcher popover; automatically follows your terminal's light or dark theme and subtly italicizes AI agent intermediate steps while leaving plain shells untouched.
-- **Focused Agent Quota Bar** — 1-row bottom progress bar displaying remaining quota for the focused agent (Codex, Antigravity, OpenCode, Claude, Freebuff), staying transparent when idle.
+- **Focused Agent Quota Bar** — 1-row bottom progress bar displaying remaining quota for the focused agent (Codex, Antigravity, OpenCode, Claude, Freebuff) strictly from local session logs/files with no network requests or credential access, staying transparent when idle.
 - **Touch & Mobile SSH Friendly** — Drag to select and auto-copy over SSH (OSC 52), tap tabs and menus directly, swipe horizontally to switch tabs (or open the full-screen Tab Overview), and toggle dual floating draggable `+` cross pads (`hct --touch`).
 - **E-Ink Mode & Built-In Reader** — High-contrast monochrome mode (`hct -e`) with optional Kaleido color accents (`--eink-color`), spinner freezing, frame pacing, edge tab buttons, and a full-screen paginated Reader (`^b v`) with Clean/Full toggle for reading long AI responses comfortably.
 - **Familiar & Safe** — Compatible with classic `herdr` shortcuts and `~/.config/herdr/config.toml`, reports focused session and terminal to outer terminals (`OSC 1337`), and guards against accidental multiplexer nesting (override with `--allow-nested`).
