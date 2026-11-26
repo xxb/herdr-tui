@@ -50,7 +50,9 @@ pub struct QuotaFileConfig {
     pub claude_7d_messages: Option<u64>,
     pub opencode_daily_requests: Option<u64>,
     pub opencode_5h_requests: Option<u64>,
+    #[allow(dead_code)]
     pub agy_5h_steps: Option<u64>,
+    #[allow(dead_code)]
     pub agy_daily_steps: Option<u64>,
 }
 
