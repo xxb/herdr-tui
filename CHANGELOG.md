@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.16.0](https://github.com/xxb/herdr-tui/compare/v0.15.0...v0.16.0) (2026-11-26)
+
+
+### Features
+
+* **usage:** show local-only Antigravity usage across session, 5h, today, 7d, and 30d (Fixes [#114](https://github.com/xxb/herdr-tui/issues/114)) ([#115](https://github.com/xxb/herdr-tui/issues/115)) ([5a2f3c4](https://github.com/xxb/herdr-tui/commit/5a2f3c4d5b20937ea0908e74fcfb2764f8d1ee54))
+
 ## [0.15.0](https://github.com/xxb/herdr-tui/compare/v0.14.0...v0.15.0) (2026-11-26)
 
 
