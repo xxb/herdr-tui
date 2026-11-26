@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.15.0](https://github.com/xxb/herdr-tui/compare/v0.14.0...v0.15.0) (2026-11-26)
+
+
+### Features
+
+* **perf:** lock main-screen PTY height on vertical-only shrink for soft keyboard ([#110](https://github.com/xxb/herdr-tui/issues/110)) ([8296796](https://github.com/xxb/herdr-tui/commit/8296796b723f54900ab4c622419cb3e89d0c6dc4))
+
+
+### Bug Fixes
+
+* **usage:** switch all agent quota tracking to local-only reads (Fixes [#112](https://github.com/xxb/herdr-tui/issues/112)) ([#113](https://github.com/xxb/herdr-tui/issues/113)) ([a42bd9a](https://github.com/xxb/herdr-tui/commit/a42bd9a3ed1b719b322ba9bbb840ef6239e5cb00))
+
 ## [0.14.0](https://github.com/xxb/herdr-tui/compare/v0.13.0...v0.14.0) (2026-11-22)
 
 
